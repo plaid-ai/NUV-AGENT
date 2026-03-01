@@ -5,7 +5,7 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.23"
+  version "0.1.24"
   license "Proprietary"
 
   depends_on "python@3.14"
@@ -145,8 +145,8 @@ class NuvAgent < Formula
   end
 
   resource "huggingface_hub" do
-    url "https://files.pythonhosted.org/packages/54/89/bfbfde252d649fae8d5f09b14a2870e5672ed160c1a6629301b3e5302621/huggingface_hub-1.3.7-py3-none-any.whl"
-    sha256 "8155ce937038fa3d0cb4347d752708079bc85e6d9eb441afb44c84bcf48620d2"
+    url "https://files.pythonhosted.org/packages/a8/af/48ac8483240de756d2438c380746e7130d1c6f75802ef22f3c6d49982787/huggingface_hub-0.36.2-py3-none-any.whl"
+    sha256 "48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270"
   end
 
   resource "jinja2" do
@@ -225,8 +225,8 @@ class NuvAgent < Formula
   end
 
   resource "transformers" do
-    url "https://files.pythonhosted.org/packages/52/f3/ac976fa8e305c9e49772527e09fbdc27cc6831b8a2f6b6063406626be5dd/transformers-5.0.0-py3-none-any.whl"
-    sha256 "587086f249ce64c817213cf36afdb318d087f790723e9b3d4500b97832afd52d"
+    url "https://files.pythonhosted.org/packages/71/d3/c16c3b3cf7655a67db1144da94b021c200ac1303f82428f2beef6c2e72bb/transformers-4.57.1-py3-none-any.whl"
+    sha256 "b10d05da8fa67dc41644dbbf9bc45a44cb86ae33da6f9295f5fbf5b7890bd267"
   end
 
   resource "typer-slim" do

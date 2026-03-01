@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nuv-agent"
-version = "0.1.23"
+version = "0.1.24"
 description = "Nuvion on-device agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
   "python-dotenv",
-  "huggingface_hub>=0.23.0",
+  "huggingface_hub>=0.23.0,<1.0.0",
   "qrcode",
   "websockets",
   "stomper",
