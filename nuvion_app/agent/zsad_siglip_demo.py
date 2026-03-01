@@ -107,10 +107,21 @@ def main():
                     score = result["score"]
                     print(f"ZSAD(siglip): {label} ({score:.3f}) anomaly={is_anomaly}")
             else:
-                score = triton_client.infer(frame_rgb)
+                result = triton_client.predict(frame_rgb)
+                score = float(result.get("score", 0.0))
                 threshold = float(os.getenv("NUVION_TRITON_THRESHOLD", os.getenv("NUVION_ZERO_SHOT_THRESHOLD", "0.7")))
                 is_anomaly = score >= threshold
-                print(f"ZSAD(triton): score={score:.3f} anomaly={is_anomaly}")
+                label = result.get("label", "unknown")
+                mode = result.get("mode", "generic")
+                if "predicted_label" in result:
+                    pred = result.get("predicted_label")
+                    pred_score = float(result.get("predicted_score", 0.0))
+                    print(
+                        f"ZSAD(triton/{mode}): predicted={pred} ({pred_score:.3f}) "
+                        f"anomaly_prob={score:.3f} anomaly={is_anomaly} anomaly_label={result.get('anomaly_label')}"
+                    )
+                else:
+                    print(f"ZSAD(triton/{mode}): {label} score={score:.3f} anomaly={is_anomaly}")
 
         if args.show:
             cv2.imshow("ZSAD", frame)

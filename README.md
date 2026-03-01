@@ -41,6 +41,18 @@ curl -fsSL https://apt.plaidai.io/install-apt.sh | bash
 
 Python requirement: 3.10+
 
+## Pull model bundle (Hugging Face)
+`plaidlabs/nuvion-v1` 모델 번들을 내려받아 Triton/AnomalyCLIP 런타임에 바로 연결할 수 있습니다.
+```bash
+# runtime: text_features + Triton model_repository (권장)
+nuv-agent pull-model --repo-id plaidlabs/nuvion-v1 --profile runtime
+```
+
+Profiles:
+- `runtime`: Triton + text features 실행에 필요한 파일만 다운로드
+- `light`: text features/metadata 중심의 경량 다운로드
+- `full`: 저장소 전체 다운로드
+
 ## macOS dev setup (Homebrew)
 Recommended for local runs on Apple Silicon.
 ```bash
@@ -105,6 +117,9 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ZERO_SHOT_ENABLED`: enable optional zero-shot anomaly detection (requires model deps)
 - `NUVION_ZSAD_BACKEND`: `siglip` 또는 `triton`
  - 기본 ZSAD 모델: `google/siglip2-base-patch16-224`
+- `NUVION_MODEL_REPO_ID`: pull-model 대상 Hugging Face repo (default: `plaidlabs/nuvion-v1`)
+- `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
+- `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
 
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
 
@@ -128,6 +143,23 @@ NUVION_ZSAD_BACKEND=triton python -m nuvion_app.agent.zsad_siglip_demo
 ## Triton backend notes
 - 기본은 **SigLIP2 base (google/siglip2-base-patch16-224)** 기준으로 맞춰져 있습니다.
 - Triton 모델은 `siglip2-zsad`(기본값)으로 가정하며, 입력/출력 스펙은 `NUVION_TRITON_*`로 조정 가능합니다.
+
+### AnomalyCLIP Triton mode
+AnomalyCLIP image encoder + precomputed text features를 함께 사용하려면:
+```bash
+export NUVION_ZSAD_BACKEND=triton
+export NUVION_TRITON_MODE=anomalyclip
+export NUVION_TRITON_MODEL=image_encoder
+export NUVION_TRITON_INPUT=images
+export NUVION_TRITON_IMAGE_FEATURES_OUTPUT=image_features
+export NUVION_TRITON_TEXT_FEATURES=$HOME/.cache/nuvion/models/plaidlabs__nuvion-v1/onnx/text_features.npy
+export NUVION_TRITON_THRESHOLD=0.7
+```
+
+설명:
+- `NUVION_TRITON_MODE=anomalyclip`: Triton 출력 `image_features`와 `text_features.npy`를 결합해 anomaly probability 계산
+- `NUVION_TRITON_TEXT_TEMPERATURE`: 기본 `0.07` (softmax temperature)
+- `NUVION_TRITON_ANOMALY_INDEX`: anomaly class 인덱스 (기본 `1`)
 
 ## Target platforms
 - Jetson Nano / ARM 기반 장치 + Triton 서빙
