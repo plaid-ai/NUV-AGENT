@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "numpy",
   "python-dotenv",
+  "huggingface_hub>=0.23.0",
   "qrcode",
   "websockets",
   "stomper",
