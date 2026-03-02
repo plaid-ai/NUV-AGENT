@@ -60,7 +60,14 @@ class ModelStoreSelfHealTest(unittest.TestCase):
             }
         }
 
-        def fake_download(*, url: str, dst_path: Path, timeout: int = 120, max_retries: int = 3) -> None:
+        def fake_download(
+            *,
+            url: str,
+            dst_path: Path,
+            timeout: int = 120,
+            max_retries: int = 3,
+            progress_label: str | None = None,
+        ) -> None:
             if "/bad/" in url:
                 raise RuntimeError(f"Download failed after 3 attempts: {url} (HTTP Error 400: Bad Request)")
             dst_path.parent.mkdir(parents=True, exist_ok=True)

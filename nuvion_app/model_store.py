@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -46,6 +47,26 @@ _DEFAULT_LOCAL_PATHS = {
     "triton_eval": "metadata/triton_eval_results.txt",
     "manifest": "metadata/gcs_manifest.json",
 }
+
+
+def _emit_model_progress(message: str) -> None:
+    try:
+        sys.stderr.write(f"[MODEL] {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _format_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(max(num_bytes, 0))
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{num_bytes}B"
 
 
 def resolve_default_model_dir(identifier: str) -> Path:
@@ -327,25 +348,77 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _download_http_file(url: str, dst_path: Path, timeout: int = 120, max_retries: int = 3) -> None:
+def _download_http_file(
+    url: str,
+    dst_path: Path,
+    timeout: int = 120,
+    max_retries: int = 3,
+    progress_label: Optional[str] = None,
+) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     part_path = dst_path.with_suffix(dst_path.suffix + ".part")
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
+            if progress_label:
+                _emit_model_progress(f"{progress_label}: 다운로드 시도 {attempt}/{max_retries}")
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 status = response.getcode()
                 if status < 200 or status >= 300:
                     raise RuntimeError(f"HTTP status={status}")
+                content_length = response.headers.get("Content-Length")
+                total_size: Optional[int] = None
+                if content_length:
+                    try:
+                        total_size = int(content_length)
+                    except ValueError:
+                        total_size = None
                 with part_path.open("wb") as out:
+                    bytes_read = 0
+                    started_at = time.monotonic()
+                    last_reported_at = started_at
+                    last_reported_percent = -1
                     while True:
                         chunk = response.read(1024 * 1024)
                         if not chunk:
                             break
                         out.write(chunk)
+                        bytes_read += len(chunk)
+
+                        if not progress_label:
+                            continue
+
+                        now = time.monotonic()
+                        elapsed = max(now - started_at, 1e-6)
+                        speed_bps = bytes_read / elapsed
+
+                        if total_size:
+                            percent = int((bytes_read * 100) / total_size)
+                            should_report = (
+                                percent >= 100
+                                or percent >= last_reported_percent + 10
+                                or now - last_reported_at >= 2.0
+                            )
+                            if should_report:
+                                _emit_model_progress(
+                                    f"{progress_label}: {percent}% "
+                                    f"({_format_size(bytes_read)}/{_format_size(total_size)}, "
+                                    f"{_format_size(int(speed_bps))}/s)"
+                                )
+                                last_reported_percent = percent
+                                last_reported_at = now
+                        else:
+                            if now - last_reported_at >= 2.0:
+                                _emit_model_progress(
+                                    f"{progress_label}: {_format_size(bytes_read)} 다운로드됨 "
+                                    f"({_format_size(int(speed_bps))}/s)"
+                                )
+                                last_reported_at = now
             part_path.replace(dst_path)
+            if progress_label:
+                _emit_model_progress(f"{progress_label}: 다운로드 완료")
             return
         except Exception as exc:
             last_error = exc
@@ -465,7 +538,8 @@ def pull_model_from_server(
     refresh_attempts = 0
 
     downloaded: list[dict[str, Any]] = []
-    for key in required_keys:
+    total_artifacts = len(required_keys)
+    for index, key in enumerate(required_keys, start=1):
         retried_integrity = False
         while True:
             artifact = artifact_by_key[key]
@@ -490,6 +564,10 @@ def pull_model_from_server(
             if dst.exists():
                 try:
                     _validate_download_integrity(dst, expected_sha256, expected_size, key)
+                    _emit_model_progress(
+                        f"[{index}/{total_artifacts}] {key}: 기존 파일 재사용 "
+                        f"({dst.name})"
+                    )
                     downloaded.append(
                         {
                             "key": key,
@@ -507,7 +585,15 @@ def pull_model_from_server(
                     _cleanup_download_target(dst)
 
             try:
-                _download_http_file(url=url, dst_path=dst)
+                _emit_model_progress(
+                    f"[{index}/{total_artifacts}] {key}: 다운로드 시작 "
+                    f"({dst.name})"
+                )
+                _download_http_file(
+                    url=url,
+                    dst_path=dst,
+                    progress_label=f"[{index}/{total_artifacts}] {key}",
+                )
                 _validate_download_integrity(dst, expected_sha256, expected_size, key)
                 downloaded.append(
                     {
