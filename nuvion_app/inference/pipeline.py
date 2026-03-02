@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import queue
+import warnings
 import random
 import string
 import asyncio
@@ -25,6 +26,16 @@ import numpy as np
 from nuvion_app.config import load_env
 import aiohttp
 import websockets
+
+# Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
+# SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
+# 해당 모듈 경고만 제한적으로 숨긴다.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*invalid escape sequence.*",
+    category=SyntaxWarning,
+    module=r"stomper\.stompbuffer",
+)
 import stomper
 
 import gi
