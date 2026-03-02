@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
+from pathlib import Path
 from typing import Tuple
 from urllib.parse import urlparse
 
@@ -89,6 +91,13 @@ def _ensure_colima_running() -> None:
             raise BootstrapError("docker_daemon_unavailable", "colima is not installed.", retryable=False)
         brew_install(["colima"])
 
+    if not command_exists("docker"):
+        raise BootstrapError(
+            "docker_install_failed",
+            "docker CLI not found after installation. Check PATH includes /usr/local/bin or /opt/homebrew/bin.",
+            retryable=False,
+        )
+
     status = run_command(["colima", "status"], check=False, capture_output=True)
     if status.returncode == 0:
         _emit_progress("Colima가 이미 실행 중입니다.")
@@ -100,6 +109,26 @@ def _ensure_colima_running() -> None:
     log.info("[BOOTSTRAP] Docker daemon unavailable. Starting Colima fallback.")
     _emit_progress("Docker daemon이 없어 Colima fallback을 시작합니다.")
     run_command(["colima", "start", "--cpu", "4", "--memory", "8", "--disk", "40"], check=True)
+
+
+def _start_docker_desktop_if_available() -> bool:
+    app_path = Path(os.getenv("NUVION_DOCKER_DESKTOP_APP", "/Applications/Docker.app"))
+    if not app_path.exists():
+        return False
+
+    timeout_sec = int(os.getenv("NUVION_DOCKER_DESKTOP_TIMEOUT_SEC", "45"))
+    _emit_progress("Docker Desktop 기동을 시도합니다.")
+    run_command(["open", "-ga", str(app_path)], check=False, capture_output=True)
+
+    deadline = time.time() + max(timeout_sec, 5)
+    while time.time() < deadline:
+        if docker_info_ok():
+            _emit_progress("Docker Desktop daemon 준비 완료.")
+            return True
+        time.sleep(2)
+
+    _emit_progress("Docker Desktop 준비 실패. Colima fallback으로 전환합니다.")
+    return False
 
 
 def ensure_docker_ready(triton_url: str) -> None:
@@ -122,6 +151,8 @@ def ensure_docker_ready(triton_url: str) -> None:
         return
 
     if os.uname().sysname.lower() == "darwin":
+        if _start_docker_desktop_if_available():
+            return
         _emit_progress("Docker daemon이 없어 Colima 기동을 시도합니다.")
         _ensure_colima_running()
     else:

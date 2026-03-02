@@ -202,6 +202,7 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_HOMEBREW_AUTOINSTALL`: macOS Homebrew 자동 설치 허용
 - `NUVION_DOCKER_AUTOINSTALL`: Docker/Colima(또는 docker.io) 자동 설치 허용
 - `NUVION_DOCKER_AUTOSTART`: Docker daemon 자동 기동 허용
+- `NUVION_DOCKER_DESKTOP_TIMEOUT_SEC`: macOS Docker Desktop daemon 준비 대기 시간(초)
 - `NUVION_TRITON_AUTOSTART`: Triton 컨테이너 자동 기동 허용
 - `NUVION_TRITON_AUTOSTART_ONLY_LOCAL`: local Triton URL에서만 자동 기동
 - `NUVION_TRITON_AUTOSTOP_ON_EXIT`: agent 종료 시 자동 기동한 Triton 컨테이너 자동 종료 (기본 `true`)
