@@ -116,6 +116,19 @@ LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
 
 OUTBOUND_QUEUE_MAX = int(os.getenv("NUVION_STOMP_QUEUE_MAX", "200"))
+AGENT_ERROR_MAX_RETRIES = int(os.getenv("NUVION_AGENT_ERROR_MAX_RETRIES", "3"))
+AGENT_ERROR_BACKOFF_BASE_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_BASE_SEC"), 1.0)
+AGENT_ERROR_BACKOFF_MAX_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_MAX_SEC"), 15.0)
+
+AGENT_ERROR_QUEUE_DEST = "/user/queue/agent/error"
+AGENT_COMMAND_QUEUE_DEST = "/user/queue/command"
+AGENT_RETRY_DESTINATIONS = {
+    "/app/device/anomaly",
+    "/app/device/production",
+    "/app/device/log",
+    "/app/device/state",
+    "/app/broadcast/start",
+}
 
 websocket: websockets.WebSocketClientProtocol | None = None
 g_app = None
@@ -123,6 +136,13 @@ signaling_loop: asyncio.AbstractEventLoop | None = None
 outbound_queue: asyncio.Queue | None = None
 auth_token: str | None = None
 auth_token_lock = threading.Lock()
+agent_uplink_blocked = False
+agent_uplink_block_reason = ""
+agent_uplink_lock = threading.Lock()
+agent_retry_attempts: dict[str, int] = {}
+agent_retry_lock = threading.Lock()
+last_sent_payloads: dict[str, dict] = {}
+last_sent_payloads_lock = threading.Lock()
 
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
@@ -441,10 +461,73 @@ def build_send_frame(destination: str, payload: dict) -> str:
     )
 
 
-def enqueue_stomp_message(destination: str, payload: dict) -> bool:
+def _clone_payload(payload: dict) -> dict:
+    return json.loads(json.dumps(payload))
+
+
+def _remember_last_payload(destination: str, payload: dict) -> None:
+    if destination not in AGENT_RETRY_DESTINATIONS:
+        return
+    with last_sent_payloads_lock:
+        last_sent_payloads[destination] = _clone_payload(payload)
+
+
+def _get_last_payload(destination: str) -> dict | None:
+    with last_sent_payloads_lock:
+        payload = last_sent_payloads.get(destination)
+        if payload is None:
+            return None
+        return _clone_payload(payload)
+
+
+def _set_agent_uplink_blocked(blocked: bool, reason: str = "") -> None:
+    global agent_uplink_blocked, agent_uplink_block_reason
+    with agent_uplink_lock:
+        agent_uplink_blocked = blocked
+        agent_uplink_block_reason = reason
+
+
+def _is_agent_uplink_blocked(destination: str) -> bool:
+    if destination not in AGENT_RETRY_DESTINATIONS:
+        return False
+    with agent_uplink_lock:
+        if not agent_uplink_blocked:
+            return False
+        log.error(
+            "[STOMP] outbound blocked by non-retryable agent error. destination=%s reason=%s",
+            destination,
+            agent_uplink_block_reason,
+        )
+        return True
+
+
+def _reset_agent_retry_attempt(destination: str) -> None:
+    with agent_retry_lock:
+        if destination in agent_retry_attempts:
+            agent_retry_attempts[destination] = 0
+
+
+def _next_agent_retry_attempt(destination: str) -> int:
+    with agent_retry_lock:
+        attempt = agent_retry_attempts.get(destination, 0) + 1
+        agent_retry_attempts[destination] = attempt
+        return attempt
+
+
+def _reset_agent_ws_state() -> None:
+    _set_agent_uplink_blocked(False, "")
+    with agent_retry_lock:
+        agent_retry_attempts.clear()
+
+
+def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
     if outbound_queue is None or signaling_loop is None:
         log.warning("[STOMP] outbound not ready, dropping message to %s", destination)
         return False
+    if _is_agent_uplink_blocked(destination):
+        return False
+    if remember:
+        _remember_last_payload(destination, payload)
 
     def _enqueue():
         try:
@@ -468,10 +551,144 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
             log.warning("[STOMP] send failed: %s", exc)
 
 
+async def _enqueue_retry_after_delay(
+    destination: str,
+    payload: dict,
+    delay_sec: float,
+    attempt: int,
+    max_attempts: int,
+    code: str,
+) -> None:
+    await asyncio.sleep(delay_sec)
+    enqueued = enqueue_stomp_message(destination, payload, remember=False)
+    if enqueued:
+        log.warning(
+            "[AGENT-ERROR] retry sent destination=%s code=%s attempt=%d/%d",
+            destination,
+            code,
+            attempt,
+            max_attempts,
+        )
+
+
+async def handle_agent_error(body: str) -> None:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        log.warning("[AGENT-ERROR] invalid payload: %s", body)
+        return
+
+    code = str(payload.get("code") or "UNKNOWN")
+    message = str(payload.get("message") or "")
+    detail = str(payload.get("detail") or "")
+    path = str(payload.get("path") or "")
+    retryable = bool(payload.get("retryable"))
+    status = payload.get("status")
+
+    status_int: int | None = None
+    if isinstance(status, int):
+        status_int = status
+    elif isinstance(status, str) and status.isdigit():
+        status_int = int(status)
+
+    if retryable:
+        if path not in AGENT_RETRY_DESTINATIONS:
+            log.warning(
+                "[AGENT-ERROR][retryable] unsupported path. code=%s path=%s message=%s",
+                code,
+                path,
+                message,
+            )
+            return
+
+        last_payload = _get_last_payload(path)
+        if last_payload is None:
+            log.warning(
+                "[AGENT-ERROR][retryable] no cached payload. code=%s path=%s message=%s",
+                code,
+                path,
+                message,
+            )
+            return
+
+        attempt = _next_agent_retry_attempt(path)
+        if attempt > AGENT_ERROR_MAX_RETRIES:
+            log.error(
+                "[AGENT-ERROR] retry exhausted. code=%s path=%s max=%d detail=%s",
+                code,
+                path,
+                AGENT_ERROR_MAX_RETRIES,
+                detail,
+            )
+            return
+
+        delay_sec = min(AGENT_ERROR_BACKOFF_BASE_SEC * (2 ** (attempt - 1)), AGENT_ERROR_BACKOFF_MAX_SEC)
+        log.warning(
+            "[AGENT-ERROR][retryable] code=%s status=%s path=%s attempt=%d/%d delay=%.1fs message=%s detail=%s",
+            code,
+            status_int,
+            path,
+            attempt,
+            AGENT_ERROR_MAX_RETRIES,
+            delay_sec,
+            message,
+            detail,
+        )
+        asyncio.create_task(
+            _enqueue_retry_after_delay(
+                destination=path,
+                payload=last_payload,
+                delay_sec=delay_sec,
+                attempt=attempt,
+                max_attempts=AGENT_ERROR_MAX_RETRIES,
+                code=code,
+            )
+        )
+        return
+
+    _reset_agent_retry_attempt(path)
+    if status_int in (401, 403):
+        reason = f"{code} {message}".strip()
+        _set_agent_uplink_blocked(True, reason)
+        log.error(
+            "[AGENT-ERROR][auth] uplink blocked. code=%s status=%s path=%s message=%s detail=%s",
+            code,
+            status_int,
+            path,
+            message,
+            detail,
+        )
+        return
+
+    if status_int is not None and 400 <= status_int < 500:
+        log.warning(
+            "[AGENT-ERROR][client] dropped. code=%s status=%s path=%s message=%s detail=%s",
+            code,
+            status_int,
+            path,
+            message,
+            detail,
+        )
+        return
+
+    log.error(
+        "[AGENT-ERROR][server] non-retryable. code=%s status=%s path=%s message=%s detail=%s",
+        code,
+        status_int,
+        path,
+        message,
+        detail,
+    )
+
+
 async def notify_broadcast_started(payload_type: int, ssrc: int):
     global websocket
     if not websocket:
         log.error("[RTP] Cannot notify broadcast started: WebSocket is None.")
+        return
+
+    destination = "/app/broadcast/start"
+    if _is_agent_uplink_blocked(destination):
         return
 
     payload = {
@@ -479,10 +696,15 @@ async def notify_broadcast_started(payload_type: int, ssrc: int):
         "kind": "video",
         "rtpParameters": build_rtp_parameters(payload_type, ssrc),
     }
+    _remember_last_payload(destination, payload)
 
-    frame_str = build_send_frame("/app/broadcast/start", payload)
-    await websocket.send(json.dumps([frame_str]))
-    log.info("[RTP] Notified server that broadcast has started.")
+    frame_str = build_send_frame(destination, payload)
+    try:
+        await websocket.send(json.dumps([frame_str]))
+        log.info("[RTP] Notified server that broadcast has started.")
+    except Exception as exc:
+        log.warning("[RTP] Failed to notify broadcast started directly: %s", exc)
+        enqueue_stomp_message(destination, payload, remember=False)
 
 
 async def handle_rtp_endpoint_ready(body: str):
@@ -552,6 +774,7 @@ async def signaling_client_main():
             await asyncio.sleep(10)
             continue
         set_auth_token(token)
+        _reset_agent_ws_state()
 
         rand_num = "".join(random.choices(string.digits, k=3))
         rand_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -585,7 +808,8 @@ async def signaling_client_main():
 
                 log.info("[SIGNALING] ✅ STOMP CONNECTED.")
 
-                await ws.send(json.dumps([stomper.subscribe("/user/queue/command", "sub-command")]))
+                await ws.send(json.dumps([stomper.subscribe(AGENT_COMMAND_QUEUE_DEST, "sub-command")]))
+                await ws.send(json.dumps([stomper.subscribe(AGENT_ERROR_QUEUE_DEST, "sub-agent-error")]))
 
                 sender_task = asyncio.create_task(outbound_sender(ws))
 
@@ -598,8 +822,10 @@ async def signaling_client_main():
                         destination = frame["headers"].get("destination")
                         body = frame["body"]
 
-                        if destination and "/user/queue/command" in destination:
+                        if destination and AGENT_COMMAND_QUEUE_DEST in destination:
                             await handle_rtp_endpoint_ready(body)
+                        elif destination and AGENT_ERROR_QUEUE_DEST in destination:
+                            await handle_agent_error(body)
 
         except Exception as exc:
             log.error("[SIGNALING] WebSocket error: %s", exc)

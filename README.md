@@ -149,8 +149,16 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_MODEL_GCS_POINTER_URI`: GCS pointer JSON URI (default: `gs://nuv-model/pointers/anomalyclip/prod.json`)
 - `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
 - `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
+- `NUVION_AGENT_ERROR_MAX_RETRIES`: 서버 agent error(`retryable=true`) 수신 시 자동 재시도 최대 횟수 (기본 `3`)
+- `NUVION_AGENT_ERROR_BACKOFF_BASE_SEC`: 첫 재시도 대기 시간(초), 이후 지수 백오프 (기본 `1.0`)
+- `NUVION_AGENT_ERROR_BACKOFF_MAX_SEC`: 재시도 최대 대기 시간(초) (기본 `15.0`)
 
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
+
+### Agent WebSocket error queue
+- Agent는 STOMP에서 `/user/queue/agent/error`를 구독합니다.
+- `retryable=true` 에러는 마지막 uplink payload(`/app/device/*`, `/app/broadcast/start`)를 백오프로 재전송합니다.
+- `401/403` 같은 non-retryable 권한 오류는 uplink를 차단하고 로그에 원인(`code`, `path`, `detail`)을 남깁니다.
 
 Optional deps:
 - Zero-shot: `pip install -e .[zsad]`
