@@ -17,6 +17,7 @@ brew tap plaid-ai/NUV-agent-homebrew
 brew install nuv-agent
 ```
 Note: Homebrew install includes Zero-shot (torch/transformers/Pillow) deps. The download is large.
+`nuv-agent setup`/`nuv-agent run` automatically bootstrap runtime dependencies (Homebrew, Docker/Colima, Triton) when needed.
 
 APT (Jetson/Ubuntu, arm64):
 ```bash
@@ -30,6 +31,7 @@ One-line install:
 ```bash
 curl -fsSL https://apt.plaidai.io/install-apt.sh | bash
 ```
+`nuv-agent setup`/`nuv-agent run` automatically bootstrap Docker/Triton/model bundle when needed.
 
 ## Quick start (dev)
 1) Copy `.env.example` to `.env` and fill in credentials.
@@ -155,6 +157,21 @@ Default config path:
 
 For dev, `.env` in the repo is used automatically.
 
+## First-time user flow (권장)
+설치 직후에는 아래 순서만 실행하면 됩니다.
+1. `nuv-agent setup`
+2. `nuv-agent run`
+
+자동 처리되는 항목:
+- 모델 번들 pull (`source=server`, `profile=runtime|full`)
+- macOS: Homebrew(미설치 시) → Docker CLI/Colima(미설치 시) → Triton 컨테이너 준비
+- Jetson/Linux: Docker(미설치 시) 점검/설치 시도 → Triton 컨테이너 준비
+
+정책:
+- Docker Desktop이 이미 실행 중이면 우선 사용
+- Docker Desktop 데몬이 없거나 불능이면 Colima 폴백
+- bootstrap 실패 시 방송/시그널링은 유지하고, 추론 backend만 `none`으로 강등
+
 ## Service
 - Linux: use `packaging/systemd/nuv-agent.service` and `systemctl enable --now nuv-agent`.
 - macOS: use Homebrew service definition in `packaging/homebrew/nuv-agent.rb`.
@@ -174,6 +191,20 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_MODEL_GCS_POINTER_URI`: GCS pointer JSON URI (default: `gs://nuv-model/pointers/anomalyclip/prod.json`)
 - `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
 - `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
+- `NUVION_RUNTIME_BOOTSTRAP_ENABLED`: setup/run bootstrap 전체 on/off
+- `NUVION_HOMEBREW_AUTOINSTALL`: macOS Homebrew 자동 설치 허용
+- `NUVION_DOCKER_AUTOINSTALL`: Docker/Colima(또는 docker.io) 자동 설치 허용
+- `NUVION_DOCKER_AUTOSTART`: Docker daemon 자동 기동 허용
+- `NUVION_TRITON_AUTOSTART`: Triton 컨테이너 자동 기동 허용
+- `NUVION_TRITON_AUTOSTART_ONLY_LOCAL`: local Triton URL에서만 자동 기동
+- `NUVION_MODEL_AUTO_PULL_ON_SETUP`: setup 단계에서 model auto pull
+- `NUVION_MODEL_AUTO_PULL_ON_RUN`: run 단계에서 model auto pull
+- `NUVION_BOOTSTRAP_MAX_RETRIES`: bootstrap 재시도 횟수
+- `NUVION_BOOTSTRAP_BACKOFF_SEC`: bootstrap 지수 백오프 시작값(초)
+- `NUVION_TRITON_CONTAINER_NAME`: 자동 관리 Triton 컨테이너 이름
+- `NUVION_TRITON_IMAGE`: 자동 기동할 Triton 이미지
+- `NUVION_TRITON_MAC_PROFILE`: macOS auto pull profile (기본 `full`)
+- `NUVION_TRITON_JETSON_PROFILE`: Jetson/Linux auto pull profile (기본 `runtime`)
 - `NUVION_AGENT_ERROR_MAX_RETRIES`: 서버 agent error(`retryable=true`) 수신 시 자동 재시도 최대 횟수 (기본 `3`)
 - `NUVION_AGENT_ERROR_BACKOFF_BASE_SEC`: 첫 재시도 대기 시간(초), 이후 지수 백오프 (기본 `1.0`)
 - `NUVION_AGENT_ERROR_BACKOFF_MAX_SEC`: 재시도 최대 대기 시간(초) (기본 `15.0`)
@@ -223,6 +254,24 @@ export NUVION_TRITON_THRESHOLD=0.7
 - `NUVION_TRITON_MODE=anomalyclip`: Triton 출력 `image_features`와 `text_features.npy`를 결합해 anomaly probability 계산
 - `NUVION_TRITON_TEXT_TEMPERATURE`: 기본 `0.07` (softmax temperature)
 - `NUVION_TRITON_ANOMALY_INDEX`: anomaly class 인덱스 (기본 `1`)
+
+## Troubleshooting (수동 복구)
+자동 bootstrap이 정책/네트워크/권한 제약으로 실패할 때만 수동 명령을 사용하세요.
+
+1) Triton 수동 실행
+```bash
+docker rm -f triton-nuv 2>/dev/null || true
+docker run -d --name triton-nuv -p 8000:8000 \
+  -v ~/.cache/nuvion/models/anomalyclip-current/triton/model_repository:/models \
+  nvcr.io/nvidia/tritonserver:24.10-py3 \
+  tritonserver --model-repository=/models
+```
+
+2) 헬스체크
+```bash
+curl -s http://127.0.0.1:8000/v2/health/ready
+curl -s http://127.0.0.1:8000/v2/models/image_encoder/config
+```
 
 ## Target platforms
 - Jetson Nano / ARM 기반 장치 + Triton 서빙

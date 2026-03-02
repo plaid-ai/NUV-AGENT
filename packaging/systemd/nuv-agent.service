@@ -2,6 +2,8 @@
 Description=Nuvion Agent
 After=network-online.target
 Wants=network-online.target
+After=docker.service
+Wants=docker.service
 
 [Service]
 Type=simple
@@ -14,6 +16,7 @@ ExecStartPre=/bin/mkdir -p /tmp/nuvion_clips/segments /tmp/nuvion_clips/clips
 ExecStartPre=/bin/chmod 1777 /tmp/nuvion_clips
 ExecStartPre=/bin/chmod 0777 /tmp/nuvion_clips/segments /tmp/nuvion_clips/clips
 ExecStartPre=/bin/sh -c 'rm -f /tmp/nuvion_clips/segments/segment_*.mp4 /tmp/nuvion_clips/clips/clip_*.mp4 || true'
+ExecStartPre=/opt/nuv-agent/venv/bin/python -s -c 'from nuvion_app.config import load_env; load_env(); from nuvion_app.runtime.bootstrap import ensure_ready; ensure_ready(stage=\"run\")'
 ExecStart=/usr/bin/nuv-agent run
 Restart=always
 RestartSec=3

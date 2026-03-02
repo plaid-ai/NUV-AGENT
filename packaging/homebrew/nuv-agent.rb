@@ -323,6 +323,18 @@ class NuvAgent < Formula
     (bin/"nuv-agent").write_env_script(real_bin, env)
   end
 
+  def caveats
+    <<~EOS
+      Runtime bootstrap is enabled by default.
+      On macOS, `nuv-agent setup` / `nuv-agent run` will try to:
+      1) install Homebrew (if missing),
+      2) install docker + colima (if missing),
+      3) start a local Triton container when NUVION_ZSAD_BACKEND=triton.
+
+      If Docker Desktop is already running, it is used first. Colima is only a fallback.
+    EOS
+  end
+
   service do
     run [opt_bin/"nuv-agent", "run"]
     keep_alive true

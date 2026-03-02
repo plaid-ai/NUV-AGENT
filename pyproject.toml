@@ -38,6 +38,7 @@ packages = [
   "nuvion_app",
   "nuvion_app.inference",
   "nuvion_app.agent",
+  "nuvion_app.runtime",
 ]
 include-package-data = true
 

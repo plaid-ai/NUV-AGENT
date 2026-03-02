@@ -26,17 +26,13 @@ This script:
 - Installs the Python package.
 - Installs the systemd unit.
 - Creates `/etc/nuv-agent/agent.env` if missing.
+- Installs optional extras for runtime bootstrap (`zsad,triton`).
 
 Python requirement: 3.10+
 
-Optional extras:
-- Zero-shot: install `nuv-agent[zsad]`
-- Triton: install `nuv-agent[triton]`
-
-To include extras during package build:
-```bash
-EXTRAS=zsad ./build-deb.sh
-```
+Runtime bootstrap:
+- `nuv-agent setup` / `nuv-agent run` now try to bootstrap Docker/Triton/model bundle automatically.
+- systemd unit includes docker dependency and bootstrap preflight.
 
 ## Release helpers
 - `packaging/release/build-sdist.sh`: build source tarball and print SHA256.
@@ -46,7 +42,7 @@ EXTRAS=zsad ./build-deb.sh
 - `packaging/apt/`: minimal `aptly` repo flow (GCS recommended).
 
 ## GitHub Actions release
-Workflow: `.github/workflows/release.yml`
+Workflow: `.github/workflows/release-publish.yml`
 
 Required secrets:
 - `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)

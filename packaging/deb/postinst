@@ -8,6 +8,9 @@ fi
 if getent group video >/dev/null 2>&1; then
   usermod -a -G video nuvion || true
 fi
+if getent group docker >/dev/null 2>&1; then
+  usermod -a -G docker nuvion || true
+fi
 
 install -d -m 0770 -o root -g nuvion /etc/nuv-agent
 
@@ -23,6 +26,9 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   if getent group video >/dev/null 2>&1; then
     usermod -a -G video "$SUDO_USER" || true
   fi
+  if getent group docker >/dev/null 2>&1; then
+    usermod -a -G docker "$SUDO_USER" || true
+  fi
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "u:${SUDO_USER}:rwx" /etc/nuv-agent || true
     setfacl -m "u:${SUDO_USER}:rw" /etc/nuv-agent/agent.env || true
@@ -32,7 +38,7 @@ fi
 if command -v python3 >/dev/null 2>&1; then
   python3 -m venv --clear --system-site-packages /opt/nuv-agent/venv
   /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade pip >/dev/null
-  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "/opt/nuv-agent/src[zsad]" >/dev/null
+  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "/opt/nuv-agent/src[zsad,triton]" >/dev/null
 fi
 
 systemctl daemon-reload || true

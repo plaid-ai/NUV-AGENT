@@ -949,4 +949,19 @@ def setup_config(
             write_env(path, lines, values)
             print(f"Saved: {path}")
 
+    try:
+        os.environ["NUV_AGENT_CONFIG"] = str(path)
+        for key, value in read_env(path).items():
+            os.environ[key] = value
+
+        from nuvion_app.runtime.bootstrap import ensure_ready
+
+        ready = ensure_ready(stage="setup")
+        if ready:
+            print("Runtime bootstrap: ready")
+        else:
+            print("Runtime bootstrap: degraded (backend switched to none for this session)")
+    except Exception as exc:
+        print(f"Runtime bootstrap skipped: {exc}")
+
     return path

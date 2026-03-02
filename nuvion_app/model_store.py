@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
-DEFAULT_MODEL_SOURCE = "gcs"
+DEFAULT_MODEL_SOURCE = "server"
 DEFAULT_MODEL_PROFILE = "runtime"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PRESIGN_TTL_SECONDS = 300
