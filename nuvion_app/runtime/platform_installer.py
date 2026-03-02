@@ -125,7 +125,7 @@ def brew_install(packages: Iterable[str]) -> None:
     brew_path = ensure_homebrew_installed()
 
     for package in package_list:
-        check_result = run_command([brew_path, "list", package], check=False)
+        check_result = run_command([brew_path, "list", package], check=False, capture_output=True)
         if check_result.returncode == 0:
             _emit_progress(f"brew 패키지 이미 설치됨: {package}")
             continue
