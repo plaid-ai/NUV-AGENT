@@ -25,26 +25,7 @@ log = logging.getLogger(__name__)
 
 _FALLBACK_CONFIG = """name: \"image_encoder\"
 platform: \"onnxruntime_onnx\"
-max_batch_size: 4
-input [
-  {
-    name: \"images\"
-    data_type: TYPE_FP32
-    dims: [3, 336, 336]
-  }
-]
-output [
-  {
-    name: \"patch_features\"
-    data_type: TYPE_FP32
-    dims: [4, 577, 768]
-  },
-  {
-    name: \"image_features\"
-    data_type: TYPE_FP32
-    dims: [768]
-  }
-]
+max_batch_size: 0
 instance_group [
   {
     kind: KIND_CPU

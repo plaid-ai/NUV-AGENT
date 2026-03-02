@@ -52,6 +52,7 @@ class TritonManagerTest(unittest.TestCase):
             self.assertEqual(resolved, model_dir / "triton" / "model_repository_onnx")
             config = (resolved / "image_encoder" / "config.pbtxt").read_text()
             self.assertIn('platform: "onnxruntime_onnx"', config)
+            self.assertNotIn('name: "images"', config)
 
 
 if __name__ == "__main__":
