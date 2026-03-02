@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import queue
+import warnings
 import random
 import string
 import asyncio
@@ -25,6 +26,16 @@ import numpy as np
 from nuvion_app.config import load_env
 import aiohttp
 import websockets
+
+# Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
+# SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
+# 해당 모듈 경고만 제한적으로 숨긴다.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*invalid escape sequence.*",
+    category=SyntaxWarning,
+    module=r"stomper\.stompbuffer",
+)
 import stomper
 
 import gi
@@ -864,6 +875,7 @@ class NuvionEventState:
         self.backend = ZSAD_BACKEND
         self.zero_shot = None
         self.triton_client = None
+        self._triton_client_thread_id = None
 
         if self.backend == "siglip":
             self.zero_shot = ZeroShotAnomalyDetector(
@@ -880,13 +892,21 @@ class NuvionEventState:
             if TritonAnomalyClient is None:
                 log.warning("[TRITON] Triton client unavailable. Disable backend.")
                 self.backend = "none"
-            else:
-                self.triton_client = TritonAnomalyClient()
         else:
             self.backend = "none"
 
         self.worker_thread = threading.Thread(target=self._zsad_worker, daemon=True)
         self.worker_thread.start()
+
+    def _get_or_create_triton_client(self):
+        if TritonAnomalyClient is None:
+            raise RuntimeError("Triton client unavailable")
+
+        current_thread_id = threading.get_ident()
+        if self.triton_client is None or self._triton_client_thread_id != current_thread_id:
+            self.triton_client = TritonAnomalyClient()
+            self._triton_client_thread_id = current_thread_id
+        return self.triton_client
 
     def send_status(
         self,
@@ -1117,9 +1137,10 @@ class NuvionEventState:
                             self.last_production_at = now
                             self.report_production(1)
 
-            elif self.backend == "triton" and self.triton_client:
+            elif self.backend == "triton":
                 try:
-                    result = self.triton_client.predict(frame)
+                    triton_client = self._get_or_create_triton_client()
+                    result = triton_client.predict(frame)
                 except Exception as exc:
                     log.warning("[TRITON] inference failed: %s", exc)
                     continue
