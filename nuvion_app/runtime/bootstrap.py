@@ -6,6 +6,7 @@ import sys
 import time
 
 from nuvion_app.runtime.errors import BootstrapError
+from nuvion_app.runtime.inference_mode import normalize_backend
 from nuvion_app.runtime.model_guard import ensure_model_ready
 from nuvion_app.runtime.triton_manager import ensure_triton_ready
 
@@ -28,7 +29,7 @@ def ensure_ready(stage: str = "run") -> bool:
     if not _truthy(os.getenv("NUVION_RUNTIME_BOOTSTRAP_ENABLED"), default=True):
         return True
 
-    backend = (os.getenv("NUVION_ZSAD_BACKEND", "triton") or "triton").strip().lower()
+    backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
     if backend != "triton":
         return True
 

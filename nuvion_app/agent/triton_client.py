@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -15,6 +16,8 @@ except Exception as exc:  # pragma: no cover
     _IMPORT_ERROR = exc
 else:
     _IMPORT_ERROR = None
+
+log = logging.getLogger(__name__)
 
 
 def _truthy(value: str) -> bool:
@@ -48,6 +51,7 @@ class TritonAnomalyClient:
         self.normalize_features = _truthy(os.getenv("NUVION_TRITON_NORMALIZE_FEATURES", "true"))
 
         self.client = httpclient.InferenceServerClient(url=self.url)
+        self._sync_io_names_from_metadata()
 
         self.text_features: np.ndarray | None = None
         if self.mode == "anomalyclip":
@@ -66,6 +70,63 @@ class TritonAnomalyClient:
                 raise ValueError(
                     f"NUVION_TRITON_ANOMALY_INDEX={self.anomaly_index} out of range [0, {class_count - 1}]"
                 )
+
+    @staticmethod
+    def _extract_tensor_names(metadata: dict, key: str) -> list[str]:
+        tensors = metadata.get(key, [])
+        if not isinstance(tensors, list):
+            return []
+        names: list[str] = []
+        for item in tensors:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+        return names
+
+    def _sync_io_names_from_metadata(self) -> None:
+        try:
+            metadata = self.client.get_model_metadata(model_name=self.model_name)
+        except Exception:
+            return
+        if not isinstance(metadata, dict):
+            return
+
+        input_names = self._extract_tensor_names(metadata, "inputs")
+        output_names = self._extract_tensor_names(metadata, "outputs")
+
+        if input_names and self.input_name not in input_names:
+            fallback_input = "image" if "image" in input_names else input_names[0]
+            log.warning(
+                "NUVION_TRITON_INPUT=%s is not available in model '%s'. Falling back to '%s'.",
+                self.input_name,
+                self.model_name,
+                fallback_input,
+            )
+            self.input_name = fallback_input
+
+        if self.mode == "anomalyclip":
+            if output_names and self.image_features_output not in output_names:
+                fallback_output = "image_features" if "image_features" in output_names else output_names[0]
+                log.warning(
+                    "NUVION_TRITON_IMAGE_FEATURES_OUTPUT=%s is not available in model '%s'. Falling back to '%s'.",
+                    self.image_features_output,
+                    self.model_name,
+                    fallback_output,
+                )
+                self.image_features_output = fallback_output
+            return
+
+        if output_names and self.output_name not in output_names:
+            fallback_output = output_names[0]
+            log.warning(
+                "NUVION_TRITON_OUTPUT=%s is not available in model '%s'. Falling back to '%s'.",
+                self.output_name,
+                self.model_name,
+                fallback_output,
+            )
+            self.output_name = fallback_output
 
     def _load_text_features(self, path_str: str) -> np.ndarray:
         path = Path(path_str).expanduser() if path_str else None

@@ -19,6 +19,7 @@ from nuvion_app.model_store import (
     resolve_default_model_dir,
 )
 from nuvion_app.runtime.errors import BootstrapError
+from nuvion_app.runtime.inference_mode import normalize_backend
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def _pull_model(profile: str, model_dir: Path) -> None:
 
 
 def ensure_model_ready(stage: str) -> Path:
-    backend = (os.getenv("NUVION_ZSAD_BACKEND", "triton") or "triton").strip().lower()
+    backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
     if backend != "triton":
         return resolve_model_dir(resolve_effective_profile())
 

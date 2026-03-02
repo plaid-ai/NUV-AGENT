@@ -181,8 +181,9 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
 - `NUVION_ZERO_SHOT_ENABLED`: enable optional zero-shot anomaly detection (requires model deps)
-- `NUVION_ZSAD_BACKEND`: 기본 `triton` (장애 대응 시 `siglip`로 수동 전환 가능)
+- `NUVION_ZSAD_BACKEND`: `triton|siglip|mps|none` (`mps`는 `siglip + NUVION_ZERO_SHOT_DEVICE=mps` alias)
 - `NUVION_ZERO_SHOT_MODEL`: 기본 ZSAD 모델 (`google/siglip2-base-patch16-224`)
+- `NUVION_ZERO_SHOT_DEVICE`: SigLIP 디바이스 우선순위 (`auto|mps|cuda|cpu`, 기본 `auto`)
 - `NUVION_MODEL_SOURCE`: `server`(권장) | `gcs`(fallback)
 - `NUVION_MODEL_POINTER`: server source에서 사용할 pointer (`anomalyclip/prod`)
 - `NUVION_MODEL_PRESIGN_TTL_SECONDS`: server source presign 요청 TTL
@@ -224,7 +225,8 @@ Optional deps:
 ## Macbook MPS demo (SigLIP2 ZSAD)
 ```bash
 pip install -r nuvion_app/inference/requirements-zsad.txt
-python -m nuvion_app.agent.zsad_siglip_demo --show
+nuv-agent set-inference --backend mps
+nuv-agent run
 ```
 
 ## Triton backend demo
@@ -235,7 +237,7 @@ NUVION_ZSAD_BACKEND=triton python -m nuvion_app.agent.zsad_siglip_demo
 
 ## Triton backend notes
 - 기본 운영 경로는 **Triton + AnomalyCLIP** 입니다.
-- 기본 Triton 모델은 `image_encoder`, 입력은 `images`, 출력은 `image_features` 입니다.
+- 기본 Triton 모델은 `image_encoder`, 입력은 `image`, 출력은 `image_features` 입니다.
 - macOS에서는 TensorRT(`model.plan`)를 사용하지 않고, ONNX 기반 `model_repository_onnx`를 자동 생성/사용합니다.
 
 ### AnomalyCLIP Triton mode
@@ -244,7 +246,7 @@ AnomalyCLIP image encoder + precomputed text features를 함께 사용하려면:
 export NUVION_ZSAD_BACKEND=triton
 export NUVION_TRITON_MODE=anomalyclip
 export NUVION_TRITON_MODEL=image_encoder
-export NUVION_TRITON_INPUT=images
+export NUVION_TRITON_INPUT=image
 export NUVION_TRITON_IMAGE_FEATURES_OUTPUT=image_features
 # pull-model을 --local-dir ~/.cache/nuvion/models/anomalyclip-current 로 실행했다고 가정
 export NUVION_TRITON_TEXT_FEATURES=$HOME/.cache/nuvion/models/anomalyclip-current/onnx/text_features.npy

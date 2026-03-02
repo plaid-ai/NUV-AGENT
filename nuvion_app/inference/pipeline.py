@@ -33,6 +33,11 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+from nuvion_app.runtime.inference_mode import (
+    apply_inference_runtime_defaults,
+    normalize_backend,
+    normalize_siglip_device,
+)
 
 try:
     from nuvion_app.agent.triton_client import TritonAnomalyClient
@@ -68,6 +73,7 @@ def parse_float(value: str | None, default: float) -> float:
 
 
 load_env()
+apply_inference_runtime_defaults()
 
 SERVER_BASE_URL = os.getenv("NUVION_SERVER_BASE_URL", "http://localhost:8080")
 DEVICE_USERNAME = os.getenv("NUVION_DEVICE_USERNAME", "device")
@@ -93,6 +99,7 @@ PRODUCTION_DEDUP_SEC = parse_float(os.getenv("NUVION_PRODUCTION_DEDUP_SEC"), 3.0
 
 ZERO_SHOT_ENABLED = os.getenv("NUVION_ZERO_SHOT_ENABLED", "true").lower() in ("1", "true", "yes")
 ZERO_SHOT_MODEL = os.getenv("NUVION_ZERO_SHOT_MODEL", "google/siglip2-base-patch16-224")
+ZERO_SHOT_DEVICE = normalize_siglip_device(os.getenv("NUVION_ZERO_SHOT_DEVICE", "auto"), default="auto")
 ZERO_SHOT_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect"))
 ZERO_SHOT_ANOMALY_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS", "defect,broken,crack,scratch"))
 ZERO_SHOT_THRESHOLD = parse_float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD"), 0.7)
@@ -101,7 +108,7 @@ ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0
 LOCAL_DISPLAY = os.getenv("NUVION_LOCAL_DISPLAY", "false").lower() in ("1", "true", "yes")
 
 TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
-ZSAD_BACKEND = os.getenv("NUVION_ZSAD_BACKEND", "triton").lower()
+ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
 
 CLIP_ENABLED = os.getenv("NUVION_CLIP_ENABLED", "true").lower() in ("1", "true", "yes")
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
@@ -865,6 +872,7 @@ class NuvionEventState:
                 labels=ZERO_SHOT_LABELS,
                 anomaly_labels=ZERO_SHOT_ANOMALY_LABELS,
                 threshold=ZERO_SHOT_THRESHOLD,
+                device_preference=ZERO_SHOT_DEVICE,
             )
             if not self.zero_shot.enabled:
                 self.backend = "none"

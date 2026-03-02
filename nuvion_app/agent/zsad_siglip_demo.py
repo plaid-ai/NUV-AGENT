@@ -5,6 +5,7 @@ import time
 import cv2
 from nuvion_app.config import load_env
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
 
 def parse_csv(value: str) -> list[str]:
@@ -18,6 +19,7 @@ def build_detector():
     labels = parse_csv(os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect"))
     anomaly_labels = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS", "defect,broken,crack,scratch"))
     threshold = float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD", "0.7"))
+    device_preference = normalize_siglip_device(os.getenv("NUVION_ZERO_SHOT_DEVICE", "auto"), default="auto")
 
     return ZeroShotAnomalyDetector(
         enabled=True,
@@ -25,6 +27,7 @@ def build_detector():
         labels=labels,
         anomaly_labels=anomaly_labels,
         threshold=threshold,
+        device_preference=device_preference,
     )
 
 def try_open_camera(index: int):
@@ -78,7 +81,10 @@ def main():
 
     detector = None
     triton_client = None
-    backend = args.backend.lower()
+    raw_backend = args.backend.lower()
+    backend = normalize_backend(raw_backend, default="siglip")
+    if raw_backend == "mps":
+        os.environ["NUVION_ZERO_SHOT_DEVICE"] = "mps"
     if backend == "siglip":
         detector = build_detector()
         if not detector.ready:

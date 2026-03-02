@@ -1,6 +1,8 @@
 import logging
 from typing import List, Optional
 
+from nuvion_app.runtime.inference_mode import normalize_siglip_device
+
 log = logging.getLogger(__name__)
 
 
@@ -68,6 +70,7 @@ class ZeroShotAnomalyDetector:
         labels: List[str],
         anomaly_labels: List[str],
         threshold: float,
+        device_preference: str = "auto",
     ):
         self.enabled = enabled
         self.ready = False
@@ -75,6 +78,7 @@ class ZeroShotAnomalyDetector:
         self.anomaly_labels = {label.strip().lower() for label in anomaly_labels if label and label.strip()}
         self.threshold = threshold
         self.model_name = model_name
+        self.device_preference = normalize_siglip_device(device_preference, default="auto")
         self._model = None
         self._processor = None
         self._device = None
@@ -101,11 +105,7 @@ class ZeroShotAnomalyDetector:
             self.enabled = False
             return
 
-        device = "cpu"
-        if torch.backends.mps.is_available():
-            device = "mps"
-        elif torch.cuda.is_available():
-            device = "cuda"
+        device = self._resolve_device(torch, self.device_preference)
 
         try:
             self._model = AutoModel.from_pretrained(self.model_name).to(device).eval()
@@ -114,10 +114,44 @@ class ZeroShotAnomalyDetector:
             self._Image = Image
             self._device = device
             self.ready = True
-            log.info("Zero-shot model loaded: %s (device=%s)", self.model_name, device)
+            log.info(
+                "Zero-shot model loaded: %s (device=%s, preference=%s)",
+                self.model_name,
+                device,
+                self.device_preference,
+            )
         except Exception as exc:
             log.warning("Failed to load zero-shot model '%s': %s", self.model_name, exc)
             self.enabled = False
+
+    @staticmethod
+    def _resolve_device(torch_module, preference: str) -> str:
+        mode = normalize_siglip_device(preference, default="auto")
+
+        has_mps = bool(getattr(getattr(torch_module, "backends", None), "mps", None))
+        mps_available = has_mps and bool(torch_module.backends.mps.is_available())
+        cuda_available = bool(torch_module.cuda.is_available())
+
+        if mode == "auto":
+            if mps_available:
+                return "mps"
+            if cuda_available:
+                return "cuda"
+            return "cpu"
+
+        if mode == "mps":
+            if mps_available:
+                return "mps"
+            log.warning("Requested device=mps but MPS is unavailable. Falling back to cpu.")
+            return "cpu"
+
+        if mode == "cuda":
+            if cuda_available:
+                return "cuda"
+            log.warning("Requested device=cuda but CUDA is unavailable. Falling back to cpu.")
+            return "cpu"
+
+        return "cpu"
 
     def classify(self, frame_rgb) -> Optional[dict]:
         if not self.enabled or not self.ready:

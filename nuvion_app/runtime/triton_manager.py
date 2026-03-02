@@ -19,6 +19,7 @@ from nuvion_app.runtime.docker_manager import (
     start_container,
 )
 from nuvion_app.runtime.errors import BootstrapError
+from nuvion_app.runtime.inference_mode import normalize_backend
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ def resolve_repository_for_runtime(model_dir: Path) -> Path:
 
 
 def ensure_triton_ready(stage: str, model_dir: Path) -> None:
-    backend = os.getenv("NUVION_ZSAD_BACKEND", "triton").strip().lower()
+    backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
     if backend != "triton":
         return
 

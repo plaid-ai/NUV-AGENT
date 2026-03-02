@@ -4,7 +4,15 @@ import argparse
 import os
 import sys
 
-from nuvion_app.config import DEFAULT_PORT, load_env, resolve_config_path, setup_config
+from nuvion_app.config import (
+    DEFAULT_PORT,
+    load_env,
+    load_template,
+    read_env,
+    resolve_config_path,
+    setup_config,
+    write_env,
+)
 from nuvion_app.model_store import (
     DEFAULT_MODEL_POINTER,
     DEFAULT_MODEL_PRESIGN_TTL_SECONDS,
@@ -18,6 +26,21 @@ from nuvion_app.model_store import (
     pull_model_from_server,
     resolve_default_model_dir,
 )
+from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
+
+
+_BACKEND_CHOICES = ("triton", "siglip", "mps", "none")
+_SIGLIP_DEVICE_CHOICES = ("auto", "mps", "cuda", "cpu")
+
+
+def _merge_template_defaults(existing: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    lines, fields = load_template()
+    merged = dict(existing)
+    for field in fields:
+        key = field["key"]
+        if key not in merged:
+            merged[key] = field["default"]
+    return lines, merged
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,6 +59,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run inference service")
     run_parser.add_argument("--config", help="Path to config env file")
+    run_parser.add_argument(
+        "--backend",
+        choices=_BACKEND_CHOICES,
+        help="Override backend for this run: triton|siglip|mps(alias for siglip+mps)|none",
+    )
+    run_parser.add_argument(
+        "--siglip-device",
+        choices=_SIGLIP_DEVICE_CHOICES,
+        help="SigLIP device preference when backend is siglip: auto|mps|cuda|cpu",
+    )
 
     pull_parser = subparsers.add_parser(
         "pull-model",
@@ -99,6 +132,20 @@ def _build_parser() -> argparse.ArgumentParser:
     path_parser = subparsers.add_parser("config-path", help="Print resolved config path")
     path_parser.add_argument("--config", help="Path to config env file")
 
+    inference_parser = subparsers.add_parser("set-inference", help="Save inference backend/device into config")
+    inference_parser.add_argument("--config", help="Path to config env file")
+    inference_parser.add_argument(
+        "--backend",
+        choices=_BACKEND_CHOICES,
+        required=True,
+        help="triton|siglip|mps(alias for siglip+mps)|none",
+    )
+    inference_parser.add_argument(
+        "--siglip-device",
+        choices=_SIGLIP_DEVICE_CHOICES,
+        help="SigLIP device preference: auto|mps|cuda|cpu",
+    )
+
     return parser
 
 
@@ -141,6 +188,13 @@ def main() -> None:
 
     if args.command == "run":
         load_env(args.config)
+        if args.backend:
+            raw_backend = args.backend.strip().lower()
+            os.environ["NUVION_ZSAD_BACKEND"] = normalize_backend(raw_backend, default="triton")
+            if raw_backend == "mps" and not args.siglip_device:
+                os.environ["NUVION_ZERO_SHOT_DEVICE"] = "mps"
+        if args.siglip_device:
+            os.environ["NUVION_ZERO_SHOT_DEVICE"] = normalize_siglip_device(args.siglip_device, default="auto")
         from nuvion_app.inference.main import main as run_main
 
         run_main()
@@ -190,7 +244,7 @@ def main() -> None:
             sys.stdout.write("  NUVION_ZSAD_BACKEND=triton\n")
             sys.stdout.write("  NUVION_TRITON_MODE=anomalyclip\n")
             sys.stdout.write("  NUVION_TRITON_MODEL=image_encoder\n")
-            sys.stdout.write("  NUVION_TRITON_INPUT=images\n")
+            sys.stdout.write("  NUVION_TRITON_INPUT=image\n")
             sys.stdout.write("  NUVION_TRITON_IMAGE_FEATURES_OUTPUT=image_features\n")
             sys.stdout.write(f"  NUVION_TRITON_TEXT_FEATURES={text_features}\n")
             if triton_repo.exists():
@@ -206,6 +260,31 @@ def main() -> None:
         path = resolve_config_path(args.config)
         sys.stdout.write(str(path))
         sys.stdout.write("\n")
+        return
+
+    if args.command == "set-inference":
+        config_path = resolve_config_path(args.config)
+        existing = read_env(config_path)
+        lines, values = _merge_template_defaults(existing)
+
+        raw_backend = args.backend.strip().lower()
+        backend = normalize_backend(raw_backend, default="triton")
+        values["NUVION_ZSAD_BACKEND"] = backend
+
+        if args.siglip_device:
+            values["NUVION_ZERO_SHOT_DEVICE"] = normalize_siglip_device(args.siglip_device, default="auto")
+        elif raw_backend == "mps":
+            values["NUVION_ZERO_SHOT_DEVICE"] = "mps"
+        else:
+            values["NUVION_ZERO_SHOT_DEVICE"] = normalize_siglip_device(
+                values.get("NUVION_ZERO_SHOT_DEVICE", "auto"),
+                default="auto",
+            )
+
+        write_env(config_path, lines, values)
+        sys.stdout.write(f"Saved inference config: {config_path}\n")
+        sys.stdout.write(f"  NUVION_ZSAD_BACKEND={values['NUVION_ZSAD_BACKEND']}\n")
+        sys.stdout.write(f"  NUVION_ZERO_SHOT_DEVICE={values['NUVION_ZERO_SHOT_DEVICE']}\n")
         return
 
     parser.print_help()
