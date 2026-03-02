@@ -24,6 +24,38 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y")
 
 
+def _parse_model_config(raw: dict | None) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    nested = raw.get("config")
+    if isinstance(nested, dict):
+        return nested
+    return raw
+
+
+def _infer_layout_and_size(dims: list[int], declared_format: str) -> tuple[str, int, int] | None:
+    if len(dims) != 3:
+        return None
+
+    def _to_positive(value: int) -> int:
+        return int(value) if int(value) > 0 else -1
+
+    d0, d1, d2 = (_to_positive(dims[0]), _to_positive(dims[1]), _to_positive(dims[2]))
+
+    declared = (declared_format or "").strip().upper()
+    if declared in {"FORMAT_NCHW", "NCHW"}:
+        return ("NCHW", d2, d1) if d1 > 0 and d2 > 0 else None
+    if declared in {"FORMAT_NHWC", "NHWC"}:
+        return ("NHWC", d1, d0) if d0 > 0 and d1 > 0 else None
+
+    # FORMAT_NONE fallback: infer by channel axis.
+    if d0 in {1, 3, 4} and d1 > 0 and d2 > 0:
+        return ("NCHW", d2, d1)
+    if d2 in {1, 3, 4} and d0 > 0 and d1 > 0:
+        return ("NHWC", d1, d0)
+    return None
+
+
 class TritonAnomalyClient:
     def __init__(self):
         load_env()
@@ -52,6 +84,7 @@ class TritonAnomalyClient:
 
         self.client = httpclient.InferenceServerClient(url=self.url)
         self._sync_io_names_from_metadata()
+        self._sync_input_shape_from_config()
 
         self.text_features: np.ndarray | None = None
         if self.mode == "anomalyclip":
@@ -127,6 +160,63 @@ class TritonAnomalyClient:
                 fallback_output,
             )
             self.output_name = fallback_output
+
+    def _sync_input_shape_from_config(self) -> None:
+        try:
+            raw_config = self.client.get_model_config(model_name=self.model_name)
+        except Exception:
+            return
+        model_config = _parse_model_config(raw_config)
+        inputs = model_config.get("input")
+        if not isinstance(inputs, list) or not inputs:
+            return
+
+        selected: dict | None = None
+        for item in inputs:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name", "")) == self.input_name:
+                selected = item
+                break
+        if selected is None:
+            item0 = inputs[0]
+            if isinstance(item0, dict):
+                selected = item0
+        if selected is None:
+            return
+
+        dims_raw = selected.get("dims")
+        if not isinstance(dims_raw, list):
+            return
+        try:
+            dims = [int(v) for v in dims_raw]
+        except Exception:
+            return
+
+        inferred = _infer_layout_and_size(dims, str(selected.get("format", "")))
+        if inferred is None:
+            return
+
+        inferred_format, inferred_width, inferred_height = inferred
+        if (
+            self.input_format == inferred_format
+            and self.input_width == inferred_width
+            and self.input_height == inferred_height
+        ):
+            return
+
+        log.warning(
+            "Triton input shape/config mismatch detected. Overriding preprocessing to %s %sx%s (was %s %sx%s).",
+            inferred_format,
+            inferred_width,
+            inferred_height,
+            self.input_format,
+            self.input_width,
+            self.input_height,
+        )
+        self.input_format = inferred_format
+        self.input_width = inferred_width
+        self.input_height = inferred_height
 
     def _load_text_features(self, path_str: str) -> np.ndarray:
         path = Path(path_str).expanduser() if path_str else None
