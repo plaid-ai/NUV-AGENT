@@ -161,6 +161,10 @@ agent_retry_attempts: dict[str, int] = {}
 agent_retry_lock = threading.Lock()
 last_sent_payloads: dict[str, dict] = {}
 last_sent_payloads_lock = threading.Lock()
+broadcast_start_notified = False
+broadcast_start_lock = threading.Lock()
+last_rtp_endpoint: tuple[str, int, int] | None = None
+last_rtp_endpoint_lock = threading.Lock()
 
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
@@ -533,9 +537,36 @@ def _next_agent_retry_attempt(destination: str) -> int:
 
 
 def _reset_agent_ws_state() -> None:
+    global broadcast_start_notified
+    global last_rtp_endpoint
     _set_agent_uplink_blocked(False, "")
     with agent_retry_lock:
         agent_retry_attempts.clear()
+    with broadcast_start_lock:
+        broadcast_start_notified = False
+    with last_rtp_endpoint_lock:
+        last_rtp_endpoint = None
+
+
+def _set_broadcast_start_notified(value: bool) -> None:
+    global broadcast_start_notified
+    with broadcast_start_lock:
+        broadcast_start_notified = value
+
+
+def _is_broadcast_start_notified() -> bool:
+    with broadcast_start_lock:
+        return broadcast_start_notified
+
+
+def _update_rtp_endpoint(ip: str, port: int, pt: int) -> bool:
+    global last_rtp_endpoint
+    endpoint = (str(ip), int(port), int(pt))
+    with last_rtp_endpoint_lock:
+        if last_rtp_endpoint == endpoint:
+            return False
+        last_rtp_endpoint = endpoint
+        return True
 
 
 def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
@@ -705,6 +736,10 @@ async def notify_broadcast_started(payload_type: int, ssrc: int):
         log.error("[RTP] Cannot notify broadcast started: WebSocket is None.")
         return
 
+    if _is_broadcast_start_notified():
+        log.info("[RTP] Broadcast start already notified for this signaling session. Skip duplicate notify.")
+        return
+
     destination = "/app/broadcast/start"
     if _is_agent_uplink_blocked(destination):
         return
@@ -719,10 +754,12 @@ async def notify_broadcast_started(payload_type: int, ssrc: int):
     frame_str = build_send_frame(destination, payload)
     try:
         await websocket.send(json.dumps([frame_str]))
+        _set_broadcast_start_notified(True)
         log.info("[RTP] Notified server that broadcast has started.")
     except Exception as exc:
         log.warning("[RTP] Failed to notify broadcast started directly: %s", exc)
-        enqueue_stomp_message(destination, payload, remember=False)
+        if enqueue_stomp_message(destination, payload, remember=False):
+            _set_broadcast_start_notified(True)
 
 
 async def handle_rtp_endpoint_ready(body: str):
@@ -770,6 +807,10 @@ async def handle_rtp_endpoint_ready(body: str):
     if not g_app:
         log.error("[RTP] GStreamer app is not initialized.")
         return
+
+    endpoint_changed = _update_rtp_endpoint(str(ip), int(port), int(pt))
+    if endpoint_changed:
+        _set_broadcast_start_notified(False)
 
     log.info("[RTP] Update Sink -> ip=%s, port=%s, pt=%s, rtcpMux=%s, comedia=%s", ip, port, pt, rtcp_mux, comedia)
     g_app.configure_rtp_sink(ip, int(port), int(pt))
