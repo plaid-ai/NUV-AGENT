@@ -196,6 +196,15 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_VIDEO_SOURCE`: USB webcam path (e.g., `/dev/video0`) or `rpi` for Pi camera
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
+- `NUVION_DEVICE_STATE_INTERVAL_SEC`: `/app/device/state` heartbeat 주기(초, 기본 `30`)
+- `NUVION_CONNECTIVITY_ENABLED`: `/app/device/connectivity` 보고 활성화 (`true|false`)
+- `NUVION_CONNECTIVITY_INTERVAL_SEC`: 연결 품질 샘플링 주기(초, 기본 `10`)
+- `NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC`: 전이 이벤트 최소 전송 간격(초, 기본 `30`)
+- `NUVION_CONNECTIVITY_POOR_RSSI_DBM`: POOR RSSI 임계값(dBm, 기본 `-80`)
+- `NUVION_CONNECTIVITY_POOR_PACKET_LOSS_PCT`: POOR packet loss 임계값(%, 기본 `8`)
+- `NUVION_CONNECTIVITY_POOR_RTT_MS`: POOR RTT 임계값(ms, 기본 `250`)
+- `NUVION_CONNECTIVITY_TARGET_HOST`: ping 대상 호스트 override (기본: `NUVION_SERVER_BASE_URL` host)
+- `NUVION_WIFI_INTERFACE`: Linux/Jetson에서 `iw` RSSI 수집용 인터페이스 (미지정 시 auto detect)
 - `NUVION_ZERO_SHOT_ENABLED`: enable optional zero-shot anomaly detection (requires model deps)
 - `NUVION_ZSAD_BACKEND`: `triton|siglip|mps|none` (`mps`는 `siglip + NUVION_ZERO_SHOT_DEVICE=mps` alias)
 - `NUVION_ZERO_SHOT_MODEL`: 기본 ZSAD 모델 (`google/siglip2-base-patch16-224`)
@@ -235,6 +244,11 @@ macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to s
 - Agent는 STOMP에서 `/user/queue/agent/error`를 구독합니다.
 - `retryable=true` 에러는 마지막 uplink payload(`/app/device/*`, `/app/broadcast/start`)를 백오프로 재전송합니다.
 - `401/403` 같은 non-retryable 권한 오류는 uplink를 차단하고 로그에 원인(`code`, `path`, `detail`)을 남깁니다.
+
+Connectivity 보고 정책:
+- macOS는 `airport -I`, Linux(Jetson)는 `iw dev <iface> link`에서 RSSI를 수집합니다.
+- 공통으로 `ping` 평균 RTT/패킷손실을 수집합니다.
+- `quality` 전이(`GOOD ↔ POOR`) 시점에만 `/app/device/connectivity`를 송신합니다.
 
 Optional deps:
 - Zero-shot: `pip install -e .[zsad]`

@@ -26,6 +26,8 @@ import numpy as np
 from nuvion_app.config import load_env
 import aiohttp
 import websockets
+from nuvion_app.inference.connectivity import ConnectivityReporter
+from nuvion_app.inference.connectivity import ConnectivityThresholds
 
 # Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
 # SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
@@ -72,6 +74,11 @@ def parse_int(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def parse_int_with_default(value: str | None, default: int) -> int:
+    parsed = parse_int(value)
+    return parsed if parsed is not None else default
 
 
 def parse_float(value: str | None, default: float) -> float:
@@ -132,6 +139,16 @@ CLIP_CONTENT_TYPE = os.getenv("NUVION_CLIP_CONTENT_TYPE", "video/mp4")
 
 LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
+DEVICE_STATE_INTERVAL_SEC = parse_float(os.getenv("NUVION_DEVICE_STATE_INTERVAL_SEC"), 30.0)
+
+CONNECTIVITY_ENABLED = os.getenv("NUVION_CONNECTIVITY_ENABLED", "true").lower() in ("1", "true", "yes")
+CONNECTIVITY_INTERVAL_SEC = parse_float(os.getenv("NUVION_CONNECTIVITY_INTERVAL_SEC"), 10.0)
+CONNECTIVITY_MIN_SEND_INTERVAL_SEC = parse_float(os.getenv("NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC"), 30.0)
+CONNECTIVITY_POOR_RSSI_DBM = parse_int_with_default(os.getenv("NUVION_CONNECTIVITY_POOR_RSSI_DBM"), -80)
+CONNECTIVITY_POOR_PACKET_LOSS_PCT = parse_float(os.getenv("NUVION_CONNECTIVITY_POOR_PACKET_LOSS_PCT"), 8.0)
+CONNECTIVITY_POOR_RTT_MS = parse_int_with_default(os.getenv("NUVION_CONNECTIVITY_POOR_RTT_MS"), 250)
+CONNECTIVITY_TARGET_HOST = (os.getenv("NUVION_CONNECTIVITY_TARGET_HOST", "") or "").strip()
+CONNECTIVITY_WIFI_INTERFACE = (os.getenv("NUVION_WIFI_INTERFACE", "") or "").strip()
 
 OUTBOUND_QUEUE_MAX = int(os.getenv("NUVION_STOMP_QUEUE_MAX", "200"))
 AGENT_ERROR_MAX_RETRIES = int(os.getenv("NUVION_AGENT_ERROR_MAX_RETRIES", "3"))
@@ -145,6 +162,7 @@ AGENT_RETRY_DESTINATIONS = {
     "/app/device/production",
     "/app/device/log",
     "/app/device/state",
+    "/app/device/connectivity",
     "/app/broadcast/start",
 }
 
@@ -600,6 +618,35 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
             log.warning("[STOMP] send failed: %s", exc)
 
 
+async def device_state_heartbeat_sender():
+    interval = max(1.0, DEVICE_STATE_INTERVAL_SEC)
+    while True:
+        payload = {
+            "status": "RUNNING",
+            "message": "heartbeat",
+            "lineId": LINE_ID,
+            "processId": PROCESS_ID,
+        }
+        enqueue_stomp_message("/app/device/state", payload)
+        await asyncio.sleep(interval)
+
+
+async def device_connectivity_sender(reporter: ConnectivityReporter):
+    interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
+    while True:
+        payload = reporter.build_transition_payload()
+        if payload and enqueue_stomp_message("/app/device/connectivity", payload):
+            log.info(
+                "[CONNECTIVITY] sent quality=%s reason=%s rssi=%s loss=%s rtt=%s",
+                payload.get("quality"),
+                payload.get("reason"),
+                payload.get("rssiDbm"),
+                payload.get("packetLossPct"),
+                payload.get("rttMs"),
+            )
+        await asyncio.sleep(interval)
+
+
 async def _enqueue_retry_after_delay(
     destination: str,
     payload: dict,
@@ -871,6 +918,22 @@ async def signaling_client_main():
                 await ws.send(json.dumps([stomper.subscribe(AGENT_ERROR_QUEUE_DEST, "sub-agent-error")]))
 
                 sender_task = asyncio.create_task(outbound_sender(ws))
+                heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
+                connectivity_task = None
+                if CONNECTIVITY_ENABLED:
+                    connectivity_target_host = CONNECTIVITY_TARGET_HOST or extract_host_from_server_url(SERVER_BASE_URL)
+                    connectivity_thresholds = ConnectivityThresholds(
+                        poor_rssi_dbm=CONNECTIVITY_POOR_RSSI_DBM,
+                        poor_packet_loss_pct=CONNECTIVITY_POOR_PACKET_LOSS_PCT,
+                        poor_rtt_ms=CONNECTIVITY_POOR_RTT_MS,
+                    )
+                    reporter = ConnectivityReporter(
+                        target_host=connectivity_target_host,
+                        wifi_interface=CONNECTIVITY_WIFI_INTERFACE or None,
+                        thresholds=connectivity_thresholds,
+                        min_send_interval_sec=CONNECTIVITY_MIN_SEND_INTERVAL_SEC,
+                    )
+                    connectivity_task = asyncio.create_task(device_connectivity_sender(reporter))
 
                 async for message in ws:
                     if not message.startswith("a["):
@@ -892,6 +955,10 @@ async def signaling_client_main():
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
+            if "heartbeat_task" in locals():
+                heartbeat_task.cancel()
+            if "connectivity_task" in locals() and connectivity_task is not None:
+                connectivity_task.cancel()
 
         log.info("[SIGNALING] Reconnecting in 10s...")
         await asyncio.sleep(10)
