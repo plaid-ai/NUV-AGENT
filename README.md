@@ -146,6 +146,43 @@ Optional build args (in `nuvion_app/inference/Dockerfile.inference`):
 - `INSTALL_ZSAD_DEPS=true`
 - `INSTALL_TRITON_DEPS=true`
 
+## Exhibition demo mode
+기본 런타임은 카메라 입력을 사용하고, `--demo`를 주면 로컬 데모 영상 파일 입력으로 전환됩니다.
+
+일반 모드:
+```bash
+nuv-agent run
+```
+
+데모 모드:
+```bash
+NUVION_DEMO_VIDEO_PATH=/opt/nuvion/demo/demo.mp4 nuv-agent run --demo
+```
+
+선택적으로 이번 실행에만 영상 경로를 override 할 수 있습니다:
+```bash
+nuv-agent run --demo --demo-video /opt/nuvion/demo/demo.mp4
+```
+
+정책:
+- 데모 모드에서 `NUVION_DEMO_VIDEO_PATH`가 비어있으면 설치 기본 경로의 샘플 영상을 자동 탐색합니다.
+  - Linux/deb: `/var/lib/nuv-agent/demo/exhibition-demo.webm`
+  - macOS/Homebrew: `/opt/homebrew/var/nuv-agent/demo/exhibition-demo.webm` 또는 `/usr/local/var/nuv-agent/demo/exhibition-demo.webm`
+- Debian 설치 시 `NUVION_DEMO_VIDEO_URL` 환경변수를 주면 postinst 기본 다운로드 URL을 원하는 영상으로 교체할 수 있습니다.
+- 경로 지정값/기본 경로 모두 유효한 영상이 없으면 즉시 실패(fail-fast)합니다.
+- 데모 영상은 EOS 시 자동으로 처음부터 재생됩니다(`NUVION_DEMO_LOOP=true`).
+- anomaly 이벤트 message에는 `[DEMO]` prefix가 붙습니다(기본 `NUVION_DEMO_TAG=[DEMO]`).
+
+기본 샘플 영상 출처(CC BY 3.0):
+- Gigaset Smartphone Production IV Quality Inspection (Wikimedia Commons)
+  - https://commons.wikimedia.org/wiki/File:Gigaset_Smartphone_Production_IV_Quality_Inspection.webm
+
+전시장용 대체 영상(직접 경로 지정 권장):
+- Assembly line (CC BY 4.0)
+  - https://commons.wikimedia.org/wiki/File:Assembly_line.webm
+- Animal feed pellet production line (CC BY-SA 4.0)
+  - https://commons.wikimedia.org/wiki/File:Animal_feed_pellet_production_line.webm
+
 ## Setup UI (device)
 If a display is available, run:
 ```bash
@@ -157,7 +194,7 @@ device credentials automatically (your account credentials are not stored on the
 It also includes:
 - **Inference Mode** quick selector (`Triton | SigLIP | SigLIP+MPS | None`)
 - **Conditional settings view** (only backend-relevant fields are shown)
-- **Preflight Check** button (server login / triton health / camera source / RTP target)
+- **Preflight Check** button (server login / triton health / camera source or demo video source / RTP target)
 - **Environment override warning** when shell env values override file values
 
 For headless devices:
@@ -194,6 +231,11 @@ For dev, `.env` in the repo is used automatically.
 
 ## Device configuration
 - `NUVION_VIDEO_SOURCE`: USB webcam path (e.g., `/dev/video0`) or `rpi` for Pi camera
+- `NUVION_DEMO_MODE`: 데모 모드 활성화 (`true|false`)
+- `NUVION_DEMO_VIDEO_PATH`: 데모 영상 파일 경로 (비어있으면 설치 기본 샘플 경로 자동 탐색)
+- `NUVION_DEMO_LOOP`: 데모 영상 EOS 시 반복 재생 여부 (`true|false`, 기본 `true`)
+- `NUVION_DEMO_TAG`: 데모 이벤트 메시지 prefix (기본 `[DEMO]`)
+- `NUVION_DEMO_VIDEO_FALLBACK_PATHS`: 추가 fallback 경로 CSV (예: `/data/demo1.webm,/data/demo2.mp4`)
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
 - `NUVION_DEVICE_STATE_INTERVAL_SEC`: `/app/device/state` heartbeat 주기(초, 기본 `30`)
@@ -248,6 +290,9 @@ macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to s
 Connectivity 보고 정책:
 - macOS는 `airport -I`, Linux(Jetson)는 `iw dev <iface> link`에서 RSSI를 수집합니다.
 - 공통으로 `ping` 평균 RTT/패킷손실을 수집합니다.
+- `uplinkKbps/downlinkKbps`는 OS별 무선 링크 bitrate를 기반으로 채웁니다.
+  - macOS: `airport -I`의 `lastTxRate/maxRate` 기반
+  - Linux/Jetson: `iw ... link`의 `tx bitrate/rx bitrate` 기반
 - `quality` 전이(`GOOD ↔ POOR`) 시점에만 `/app/device/connectivity`를 송신합니다.
 
 Optional deps:

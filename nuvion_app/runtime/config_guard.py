@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from nuvion_app.config import REQUIRED_KEYS, load_template, read_env, write_env
+from nuvion_app.inference.video_source import resolve_demo_video_path
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
@@ -14,6 +15,12 @@ _VALID_MODEL_SOURCES = {"server", "gcs"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _SECRET_MARKERS = ("PASSWORD", "TOKEN", "SECRET")
+
+
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -161,6 +168,12 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
 
     if source not in _VALID_MODEL_SOURCES:
         errors.append(ConfigIssue(key="NUVION_MODEL_SOURCE", message="지원하지 않는 모델 source입니다. (server|gcs)"))
+
+    if _is_truthy(values.get("NUVION_DEMO_MODE", "false")):
+        try:
+            resolve_demo_video_path(values.get("NUVION_DEMO_VIDEO_PATH"))
+        except ValueError as exc:
+            errors.append(ConfigIssue(key="NUVION_DEMO_VIDEO_PATH", message=str(exc)))
 
     if backend == "triton":
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()

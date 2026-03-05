@@ -14,6 +14,10 @@ Recommended service env vars (already in the formula):
 - `GI_TYPELIB_PATH`
 - `GST_PLUGIN_PATH`
 
+Demo sample video:
+- Formula installs a default demo asset to `$(brew --prefix)/var/nuv-agent/demo/exhibition-demo.webm`.
+- Use with `nuv-agent run --demo --demo-video <path>`.
+
 ## Debian/Ubuntu (.deb)
 Build a package on the target architecture (e.g., Jetson ARM64):
 ```bash
@@ -27,6 +31,8 @@ This script:
 - Installs the systemd unit.
 - Creates `/etc/nuv-agent/agent.env` if missing.
 - Installs optional extras for runtime bootstrap (`zsad,triton`).
+- Best-effort downloads a default demo video to `/var/lib/nuv-agent/demo/exhibition-demo.webm`.
+- Override source URL at install time with `NUVION_DEMO_VIDEO_URL=<direct-video-url>`.
 
 Python requirement: 3.10+
 

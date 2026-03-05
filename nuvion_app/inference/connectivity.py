@@ -11,6 +11,10 @@ AIRPORT_DEFAULT_PATH = "/System/Library/PrivateFrameworks/Apple80211.framework/V
 
 RSSI_AIRPORT_PATTERN = re.compile(r"agrCtlRSSI:\s*(-?\d+)")
 RSSI_IW_PATTERN = re.compile(r"signal:\s*(-?\d+)\s*dBm", re.IGNORECASE)
+AIRPORT_LAST_TX_RATE_PATTERN = re.compile(r"lastTxRate:\s*([0-9.]+)", re.IGNORECASE)
+AIRPORT_MAX_RATE_PATTERN = re.compile(r"maxRate:\s*([0-9.]+)", re.IGNORECASE)
+IW_TX_BITRATE_PATTERN = re.compile(r"tx bitrate:\s*([0-9.]+)\s*([KMG])?bit/s", re.IGNORECASE)
+IW_RX_BITRATE_PATTERN = re.compile(r"rx bitrate:\s*([0-9.]+)\s*([KMG])?bit/s", re.IGNORECASE)
 PING_PACKET_LOSS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)%\s*packet loss", re.IGNORECASE)
 PING_RTT_PATTERN = re.compile(
     r"(?:round-trip|rtt)[^=]*=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)\s*ms",
@@ -52,6 +56,42 @@ def parse_iw_link_output_for_rssi(output: str | None) -> int | None:
         return int(match.group(1))
     except ValueError:
         return None
+
+
+def _to_kbps(value: str, unit: str | None) -> int | None:
+    try:
+        numeric = float(value)
+    except ValueError:
+        return None
+    normalized = (unit or "K").upper()
+    factor = {"K": 1.0, "M": 1000.0, "G": 1_000_000.0}.get(normalized)
+    if factor is None:
+        return None
+    return int(round(numeric * factor))
+
+
+def parse_airport_output_for_bitrate_kbps(output: str | None) -> tuple[int | None, int | None]:
+    if not output:
+        return None, None
+
+    tx_match = AIRPORT_LAST_TX_RATE_PATTERN.search(output)
+    max_match = AIRPORT_MAX_RATE_PATTERN.search(output)
+
+    uplink_kbps = _to_kbps(tx_match.group(1), "M") if tx_match else None
+    # airport 출력은 downlink 지표가 별도로 없어 maxRate 또는 lastTxRate를 대체 사용
+    downlink_kbps = _to_kbps(max_match.group(1), "M") if max_match else uplink_kbps
+    return uplink_kbps, downlink_kbps
+
+
+def parse_iw_link_output_for_bitrate_kbps(output: str | None) -> tuple[int | None, int | None]:
+    if not output:
+        return None, None
+    tx_match = IW_TX_BITRATE_PATTERN.search(output)
+    rx_match = IW_RX_BITRATE_PATTERN.search(output)
+
+    uplink_kbps = _to_kbps(tx_match.group(1), tx_match.group(2)) if tx_match else None
+    downlink_kbps = _to_kbps(rx_match.group(1), rx_match.group(2)) if rx_match else None
+    return uplink_kbps, downlink_kbps
 
 
 def parse_ping_output(output: str | None) -> tuple[float | None, int | None]:
@@ -137,6 +177,30 @@ def collect_ping_metrics(
     return parse_ping_output(output)
 
 
+def collect_link_bitrate_kbps(
+    wifi_interface: str | None = None,
+    platform_name: str | None = None,
+    run_command_fn: Callable[[list[str], float], str | None] = run_command_output,
+) -> tuple[int | None, int | None]:
+    platform = platform_name or sys.platform
+
+    if platform == "darwin":
+        airport_path = os.getenv("NUVION_AIRPORT_PATH", AIRPORT_DEFAULT_PATH)
+        output = run_command_fn([airport_path, "-I"], 2.0)
+        if output is None and airport_path != "airport":
+            output = run_command_fn(["airport", "-I"], 2.0)
+        return parse_airport_output_for_bitrate_kbps(output)
+
+    if platform.startswith("linux"):
+        iface = (wifi_interface or "").strip() or detect_linux_wifi_interface(run_command_fn)
+        if not iface:
+            return None, None
+        output = run_command_fn(["iw", "dev", iface, "link"], 2.0)
+        return parse_iw_link_output_for_bitrate_kbps(output)
+
+    return None, None
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -157,6 +221,7 @@ class ConnectivityReporter:
         min_send_interval_sec: float = 30.0,
         rssi_collector: Callable[[], int | None] | None = None,
         ping_collector: Callable[[], tuple[float | None, int | None]] | None = None,
+        bitrate_collector: Callable[[], tuple[int | None, int | None]] | None = None,
         clock: Callable[[], float] | None = None,
         measured_at_factory: Callable[[], str] | None = None,
     ):
@@ -173,6 +238,9 @@ class ConnectivityReporter:
         self._ping_collector = ping_collector or (
             lambda: collect_ping_metrics(self.target_host)
         )
+        self._bitrate_collector = bitrate_collector or (
+            lambda: collect_link_bitrate_kbps(wifi_interface=self.wifi_interface)
+        )
 
         self._last_quality: str | None = None
         self._last_sent_at: float = 0.0
@@ -180,6 +248,7 @@ class ConnectivityReporter:
     def build_transition_payload(self) -> dict | None:
         rssi_dbm = self._rssi_collector()
         packet_loss_pct, rtt_ms = self._ping_collector()
+        uplink_kbps, downlink_kbps = self._bitrate_collector()
 
         reasons: list[str] = []
         if rssi_dbm is not None and rssi_dbm <= self.thresholds.poor_rssi_dbm:
@@ -203,7 +272,7 @@ class ConnectivityReporter:
             if now - self._last_sent_at < self.min_send_interval_sec:
                 return None
             self._last_sent_at = now
-            return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms)
+            return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms, uplink_kbps, downlink_kbps)
 
         if quality == self._last_quality:
             return None
@@ -213,7 +282,7 @@ class ConnectivityReporter:
 
         self._last_quality = quality
         self._last_sent_at = now
-        return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms)
+        return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms, uplink_kbps, downlink_kbps)
 
     def _build_payload(
         self,
@@ -222,6 +291,8 @@ class ConnectivityReporter:
         rssi_dbm: int | None,
         packet_loss_pct: float | None,
         rtt_ms: int | None,
+        uplink_kbps: int | None,
+        downlink_kbps: int | None,
     ) -> dict:
         return {
             "quality": quality,
@@ -229,7 +300,7 @@ class ConnectivityReporter:
             "rssiDbm": rssi_dbm,
             "packetLossPct": packet_loss_pct,
             "rttMs": rtt_ms,
-            "uplinkKbps": None,
-            "downlinkKbps": None,
+            "uplinkKbps": uplink_kbps,
+            "downlinkKbps": downlink_kbps,
             "measuredAt": self._measured_at_factory(),
         }

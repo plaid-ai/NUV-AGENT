@@ -46,6 +46,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+from nuvion_app.inference.video_source import build_video_source_pipeline
+from nuvion_app.inference.video_source import is_truthy
 from nuvion_app.runtime.inference_mode import (
     apply_inference_runtime_defaults,
     normalize_backend,
@@ -99,6 +101,10 @@ DEVICE_PASSWORD = os.getenv("NUVION_DEVICE_PASSWORD", "password")
 
 VIDEO_SOURCE_ENV = os.getenv("NUVION_VIDEO_SOURCE", "/dev/video0")
 GST_SOURCE_OVERRIDE = os.getenv("NUVION_GST_SOURCE")
+DEMO_MODE = is_truthy(os.getenv("NUVION_DEMO_MODE", "false"))
+DEMO_VIDEO_PATH = (os.getenv("NUVION_DEMO_VIDEO_PATH", "") or "").strip()
+DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
+DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
 RTP_REMOTE_IP_ENV = os.getenv("NUVION_RTP_REMOTE_IP", "")
 RTP_SSRC_ENV = os.getenv("NUVION_RTP_SSRC", None)
@@ -115,7 +121,7 @@ PRODUCTION_CONFIDENCE_THRESHOLD = parse_float(os.getenv("NUVION_PRODUCTION_CONFI
 ANOMALY_MIN_INTERVAL_SEC = parse_float(os.getenv("NUVION_ANOMALY_MIN_INTERVAL_SEC"), 5.0)
 PRODUCTION_DEDUP_SEC = parse_float(os.getenv("NUVION_PRODUCTION_DEDUP_SEC"), 3.0)
 
-ZERO_SHOT_ENABLED = os.getenv("NUVION_ZERO_SHOT_ENABLED", "true").lower() in ("1", "true", "yes")
+ZERO_SHOT_ENABLED = is_truthy(os.getenv("NUVION_ZERO_SHOT_ENABLED", "true"))
 ZERO_SHOT_MODEL = os.getenv("NUVION_ZERO_SHOT_MODEL", "google/siglip2-base-patch16-224")
 ZERO_SHOT_DEVICE = normalize_siglip_device(os.getenv("NUVION_ZERO_SHOT_DEVICE", "auto"), default="auto")
 ZERO_SHOT_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect"))
@@ -123,12 +129,12 @@ ZERO_SHOT_ANOMALY_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS"
 ZERO_SHOT_THRESHOLD = parse_float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD"), 0.7)
 ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0)
 
-LOCAL_DISPLAY = os.getenv("NUVION_LOCAL_DISPLAY", "false").lower() in ("1", "true", "yes")
+LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
 
 TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
 ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
 
-CLIP_ENABLED = os.getenv("NUVION_CLIP_ENABLED", "true").lower() in ("1", "true", "yes")
+CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
 CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 1.0)
@@ -141,7 +147,7 @@ LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
 DEVICE_STATE_INTERVAL_SEC = parse_float(os.getenv("NUVION_DEVICE_STATE_INTERVAL_SEC"), 30.0)
 
-CONNECTIVITY_ENABLED = os.getenv("NUVION_CONNECTIVITY_ENABLED", "true").lower() in ("1", "true", "yes")
+CONNECTIVITY_ENABLED = is_truthy(os.getenv("NUVION_CONNECTIVITY_ENABLED", "true"))
 CONNECTIVITY_INTERVAL_SEC = parse_float(os.getenv("NUVION_CONNECTIVITY_INTERVAL_SEC"), 10.0)
 CONNECTIVITY_MIN_SEND_INTERVAL_SEC = parse_float(os.getenv("NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC"), 30.0)
 CONNECTIVITY_POOR_RSSI_DBM = parse_int_with_default(os.getenv("NUVION_CONNECTIVITY_POOR_RSSI_DBM"), -80)
@@ -976,6 +982,8 @@ class NuvionEventState:
         self.last_sent_status = None
         self.last_sent_at = 0.0
         self.clip_enabled = CLIP_ENABLED
+        self.demo_mode = DEMO_MODE
+        self.demo_tag = DEMO_TAG
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
@@ -1045,10 +1053,11 @@ class NuvionEventState:
             if clip_object:
                 clip_status = "UPLOADING"
 
+        tagged_message = self._apply_demo_tag(message)
         payload = {
             "anomalyType": anomaly_type,
             "anomalyStatus": status,
-            "message": message,
+            "message": tagged_message,
             "severity": severity,
             "lineId": LINE_ID,
             "processId": PROCESS_ID,
@@ -1062,9 +1071,16 @@ class NuvionEventState:
         self.last_sent_status = status
         self.last_sent_at = now
         if status_changed:
-            log.info("[ZSAD] Sent %s status (change): %s", status, message)
+            log.info("[ZSAD] Sent %s status (change): %s", status, tagged_message)
         else:
-            log.info("[ZSAD] Sent %s status (repeat): %s", status, message)
+            log.info("[ZSAD] Sent %s status (repeat): %s", status, tagged_message)
+
+    def _apply_demo_tag(self, message: str) -> str:
+        if not self.demo_mode:
+            return message
+        if message.lstrip().startswith(self.demo_tag):
+            return message
+        return f"{self.demo_tag} {message}"
 
     def start_clip_upload(self) -> str | None:
         if not self.clip_enabled or not CLIP_ENABLED:
@@ -1273,39 +1289,6 @@ class NuvionEventState:
                         self.last_production_at = now
                         self.report_production(1)
 
-
-def build_source_pipeline(video_source: str, width: int, height: int, fps: int) -> str:
-    if GST_SOURCE_OVERRIDE:
-        return GST_SOURCE_OVERRIDE
-
-    if not video_source or video_source == "auto":
-        video_source = "avf" if sys.platform == "darwin" else "/dev/video0"
-
-    if video_source.startswith("/dev/video"):
-        if sys.platform == "darwin":
-            source = "avfvideosrc"
-        else:
-            source = f"v4l2src device={video_source}"
-    elif video_source.lower() in {"rpi", "libcamera"}:
-        source = "libcamerasrc"
-    elif video_source.lower().startswith(("avf", "avfoundation", "mac")):
-        device_index = None
-        if ":" in video_source:
-            _, maybe_index = video_source.split(":", 1)
-            if maybe_index.isdigit():
-                device_index = int(maybe_index)
-        source = f"avfvideosrc device-index={device_index}" if device_index is not None else "avfvideosrc"
-    else:
-        source = "autovideosrc"
-
-    return (
-        f"{source} ! "
-        f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
-        "videoconvert ! "
-        "video/x-raw,format=RGB"
-    )
-
-
 def on_new_sample(appsink, user_data: NuvionEventState):
     sample = appsink.emit("pull-sample")
     if sample is None:
@@ -1341,6 +1324,8 @@ class GStreamerInferenceApp:
         self.video_height = 480
         self.frame_rate = 30
         self.video_source = video_source
+        self.demo_mode = DEMO_MODE
+        self.demo_loop = DEMO_LOOP
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
         self.user_data = NuvionEventState(self.update_overlay_text)
@@ -1355,7 +1340,15 @@ class GStreamerInferenceApp:
 
     def create_pipeline(self):
         Gst.init(None)
-        source_pipeline = build_source_pipeline(self.video_source, self.video_width, self.video_height, self.frame_rate)
+        source_pipeline = build_video_source_pipeline(
+            self.video_source,
+            self.video_width,
+            self.video_height,
+            self.frame_rate,
+            gst_source_override=GST_SOURCE_OVERRIDE,
+            demo_mode=self.demo_mode,
+            demo_video_path=DEMO_VIDEO_PATH,
+        )
 
         overlay_pipeline = (
             "videoconvert ! "
@@ -1451,6 +1444,16 @@ class GStreamerInferenceApp:
     def bus_call(self, bus, message, loop):
         msg_type = message.type
         if msg_type == Gst.MessageType.EOS:
+            if self.demo_mode and self.demo_loop and self.pipeline:
+                ok = self.pipeline.seek_simple(
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                    0,
+                )
+                if ok:
+                    log.info("[DEMO] End-of-stream reached. Restarting demo video.")
+                    return True
+                log.error("[DEMO] Failed to seek demo video on EOS.")
             log.info("End-of-stream")
             self.shutdown()
         elif msg_type == Gst.MessageType.ERROR:
@@ -1485,11 +1488,12 @@ class GStreamerInferenceApp:
 
     def _default_overlay_text(self) -> str:
         backend = getattr(self.user_data, "backend", "none")
+        prefix = "DEMO | " if self.demo_mode else ""
         if backend == "triton":
-            return "ZSAD TRITON ON"
+            return f"{prefix}ZSAD TRITON ON"
         if backend == "siglip":
-            return "ZSAD ON"
-        return "ZSAD OFF"
+            return f"{prefix}ZSAD ON"
+        return f"{prefix}ZSAD OFF"
 
     def run(self):
         def _start():

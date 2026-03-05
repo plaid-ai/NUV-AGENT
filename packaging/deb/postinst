@@ -18,6 +18,36 @@ if [ ! -f /etc/nuv-agent/agent.env ]; then
   cp /opt/nuv-agent/share/agent.env.example /etc/nuv-agent/agent.env
 fi
 
+DEMO_DIR="/var/lib/nuv-agent/demo"
+DEMO_FILE="exhibition-demo.webm"
+DEMO_PATH="${DEMO_DIR}/${DEMO_FILE}"
+DEMO_URL="${NUVION_DEMO_VIDEO_URL:-https://upload.wikimedia.org/wikipedia/commons/a/af/Gigaset_Smartphone_Production_IV_Quality_Inspection.webm}"
+
+install -d -m 0775 -o root -g nuvion "$DEMO_DIR"
+
+if [ ! -s "$DEMO_PATH" ]; then
+  tmp_file="$(mktemp /tmp/nuv-agent-demo.XXXXXX)"
+  downloaded="false"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 "$DEMO_URL" -o "$tmp_file"; then
+      downloaded="true"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if wget -q --tries=3 --timeout=10 -O "$tmp_file" "$DEMO_URL"; then
+      downloaded="true"
+    fi
+  fi
+
+  if [ "$downloaded" = "true" ] && [ -s "$tmp_file" ]; then
+    mv "$tmp_file" "$DEMO_PATH"
+    chown root:nuvion "$DEMO_PATH"
+    chmod 0644 "$DEMO_PATH"
+  else
+    rm -f "$tmp_file"
+    echo "[postinst] warning: failed to download demo video from ${DEMO_URL}" >&2
+  fi
+fi
+
 chown root:nuvion /etc/nuv-agent/agent.env
 chmod 0660 /etc/nuv-agent/agent.env
 
@@ -36,6 +66,16 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
 fi
 
 if command -v python3 >/dev/null 2>&1; then
+  if [ -f "$DEMO_PATH" ]; then
+    if grep -q '^NUVION_DEMO_VIDEO_PATH=' /etc/nuv-agent/agent.env; then
+      if grep -q '^NUVION_DEMO_VIDEO_PATH=$' /etc/nuv-agent/agent.env; then
+        sed -i "s|^NUVION_DEMO_VIDEO_PATH=$|NUVION_DEMO_VIDEO_PATH=${DEMO_PATH}|" /etc/nuv-agent/agent.env
+      fi
+    else
+      echo "NUVION_DEMO_VIDEO_PATH=${DEMO_PATH}" >> /etc/nuv-agent/agent.env
+    fi
+  fi
+
   python3 -m venv --clear --system-site-packages /opt/nuv-agent/venv
   /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade pip >/dev/null
   /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "/opt/nuv-agent/src[zsad,triton]" >/dev/null

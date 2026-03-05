@@ -4,9 +4,12 @@ import unittest
 
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.connectivity import collect_link_bitrate_kbps
 from nuvion_app.inference.connectivity import collect_ping_metrics
 from nuvion_app.inference.connectivity import collect_rssi_dbm
+from nuvion_app.inference.connectivity import parse_airport_output_for_bitrate_kbps
 from nuvion_app.inference.connectivity import parse_airport_output_for_rssi
+from nuvion_app.inference.connectivity import parse_iw_link_output_for_bitrate_kbps
 from nuvion_app.inference.connectivity import parse_iw_link_output_for_rssi
 from nuvion_app.inference.connectivity import parse_ping_output
 
@@ -26,6 +29,23 @@ class ConnectivityParserTest(unittest.TestCase):
             \ttx bitrate: 54.0 MBit/s
         """
         self.assertEqual(parse_iw_link_output_for_rssi(output), -78)
+
+    def test_parse_airport_output_for_bitrate_kbps(self) -> None:
+        output = """
+            agrCtlRSSI: -67
+            lastTxRate: 351
+            maxRate: 780
+        """
+        self.assertEqual(parse_airport_output_for_bitrate_kbps(output), (351000, 780000))
+
+    def test_parse_iw_link_output_for_bitrate_kbps(self) -> None:
+        output = """
+            Connected to aa:bb:cc:dd:ee:ff (on wlan0)
+            \tsignal: -78 dBm
+            \ttx bitrate: 54.0 MBit/s
+            \trx bitrate: 18.5 MBit/s
+        """
+        self.assertEqual(parse_iw_link_output_for_bitrate_kbps(output), (54000, 18500))
 
     def test_parse_ping_output_linux_and_macos(self) -> None:
         linux_output = """
@@ -68,6 +88,26 @@ class ConnectivityParserTest(unittest.TestCase):
 
         self.assertEqual(collect_ping_metrics("api.example.com", platform_name="linux", run_command_fn=fake_run), (0.0, 15))
 
+    def test_collect_link_bitrate_for_darwin(self) -> None:
+        def fake_run(cmd: list[str], timeout: float) -> str | None:
+            _ = timeout
+            if cmd[-1] == "-I":
+                return "lastTxRate: 433\nmaxRate: 866"
+            return None
+
+        self.assertEqual(collect_link_bitrate_kbps(platform_name="darwin", run_command_fn=fake_run), (433000, 866000))
+
+    def test_collect_link_bitrate_for_linux(self) -> None:
+        def fake_run(cmd: list[str], timeout: float) -> str | None:
+            _ = timeout
+            if cmd == ["iw", "dev"]:
+                return "phy#0\n\tInterface wlan0\n"
+            if cmd == ["iw", "dev", "wlan0", "link"]:
+                return "Connected\n\ttx bitrate: 65.0 MBit/s\n\trx bitrate: 32.5 MBit/s\n"
+            return None
+
+        self.assertEqual(collect_link_bitrate_kbps(platform_name="linux", run_command_fn=fake_run), (65000, 32500))
+
 
 class ConnectivityReporterTest(unittest.TestCase):
     def test_reporter_sends_only_transitions(self) -> None:
@@ -90,6 +130,9 @@ class ConnectivityReporterTest(unittest.TestCase):
             idx["i"] += 1
             return sample["loss"], sample["rtt"]
 
+        def bitrate_collector() -> tuple[int | None, int | None]:
+            return 12000, 18000
+
         ticks = iter([0.0, 2.0, 4.0, 6.0, 8.0])
 
         reporter = ConnectivityReporter(
@@ -98,6 +141,7 @@ class ConnectivityReporterTest(unittest.TestCase):
             min_send_interval_sec=1.0,
             rssi_collector=rssi_collector,
             ping_collector=ping_collector,
+            bitrate_collector=bitrate_collector,
             clock=lambda: next(ticks),
             measured_at_factory=lambda: "2026-03-04T07:42:10Z",
         )
@@ -111,9 +155,13 @@ class ConnectivityReporterTest(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual(second["quality"], "POOR")
         self.assertIn("wifi_rssi_low", second["reason"])
+        self.assertEqual(second["uplinkKbps"], 12000)
+        self.assertEqual(second["downlinkKbps"], 18000)
         self.assertIsNone(third)  # Repeated POOR state is ignored.
         self.assertIsNotNone(fourth)
         self.assertEqual(fourth["quality"], "GOOD")
+        self.assertEqual(fourth["uplinkKbps"], 12000)
+        self.assertEqual(fourth["downlinkKbps"], 18000)
 
 
 if __name__ == "__main__":

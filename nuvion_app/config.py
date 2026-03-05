@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
+from nuvion_app.inference.video_source import resolve_demo_video_path
 
 
 DEFAULT_PORT = 8088
@@ -385,6 +386,12 @@ def _has_display() -> bool:
     return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
 
 
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _field_group(key: str) -> str:
     if key.startswith("NUVION_TRITON_"):
         return "triton"
@@ -523,6 +530,18 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def _check_demo_video_source(values: Dict[str, str]) -> Dict[str, str]:
+    try:
+        path = resolve_demo_video_path(values.get("NUVION_DEMO_VIDEO_PATH"))
+    except ValueError as exc:
+        return {
+            "name": "Demo video source",
+            "status": "fail",
+            "detail": str(exc),
+        }
+    return {"name": "Demo video source", "status": "pass", "detail": f"Demo video file is ready: {path}"}
+
+
 def _check_rtp_target(values: Dict[str, str]) -> Dict[str, str]:
     rtp_ip = (values.get("NUVION_RTP_REMOTE_IP") or "").strip()
     if not rtp_ip:
@@ -547,10 +566,12 @@ def _check_rtp_target(values: Dict[str, str]) -> Dict[str, str]:
 
 
 def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
+    demo_mode = _is_truthy(values.get("NUVION_DEMO_MODE", "false"))
+    source_check = _check_demo_video_source(values) if demo_mode else _check_camera_source(values)
     checks = [
         _check_server_login(values),
         _check_triton_health(values),
-        _check_camera_source(values),
+        source_check,
         _check_rtp_target(values),
     ]
     has_fail = any(check["status"] == "fail" for check in checks)
