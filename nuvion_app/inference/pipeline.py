@@ -1331,6 +1331,8 @@ class GStreamerInferenceApp:
 
         self.pipeline = None
         self.loop = None
+        self._demo_restarting = False
+        self._demo_last_restart_at = 0.0
 
         self.create_pipeline()
 
@@ -1440,23 +1442,50 @@ class GStreamerInferenceApp:
         else:
             self.update_overlay_text(self._default_overlay_text())
 
+    def _restart_demo_pipeline(self, reason: str) -> bool:
+        if not self.pipeline:
+            return False
+        now = time.time()
+        if self._demo_restarting:
+            return False
+        # Avoid tight restart loops when upstream keeps failing.
+        if now - self._demo_last_restart_at < 0.5:
+            return False
+
+        self._demo_restarting = True
+        self._demo_last_restart_at = now
+        try:
+            self.pipeline.set_state(Gst.State.NULL)
+            # Wait state transition to settle before replay.
+            self.pipeline.get_state(2 * Gst.SECOND)
+            restart_result = self.pipeline.set_state(Gst.State.PLAYING)
+            if restart_result == Gst.StateChangeReturn.FAILURE:
+                return False
+            self.update_overlay_text(self._default_overlay_text())
+            log.info("[DEMO] Restarted demo video (%s).", reason)
+            return True
+        finally:
+            self._demo_restarting = False
+
     def bus_call(self, bus, message, loop):
         msg_type = message.type
         if msg_type == Gst.MessageType.EOS:
             if self.demo_mode and self.demo_loop and self.pipeline:
-                # 일부 조합(uridecodebin + splitmuxsink)에서 seek 기반 루프는
-                # segment format assertion을 유발할 수 있어 상태 전환으로 재시작한다.
-                self.pipeline.set_state(Gst.State.READY)
-                restart_result = self.pipeline.set_state(Gst.State.PLAYING)
-                if restart_result != Gst.StateChangeReturn.FAILURE:
-                    self.update_overlay_text(self._default_overlay_text())
-                    log.info("[DEMO] End-of-stream reached. Restarted demo video.")
+                if self._restart_demo_pipeline("eos"):
                     return True
                 log.error("[DEMO] Failed to restart demo video on EOS.")
             log.info("End-of-stream")
             self.shutdown()
         elif msg_type == Gst.MessageType.ERROR:
             err, dbg = message.parse_error()
+            err_text = str(err).lower()
+            dbg_text = (dbg or "").lower()
+            if self.demo_mode and self.demo_loop and (
+                "not-linked" in err_text or "not-linked" in dbg_text
+            ):
+                log.warning("[DEMO] GStreamer not-linked error detected. Trying pipeline restart.")
+                if self._restart_demo_pipeline("not-linked-error"):
+                    return True
             log.error("GStreamer Error: %s, %s", err, dbg)
             self.shutdown()
         return True
