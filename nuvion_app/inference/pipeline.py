@@ -36,7 +36,6 @@ warnings.filterwarnings(
     "ignore",
     message=r".*invalid escape sequence.*",
     category=SyntaxWarning,
-    module=r"stomper\.stompbuffer",
 )
 import stomper
 
@@ -1367,7 +1366,7 @@ class GStreamerInferenceApp:
             "tune=zerolatency "
             "speed-preset=faster "
             "bitrate=8000 "
-            "vbv-buf-capacity=12000 "
+            "vbv-buf-capacity=10000 "
             "key-int-max=30 "
             "bframes=0 "
             "threads=4 "
@@ -1445,15 +1444,15 @@ class GStreamerInferenceApp:
         msg_type = message.type
         if msg_type == Gst.MessageType.EOS:
             if self.demo_mode and self.demo_loop and self.pipeline:
-                ok = self.pipeline.seek_simple(
-                    Gst.Format.TIME,
-                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                    0,
-                )
-                if ok:
-                    log.info("[DEMO] End-of-stream reached. Restarting demo video.")
+                # 일부 조합(uridecodebin + splitmuxsink)에서 seek 기반 루프는
+                # segment format assertion을 유발할 수 있어 상태 전환으로 재시작한다.
+                self.pipeline.set_state(Gst.State.READY)
+                restart_result = self.pipeline.set_state(Gst.State.PLAYING)
+                if restart_result != Gst.StateChangeReturn.FAILURE:
+                    self.update_overlay_text(self._default_overlay_text())
+                    log.info("[DEMO] End-of-stream reached. Restarted demo video.")
                     return True
-                log.error("[DEMO] Failed to seek demo video on EOS.")
+                log.error("[DEMO] Failed to restart demo video on EOS.")
             log.info("End-of-stream")
             self.shutdown()
         elif msg_type == Gst.MessageType.ERROR:
