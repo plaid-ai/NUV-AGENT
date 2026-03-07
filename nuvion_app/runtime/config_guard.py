@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from nuvion_app.config import REQUIRED_KEYS, load_template, read_env, write_env
+from nuvion_app.config import effective_required_keys, load_template, read_env, write_env
 from nuvion_app.inference.video_source import resolve_demo_video_path
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
@@ -159,7 +159,7 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     warnings: List[ConfigIssue] = []
     errors: List[ConfigIssue] = []
 
-    for key in REQUIRED_KEYS:
+    for key in effective_required_keys(values):
         if _is_placeholder(values.get(key)):
             errors.append(ConfigIssue(key=key, message="필수 값이 비어있거나 placeholder입니다."))
 

@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
 from nuvion_app.inference.video_source import resolve_demo_video_path
+from nuvion_app.inference.webrtc_signaling import UPLINK_MODE_RTP, normalize_uplink_mode
 
 
 DEFAULT_PORT = 8088
@@ -29,12 +30,15 @@ PAIRING_TIMEOUT_SEC = int(os.getenv("NUVION_PAIRING_TIMEOUT_SEC", "600"))
 PROVISION_ENDPOINT = os.getenv("NUVION_DEVICE_PROVISION_ENDPOINT", "/devices/provision")
 PAIRING_INIT_ENDPOINT = os.getenv("NUVION_PAIRING_INIT_ENDPOINT", "/devices/pairings/init")
 PAIRING_STATUS_ENDPOINT = os.getenv("NUVION_PAIRING_STATUS_ENDPOINT", "/devices/pairings/{pairing_id}")
-REQUIRED_KEYS = {
+BASE_REQUIRED_KEYS = {
     "NUVION_SERVER_BASE_URL",
     "NUVION_DEVICE_USERNAME",
     "NUVION_DEVICE_PASSWORD",
+}
+LEGACY_RTP_REQUIRED_KEYS = {
     "NUVION_RTP_REMOTE_IP",
 }
+REQUIRED_KEYS = BASE_REQUIRED_KEYS | LEGACY_RTP_REQUIRED_KEYS
 PLACEHOLDER_VALUES = {"***"}
 
 _LOADED = False
@@ -56,6 +60,14 @@ def _is_placeholder(value: Optional[str]) -> bool:
 
 def _is_secret_key(key: str) -> bool:
     return any(marker in key for marker in SECRET_KEY_MARKERS)
+
+
+def effective_required_keys(values: Optional[Dict[str, str]] = None) -> set[str]:
+    resolved = set(BASE_REQUIRED_KEYS)
+    uplink_mode = normalize_uplink_mode((values or {}).get("NUVION_UPLINK_MODE"))
+    if uplink_mode == UPLINK_MODE_RTP:
+        resolved.update(LEGACY_RTP_REQUIRED_KEYS)
+    return resolved
 
 
 def template_path() -> Path:
@@ -339,7 +351,7 @@ def _merge_defaults(fields: List[Dict[str, str]], existing: Dict[str, str]) -> D
 
 def _validate_required(values: Dict[str, str]) -> List[str]:
     missing = []
-    for key in REQUIRED_KEYS:
+    for key in effective_required_keys(values):
         if _is_placeholder(values.get(key)):
             missing.append(key)
     return missing
@@ -347,10 +359,11 @@ def _validate_required(values: Dict[str, str]) -> List[str]:
 
 def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced: bool) -> Dict[str, str]:
     values = _merge_defaults(fields, existing)
+    required_keys = effective_required_keys(values)
     for field in fields:
         key = field["key"]
         default = values.get(key, "")
-        required = key in REQUIRED_KEYS
+        required = key in required_keys
         if not advanced and not required:
             continue
 
@@ -572,8 +585,9 @@ def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
         _check_server_login(values),
         _check_triton_health(values),
         source_check,
-        _check_rtp_target(values),
     ]
+    if normalize_uplink_mode(values.get("NUVION_UPLINK_MODE")) == UPLINK_MODE_RTP:
+        checks.append(_check_rtp_target(values))
     has_fail = any(check["status"] == "fail" for check in checks)
     return {"ok": not has_fail, "checks": checks}
 
@@ -586,6 +600,7 @@ def _render_form(
     env_overrides: Optional[Dict[str, str]] = None,
 ) -> str:
     env_overrides = env_overrides or {}
+    required_keys = effective_required_keys(values)
     backend_value = (values.get("NUVION_ZSAD_BACKEND") or "triton").strip().lower() or "triton"
     if backend_value not in {"triton", "siglip", "mps", "none"}:
         backend_value = "triton"
@@ -616,7 +631,7 @@ def _render_form(
         if is_secret and values.get(key):
             value = ""
             note = "<div class=\"note\">Leave blank to keep current value.</div>"
-        required_attr = "required" if (key in REQUIRED_KEYS and _is_placeholder(values.get(key))) else ""
+        required_attr = "required" if (key in required_keys and _is_placeholder(values.get(key))) else ""
         if key in missing:
             placeholder = " required"
         rows.append(

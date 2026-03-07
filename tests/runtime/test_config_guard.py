@@ -55,6 +55,25 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(issue.key == "NUVION_DEVICE_PASSWORD" for issue in report.errors))
 
+    def test_guard_accepts_missing_rtp_target_in_webrtc_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_UPLINK_MODE=webrtc",
+                        "NUVION_RTP_REMOTE_IP=",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "",
+                    ]
+                )
+            )
+            report = guard_config(config_path=config_path, apply_fixes=True)
+            self.assertTrue(report.ok)
+
     def test_guard_reports_env_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"

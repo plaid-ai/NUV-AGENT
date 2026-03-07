@@ -28,6 +28,20 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.webrtc_signaling import (
+    WEBRTC_UPLINK_ANSWER,
+    WEBRTC_UPLINK_ICE_CANDIDATE,
+    WEBRTC_UPLINK_OFFER_DEST,
+    WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+    WEBRTC_UPLINK_START,
+    WEBRTC_UPLINK_STATE,
+    WEBRTC_UPLINK_STOP_DEST,
+    UPLINK_MODE_RTP,
+    UPLINK_MODE_WEBRTC,
+    normalize_uplink_mode,
+    parse_command_payload,
+)
+from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
 
 # Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
 # SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
@@ -106,6 +120,8 @@ DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
 RTP_REMOTE_IP_ENV = os.getenv("NUVION_RTP_REMOTE_IP", "")
+UPLINK_MODE = normalize_uplink_mode(os.getenv("NUVION_UPLINK_MODE", UPLINK_MODE_WEBRTC))
+WEBRTC_FORCE_RELAY = is_truthy(os.getenv("NUVION_WEBRTC_FORCE_RELAY", "true"))
 RTP_SSRC_ENV = os.getenv("NUVION_RTP_SSRC", None)
 H264_PROFILE_LEVEL_ID_ENV = os.getenv("NUVION_H264_PROFILE_LEVEL_ID", "64001f")
 H264_PROFILE_ENV = os.getenv("NUVION_H264_PROFILE", "baseline")
@@ -169,6 +185,9 @@ AGENT_RETRY_DESTINATIONS = {
     "/app/device/state",
     "/app/device/connectivity",
     "/app/broadcast/start",
+    WEBRTC_UPLINK_OFFER_DEST,
+    WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+    WEBRTC_UPLINK_STOP_DEST,
 }
 
 websocket: websockets.WebSocketClientProtocol | None = None
@@ -569,6 +588,8 @@ def _reset_agent_ws_state() -> None:
         broadcast_start_notified = False
     with last_rtp_endpoint_lock:
         last_rtp_endpoint = None
+    if g_app and getattr(g_app, "webrtc_uplink", None):
+        g_app.webrtc_uplink.on_signaling_reset()
 
 
 def _set_broadcast_start_notified(value: bool) -> None:
@@ -814,16 +835,8 @@ async def notify_broadcast_started(payload_type: int, ssrc: int):
             _set_broadcast_start_notified(True)
 
 
-async def handle_rtp_endpoint_ready(body: str):
+async def handle_legacy_rtp_endpoint_ready(data: dict):
     global g_app
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return
-
-    if data.get("type") != "RTP_ENDPOINT_READY":
-        return
 
     broadcast_id = data.get("broadcastId")
     sdp = data.get("sdp")
@@ -868,6 +881,40 @@ async def handle_rtp_endpoint_ready(body: str):
     g_app.configure_rtp_sink(ip, int(port), int(pt))
 
     await notify_broadcast_started(int(pt), g_app.rtp_ssrc)
+
+
+async def handle_webrtc_uplink_command(data: dict) -> bool:
+    global g_app
+
+    if not g_app or not getattr(g_app, "webrtc_uplink", None):
+        return False
+
+    command_type = str(data.get("type") or "").strip()
+    if command_type == WEBRTC_UPLINK_START:
+        g_app.webrtc_uplink.start(data)
+        return True
+    if command_type == WEBRTC_UPLINK_ANSWER:
+        g_app.webrtc_uplink.apply_answer(data)
+        return True
+    if command_type == WEBRTC_UPLINK_ICE_CANDIDATE:
+        g_app.webrtc_uplink.add_remote_ice_candidate(data)
+        return True
+    if command_type == WEBRTC_UPLINK_STATE:
+        g_app.webrtc_uplink.handle_remote_state(data)
+        return True
+    return False
+
+
+async def handle_command_message(body: str):
+    data = parse_command_payload(body)
+    if not data:
+        return
+
+    if await handle_webrtc_uplink_command(data):
+        return
+
+    if data.get("type") == "RTP_ENDPOINT_READY":
+        await handle_legacy_rtp_endpoint_ready(data)
 
 
 async def signaling_client_main():
@@ -950,7 +997,7 @@ async def signaling_client_main():
                         body = frame["body"]
 
                         if destination and AGENT_COMMAND_QUEUE_DEST in destination:
-                            await handle_rtp_endpoint_ready(body)
+                            await handle_command_message(body)
                         elif destination and AGENT_ERROR_QUEUE_DEST in destination:
                             await handle_agent_error(body)
 
@@ -1325,9 +1372,14 @@ class GStreamerInferenceApp:
         self.video_source = video_source
         self.demo_mode = DEMO_MODE
         self.demo_loop = DEMO_LOOP
+        self.uplink_mode = UPLINK_MODE
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
         self.user_data = NuvionEventState(self.update_overlay_text)
+        self.webrtc_uplink = WebRTCUplinkController(
+            send_message=self.send_webrtc_signal,
+            default_force_relay=WEBRTC_FORCE_RELAY,
+        ) if self.uplink_mode == UPLINK_MODE_WEBRTC else None
 
         self.pipeline = None
         self.loop = None
@@ -1378,25 +1430,48 @@ class GStreamerInferenceApp:
             f"video/x-h264,profile={H264_PROFILE_ENV} ! "
         )
 
-        if CLIP_ENABLED:
-            segment_ns = int(CLIP_SEGMENT_SEC * 1_000_000_000)
-            segment_location = os.path.join(CLIP_SEGMENTS_DIR, "segment_%05d.mp4")
-            rtp_pipeline = (
-                f"{encoder_pipeline}"
-                "tee name=enc_t "
-                "enc_t. ! queue ! "
-                f"rtph264pay name=rtp_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
-                "udpsink name=rtp_sink host=0.0.0.0 port=5004 async=false sync=false "
-                "enc_t. ! queue ! h264parse config-interval=1 ! "
-                f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
-                f"max-files={CLIP_MAX_SEGMENTS} location=\"{segment_location}\""
-            )
+        if self.uplink_mode == UPLINK_MODE_WEBRTC:
+            if CLIP_ENABLED:
+                segment_ns = int(CLIP_SEGMENT_SEC * 1_000_000_000)
+                segment_location = os.path.join(CLIP_SEGMENTS_DIR, "segment_%05d.mp4")
+                uplink_pipeline = (
+                    f"{encoder_pipeline}"
+                    "tee name=enc_t "
+                    "enc_t. ! queue ! h264parse config-interval=1 ! "
+                    f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
+                    "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
+                    "webrtc_uplink. "
+                    "enc_t. ! queue ! h264parse config-interval=1 ! "
+                    f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
+                    f"max-files={CLIP_MAX_SEGMENTS} location=\"{segment_location}\""
+                )
+            else:
+                uplink_pipeline = (
+                    f"{encoder_pipeline}"
+                    f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
+                    "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
+                    "webrtc_uplink."
+                )
         else:
-            rtp_pipeline = (
-                f"{encoder_pipeline}"
-                f"rtph264pay name=rtp_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
-                "udpsink name=rtp_sink host=0.0.0.0 port=5004 async=false sync=false"
-            )
+            if CLIP_ENABLED:
+                segment_ns = int(CLIP_SEGMENT_SEC * 1_000_000_000)
+                segment_location = os.path.join(CLIP_SEGMENTS_DIR, "segment_%05d.mp4")
+                uplink_pipeline = (
+                    f"{encoder_pipeline}"
+                    "tee name=enc_t "
+                    "enc_t. ! queue ! "
+                    f"rtph264pay name=rtp_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
+                    "udpsink name=rtp_sink host=0.0.0.0 port=5004 async=false sync=false "
+                    "enc_t. ! queue ! h264parse config-interval=1 ! "
+                    f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
+                    f"max-files={CLIP_MAX_SEGMENTS} location=\"{segment_location}\""
+                )
+            else:
+                uplink_pipeline = (
+                    f"{encoder_pipeline}"
+                    f"rtph264pay name=rtp_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
+                    "udpsink name=rtp_sink host=0.0.0.0 port=5004 async=false sync=false"
+                )
 
         if LOCAL_DISPLAY:
             pipeline_string = (
@@ -1408,7 +1483,7 @@ class GStreamerInferenceApp:
                 f"{overlay_pipeline}"
                 "tee name=dt "
                 "dt. ! queue ! "
-                f"{rtp_pipeline} "
+                f"{uplink_pipeline} "
                 "dt. ! queue ! videoconvert ! autovideosink sync=false"
             )
         else:
@@ -1419,8 +1494,11 @@ class GStreamerInferenceApp:
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
                 "t. ! queue ! "
                 f"{overlay_pipeline}"
-                f"{rtp_pipeline}"
+                f"{uplink_pipeline}"
             )
+
+        if self.uplink_mode == UPLINK_MODE_WEBRTC:
+            pipeline_string = f"{pipeline_string} webrtcbin name=webrtc_uplink bundle-policy=max-bundle latency=0"
 
         log.info("[PIPELINE] %s", pipeline_string)
         self.pipeline = Gst.parse_launch(pipeline_string)
@@ -1441,6 +1519,9 @@ class GStreamerInferenceApp:
             log.warning("[PIPELINE] zsad_overlay not found.")
         else:
             self.update_overlay_text(self._default_overlay_text())
+
+        if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
+            self.webrtc_uplink = None
 
     def _restart_demo_pipeline(self, reason: str) -> bool:
         if not self.pipeline:
@@ -1505,6 +1586,9 @@ class GStreamerInferenceApp:
             rtp_pay.set_property("pt", pt)
             rtp_pay.set_property("ssrc", self.rtp_ssrc)
 
+    def send_webrtc_signal(self, destination: str, payload: dict, remember: bool) -> bool:
+        return enqueue_stomp_message(destination, payload, remember=remember)
+
     def update_overlay_text(self, text: str):
         if not self.overlay:
             return
@@ -1517,11 +1601,12 @@ class GStreamerInferenceApp:
     def _default_overlay_text(self) -> str:
         backend = getattr(self.user_data, "backend", "none")
         prefix = "DEMO | " if self.demo_mode else ""
+        uplink = "WEBRTC" if self.uplink_mode == UPLINK_MODE_WEBRTC else "RTP"
         if backend == "triton":
-            return f"{prefix}ZSAD TRITON ON"
+            return f"{prefix}ZSAD TRITON ON | {uplink}"
         if backend == "siglip":
-            return f"{prefix}ZSAD ON"
-        return f"{prefix}ZSAD OFF"
+            return f"{prefix}ZSAD ON | {uplink}"
+        return f"{prefix}ZSAD OFF | {uplink}"
 
     def run(self):
         def _start():
@@ -1549,6 +1634,8 @@ class GStreamerInferenceApp:
 
     def shutdown(self):
         self.user_data.running = False
+        if self.webrtc_uplink:
+            self.webrtc_uplink.stop(send_signal=True)
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
         if self.loop and self.loop.is_running():
