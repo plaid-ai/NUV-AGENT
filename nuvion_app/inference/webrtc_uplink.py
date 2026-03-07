@@ -72,6 +72,10 @@ class WebRTCUplinkController:
             log.warning("[WEBRTC-UPLINK] start payload missing sessionId or broadcastId: %s", payload)
             return
 
+        if self._session and self._session.session_id == session_id:
+            log.info("[WEBRTC-UPLINK] ignoring duplicate start for sessionId=%s", session_id)
+            return
+
         ice_servers = parse_ice_servers(payload.get("iceServers"))
         force_relay = bool(payload.get("forceRelay", self._default_force_relay))
         self._session = WebRTCUplinkSession(
