@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+print_nuv_agent_banner() {
+  printf '%s\n' \
+' _   _ _   ___      _    ____ _____ _   _ _____' \
+'| \ | | | | \ \    / /  / \  / ___| ____| \ | |_   _|' \
+'|  \| | | | |\ \  / /  / _ \| |  _|  _| |  \| | | |' \
+'| |\  | |_| | \ \/ /  / ___ \ |_| | |___| |\  | | |' \
+'|_| \_|\___/   \__/  /_/   \_\____|_____|_| \_| |_|'
+}
+
 if ! id -u nuvion >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin nuvion
 fi
@@ -84,3 +93,8 @@ fi
 
 systemctl daemon-reload || true
 systemctl enable --now nuv-agent.service || true
+
+echo
+print_nuv_agent_banner
+echo
+echo "nuv-agent installed. Run: nuv-agent setup"
