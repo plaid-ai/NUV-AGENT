@@ -5,7 +5,7 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.48"
+  version "0.1.49"
   license "Proprietary"
 
   depends_on "python@3.14"
@@ -341,7 +341,17 @@ class NuvAgent < Formula
   end
 
   def caveats
+    art = <<~'ART'
+       _   _ _   ___      _    ____ _____ _   _ _____
+      | \ | | | | \ \    / /  / \  / ___| ____| \ | |_   _|
+      |  \| | | | |\ \  / /  / _ \| |  _|  _| |  \| | | |
+      | |\  | |_| | \ \/ /  / ___ \ |_| | |___| |\  | | |
+      |_| \_|\___/   \__/  /_/   \_\____|_____|_| \_| |_|
+    ART
+
     <<~EOS
+      #{art}
+
       Runtime bootstrap is enabled by default.
       On macOS, `nuv-agent setup` / `nuv-agent run` will try to:
       1) install Homebrew (if missing),
