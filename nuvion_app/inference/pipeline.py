@@ -28,6 +28,11 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.device_state import (
+    DEVICE_STATE_ERROR,
+    DEVICE_STATE_RUNNING,
+    DeviceStateCoordinator,
+)
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -644,32 +649,33 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
             log.warning("[STOMP] send failed: %s", exc)
 
 
-async def device_state_heartbeat_sender():
+async def device_state_heartbeat_sender(state_coordinator: DeviceStateCoordinator | None):
     interval = max(1.0, DEVICE_STATE_INTERVAL_SEC)
     while True:
-        payload = {
-            "status": "RUNNING",
-            "message": "heartbeat",
-            "lineId": LINE_ID,
-            "processId": PROCESS_ID,
-        }
-        enqueue_stomp_message("/app/device/state", payload)
+        if state_coordinator is not None:
+            state_coordinator.emit_heartbeat()
         await asyncio.sleep(interval)
 
 
-async def device_connectivity_sender(reporter: ConnectivityReporter):
+async def device_connectivity_sender(
+    reporter: ConnectivityReporter,
+    state_coordinator: DeviceStateCoordinator | None,
+):
     interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
     while True:
         payload = reporter.build_transition_payload()
-        if payload and enqueue_stomp_message("/app/device/connectivity", payload):
-            log.info(
-                "[CONNECTIVITY] sent quality=%s reason=%s rssi=%s loss=%s rtt=%s",
-                payload.get("quality"),
-                payload.get("reason"),
-                payload.get("rssiDbm"),
-                payload.get("packetLossPct"),
-                payload.get("rttMs"),
-            )
+        if payload:
+            if state_coordinator is not None and payload.get("quality"):
+                state_coordinator.set_connectivity_quality(str(payload["quality"]))
+            if enqueue_stomp_message("/app/device/connectivity", payload):
+                log.info(
+                    "[CONNECTIVITY] sent quality=%s reason=%s rssi=%s loss=%s rtt=%s",
+                    payload.get("quality"),
+                    payload.get("reason"),
+                    payload.get("rssiDbm"),
+                    payload.get("packetLossPct"),
+                    payload.get("rttMs"),
+                )
         await asyncio.sleep(interval)
 
 
@@ -970,7 +976,8 @@ async def signaling_client_main():
                 await ws.send(json.dumps([stomper.subscribe(AGENT_ERROR_QUEUE_DEST, "sub-agent-error")]))
 
                 sender_task = asyncio.create_task(outbound_sender(ws))
-                heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
+                state_coordinator = getattr(g_app.user_data, "device_state", None) if g_app else None
+                heartbeat_task = asyncio.create_task(device_state_heartbeat_sender(state_coordinator))
                 connectivity_task = None
                 if CONNECTIVITY_ENABLED:
                     connectivity_target_host = CONNECTIVITY_TARGET_HOST or extract_host_from_server_url(SERVER_BASE_URL)
@@ -985,7 +992,7 @@ async def signaling_client_main():
                         thresholds=connectivity_thresholds,
                         min_send_interval_sec=CONNECTIVITY_MIN_SEND_INTERVAL_SEC,
                     )
-                    connectivity_task = asyncio.create_task(device_connectivity_sender(reporter))
+                    connectivity_task = asyncio.create_task(device_connectivity_sender(reporter, state_coordinator))
 
                 async for message in ws:
                     if not message.startswith("a["):
@@ -1038,6 +1045,11 @@ class NuvionEventState:
         self.zero_shot = None
         self.triton_client = None
         self._triton_client_thread_id = None
+        self.device_state = DeviceStateCoordinator(
+            send_message=self.send_device_state,
+            line_id=LINE_ID,
+            process_id=PROCESS_ID,
+        )
 
         if self.backend == "siglip":
             self.zero_shot = ZeroShotAnomalyDetector(
@@ -1079,6 +1091,11 @@ class NuvionEventState:
         clip_object: str | None = None,
         clip_status: str | None = None,
     ):
+        if status == "DEFECT":
+            self.device_state.set_detection_state(DEVICE_STATE_ERROR)
+        elif status == "NORMAL":
+            self.device_state.set_detection_state(DEVICE_STATE_RUNNING)
+
         now = time.time()
         prev_sent_status = self.last_sent_status
         status_changed = (prev_sent_status is None) or (status != prev_sent_status)
@@ -1256,6 +1273,9 @@ class NuvionEventState:
             "processId": PROCESS_ID,
         }
         enqueue_stomp_message("/app/device/production", payload)
+
+    def send_device_state(self, payload: dict[str, object]) -> bool:
+        return enqueue_stomp_message("/app/device/state", payload)
 
     def _emit_overlay(self, text: str):
         if self.overlay_callback:
