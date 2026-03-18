@@ -166,7 +166,11 @@ class WebRTCUplinkController:
             return
         state = str(payload.get("state") or payload.get("connectionState") or "").strip().lower()
         if state in {"failed", "closed", "stopped"}:
-            log.warning("[WEBRTC-UPLINK] remote state=%s. stopping local session.", state)
+            reason = str(payload.get("reason") or "").strip()
+            if reason:
+                log.warning("[WEBRTC-UPLINK] remote state=%s reason=%s. stopping local session.", state, reason)
+            else:
+                log.warning("[WEBRTC-UPLINK] remote state=%s. stopping local session.", state)
             self.stop(send_signal=False)
 
     def stop(self, *, send_signal: bool = True) -> None:

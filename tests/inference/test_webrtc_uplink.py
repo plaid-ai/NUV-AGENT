@@ -217,6 +217,28 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertFalse(handled)
         self.assertEqual(len(_FakeGLib.calls), 0)
 
+    def test_handle_remote_state_stopped_schedules_local_stop(self) -> None:
+        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
+        controller.start(
+            {
+                "broadcastId": "device-1",
+                "sessionId": "session-1",
+                "forceRelay": True,
+                "iceServers": [],
+            }
+        )
+
+        controller.handle_remote_state(
+            {
+                "broadcastId": "device-1",
+                "sessionId": "session-1",
+                "state": "STOPPED",
+                "reason": "viewer-stop",
+            }
+        )
+
+        self.assertEqual(len(_FakeGLib.calls), 2)
+
     def test_stop_gates_webrtc_branch_and_clears_session(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
         controller._pipeline = _FakeEventTarget()
