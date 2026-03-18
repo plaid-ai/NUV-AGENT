@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -49,6 +50,9 @@ class WebRTCUplinkController:
         self._webrtcbin: Gst.Element | None = None
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
+        self._stop_pending = False
+        self._last_error_signature: tuple[str, str] | None = None
+        self._last_error_logged_at = 0.0
 
     def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
         self._pipeline = pipeline
@@ -69,11 +73,21 @@ class WebRTCUplinkController:
         if not self._is_uplink_error_message(message, dbg):
             return False
 
-        log.warning(
-            "[WEBRTC-UPLINK] handled internal GStreamer error without shutting down agent: %s, %s",
-            err,
-            dbg,
+        signature = self._error_signature(message, dbg)
+        now = time.monotonic()
+        should_log = (
+            self._last_error_signature != signature
+            or now - self._last_error_logged_at > 1.0
         )
+        self._last_error_signature = signature
+        self._last_error_logged_at = now
+
+        if should_log:
+            log.warning(
+                "[WEBRTC-UPLINK] handled internal GStreamer error without shutting down agent: %s, %s",
+                err,
+                dbg,
+            )
         self.stop(send_signal=bool(self._session and not self._stop_sent))
         return True
 
@@ -104,6 +118,9 @@ class WebRTCUplinkController:
             ice_servers=ice_servers,
         )
         self._stop_sent = False
+        self._stop_pending = False
+        self._last_error_signature = None
+        self._last_error_logged_at = 0.0
         GLib.idle_add(self._start_on_main_loop)
 
     def apply_answer(self, payload: dict[str, Any]) -> None:
@@ -147,6 +164,9 @@ class WebRTCUplinkController:
             self.stop(send_signal=False)
 
     def stop(self, *, send_signal: bool = True) -> None:
+        if self._stop_pending:
+            return
+        self._stop_pending = True
         if send_signal and self._session and not self._stop_sent:
             self._send_stop_message()
         GLib.idle_add(self._stop_on_main_loop)
@@ -157,6 +177,18 @@ class WebRTCUplinkController:
     def _matches_session(self, payload: dict[str, Any]) -> bool:
         session_id = str(payload.get("sessionId") or "").strip()
         return bool(self._session and session_id and session_id == self._session.session_id)
+
+    def _error_signature(self, message: object, dbg: str | None) -> tuple[str, str]:
+        src = getattr(message, "src", None)
+        src_path = ""
+        if src is not None:
+            get_path_string = getattr(src, "get_path_string", None)
+            if callable(get_path_string):
+                try:
+                    src_path = str(get_path_string() or "")
+                except Exception:
+                    src_path = ""
+        return src_path, str(dbg or "")
 
     def _is_uplink_error_message(self, message: object, dbg: str | None) -> bool:
         markers = ("webrtc_uplink", "transportreceivebin", "nicesrc", "gstwebrtcbin")
@@ -217,6 +249,7 @@ class WebRTCUplinkController:
             except Exception:
                 pass
         self._session = None
+        self._stop_pending = False
         return False
 
     def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:

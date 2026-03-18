@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 
 from nuvion_app.inference.webrtc_signaling import (
-    UPLINK_MODE_RTP,
     UPLINK_MODE_WEBRTC,
     normalize_uplink_mode,
     parse_ice_servers,
@@ -15,7 +14,7 @@ class WebRTCSignalingTest(unittest.TestCase):
     def test_normalize_uplink_mode_defaults_to_webrtc(self) -> None:
         self.assertEqual(normalize_uplink_mode(None), UPLINK_MODE_WEBRTC)
         self.assertEqual(normalize_uplink_mode("unknown"), UPLINK_MODE_WEBRTC)
-        self.assertEqual(normalize_uplink_mode("RTP"), UPLINK_MODE_RTP)
+        self.assertEqual(normalize_uplink_mode("RTP"), UPLINK_MODE_WEBRTC)
 
     def test_parse_ice_servers_accepts_json_string(self) -> None:
         raw = '[{"urls":["turn:turn.example.com:3478?transport=udp"],"username":"user","credential":"pass"}]'

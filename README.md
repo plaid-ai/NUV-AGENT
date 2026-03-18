@@ -1,12 +1,12 @@
 # Nuvion Agent (Device Software)
 
 NUV-agent는 온디바이스 AI 장치에 설치하는 소프트웨어입니다. 도커 기반으로 제작되어 이식이 쉽고,
-USB 기반 웹캠 카메라 스트림을 Nuvion-be 스프링 서버를 통해 송출할 수 있습니다. 동시에 제로샷 AI 모델로
+USB 기반 웹캠 카메라 스트림을 Nuvion-be 스프링 서버로 WebRTC 업링크 송출할 수 있습니다. 동시에 제로샷 AI 모델로
 이상 감지를 수행하여 공장에서 이상 감지와 생산량 추적을 할 수 있도록 해주는 프로그램입니다. 감지 결과는
 영상 위에 실시간으로 오버레이 됩니다.
 
 ## Structure
-- `nuvion_app/inference`: GStreamer RTP streaming + zero-shot anomaly detection
+- `nuvion_app/inference`: GStreamer WebRTC uplink + zero-shot anomaly detection
 
 ## Install (brew/apt)
 Packaging templates and build scripts live in `packaging/`. See `packaging/README.md`.
@@ -194,7 +194,7 @@ device credentials automatically (your account credentials are not stored on the
 It also includes:
 - **Inference Mode** quick selector (`Triton | SigLIP | SigLIP+MPS | None`)
 - **Conditional settings view** (only backend-relevant fields are shown)
-- **Preflight Check** button (server login / triton health / camera source or demo video source / RTP target)
+- **Preflight Check** button (server login / triton health / camera source or demo video source)
 - **Environment override warning** when shell env values override file values
 
 For headless devices:
