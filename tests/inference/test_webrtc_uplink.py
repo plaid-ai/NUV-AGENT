@@ -61,10 +61,17 @@ class _FakeEventFactory:
 class _FakeEventTarget:
     def __init__(self) -> None:
         self.events: list[object] = []
+        self.properties: dict[str, object] = {}
 
     def send_event(self, event: object) -> bool:
         self.events.append(event)
         return True
+
+    def set_property(self, name: str, value: object) -> None:
+        self.properties[name] = value
+
+    def emit(self, signal_name: str, *_args: object) -> None:
+        self.events.append(signal_name)
 
 
 def _install_fake_gi() -> None:
@@ -210,10 +217,11 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertFalse(handled)
         self.assertEqual(len(_FakeGLib.calls), 0)
 
-    def test_stop_flushes_only_webrtcbin_branch(self) -> None:
+    def test_stop_gates_webrtc_branch_and_clears_session(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
         controller._pipeline = _FakeEventTarget()
         controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
         controller._session = self.module.WebRTCUplinkSession(
             broadcast_id="device-1",
             session_id="session-1",
@@ -223,8 +231,8 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         controller._stop_on_main_loop()
 
-        self.assertEqual(controller._webrtcbin.events, ["flush-start", "flush-stop"])
-        self.assertEqual(controller._pipeline.events, [])
+        self.assertEqual(controller._webrtcbin.events, ["close"])
+        self.assertEqual(controller._webrtc_gate.properties, {"drop": True})
         self.assertIsNone(controller._session)
 
 

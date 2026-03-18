@@ -1258,7 +1258,7 @@ class GStreamerInferenceApp:
                 "enc_t. ! queue ! h264parse config-interval=1 ! "
                 f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
                 "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-                "webrtc_uplink. "
+                "valve name=webrtc_gate drop=true ! webrtc_uplink. "
                 "enc_t. ! queue ! h264parse config-interval=1 ! "
                 f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
                 f"max-files={CLIP_MAX_SEGMENTS} location=\"{segment_location}\""
@@ -1268,7 +1268,7 @@ class GStreamerInferenceApp:
                 f"{encoder_pipeline}"
                 f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
                 "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-                "webrtc_uplink."
+                "valve name=webrtc_gate drop=true ! webrtc_uplink."
             )
 
         if LOCAL_DISPLAY:

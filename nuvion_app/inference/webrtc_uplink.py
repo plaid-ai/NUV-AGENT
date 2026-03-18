@@ -48,15 +48,22 @@ class WebRTCUplinkController:
         self._default_force_relay = default_force_relay
         self._pipeline: Gst.Pipeline | None = None
         self._webrtcbin: Gst.Element | None = None
+        self._webrtc_gate: Gst.Element | None = None
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
         self._stop_pending = False
         self._last_error_signature: tuple[str, str] | None = None
         self._last_error_logged_at = 0.0
 
-    def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
+    def attach_pipeline(
+        self,
+        pipeline: Gst.Pipeline,
+        element_name: str = "webrtc_uplink",
+        gate_name: str = "webrtc_gate",
+    ) -> bool:
         self._pipeline = pipeline
         self._webrtcbin = pipeline.get_by_name(element_name)
+        self._webrtc_gate = pipeline.get_by_name(gate_name)
         if not self._webrtcbin:
             log.warning("[WEBRTC-UPLINK] element '%s' not found.", element_name)
             return False
@@ -222,6 +229,12 @@ class WebRTCUplinkController:
         if not self._webrtcbin or not self._session:
             return False
 
+        if self._webrtc_gate:
+            try:
+                self._webrtc_gate.set_property("drop", False)
+            except Exception:
+                pass
+
         stun_server, turn_servers = to_gst_ice_server_config(self._session.ice_servers)
         self._webrtcbin.set_property("stun-server", stun_server or "")
         self._webrtcbin.set_property("turn-server", turn_servers[0] if turn_servers else "")
@@ -239,12 +252,16 @@ class WebRTCUplinkController:
         return False
 
     def _stop_on_main_loop(self) -> bool:
+        if self._webrtc_gate:
+            try:
+                # Gate the RTP branch before touching webrtcbin so live buffers stop flowing
+                # into a failed/closing peer connection.
+                self._webrtc_gate.set_property("drop", True)
+            except Exception:
+                pass
         if self._webrtcbin:
             try:
-                # Flush only the WebRTC uplink branch. Flushing the whole pipeline also hits
-                # the clip recording branch and can leave live segment state inconsistent.
-                self._webrtcbin.send_event(Gst.Event.new_flush_start())
-                self._webrtcbin.send_event(Gst.Event.new_flush_stop(False))
+                self._webrtcbin.emit("close")
             except Exception:
                 pass
         self._session = None
