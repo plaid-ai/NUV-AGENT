@@ -75,21 +75,18 @@ class WebRTCUplinkController:
         if self._stop_pending:
             return True
 
-        signature = self._error_signature(message, dbg)
         now = time.monotonic()
-        should_log = (
-            self._last_error_signature != signature
-            or now - self._last_error_logged_at > 1.0
-        )
-        self._last_error_signature = signature
-        self._last_error_logged_at = now
+        if now - self._last_error_logged_at <= 1.0:
+            self.stop(send_signal=bool(self._session and not self._stop_sent))
+            return True
 
-        if should_log:
-            log.warning(
-                "[WEBRTC-UPLINK] handled internal GStreamer error without shutting down agent: %s, %s",
-                err,
-                dbg,
-            )
+        self._last_error_signature = self._error_signature(message, dbg)
+        self._last_error_logged_at = now
+        log.warning(
+            "[WEBRTC-UPLINK] handled internal GStreamer error without shutting down agent: %s, %s",
+            err,
+            dbg,
+        )
         self.stop(send_signal=bool(self._session and not self._stop_sent))
         return True
 
