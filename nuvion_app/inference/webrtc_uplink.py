@@ -72,6 +72,8 @@ class WebRTCUplinkController:
     def handle_gstreamer_error(self, message: object, err: object, dbg: str | None) -> bool:
         if not self._is_uplink_error_message(message, dbg):
             return False
+        if self._stop_pending:
+            return True
 
         signature = self._error_signature(message, dbg)
         now = time.monotonic()
