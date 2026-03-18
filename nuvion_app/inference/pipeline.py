@@ -1197,6 +1197,7 @@ class GStreamerInferenceApp:
         self.user_data = NuvionEventState(self.update_overlay_text)
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
+            on_session_stopped=self._handle_uplink_session_stopped,
             default_force_relay=WEBRTC_FORCE_RELAY,
         )
 
@@ -1344,6 +1345,40 @@ class GStreamerInferenceApp:
             return True
         finally:
             self._demo_restarting = False
+
+    def _restart_uplink_pipeline(self, reason: str) -> bool:
+        if not self.pipeline:
+            return False
+        now = time.time()
+        if self._demo_restarting:
+            return False
+        if now - self._demo_last_restart_at < 0.5:
+            return False
+
+        self._demo_restarting = True
+        self._demo_last_restart_at = now
+        try:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline.get_state(2 * Gst.SECOND)
+            restart_result = self.pipeline.set_state(Gst.State.PLAYING)
+            if restart_result == Gst.StateChangeReturn.FAILURE:
+                return False
+            self.update_overlay_text(self._default_overlay_text())
+            log.info("[WEBRTC-UPLINK] Restarted pipeline (%s).", reason)
+            return True
+        finally:
+            self._demo_restarting = False
+
+    def _handle_uplink_session_stopped(self, reason: str) -> None:
+        normalized_reason = (reason or "").strip().lower()
+        if normalized_reason not in {"stopped", "broadcast-stop", "viewer-stop", "failed", "closed", "disconnected"}:
+            return
+
+        def _restart():
+            self._restart_uplink_pipeline(normalized_reason or "uplink-stop")
+            return False
+
+        GLib.idle_add(_restart)
 
     def bus_call(self, bus, message, loop):
         msg_type = message.type

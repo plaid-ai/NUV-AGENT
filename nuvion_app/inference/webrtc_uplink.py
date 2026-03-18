@@ -42,9 +42,11 @@ class WebRTCUplinkController:
         self,
         *,
         send_message: Callable[[str, dict[str, Any], bool], bool],
+        on_session_stopped: Callable[[str], None] | None = None,
         default_force_relay: bool = True,
     ) -> None:
         self._send_message = send_message
+        self._on_session_stopped = on_session_stopped
         self._default_force_relay = default_force_relay
         self._pipeline: Gst.Pipeline | None = None
         self._webrtcbin: Gst.Element | None = None
@@ -52,6 +54,7 @@ class WebRTCUplinkController:
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
         self._stop_pending = False
+        self._stop_reason = ""
         self._last_error_signature: tuple[str, str] | None = None
         self._last_error_logged_at = 0.0
 
@@ -125,6 +128,7 @@ class WebRTCUplinkController:
         )
         self._stop_sent = False
         self._stop_pending = False
+        self._stop_reason = ""
         self._last_error_signature = None
         self._last_error_logged_at = 0.0
         GLib.idle_add(self._start_on_main_loop)
@@ -171,12 +175,13 @@ class WebRTCUplinkController:
                 log.warning("[WEBRTC-UPLINK] remote state=%s reason=%s. stopping local session.", state, reason)
             else:
                 log.warning("[WEBRTC-UPLINK] remote state=%s. stopping local session.", state)
-            self.stop(send_signal=False)
+            self.stop(send_signal=False, reason=reason or state)
 
-    def stop(self, *, send_signal: bool = True) -> None:
+    def stop(self, *, send_signal: bool = True, reason: str = "") -> None:
         if self._stop_pending:
             return
         self._stop_pending = True
+        self._stop_reason = reason
         if send_signal and self._session and not self._stop_sent:
             self._send_stop_message()
         GLib.idle_add(self._stop_on_main_loop)
@@ -269,7 +274,14 @@ class WebRTCUplinkController:
             except Exception:
                 pass
         self._session = None
+        stop_reason = self._stop_reason
+        self._stop_reason = ""
         self._stop_pending = False
+        if self._on_session_stopped is not None:
+            try:
+                self._on_session_stopped(stop_reason)
+            except Exception:
+                pass
         return False
 
     def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:
@@ -340,14 +352,14 @@ class WebRTCUplinkController:
         state_nick = getattr(state, "value_nick", str(state))
         log.info("[WEBRTC-UPLINK] connection-state=%s", state_nick)
         if state_nick in {"failed", "closed"}:
-            self.stop(send_signal=not self._stop_sent)
+            self.stop(send_signal=not self._stop_sent, reason=state_nick)
 
     def _on_ice_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
         state = element.get_property("ice-connection-state")
         state_nick = getattr(state, "value_nick", str(state))
         log.info("[WEBRTC-UPLINK] ice-connection-state=%s", state_nick)
         if state_nick in {"failed", "closed", "disconnected"} and self._session:
-            self.stop(send_signal=not self._stop_sent)
+            self.stop(send_signal=not self._stop_sent, reason=state_nick)
 
     def _send_stop_message(self) -> None:
         if not self._session:

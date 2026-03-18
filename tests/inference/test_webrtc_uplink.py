@@ -239,6 +239,27 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         self.assertEqual(len(_FakeGLib.calls), 2)
 
+    def test_stop_notifies_callback_with_reason(self) -> None:
+        reasons: list[str] = []
+        controller = self.module.WebRTCUplinkController(
+            send_message=lambda *_args: True,
+            on_session_stopped=reasons.append,
+        )
+        controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
+        controller._session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-1",
+            force_relay=True,
+            ice_servers=[],
+        )
+
+        controller.stop(send_signal=False, reason="broadcast-stop")
+        stop_call = _FakeGLib.calls[-1]
+        stop_call[0](*stop_call[1])
+
+        self.assertEqual(reasons, ["broadcast-stop"])
+
     def test_stop_gates_webrtc_branch_and_clears_session(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
         controller._pipeline = _FakeEventTarget()
