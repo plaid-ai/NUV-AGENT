@@ -14,7 +14,6 @@ import string
 import asyncio
 import logging
 import threading
-import glob
 import math
 import shutil
 import subprocess
@@ -28,6 +27,7 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.clip_segments import collect_stable_segments
 from nuvion_app.inference.device_state import (
     DEVICE_STATE_ERROR,
     DEVICE_STATE_RUNNING,
@@ -158,6 +158,7 @@ CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
 CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 1.0)
+CLIP_SEGMENT_SETTLE_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SETTLE_SEC"), 1.5)
 CLIP_MAX_SEGMENTS = int(os.getenv("NUVION_CLIP_MAX_SEGMENTS", "30"))
 CLIP_OUTPUT_DIR = os.getenv("NUVION_CLIP_OUTPUT_DIR", "/tmp/nuvion_clips")
 CLIP_COOLDOWN_SEC = parse_float(os.getenv("NUVION_CLIP_COOLDOWN_SEC"), 10.0)
@@ -1196,23 +1197,14 @@ class NuvionEventState:
             with self.clip_lock:
                 self.clip_in_progress = False
 
-    def _list_segments(self) -> list[str]:
-        pattern = os.path.join(CLIP_SEGMENTS_DIR, "segment_*.mp4")
-        segments = glob.glob(pattern)
-        segments.sort(key=os.path.getmtime)
-        if len(segments) > 1:
-            segments = segments[:-1]
-        return segments
-
     def _collect_segments(self, before: float | None = None, after: float | None = None, count: int = 5) -> list[str]:
-        segments = self._list_segments()
-        if before is not None:
-            segments = [s for s in segments if os.path.getmtime(s) <= before]
-            return segments[-count:]
-        if after is not None:
-            segments = [s for s in segments if os.path.getmtime(s) >= after]
-            return segments[:count]
-        return segments[-count:]
+        return collect_stable_segments(
+            CLIP_SEGMENTS_DIR,
+            settle_sec=CLIP_SEGMENT_SETTLE_SEC,
+            before=before,
+            after=after,
+            count=count,
+        )
 
     def _build_clip_from_segments(self, detected_at: float) -> str | None:
         ffmpeg_path = resolve_ffmpeg_path()
