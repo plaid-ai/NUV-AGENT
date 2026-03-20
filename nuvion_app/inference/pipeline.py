@@ -290,6 +290,18 @@ def resolve_ffmpeg_path() -> str | None:
     if _FFMPEG_PATH is not None:
         return _FFMPEG_PATH
 
+
+def resolve_ffprobe_path() -> str | None:
+    ffmpeg_path = resolve_ffmpeg_path()
+    if not ffmpeg_path:
+        return shutil.which("ffprobe")
+
+    ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    candidate = os.path.join(ffmpeg_dir, "ffprobe")
+    if os.path.exists(candidate):
+        return candidate
+    return shutil.which("ffprobe")
+
     custom = os.getenv("NUVION_FFMPEG_PATH", "").strip()
     if custom:
         if os.path.isfile(custom) and os.access(custom, os.X_OK):
@@ -1199,9 +1211,13 @@ class NuvionEventState:
                 self.clip_in_progress = False
 
     def _collect_segments(self, before: float | None = None, after: float | None = None, count: int = 5) -> list[str]:
+        ffprobe_path = resolve_ffprobe_path()
+        if not ffprobe_path:
+            log.warning("[CLIP] ffprobe not found. Falling back to mtime-only segment filtering.")
         return collect_stable_segments(
             CLIP_SEGMENTS_DIR,
             settle_sec=CLIP_SEGMENT_SETTLE_SEC,
+            ffprobe_path=ffprobe_path,
             before=before,
             after=after,
             count=count,

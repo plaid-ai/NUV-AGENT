@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from nuvion_app.inference.clip_segments import collect_stable_segments
+from nuvion_app.inference.clip_segments import is_stable_mp4
 from nuvion_app.inference.clip_segments import list_stable_segments
 
 
@@ -57,3 +58,17 @@ class ClipSegmentsTest(unittest.TestCase):
 
             self.assertEqual(before_result, [seg0, seg1])
             self.assertEqual(after_result, [seg1, seg2])
+
+    def test_list_stable_segments_excludes_unprobeable_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self._touch_segment(tmp, "segment_00000.mp4", 95.0)
+            bad = self._touch_segment(tmp, "segment_00001.mp4", 95.0)
+
+            result = list_stable_segments(
+                tmp,
+                settle_sec=1.0,
+                now_ts=100.0,
+                probe_func=lambda path: path == good,
+            )
+
+            self.assertEqual(result, [good])
