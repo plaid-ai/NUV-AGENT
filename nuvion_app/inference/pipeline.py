@@ -290,18 +290,6 @@ def resolve_ffmpeg_path() -> str | None:
     if _FFMPEG_PATH is not None:
         return _FFMPEG_PATH
 
-
-def resolve_ffprobe_path() -> str | None:
-    ffmpeg_path = resolve_ffmpeg_path()
-    if not ffmpeg_path:
-        return shutil.which("ffprobe")
-
-    ffmpeg_dir = os.path.dirname(ffmpeg_path)
-    candidate = os.path.join(ffmpeg_dir, "ffprobe")
-    if os.path.exists(candidate):
-        return candidate
-    return shutil.which("ffprobe")
-
     custom = os.getenv("NUVION_FFMPEG_PATH", "").strip()
     if custom:
         if os.path.isfile(custom) and os.access(custom, os.X_OK):
@@ -329,6 +317,18 @@ def resolve_ffprobe_path() -> str | None:
             return _FFMPEG_PATH
 
     return None
+
+
+def resolve_ffprobe_path() -> str | None:
+    ffmpeg_path = resolve_ffmpeg_path()
+    if not ffmpeg_path:
+        return shutil.which("ffprobe")
+
+    ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    candidate = os.path.join(ffmpeg_dir, "ffprobe")
+    if os.path.exists(candidate):
+        return candidate
+    return shutil.which("ffprobe")
 
 
 def extract_host_from_server_url(url: str) -> str:
