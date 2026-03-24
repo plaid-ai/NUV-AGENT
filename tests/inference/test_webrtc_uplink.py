@@ -119,7 +119,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         self.assertEqual(len(_FakeGLib.calls), 1)
 
-    def test_start_ignores_new_session_while_existing_session_is_active(self) -> None:
+    def test_start_replaces_new_session_while_existing_session_is_active(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
 
         controller.start(
@@ -139,7 +139,9 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(len(_FakeGLib.calls), 1)
+        self.assertEqual(len(_FakeGLib.calls), 2)
+        self.assertIsNotNone(controller._pending_session)
+        self.assertEqual(controller._pending_session.session_id, "session-2")
 
     def test_handle_gstreamer_error_recovers_uplink_internal_errors(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
@@ -244,6 +246,29 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller._start_on_main_loop()
 
         self.assertEqual(controller._webrtc_gate.properties.get("drop"), False)
+
+    def test_stop_on_main_loop_schedules_pending_session_restart(self) -> None:
+        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
+        controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
+        controller._session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-1",
+            force_relay=True,
+            ice_servers=[],
+        )
+        controller._pending_session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-2",
+            force_relay=True,
+            ice_servers=[],
+        )
+
+        controller._stop_on_main_loop()
+
+        self.assertIsNotNone(controller._session)
+        self.assertEqual(controller._session.session_id, "session-2")
+        self.assertEqual(len(_FakeGLib.calls), 1)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,7 @@ class WebRTCUplinkController:
         self._webrtcbin: Gst.Element | None = None
         self._webrtc_gate: Gst.Element | None = None
         self._session: WebRTCUplinkSession | None = None
+        self._pending_session: WebRTCUplinkSession | None = None
         self._stop_sent = False
         self._stop_scheduled = False
         self._stop_reason = "unknown"
@@ -75,7 +76,7 @@ class WebRTCUplinkController:
         if not self._is_uplink_error_message(message, dbg):
             return False
 
-        if self._stop_scheduled:
+        if self._stop_scheduled or self._pending_session is not None:
             if not self._teardown_error_suppressed:
                 log.info(
                     "[WEBRTC-UPLINK] suppressing repeated teardown GStreamer errors (reason=%s): %s, %s",
@@ -104,30 +105,33 @@ class WebRTCUplinkController:
             log.warning("[WEBRTC-UPLINK] start payload missing sessionId or broadcastId: %s", payload)
             return
 
-        if self._session:
-            if self._session.session_id == session_id:
-                log.info("[WEBRTC-UPLINK] ignoring duplicate start for sessionId=%s", session_id)
-                return
-            log.info(
-                "[WEBRTC-UPLINK] ignoring start for sessionId=%s because sessionId=%s is already active",
-                session_id,
-                self._session.session_id,
-            )
-            return
-
         ice_servers = parse_ice_servers(payload.get("iceServers"))
         force_relay = bool(payload.get("forceRelay", self._default_force_relay))
-        self._session = WebRTCUplinkSession(
+        next_session = WebRTCUplinkSession(
             broadcast_id=broadcast_id,
             session_id=session_id,
             force_relay=force_relay,
             ice_servers=ice_servers,
         )
-        self._stop_sent = False
-        self._stop_scheduled = False
-        self._stop_reason = "running"
-        self._teardown_error_suppressed = False
-        GLib.idle_add(self._start_on_main_loop)
+
+        if self._session:
+            if self._session.session_id == session_id:
+                log.info("[WEBRTC-UPLINK] ignoring duplicate start for sessionId=%s", session_id)
+                return
+            log.info(
+                "[WEBRTC-UPLINK] replacing active sessionId=%s with newer sessionId=%s",
+                self._session.session_id,
+                session_id,
+            )
+            self._pending_session = next_session
+            self.stop(send_signal=False, reason="superseded-by-new-start")
+            return
+
+        if self._pending_session and self._pending_session.session_id == session_id:
+            log.info("[WEBRTC-UPLINK] ignoring duplicate pending start for sessionId=%s", session_id)
+            return
+
+        self._activate_session(next_session)
 
     def apply_answer(self, payload: dict[str, Any]) -> None:
         if not self._session or not self._matches_session(payload):
@@ -186,6 +190,15 @@ class WebRTCUplinkController:
 
     def on_signaling_reset(self) -> None:
         self._stop_sent = False
+
+    def _activate_session(self, session: WebRTCUplinkSession, *, reset_stop_flags: bool = True) -> None:
+        self._session = session
+        self._stop_sent = False
+        if reset_stop_flags:
+            self._stop_scheduled = False
+            self._stop_reason = "running"
+            self._teardown_error_suppressed = False
+        GLib.idle_add(self._start_on_main_loop)
 
     def _matches_session(self, payload: dict[str, Any]) -> bool:
         session_id = str(payload.get("sessionId") or "").strip()
@@ -261,7 +274,20 @@ class WebRTCUplinkController:
             except Exception:
                 pass
         self._session = None
+        if self._pending_session is not None:
+            pending_session = self._pending_session
+            self._pending_session = None
+            self._session = pending_session
+            GLib.idle_add(self._start_pending_session_on_main_loop)
         return False
+
+    def _start_pending_session_on_main_loop(self) -> bool:
+        if not self._session:
+            return False
+        self._stop_scheduled = False
+        self._stop_reason = "running"
+        self._teardown_error_suppressed = False
+        return self._start_on_main_loop()
 
     def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:
         if not self._webrtcbin:
