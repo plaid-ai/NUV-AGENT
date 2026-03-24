@@ -168,6 +168,38 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(len(_FakeGLib.calls), 2)
 
+    def test_handle_gstreamer_error_suppresses_repeated_teardown_burst(self) -> None:
+        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
+        controller.start(
+            {
+                "broadcastId": "device-1",
+                "sessionId": "session-1",
+                "forceRelay": True,
+                "iceServers": [],
+            }
+        )
+
+        message = _FakeMessage(
+            _FakeSrc(
+                "nicesrc0",
+                "/GstPipeline:pipeline0/GstWebRTCBin:webrtc_uplink/TransportReceiveBin:transportreceivebin0/GstNiceSrc:nicesrc0",
+            )
+        )
+        first = controller.handle_gstreamer_error(
+            message,
+            "internal data stream error",
+            "../subprojects/gstreamer/.../GstNiceSrc:nicesrc0",
+        )
+        second = controller.handle_gstreamer_error(
+            message,
+            "internal data stream error",
+            "../subprojects/gstreamer/.../GstNiceSrc:nicesrc0",
+        )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(len(_FakeGLib.calls), 2)
+
     def test_handle_gstreamer_error_does_not_swallow_non_uplink_errors(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
 

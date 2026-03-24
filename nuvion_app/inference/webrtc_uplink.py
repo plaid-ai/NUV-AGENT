@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -49,6 +50,9 @@ class WebRTCUplinkController:
         self._webrtcbin: Gst.Element | None = None
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
+        self._stop_scheduled = False
+        self._stop_reason = "unknown"
+        self._teardown_error_suppressed = False
 
     def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
         self._pipeline = pipeline
@@ -69,12 +73,26 @@ class WebRTCUplinkController:
         if not self._is_uplink_error_message(message, dbg):
             return False
 
+        if self._stop_scheduled:
+            if not self._teardown_error_suppressed:
+                log.info(
+                    "[WEBRTC-UPLINK] suppressing repeated teardown GStreamer errors (reason=%s): %s, %s",
+                    self._stop_reason,
+                    err,
+                    dbg,
+                )
+                self._teardown_error_suppressed = True
+            return True
+
         log.warning(
             "[WEBRTC-UPLINK] handled internal GStreamer error without shutting down agent: %s, %s",
             err,
             dbg,
         )
-        self.stop(send_signal=bool(self._session and not self._stop_sent))
+        self.stop(
+            send_signal=bool(self._session and not self._stop_sent),
+            reason="gstreamer-error",
+        )
         return True
 
     def start(self, payload: dict[str, Any]) -> None:
@@ -104,6 +122,9 @@ class WebRTCUplinkController:
             ice_servers=ice_servers,
         )
         self._stop_sent = False
+        self._stop_scheduled = False
+        self._stop_reason = "running"
+        self._teardown_error_suppressed = False
         GLib.idle_add(self._start_on_main_loop)
 
     def apply_answer(self, payload: dict[str, Any]) -> None:
@@ -142,11 +163,21 @@ class WebRTCUplinkController:
         if not self._session or not self._matches_session(payload):
             return
         state = str(payload.get("state") or payload.get("connectionState") or "").strip().lower()
+        reason = str(payload.get("reason") or state or "remote-state").strip().lower()
         if state in {"failed", "closed", "stopped"}:
-            log.warning("[WEBRTC-UPLINK] remote state=%s. stopping local session.", state)
-            self.stop(send_signal=False)
+            log.warning(
+                "[WEBRTC-UPLINK] remote state=%s reason=%s. stopping local session.",
+                state,
+                reason,
+            )
+            self.stop(send_signal=False, reason=reason)
 
-    def stop(self, *, send_signal: bool = True) -> None:
+    def stop(self, *, send_signal: bool = True, reason: str = "local-stop") -> None:
+        if self._stop_scheduled:
+            return
+        self._stop_scheduled = True
+        self._stop_reason = reason
+        self._teardown_error_suppressed = False
         if send_signal and self._session and not self._stop_sent:
             self._send_stop_message()
         GLib.idle_add(self._stop_on_main_loop)
@@ -287,14 +318,14 @@ class WebRTCUplinkController:
         state_nick = getattr(state, "value_nick", str(state))
         log.info("[WEBRTC-UPLINK] connection-state=%s", state_nick)
         if state_nick in {"failed", "closed"}:
-            self.stop(send_signal=not self._stop_sent)
+            self.stop(send_signal=not self._stop_sent, reason=f"connection-state-{state_nick}")
 
     def _on_ice_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
         state = element.get_property("ice-connection-state")
         state_nick = getattr(state, "value_nick", str(state))
         log.info("[WEBRTC-UPLINK] ice-connection-state=%s", state_nick)
         if state_nick in {"failed", "closed", "disconnected"} and self._session:
-            self.stop(send_signal=not self._stop_sent)
+            self.stop(send_signal=not self._stop_sent, reason=f"ice-state-{state_nick}")
 
     def _send_stop_message(self) -> None:
         if not self._session:
