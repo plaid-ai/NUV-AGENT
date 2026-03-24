@@ -39,6 +39,7 @@ class WebRTCUplinkSession:
 
 class WebRTCUplinkController:
     _HANDOVER_DELAY_MS = 200
+    _HANDOVER_IGNORE_SEC = 2.0
 
     def __init__(
         self,
@@ -57,6 +58,7 @@ class WebRTCUplinkController:
         self._stop_scheduled = False
         self._stop_reason = "unknown"
         self._teardown_error_suppressed = False
+        self._handover_ignore_until = 0.0
 
     def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
         self._pipeline = pipeline
@@ -125,6 +127,7 @@ class WebRTCUplinkController:
                 self._session.session_id,
                 session_id,
             )
+            self._handover_ignore_until = time.monotonic() + self._HANDOVER_IGNORE_SEC
             self._pending_session = next_session
             self.stop(send_signal=False, reason="superseded-by-new-start")
             return
@@ -347,7 +350,11 @@ class WebRTCUplinkController:
 
         offer = reply.get_value("offer")
         if offer is None:
-            if self._stop_scheduled or self._pending_session is not None:
+            if (
+                self._stop_scheduled
+                or self._pending_session is not None
+                or time.monotonic() < self._handover_ignore_until
+            ):
                 log.info("[WEBRTC-UPLINK] ignoring empty offer callback during session handover.")
                 return
             log.error("[WEBRTC-UPLINK] offer promise missing offer value.")
@@ -355,6 +362,7 @@ class WebRTCUplinkController:
 
         self._webrtcbin.emit("set-local-description", offer, Gst.Promise.new())
         sdp_text = offer.sdp.as_text()
+        self._handover_ignore_until = 0.0
         payload = build_uplink_payload(
             WEBRTC_UPLINK_OFFER,
             self._session.broadcast_id,
