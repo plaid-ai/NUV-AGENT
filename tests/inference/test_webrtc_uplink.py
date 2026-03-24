@@ -8,11 +8,17 @@ import unittest
 
 class _FakeGLib:
     calls: list[tuple[object, tuple[object, ...]]] = []
+    timeout_calls: list[tuple[int, object, tuple[object, ...]]] = []
 
     @classmethod
     def idle_add(cls, func: object, *args: object) -> int:
         cls.calls.append((func, args))
         return len(cls.calls)
+
+    @classmethod
+    def timeout_add(cls, interval_ms: int, func: object, *args: object) -> int:
+        cls.timeout_calls.append((interval_ms, func, args))
+        return len(cls.timeout_calls)
 
 
 class _FakePromise:
@@ -103,6 +109,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
     def setUp(self) -> None:
         _FakeGLib.calls.clear()
+        _FakeGLib.timeout_calls.clear()
 
     def test_start_ignores_duplicate_session(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
@@ -266,9 +273,27 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         controller._stop_on_main_loop()
 
+        self.assertIsNone(controller._session)
+        self.assertIsNotNone(controller._pending_session)
+        self.assertEqual(controller._pending_session.session_id, "session-2")
+        self.assertEqual(len(_FakeGLib.timeout_calls), 1)
+
+    def test_start_pending_session_on_main_loop_activates_pending_session(self) -> None:
+        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
+        controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
+        controller._pending_session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-2",
+            force_relay=True,
+            ice_servers=[],
+        )
+
+        controller._start_pending_session_on_main_loop()
+
         self.assertIsNotNone(controller._session)
         self.assertEqual(controller._session.session_id, "session-2")
-        self.assertEqual(len(_FakeGLib.calls), 1)
+        self.assertEqual(controller._webrtc_gate.properties.get("drop"), False)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ class WebRTCUplinkSession:
 
 
 class WebRTCUplinkController:
+    _HANDOVER_DELAY_MS = 200
+
     def __init__(
         self,
         *,
@@ -191,14 +193,23 @@ class WebRTCUplinkController:
     def on_signaling_reset(self) -> None:
         self._stop_sent = False
 
-    def _activate_session(self, session: WebRTCUplinkSession, *, reset_stop_flags: bool = True) -> None:
+    def _activate_session(
+        self,
+        session: WebRTCUplinkSession,
+        *,
+        reset_stop_flags: bool = True,
+        schedule_start: bool = True,
+    ) -> None:
         self._session = session
         self._stop_sent = False
         if reset_stop_flags:
             self._stop_scheduled = False
             self._stop_reason = "running"
             self._teardown_error_suppressed = False
-        GLib.idle_add(self._start_on_main_loop)
+        if schedule_start:
+            GLib.idle_add(self._start_on_main_loop)
+        else:
+            self._start_on_main_loop()
 
     def _matches_session(self, payload: dict[str, Any]) -> bool:
         session_id = str(payload.get("sessionId") or "").strip()
@@ -250,7 +261,7 @@ class WebRTCUplinkController:
         self._webrtcbin.set_property("ice-transport-policy", policy)
         self._webrtcbin.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
 
-        promise = Gst.Promise.new_with_change_func(self._on_offer_created, None, None)
+        promise = Gst.Promise.new_with_change_func(self._on_offer_created, self._session.session_id, None)
         self._webrtcbin.emit("create-offer", None, promise)
         log.info(
             "[WEBRTC-UPLINK] creating offer. sessionId=%s relay=%s",
@@ -275,19 +286,16 @@ class WebRTCUplinkController:
                 pass
         self._session = None
         if self._pending_session is not None:
-            pending_session = self._pending_session
-            self._pending_session = None
-            self._session = pending_session
-            GLib.idle_add(self._start_pending_session_on_main_loop)
+            GLib.timeout_add(self._HANDOVER_DELAY_MS, self._start_pending_session_on_main_loop)
         return False
 
     def _start_pending_session_on_main_loop(self) -> bool:
-        if not self._session:
+        if self._session or self._pending_session is None:
             return False
-        self._stop_scheduled = False
-        self._stop_reason = "running"
-        self._teardown_error_suppressed = False
-        return self._start_on_main_loop()
+        pending_session = self._pending_session
+        self._pending_session = None
+        self._activate_session(pending_session, schedule_start=False)
+        return False
 
     def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:
         if not self._webrtcbin:
@@ -314,17 +322,34 @@ class WebRTCUplinkController:
         log.debug("[WEBRTC-UPLINK] added remote ICE candidate mline=%s", mline_index)
         return False
 
-    def _on_offer_created(self, promise: Gst.Promise, *_args: object) -> None:
-        if not self._webrtcbin or not self._session:
+    def _on_offer_created(self, promise: Gst.Promise, expected_session_id: str | None = None, *_args: object) -> None:
+        if not self._webrtcbin:
+            return
+
+        current_session_id = self._session.session_id if self._session else None
+        if expected_session_id and current_session_id != expected_session_id:
+            log.info(
+                "[WEBRTC-UPLINK] ignoring stale offer callback for sessionId=%s current=%s",
+                expected_session_id,
+                current_session_id,
+            )
+            return
+        if not self._session:
             return
 
         reply = promise.get_reply()
         if reply is None:
+            if self._stop_scheduled or self._pending_session is not None:
+                log.info("[WEBRTC-UPLINK] ignoring incomplete offer callback during session handover.")
+                return
             log.error("[WEBRTC-UPLINK] offer promise returned no reply.")
             return
 
         offer = reply.get_value("offer")
         if offer is None:
+            if self._stop_scheduled or self._pending_session is not None:
+                log.info("[WEBRTC-UPLINK] ignoring empty offer callback during session handover.")
+                return
             log.error("[WEBRTC-UPLINK] offer promise missing offer value.")
             return
 
