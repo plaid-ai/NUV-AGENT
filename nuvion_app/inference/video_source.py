@@ -72,6 +72,7 @@ def build_video_source_pipeline(
     demo_mode: bool = False,
     demo_video_path: str | None = None,
     platform_name: str | None = None,
+    output_format: str | None = "RGB",
 ) -> str:
     if gst_source_override and gst_source_override.strip():
         return gst_source_override.strip()
@@ -81,16 +82,17 @@ def build_video_source_pipeline(
     if demo_mode:
         demo_path = resolve_demo_video_path(demo_video_path)
         uri = demo_path.as_uri()
-        return (
+        pipeline = (
             f'uridecodebin uri="{uri}" ! '
             "queue ! "
             "videoconvert ! "
             "videoscale ! "
             "videorate ! "
             f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
-            "videoconvert ! "
-            "video/x-raw,format=RGB"
         )
+        if output_format:
+            pipeline = f"{pipeline} videoconvert ! video/x-raw,format={output_format}"
+        return pipeline
 
     resolved_source = video_source
     if not resolved_source or resolved_source == "auto":
@@ -113,9 +115,10 @@ def build_video_source_pipeline(
     else:
         source = "autovideosrc"
 
-    return (
+    pipeline = (
         f"{source} ! "
         f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
-        "videoconvert ! "
-        "video/x-raw,format=RGB"
     )
+    if output_format:
+        pipeline = f"{pipeline} videoconvert ! video/x-raw,format={output_format}"
+    return pipeline

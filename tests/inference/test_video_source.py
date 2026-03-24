@@ -21,6 +21,18 @@ class VideoSourceTest(unittest.TestCase):
         self.assertIn("v4l2src device=/dev/video0", pipeline)
         self.assertIn("video/x-raw,format=RGB", pipeline)
 
+    def test_build_camera_source_without_output_format_keeps_raw_caps(self) -> None:
+        pipeline = build_video_source_pipeline(
+            "/dev/video0",
+            640,
+            480,
+            30,
+            platform_name="darwin",
+            output_format=None,
+        )
+        self.assertIn("avfvideosrc", pipeline)
+        self.assertNotIn("video/x-raw,format=RGB", pipeline)
+
     def test_build_camera_source_macos_auto(self) -> None:
         pipeline = build_video_source_pipeline(
             "auto",

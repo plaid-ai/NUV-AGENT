@@ -174,6 +174,10 @@ def _build_encoder_pipeline() -> tuple[str, str]:
     )
 
 
+def _should_split_source_branches_for_mac(encoder_name: str) -> bool:
+    return sys.platform == "darwin" and encoder_name.startswith("vtenc_h264")
+
+
 load_env()
 apply_inference_runtime_defaults()
 
@@ -1485,6 +1489,9 @@ class GStreamerInferenceApp:
 
     def create_pipeline(self):
         Gst.init(None)
+        encoder_pipeline, encoder_name = _build_encoder_pipeline()
+        log.info("[PIPELINE] selected encoder=%s", encoder_name)
+        split_source_branches = _should_split_source_branches_for_mac(encoder_name)
         source_pipeline = build_video_source_pipeline(
             self.video_source,
             self.video_width,
@@ -1493,6 +1500,7 @@ class GStreamerInferenceApp:
             gst_source_override=GST_SOURCE_OVERRIDE,
             demo_mode=self.demo_mode,
             demo_video_path=DEMO_VIDEO_PATH,
+            output_format=None if split_source_branches else "RGB",
         )
 
         overlay_pipeline = (
@@ -1504,9 +1512,6 @@ class GStreamerInferenceApp:
             "text=\"\" "
             "! "
         )
-
-        encoder_pipeline, encoder_name = _build_encoder_pipeline()
-        log.info("[PIPELINE] selected encoder=%s", encoder_name)
 
         if self.uplink_mode == UPLINK_MODE_WEBRTC:
             if CLIP_ENABLED:
@@ -1551,7 +1556,35 @@ class GStreamerInferenceApp:
                     "udpsink name=rtp_sink host=0.0.0.0 port=5004 async=false sync=false"
                 )
 
-        if LOCAL_DISPLAY:
+        if split_source_branches:
+            zsad_branch = (
+                "t. ! queue ! "
+                "videoconvert ! "
+                "video/x-raw,format=RGB ! "
+                "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
+            )
+            if LOCAL_DISPLAY:
+                pipeline_string = (
+                    f"{source_pipeline} ! "
+                    "tee name=t "
+                    f"{zsad_branch}"
+                    "t. ! queue ! "
+                    f"{overlay_pipeline}"
+                    "tee name=dt "
+                    "dt. ! queue ! "
+                    f"{uplink_pipeline} "
+                    "dt. ! queue ! videoconvert ! autovideosink sync=false"
+                )
+            else:
+                pipeline_string = (
+                    f"{source_pipeline} ! "
+                    "tee name=t "
+                    f"{zsad_branch}"
+                    "t. ! queue ! "
+                    f"{overlay_pipeline}"
+                    f"{uplink_pipeline}"
+                )
+        elif LOCAL_DISPLAY:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
