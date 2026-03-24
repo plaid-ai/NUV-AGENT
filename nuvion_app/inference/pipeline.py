@@ -111,6 +111,69 @@ def parse_float(value: str | None, default: float) -> float:
         return default
 
 
+def _gst_element_exists(element_name: str) -> bool:
+    try:
+        return Gst.ElementFactory.find(element_name) is not None
+    except Exception:
+        return False
+
+
+def _build_encoder_pipeline() -> tuple[str, str]:
+    if sys.platform == "darwin":
+        if _gst_element_exists("vtenc_h264_hw"):
+            return (
+                (
+                    "videoconvert ! "
+                    "video/x-raw,format=NV12 ! "
+                    "vtenc_h264_hw "
+                    "realtime=true "
+                    "allow-frame-reordering=false "
+                    "rate-control=cbr "
+                    "bitrate=8000 "
+                    "max-keyframe-interval=30 "
+                    "! "
+                    "video/x-h264,stream-format=avc,alignment=au ! "
+                ),
+                "vtenc_h264_hw",
+            )
+        if _gst_element_exists("vtenc_h264"):
+            return (
+                (
+                    "videoconvert ! "
+                    "video/x-raw,format=NV12 ! "
+                    "vtenc_h264 "
+                    "realtime=true "
+                    "allow-frame-reordering=false "
+                    "rate-control=cbr "
+                    "bitrate=8000 "
+                    "max-keyframe-interval=30 "
+                    "! "
+                    "video/x-h264,stream-format=avc,alignment=au ! "
+                ),
+                "vtenc_h264",
+            )
+
+    return (
+        (
+            "videoconvert ! "
+            "video/x-raw,format=I420 ! "
+            "x264enc "
+            "tune=zerolatency "
+            "speed-preset=faster "
+            "bitrate=8000 "
+            "vbv-buf-capacity=10000 "
+            "key-int-max=30 "
+            "bframes=0 "
+            "threads=4 "
+            "sliced-threads=true "
+            "pass=cbr "
+            "! "
+            f"video/x-h264,profile={H264_PROFILE_ENV} ! "
+        ),
+        "x264enc",
+    )
+
+
 load_env()
 apply_inference_runtime_defaults()
 
@@ -1442,22 +1505,8 @@ class GStreamerInferenceApp:
             "! "
         )
 
-        encoder_pipeline = (
-            "videoconvert ! "
-            "video/x-raw,format=I420 ! "
-            "x264enc "
-            "tune=zerolatency "
-            "speed-preset=faster "
-            "bitrate=8000 "
-            "vbv-buf-capacity=10000 "
-            "key-int-max=30 "
-            "bframes=0 "
-            "threads=4 "
-            "sliced-threads=true "
-            "pass=cbr "
-            "! "
-            f"video/x-h264,profile={H264_PROFILE_ENV} ! "
-        )
+        encoder_pipeline, encoder_name = _build_encoder_pipeline()
+        log.info("[PIPELINE] selected encoder=%s", encoder_name)
 
         if self.uplink_mode == UPLINK_MODE_WEBRTC:
             if CLIP_ENABLED:
