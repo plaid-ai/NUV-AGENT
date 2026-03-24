@@ -52,6 +52,7 @@ class _FakeEventTarget:
     def __init__(self) -> None:
         self.events: list[object] = []
         self.emits: list[tuple[object, tuple[object, ...]]] = []
+        self.properties: dict[str, object] = {}
 
     def send_event(self, event: object) -> bool:
         self.events.append(event)
@@ -60,6 +61,9 @@ class _FakeEventTarget:
     def emit(self, signal: object, *args: object) -> bool:
         self.emits.append((signal, args))
         return True
+
+    def set_property(self, name: str, value: object) -> None:
+        self.properties[name] = value
 
 
 def _install_fake_gi() -> None:
@@ -210,6 +214,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
         controller._pipeline = _FakeEventTarget()
         controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
         controller._session = self.module.WebRTCUplinkSession(
             broadcast_id="device-1",
             session_id="session-1",
@@ -221,8 +226,24 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         self.assertEqual(len(controller._webrtcbin.emits), 1)
         self.assertEqual(controller._webrtcbin.emits[0][0], "close")
+        self.assertEqual(controller._webrtc_gate.properties.get("drop"), True)
         self.assertEqual(controller._pipeline.events, [])
         self.assertIsNone(controller._session)
+
+    def test_start_opens_webrtc_gate_before_offer(self) -> None:
+        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
+        controller._webrtcbin = _FakeEventTarget()
+        controller._webrtc_gate = _FakeEventTarget()
+        controller._session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-1",
+            force_relay=True,
+            ice_servers=[],
+        )
+
+        controller._start_on_main_loop()
+
+        self.assertEqual(controller._webrtc_gate.properties.get("drop"), False)
 
 
 if __name__ == "__main__":
