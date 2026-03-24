@@ -111,6 +111,17 @@ def parse_float(value: str | None, default: float) -> float:
         return default
 
 
+def resolve_local_display_enabled(value: str | None) -> bool:
+    raw = (value or "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if sys.platform == "darwin":
+        return True
+    return bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+
+
 def _gst_element_exists(element_name: str) -> bool:
     try:
         return Gst.ElementFactory.find(element_name) is not None
@@ -213,7 +224,7 @@ ZERO_SHOT_ANOMALY_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS"
 ZERO_SHOT_THRESHOLD = parse_float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD"), 0.7)
 ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0)
 
-LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
+LOCAL_DISPLAY = resolve_local_display_enabled(os.getenv("NUVION_LOCAL_DISPLAY", "auto"))
 
 TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
 ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
@@ -740,7 +751,13 @@ async def device_connectivity_sender(
 ):
     interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
     while True:
-        payload = reporter.build_transition_payload()
+        snapshot = reporter.build_snapshot_payload()
+        if g_app and snapshot:
+            try:
+                g_app.update_local_connectivity(snapshot)
+            except Exception:
+                pass
+        payload = reporter.build_transition_payload(snapshot=snapshot)
         if payload:
             if state_coordinator is not None and payload.get("quality"):
                 state_coordinator.set_connectivity_quality(str(payload["quality"]))
@@ -1101,13 +1118,14 @@ async def signaling_client_main():
 
 
 class NuvionEventState:
-    def __init__(self, overlay_callback=None):
+    def __init__(self, overlay_callback=None, frame_stats_callback=None):
         self.running = True
         self.last_anomaly_at = 0.0
         self.last_production_at = 0.0
         self.zero_shot_last_sample = 0.0
         self.zero_shot_queue = queue.Queue(maxsize=1)
         self.overlay_callback = overlay_callback
+        self.frame_stats_callback = frame_stats_callback
         self.last_status = None
         self.last_sent_status = None
         self.last_sent_at = 0.0
@@ -1371,6 +1389,13 @@ class NuvionEventState:
         except queue.Full:
             pass
 
+    def record_frame_sample(self) -> None:
+        if self.frame_stats_callback:
+            try:
+                self.frame_stats_callback()
+            except Exception:
+                pass
+
     def _zsad_worker(self):
         while self.running:
             try:
@@ -1452,6 +1477,7 @@ def on_new_sample(appsink, user_data: NuvionEventState):
         return Gst.FlowReturn.OK
 
     buffer.unmap(mapinfo)
+    user_data.record_frame_sample()
     user_data.maybe_enqueue_frame(frame)
     return Gst.FlowReturn.OK
 
@@ -1467,7 +1493,13 @@ class GStreamerInferenceApp:
         self.uplink_mode = UPLINK_MODE
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
-        self.user_data = NuvionEventState(self.update_overlay_text)
+        self.local_stats_overlay = None
+        self._stats_status_text = ""
+        self._stats_fps: float | None = None
+        self._stats_connectivity: dict[str, object] | None = None
+        self._stats_frame_window_started_at = time.monotonic()
+        self._stats_frame_count = 0
+        self.user_data = NuvionEventState(self.update_overlay_text, self.record_local_frame_sample)
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
             default_force_relay=WEBRTC_FORCE_RELAY,
@@ -1501,6 +1533,16 @@ class GStreamerInferenceApp:
             "font-desc=\"Sans 24\" "
             "halignment=left valignment=top "
             "shaded-background=true "
+            "text=\"\" "
+            "! "
+        )
+        local_stats_panel_pipeline = (
+            f"videotestsrc pattern=black is-live=true ! "
+            f"video/x-raw,width={self.video_width},height=96,framerate={self.frame_rate}/1 ! "
+            "textoverlay name=local_stats_overlay "
+            "font-desc=\"Sans 16\" "
+            "halignment=left valignment=top "
+            "shaded-background=false "
             "text=\"\" "
             "! "
         )
@@ -1562,7 +1604,10 @@ class GStreamerInferenceApp:
                 "tee name=dt "
                 "dt. ! queue ! "
                 f"{uplink_pipeline} "
-                "dt. ! queue ! videoconvert ! autovideosink sync=false"
+                f"dt. ! queue ! videoconvert ! videoscale ! video/x-raw,width={self.video_width},height={self.video_height} ! local_preview.sink_0 "
+                f"{local_stats_panel_pipeline} local_preview.sink_1 "
+                f"compositor name=local_preview sink_0::xpos=0 sink_0::ypos=0 sink_1::xpos=0 sink_1::ypos={self.video_height} background=black ! "
+                "videoconvert ! autovideosink sync=false"
             )
         else:
             pipeline_string = (
@@ -1597,6 +1642,12 @@ class GStreamerInferenceApp:
             log.warning("[PIPELINE] zsad_overlay not found.")
         else:
             self.update_overlay_text(self._default_overlay_text())
+
+        self.local_stats_overlay = self.pipeline.get_by_name("local_stats_overlay")
+        if LOCAL_DISPLAY and not self.local_stats_overlay:
+            log.warning("[PIPELINE] local_stats_overlay not found.")
+        else:
+            self.refresh_local_stats_panel()
 
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None
@@ -1670,12 +1721,87 @@ class GStreamerInferenceApp:
         return enqueue_stomp_message(destination, payload, remember=remember)
 
     def update_overlay_text(self, text: str):
+        self._stats_status_text = text
         if not self.overlay:
             return
         def _apply():
             if self.overlay:
                 self.overlay.set_property("text", text)
             return False
+        GLib.idle_add(_apply)
+        self.refresh_local_stats_panel()
+
+    def record_local_frame_sample(self):
+        if not LOCAL_DISPLAY:
+            return
+        self._stats_frame_count += 1
+        now = time.monotonic()
+        elapsed = now - self._stats_frame_window_started_at
+        if elapsed < 1.0:
+            return
+        self._stats_fps = self._stats_frame_count / max(elapsed, 0.001)
+        self._stats_frame_count = 0
+        self._stats_frame_window_started_at = now
+        self.refresh_local_stats_panel()
+
+    def update_local_connectivity(self, payload: dict[str, object]) -> None:
+        self._stats_connectivity = payload
+        self.refresh_local_stats_panel()
+
+    def _compose_local_stats_text(self) -> str:
+        lines: list[str] = []
+        status_text = self._stats_status_text or self._default_overlay_text()
+        lines.append(status_text)
+
+        if self._stats_fps is not None:
+            lines.append(f"FPS {self._stats_fps:.1f}")
+        else:
+            lines.append("FPS --")
+
+        payload = self._stats_connectivity
+        if not payload:
+            lines.append("NET N/A")
+            return "\n".join(lines)
+
+        quality = str(payload.get("quality") or "UNKNOWN")
+        parts = [f"NET {quality}"]
+        rssi = payload.get("rssiDbm")
+        rtt = payload.get("rttMs")
+        loss = payload.get("packetLossPct")
+        uplink = payload.get("uplinkKbps")
+        downlink = payload.get("downlinkKbps")
+
+        if rssi is not None:
+            parts.append(f"RSSI {rssi}dBm")
+        if rtt is not None:
+            parts.append(f"RTT {rtt}ms")
+        if loss is not None:
+            try:
+                parts.append(f"LOSS {float(loss):.1f}%")
+            except (TypeError, ValueError):
+                parts.append(f"LOSS {loss}")
+        lines.append(" ".join(parts))
+
+        rate_parts: list[str] = []
+        if uplink is not None:
+            rate_parts.append(f"UP {uplink}kbps")
+        if downlink is not None:
+            rate_parts.append(f"DOWN {downlink}kbps")
+        if rate_parts:
+            lines.append(" ".join(rate_parts))
+
+        return "\n".join(lines)
+
+    def refresh_local_stats_panel(self) -> None:
+        if not self.local_stats_overlay:
+            return
+        text = self._compose_local_stats_text()
+
+        def _apply():
+            if self.local_stats_overlay:
+                self.local_stats_overlay.set_property("text", text)
+            return False
+
         GLib.idle_add(_apply)
 
     def _default_overlay_text(self) -> str:

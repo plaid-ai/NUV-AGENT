@@ -245,7 +245,7 @@ class ConnectivityReporter:
         self._last_quality: str | None = None
         self._last_sent_at: float = 0.0
 
-    def build_transition_payload(self) -> dict | None:
+    def _collect_payload(self) -> dict | None:
         rssi_dbm = self._rssi_collector()
         packet_loss_pct, rtt_ms = self._ping_collector()
         uplink_kbps, downlink_kbps = self._bitrate_collector()
@@ -263,6 +263,17 @@ class ConnectivityReporter:
 
         quality = "POOR" if reasons else "GOOD"
         reason = ",".join(reasons) if reasons else "healthy"
+        return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms, uplink_kbps, downlink_kbps)
+
+    def build_snapshot_payload(self) -> dict | None:
+        return self._collect_payload()
+
+    def build_transition_payload(self, snapshot: dict | None = None) -> dict | None:
+        payload = snapshot or self._collect_payload()
+        if payload is None:
+            return None
+
+        quality = str(payload["quality"])
         now = self._clock()
 
         if self._last_quality is None:
@@ -272,7 +283,7 @@ class ConnectivityReporter:
             if now - self._last_sent_at < self.min_send_interval_sec:
                 return None
             self._last_sent_at = now
-            return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms, uplink_kbps, downlink_kbps)
+            return payload
 
         if quality == self._last_quality:
             return None
@@ -282,7 +293,7 @@ class ConnectivityReporter:
 
         self._last_quality = quality
         self._last_sent_at = now
-        return self._build_payload(quality, reason, rssi_dbm, packet_loss_pct, rtt_ms, uplink_kbps, downlink_kbps)
+        return payload
 
     def _build_payload(
         self,

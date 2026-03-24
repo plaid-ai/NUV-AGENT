@@ -163,6 +163,25 @@ class ConnectivityReporterTest(unittest.TestCase):
         self.assertEqual(fourth["uplinkKbps"], 12000)
         self.assertEqual(fourth["downlinkKbps"], 18000)
 
+    def test_reporter_builds_snapshot_without_transition(self) -> None:
+        reporter = ConnectivityReporter(
+            target_host="api.example.com",
+            thresholds=ConnectivityThresholds(poor_rssi_dbm=-80, poor_packet_loss_pct=8.0, poor_rtt_ms=250),
+            rssi_collector=lambda: -61,
+            ping_collector=lambda: (0.0, 24),
+            bitrate_collector=lambda: (433000, 866000),
+            measured_at_factory=lambda: "2026-03-04T07:42:10Z",
+        )
+
+        snapshot = reporter.build_snapshot_payload()
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["quality"], "GOOD")
+        self.assertEqual(snapshot["rssiDbm"], -61)
+        self.assertEqual(snapshot["rttMs"], 24)
+        self.assertEqual(snapshot["uplinkKbps"], 433000)
+        self.assertEqual(snapshot["downlinkKbps"], 866000)
+
 
 if __name__ == "__main__":
     unittest.main()
