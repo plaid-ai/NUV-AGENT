@@ -32,6 +32,7 @@ class VideoSourceTest(unittest.TestCase):
         )
         self.assertIn("avfvideosrc", pipeline)
         self.assertNotIn("video/x-raw,format=RGB", pipeline)
+        self.assertFalse(pipeline.rstrip().endswith("!"))
 
     def test_build_camera_source_macos_auto(self) -> None:
         pipeline = build_video_source_pipeline(

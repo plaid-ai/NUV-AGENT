@@ -88,10 +88,10 @@ def build_video_source_pipeline(
             "videoconvert ! "
             "videoscale ! "
             "videorate ! "
-            f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
+            f"video/x-raw,width={width},height={height},framerate={fps}/1"
         )
         if output_format:
-            pipeline = f"{pipeline} videoconvert ! video/x-raw,format={output_format}"
+            pipeline = f"{pipeline} ! videoconvert ! video/x-raw,format={output_format}"
         return pipeline
 
     resolved_source = video_source
@@ -117,8 +117,8 @@ def build_video_source_pipeline(
 
     pipeline = (
         f"{source} ! "
-        f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
+        f"video/x-raw,width={width},height={height},framerate={fps}/1"
     )
     if output_format:
-        pipeline = f"{pipeline} videoconvert ! video/x-raw,format={output_format}"
+        pipeline = f"{pipeline} ! videoconvert ! video/x-raw,format={output_format}"
     return pipeline
