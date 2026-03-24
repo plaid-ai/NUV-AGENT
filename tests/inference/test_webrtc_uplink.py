@@ -48,22 +48,17 @@ class _FakeMessage:
         self.src = src
 
 
-class _FakeEventFactory:
-    @staticmethod
-    def new_flush_start() -> str:
-        return "flush-start"
-
-    @staticmethod
-    def new_flush_stop(_reset_time: bool) -> str:
-        return "flush-stop"
-
-
 class _FakeEventTarget:
     def __init__(self) -> None:
         self.events: list[object] = []
+        self.emits: list[tuple[object, tuple[object, ...]]] = []
 
     def send_event(self, event: object) -> bool:
         self.events.append(event)
+        return True
+
+    def emit(self, signal: object, *args: object) -> bool:
+        self.emits.append((signal, args))
         return True
 
 
@@ -77,7 +72,6 @@ def _install_fake_gi() -> None:
         Pipeline=object,
         Element=object,
         Promise=_FakePromise,
-        Event=_FakeEventFactory,
     )
     repository.GstSdp = types.SimpleNamespace(
         SDPMessage=types.SimpleNamespace(new=lambda: (0, object())),
@@ -212,7 +206,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertFalse(handled)
         self.assertEqual(len(_FakeGLib.calls), 0)
 
-    def test_stop_flushes_only_webrtcbin_branch(self) -> None:
+    def test_stop_closes_only_webrtcbin_branch(self) -> None:
         controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
         controller._pipeline = _FakeEventTarget()
         controller._webrtcbin = _FakeEventTarget()
@@ -225,7 +219,8 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         controller._stop_on_main_loop()
 
-        self.assertEqual(controller._webrtcbin.events, ["flush-start", "flush-stop"])
+        self.assertEqual(len(controller._webrtcbin.emits), 1)
+        self.assertEqual(controller._webrtcbin.emits[0][0], "close")
         self.assertEqual(controller._pipeline.events, [])
         self.assertIsNone(controller._session)
 

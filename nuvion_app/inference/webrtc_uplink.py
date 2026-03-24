@@ -241,10 +241,9 @@ class WebRTCUplinkController:
     def _stop_on_main_loop(self) -> bool:
         if self._webrtcbin:
             try:
-                # Flush only the WebRTC uplink branch. Flushing the whole pipeline also hits
-                # the clip recording branch and can leave live segment state inconsistent.
-                self._webrtcbin.send_event(Gst.Event.new_flush_start())
-                self._webrtcbin.send_event(Gst.Event.new_flush_stop(False))
+                # Prefer the native webrtcbin close action. Force-flushing the branch
+                # causes noisy "data flow before segment event" warnings during teardown.
+                self._webrtcbin.emit("close", Gst.Promise.new())
             except Exception:
                 pass
         self._session = None
