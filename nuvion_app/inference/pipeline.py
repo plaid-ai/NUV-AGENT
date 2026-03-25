@@ -34,6 +34,7 @@ from nuvion_app.inference.device_state import (
     DEVICE_STATE_RUNNING,
     DeviceStateCoordinator,
 )
+from nuvion_app.inference.snapshot_media import encode_snapshot_jpeg
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -238,6 +239,8 @@ CLIP_MAX_SEGMENTS = int(os.getenv("NUVION_CLIP_MAX_SEGMENTS", "30"))
 CLIP_OUTPUT_DIR = os.getenv("NUVION_CLIP_OUTPUT_DIR", "/tmp/nuvion_clips")
 CLIP_COOLDOWN_SEC = parse_float(os.getenv("NUVION_CLIP_COOLDOWN_SEC"), 10.0)
 CLIP_CONTENT_TYPE = os.getenv("NUVION_CLIP_CONTENT_TYPE", "video/mp4")
+SNAPSHOT_CONTENT_TYPE = os.getenv("NUVION_SNAPSHOT_CONTENT_TYPE", "image/jpeg")
+SNAPSHOT_JPEG_QUALITY = parse_int_with_default(os.getenv("NUVION_SNAPSHOT_JPEG_QUALITY"), 90)
 
 LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
@@ -575,8 +578,11 @@ def api_request(
     return None
 
 
-def request_upload_url() -> dict | None:
-    payload = {"type": "CLIP", "contentType": CLIP_CONTENT_TYPE}
+def request_upload_url(media_type: str = "CLIP", content_type: str | None = None) -> dict | None:
+    payload = {
+        "type": media_type,
+        "contentType": content_type or (CLIP_CONTENT_TYPE if media_type == "CLIP" else SNAPSHOT_CONTENT_TYPE),
+    }
     response = api_request("POST", "/devices/media/upload-url", payload)
     if not response:
         return None
@@ -601,6 +607,25 @@ def upload_file_to_url(upload_url: str, file_path: str, content_type: str) -> bo
             if token:
                 req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=60) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        log.warning("[UPLOAD] Failed: %s", exc)
+    except Exception as exc:
+        log.warning("[UPLOAD] Error: %s", exc)
+    return False
+
+
+def upload_bytes_to_url(upload_url: str, data: bytes, content_type: str) -> bool:
+    try:
+        server_host = urlparse(SERVER_BASE_URL).netloc
+        upload_host = urlparse(upload_url).netloc
+        req = urllib.request.Request(upload_url, data=data, method="PUT")
+        req.add_header("Content-Type", content_type)
+        if server_host and upload_host == server_host:
+            token = get_auth_token()
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         log.warning("[UPLOAD] Failed: %s", exc)
@@ -1135,6 +1160,8 @@ class NuvionEventState:
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
+        self.latest_frame_rgb = None
+        self.latest_frame_lock = threading.Lock()
 
         self.backend = ZSAD_BACKEND
         self.zero_shot = None
@@ -1183,6 +1210,7 @@ class NuvionEventState:
         anomaly_type: str,
         message: str,
         severity: str,
+        snapshot_object: str | None = None,
         clip_object: str | None = None,
         clip_status: str | None = None,
     ):
@@ -1206,10 +1234,13 @@ class NuvionEventState:
         else:
             return
 
-        if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
-            clip_object = self.start_clip_upload()
-            if clip_object:
-                clip_status = "UPLOADING"
+        if status == "DEFECT" and status_changed:
+            if snapshot_object is None:
+                snapshot_object = self.capture_snapshot_upload()
+            if clip_object is None and clip_status is None:
+                clip_object = self.start_clip_upload()
+                if clip_object:
+                    clip_status = "UPLOADING"
 
         tagged_message = self._apply_demo_tag(message)
         payload = {
@@ -1219,7 +1250,7 @@ class NuvionEventState:
             "severity": severity,
             "lineId": LINE_ID,
             "processId": PROCESS_ID,
-            "snapshotObject": None,
+            "snapshotObject": snapshot_object,
             "clipObject": clip_object,
             "clipStatus": clip_status,
         }
@@ -1270,6 +1301,36 @@ class NuvionEventState:
             args=(object_name, upload_url, now),
             daemon=True,
         ).start()
+        return object_name
+
+    def capture_snapshot_upload(self) -> str | None:
+        with self.latest_frame_lock:
+            frame_rgb = self.latest_frame_rgb
+        if frame_rgb is None:
+            log.warning("[SNAPSHOT] No frame available for snapshot upload.")
+            return None
+
+        meta = request_upload_url("SNAPSHOT", SNAPSHOT_CONTENT_TYPE)
+        if not meta:
+            return None
+
+        object_name = meta.get("objectName")
+        upload_url = meta.get("uploadUrl")
+        if not object_name or not upload_url:
+            return None
+
+        try:
+            snapshot_bytes = encode_snapshot_jpeg(frame_rgb, quality=SNAPSHOT_JPEG_QUALITY)
+        except Exception as exc:
+            log.warning("[SNAPSHOT] JPEG encode failed: %s", exc)
+            return None
+
+        ok = upload_bytes_to_url(upload_url, snapshot_bytes, SNAPSHOT_CONTENT_TYPE)
+        if not ok:
+            log.warning("[SNAPSHOT] Upload failed for object=%s", object_name)
+            return None
+
+        log.info("[SNAPSHOT] Uploaded snapshot object=%s", object_name)
         return object_name
 
     def _capture_and_upload_clip(self, object_name: str, upload_url: str, detected_at: float):
@@ -1381,6 +1442,9 @@ class NuvionEventState:
         if now - self.zero_shot_last_sample < ZERO_SHOT_SAMPLE_SEC:
             return
         self.zero_shot_last_sample = now
+
+        with self.latest_frame_lock:
+            self.latest_frame_rgb = frame_rgb.copy()
 
         if self.zero_shot_queue.full():
             return
