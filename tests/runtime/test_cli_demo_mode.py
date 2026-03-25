@@ -12,7 +12,7 @@ from nuvion_app import cli
 
 class CliDemoModeTest(unittest.TestCase):
     def setUp(self) -> None:
-        for key in ("NUVION_DEMO_MODE", "NUVION_DEMO_VIDEO_PATH"):
+        for key in ("NUVION_DEMO_MODE",):
             os.environ.pop(key, None)
 
     def _run_cli(self, argv: list[str]) -> None:
@@ -33,10 +33,10 @@ class CliDemoModeTest(unittest.TestCase):
         self._run_cli(["nuv-agent", "run", "--demo"])
         self.assertEqual(os.getenv("NUVION_DEMO_MODE"), "true")
 
-    def test_run_demo_video_overrides_env(self) -> None:
-        with mock.patch.dict(os.environ, {"NUVION_DEMO_VIDEO_PATH": "/tmp/old.mp4"}, clear=False):
-            self._run_cli(["nuv-agent", "run", "--demo", "--demo-video", "/tmp/new.mp4"])
-            self.assertEqual(os.getenv("NUVION_DEMO_VIDEO_PATH"), "/tmp/new.mp4")
+    def test_run_demo_rejects_removed_demo_video_option(self) -> None:
+        with mock.patch.object(sys, "argv", ["nuv-agent", "run", "--demo", "--demo-video", "/tmp/demo.mp4"]):
+            with self.assertRaises(SystemExit):
+                cli.main()
 
 
 if __name__ == "__main__":

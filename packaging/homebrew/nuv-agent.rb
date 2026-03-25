@@ -105,11 +105,6 @@ class NuvAgent < Formula
     sha256 "bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4"
   end
 
-  resource "demo-video" do
-    url "https://upload.wikimedia.org/wikipedia/commons/a/af/Gigaset_Smartphone_Production_IV_Quality_Inspection.webm"
-    sha256 "9f1df90978a735f1836cf36777075e959bef20ba63b4546fb0feec38fb731dec"
-  end
-
   resource "anyio" do
     url "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl"
     sha256 "d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c"
@@ -305,7 +300,6 @@ class NuvAgent < Formula
     venv = virtualenv_create(libexec, python, system_site_packages: true)
 
     resources.each do |r|
-      next if r.name == "demo-video"
       r.stage do
         wheel = Dir["*.whl"].first
         target = wheel ? Pathname.pwd/wheel : Pathname.pwd
@@ -317,16 +311,6 @@ class NuvAgent < Formula
     system python, "-m", "pip", "--python=#{venv.root}/bin/python", "install",
            "--no-deps", "--ignore-installed", "--no-compile", buildpath
     (etc/"nuv-agent").mkpath
-    demo_dir = var/"nuv-agent/demo"
-    demo_dir.mkpath
-
-    resource("demo-video").stage do
-      demo_src = Dir["*.webm"].first
-      if demo_src
-        cp demo_src, demo_dir/"exhibition-demo.webm"
-      end
-    end
-
     env = {
       "DYLD_FALLBACK_LIBRARY_PATH" => "#{HOMEBREW_PREFIX}/lib:#{Formula["glib"].opt_lib}:#{Formula["gstreamer"].opt_lib}",
       "GI_TYPELIB_PATH" => "#{HOMEBREW_PREFIX}/lib/girepository-1.0",
@@ -358,10 +342,8 @@ class NuvAgent < Formula
       2) install docker + colima (if missing),
       3) start a local Triton container when NUVION_ZSAD_BACKEND=triton.
 
-      Demo sample video installed:
-        #{var}/nuv-agent/demo/exhibition-demo.webm
       To run demo mode:
-        nuv-agent run --demo --demo-video #{var}/nuv-agent/demo/exhibition-demo.webm
+        nuv-agent run --demo
 
       If Docker Desktop is already running, it is used first. Colima is only a fallback.
     EOS

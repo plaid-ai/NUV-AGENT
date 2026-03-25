@@ -115,7 +115,6 @@ DEVICE_PASSWORD = os.getenv("NUVION_DEVICE_PASSWORD", "password")
 VIDEO_SOURCE_ENV = os.getenv("NUVION_VIDEO_SOURCE", "/dev/video0")
 GST_SOURCE_OVERRIDE = os.getenv("NUVION_GST_SOURCE")
 DEMO_MODE = is_truthy(os.getenv("NUVION_DEMO_MODE", "false"))
-DEMO_VIDEO_PATH = (os.getenv("NUVION_DEMO_VIDEO_PATH", "") or "").strip()
 DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
@@ -1400,7 +1399,6 @@ class GStreamerInferenceApp:
             self.frame_rate,
             gst_source_override=GST_SOURCE_OVERRIDE,
             demo_mode=self.demo_mode,
-            demo_video_path=DEMO_VIDEO_PATH,
         )
 
         overlay_pipeline = (

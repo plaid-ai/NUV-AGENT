@@ -104,7 +104,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_DEVICE_PASSWORD=secret",
                         "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_DEMO_MODE=true",
-                        "NUVION_DEMO_VIDEO_PATH=",
                         "",
                     ]
                 )
@@ -112,11 +111,8 @@ class ConfigGuardTest(unittest.TestCase):
             report = guard_config(config_path=config_path, apply_fixes=True)
             self.assertTrue(report.ok)
 
-    def test_guard_accepts_demo_video_path_when_demo_enabled(self) -> None:
+    def test_guard_rejects_invalid_mvtec_base_url_when_demo_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            demo_file = Path(tmp) / "demo.mp4"
-            demo_file.write_bytes(b"fake")
-
             config_path = Path(tmp) / "agent.env"
             config_path.write_text(
                 "\n".join(
@@ -126,36 +122,14 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_DEVICE_PASSWORD=secret",
                         "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_DEMO_MODE=true",
-                        f"NUVION_DEMO_VIDEO_PATH={demo_file}",
+                        "NUVION_DEMO_MVTEC_BASE_URL=ftp://invalid",
                         "",
                     ]
                 )
             )
             report = guard_config(config_path=config_path, apply_fixes=True)
-            self.assertTrue(report.ok)
-
-    def test_guard_accepts_fallback_demo_video_path_when_empty(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            demo_file = Path(tmp) / "demo.webm"
-            demo_file.write_bytes(b"fake")
-
-            config_path = Path(tmp) / "agent.env"
-            config_path.write_text(
-                "\n".join(
-                    [
-                        "NUVION_SERVER_BASE_URL=https://api.example.com",
-                        "NUVION_DEVICE_USERNAME=device-1",
-                        "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
-                        "NUVION_DEMO_MODE=true",
-                        "NUVION_DEMO_VIDEO_PATH=",
-                        "",
-                    ]
-                )
-            )
-            with mock.patch.dict(os.environ, {"NUVION_DEMO_VIDEO_FALLBACK_PATHS": str(demo_file)}, clear=False):
-                report = guard_config(config_path=config_path, apply_fixes=True)
-            self.assertTrue(report.ok)
+            self.assertFalse(report.ok)
+            self.assertTrue(any(issue.key == "NUVION_DEMO_MVTEC_BASE_URL" for issue in report.errors))
 
 
 if __name__ == "__main__":

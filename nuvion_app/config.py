@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
-from nuvion_app.inference.video_source import resolve_demo_video_path
 from nuvion_app.inference.webrtc_signaling import UPLINK_MODE_RTP, normalize_uplink_mode
 
 
@@ -545,18 +544,6 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
 
 
 def _check_demo_video_source(values: Dict[str, str]) -> Dict[str, str]:
-    raw_demo_path = (values.get("NUVION_DEMO_VIDEO_PATH") or "").strip()
-    if raw_demo_path:
-        try:
-            path = resolve_demo_video_path(raw_demo_path)
-        except ValueError as exc:
-            return {
-                "name": "Demo video source",
-                "status": "fail",
-                "detail": str(exc),
-            }
-        return {"name": "Demo video source", "status": "pass", "detail": f"Demo video file is ready: {path}"}
-
     try:
         detail = validate_mvtec_demo_settings(
             base_url=values.get("NUVION_DEMO_MVTEC_BASE_URL"),

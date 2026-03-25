@@ -68,11 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--demo",
         action="store_true",
-        help="Run in demo mode using a prerecorded local video source",
-    )
-    run_parser.add_argument(
-        "--demo-video",
-        help="Demo video file path (overrides NUVION_DEMO_VIDEO_PATH for this run)",
+        help="Run in demo mode using the built-in MVTec slideshow source",
     )
     run_parser.add_argument(
         "--siglip-device",
@@ -201,15 +197,10 @@ def main() -> None:
         return
 
     if args.command == "run":
-        if args.demo_video and not args.demo:
-            parser.error("--demo-video requires --demo")
-
         config_path = resolve_config_path(args.config)
         load_env(str(config_path))
         if args.demo:
             os.environ["NUVION_DEMO_MODE"] = "true"
-        if args.demo_video:
-            os.environ["NUVION_DEMO_VIDEO_PATH"] = args.demo_video
         if args.backend:
             raw_backend = args.backend.strip().lower()
             os.environ["NUVION_ZSAD_BACKEND"] = normalize_backend(raw_backend, default="triton")

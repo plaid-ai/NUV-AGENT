@@ -14,9 +14,9 @@ Recommended service env vars (already in the formula):
 - `GI_TYPELIB_PATH`
 - `GST_PLUGIN_PATH`
 
-Demo sample video:
-- Formula installs a default demo asset to `$(brew --prefix)/var/nuv-agent/demo/exhibition-demo.webm`.
-- Use with `nuv-agent run --demo --demo-video <path>`.
+Demo mode:
+- `nuv-agent run --demo` downloads and caches a random MVTec category slideshow locally.
+- Public dataset base URL defaults to `https://storage.googleapis.com/mvtec-dataset/mvtec-ad`.
 
 ## Debian/Ubuntu (.deb)
 Build a package on the target architecture (e.g., Jetson ARM64):
@@ -31,8 +31,7 @@ This script:
 - Installs the systemd unit.
 - Creates `/etc/nuv-agent/agent.env` if missing.
 - Installs optional extras for runtime bootstrap (`zsad,triton`).
-- Best-effort downloads a default demo video to `/var/lib/nuv-agent/demo/exhibition-demo.webm`.
-- Override source URL at install time with `NUVION_DEMO_VIDEO_URL=<direct-video-url>`.
+- Demo mode uses the public MVTec dataset bucket and local cache at runtime.
 
 Python requirement: 3.10+
 

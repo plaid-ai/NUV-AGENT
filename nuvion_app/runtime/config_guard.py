@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from nuvion_app.config import effective_required_keys, load_template, read_env, write_env
-from nuvion_app.inference.video_source import resolve_demo_video_path
+from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
@@ -171,9 +171,13 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
 
     if _is_truthy(values.get("NUVION_DEMO_MODE", "false")):
         try:
-            resolve_demo_video_path(values.get("NUVION_DEMO_VIDEO_PATH"))
+            validate_mvtec_demo_settings(
+                base_url=values.get("NUVION_DEMO_MVTEC_BASE_URL"),
+                categories=values.get("NUVION_DEMO_MVTEC_CATEGORIES"),
+                cache_dir=values.get("NUVION_DEMO_MVTEC_CACHE_DIR"),
+            )
         except ValueError as exc:
-            errors.append(ConfigIssue(key="NUVION_DEMO_VIDEO_PATH", message=str(exc)))
+            errors.append(ConfigIssue(key="NUVION_DEMO_MVTEC_BASE_URL", message=str(exc)))
 
     if backend == "triton":
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()
