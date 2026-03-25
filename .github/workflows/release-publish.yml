@@ -37,14 +37,19 @@ jobs:
         id: sha
         run: |
           TARBALL=$(ls dist/nuv_agent-*.tar.gz | head -1)
-          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
-          SHA=$(python -c "import hashlib, pathlib; p=pathlib.Path('$TARBALL'); print(hashlib.sha256(p.read_bytes()).hexdigest())")
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
           TAG="${{ inputs.tag }}"
           if [ -z "$TAG" ]; then
             TAG="${GITHUB_REF_NAME}"
           fi
           VERSION="${TAG#v}"
+          EXPECTED_TARBALL="dist/nuv_agent-${VERSION}.tar.gz"
+          if [ "$TARBALL" != "$EXPECTED_TARBALL" ]; then
+            echo "Version mismatch: built $TARBALL but tag expects $EXPECTED_TARBALL" >&2
+            exit 1
+          fi
+          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
+          SHA=$(python -c "import hashlib, pathlib; p=pathlib.Path('$TARBALL'); print(hashlib.sha256(p.read_bytes()).hexdigest())")
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
