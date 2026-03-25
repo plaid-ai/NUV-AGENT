@@ -6,6 +6,12 @@ import sys
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
 
+def is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def build_video_source_pipeline(
     video_source: str,
     width: int,
