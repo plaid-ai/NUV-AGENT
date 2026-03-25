@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
 DEFAULT_DEMO_VIDEO_FILENAME = "exhibition-demo.webm"
 DEFAULT_DEMO_VIDEO_PATHS = (
@@ -79,11 +80,32 @@ def build_video_source_pipeline(
     current_platform = platform_name or sys.platform
 
     if demo_mode:
-        demo_path = resolve_demo_video_path(demo_video_path)
-        uri = demo_path.as_uri()
+        raw_demo_path = (demo_video_path or "").strip()
+        if raw_demo_path:
+            demo_path = resolve_demo_video_path(raw_demo_path)
+            uri = demo_path.as_uri()
+            return (
+                f'uridecodebin uri="{uri}" ! '
+                "queue ! "
+                "videoconvert ! "
+                "videoscale ! "
+                "videorate ! "
+                f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
+                "videoconvert ! "
+                "video/x-raw,format=RGB"
+            )
+
+        mvtec_source = prepare_mvtec_demo_source(
+            base_url=os.getenv("NUVION_DEMO_MVTEC_BASE_URL"),
+            categories=os.getenv("NUVION_DEMO_MVTEC_CATEGORIES"),
+            cache_dir=os.getenv("NUVION_DEMO_MVTEC_CACHE_DIR"),
+            image_duration_sec=float(os.getenv("NUVION_DEMO_IMAGE_DURATION_SEC", "1.0")),
+        )
         return (
-            f'uridecodebin uri="{uri}" ! '
-            "queue ! "
+            f'multifilesrc location="{mvtec_source.stage_pattern}" '
+            'index=0 loop=true '
+            f'caps="{mvtec_source.slideshow_caps}" ! '
+            f"{mvtec_source.decoder} ! "
             "videoconvert ! "
             "videoscale ! "
             "videorate ! "
