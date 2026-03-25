@@ -147,29 +147,37 @@ Optional build args (in `nuvion_app/inference/Dockerfile.inference`):
 - `INSTALL_TRITON_DEPS=true`
 
 ## Exhibition demo mode
-기본 런타임은 카메라 입력을 사용하고, `--demo`를 주면 로컬 데모 영상 파일 입력으로 전환됩니다.
+기본 런타임은 카메라 입력을 사용하고, `--demo`를 주면 데모 입력으로 전환됩니다.
 
 일반 모드:
 ```bash
 nuv-agent run
 ```
 
-데모 모드:
+MVTec 슬라이드쇼 데모 모드:
 ```bash
-NUVION_DEMO_VIDEO_PATH=/opt/nuvion/demo/demo.mp4 nuv-agent run --demo
+nuv-agent run --demo
 ```
 
-선택적으로 이번 실행에만 영상 경로를 override 할 수 있습니다:
+이 경우 public demo bucket에서 `screw`, `metal_nut`, `cable`, `capsule` 중 하나를 랜덤으로 골라
+`train/good` 이미지를 로컬 캐시에 내려받은 뒤 슬라이드쇼처럼 반복 재생합니다.
+
+선택적으로 이번 실행에만 로컬 영상 파일 입력으로 override 할 수 있습니다:
 ```bash
 nuv-agent run --demo --demo-video /opt/nuvion/demo/demo.mp4
 ```
 
 정책:
-- 데모 모드에서 `NUVION_DEMO_VIDEO_PATH`가 비어있으면 설치 기본 경로의 샘플 영상을 자동 탐색합니다.
-  - Linux/deb: `/var/lib/nuv-agent/demo/exhibition-demo.webm`
-  - macOS/Homebrew: `/opt/homebrew/var/nuv-agent/demo/exhibition-demo.webm` 또는 `/usr/local/var/nuv-agent/demo/exhibition-demo.webm`
+- `--demo-video`를 주면 로컬 영상 파일 입력을 사용합니다.
+- `NUVION_DEMO_VIDEO_PATH`가 비어있으면 MVTec 슬라이드쇼 입력을 사용합니다.
+- MVTec 기본 공개 bucket:
+  - `NUVION_DEMO_MVTEC_BASE_URL=https://storage.googleapis.com/mvtec-dataset/mvtec-ad`
+- 기본 카테고리:
+  - `screw,metal_nut,cable,capsule`
+- 로컬 캐시 기본 경로:
+  - `~/.cache/nuvion/demo/mvtec`
 - Debian 설치 시 `NUVION_DEMO_VIDEO_URL` 환경변수를 주면 postinst 기본 다운로드 URL을 원하는 영상으로 교체할 수 있습니다.
-- 경로 지정값/기본 경로 모두 유효한 영상이 없으면 즉시 실패(fail-fast)합니다.
+- MVTec demo source 설정이 잘못되면 즉시 실패(fail-fast)합니다.
 - 데모 영상은 EOS 시 자동으로 처음부터 재생됩니다(`NUVION_DEMO_LOOP=true`).
 - anomaly 이벤트 message에는 `[DEMO]` prefix가 붙습니다(기본 `NUVION_DEMO_TAG=[DEMO]`).
 

@@ -93,7 +93,7 @@ class ConfigGuardTest(unittest.TestCase):
                 report = guard_config(config_path=config_path, apply_fixes=False)
             self.assertIn("NUVION_TRITON_INPUT", report.env_overrides)
 
-    def test_guard_requires_demo_video_path_when_demo_enabled(self) -> None:
+    def test_guard_accepts_mvtec_demo_defaults_when_demo_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
             config_path.write_text(
@@ -109,11 +109,8 @@ class ConfigGuardTest(unittest.TestCase):
                     ]
                 )
             )
-            with mock.patch("nuvion_app.inference.video_source.DEFAULT_DEMO_VIDEO_PATHS", tuple()):
-                with mock.patch.dict(os.environ, {"NUVION_DEMO_VIDEO_FALLBACK_PATHS": ""}, clear=False):
-                    report = guard_config(config_path=config_path, apply_fixes=True)
-            self.assertFalse(report.ok)
-            self.assertTrue(any(issue.key == "NUVION_DEMO_VIDEO_PATH" for issue in report.errors))
+            report = guard_config(config_path=config_path, apply_fixes=True)
+            self.assertTrue(report.ok)
 
     def test_guard_accepts_demo_video_path_when_demo_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

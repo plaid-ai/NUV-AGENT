@@ -49,19 +49,25 @@ class VideoSourceTest(unittest.TestCase):
             self.assertIn("uridecodebin", pipeline)
             self.assertIn(demo_file.resolve().as_uri(), pipeline)
 
-    def test_demo_mode_requires_path(self) -> None:
-        with mock.patch("nuvion_app.inference.video_source.DEFAULT_DEMO_VIDEO_PATHS", tuple()):
-            with mock.patch.dict("os.environ", {"NUVION_DEMO_VIDEO_FALLBACK_PATHS": ""}, clear=False):
-                with self.assertRaises(ValueError):
-                    build_video_source_pipeline(
-                        "/dev/video0",
-                        640,
-                        480,
-                        30,
-                        demo_mode=True,
-                        demo_video_path="",
-                        platform_name="linux",
-                    )
+    def test_demo_mode_without_video_uses_mvtec_slideshow(self) -> None:
+        fake_source = mock.Mock(
+            stage_pattern="/tmp/mvtec/slides/screw/%05d.png",
+            slideshow_caps="image/png,framerate=1/1",
+            decoder="pngdec",
+        )
+        with mock.patch("nuvion_app.inference.video_source.prepare_mvtec_demo_source", return_value=fake_source):
+            pipeline = build_video_source_pipeline(
+                "/dev/video0",
+                640,
+                480,
+                30,
+                demo_mode=True,
+                demo_video_path="",
+                platform_name="linux",
+            )
+        self.assertIn("multifilesrc", pipeline)
+        self.assertIn(fake_source.stage_pattern, pipeline)
+        self.assertIn(fake_source.decoder, pipeline)
 
     def test_gst_override_takes_priority(self) -> None:
         pipeline = build_video_source_pipeline(
