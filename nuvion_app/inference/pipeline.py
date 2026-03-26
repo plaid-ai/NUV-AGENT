@@ -151,11 +151,23 @@ ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), def
 CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
-CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 1.0)
+CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 2.0)
 CLIP_MAX_SEGMENTS = int(os.getenv("NUVION_CLIP_MAX_SEGMENTS", "30"))
 CLIP_OUTPUT_DIR = os.getenv("NUVION_CLIP_OUTPUT_DIR", "/tmp/nuvion_clips")
 CLIP_COOLDOWN_SEC = parse_float(os.getenv("NUVION_CLIP_COOLDOWN_SEC"), 10.0)
 CLIP_CONTENT_TYPE = os.getenv("NUVION_CLIP_CONTENT_TYPE", "video/mp4")
+CLIP_WARMUP_SEC = parse_float(
+    os.getenv("NUVION_CLIP_WARMUP_SEC"),
+    CLIP_PRE_SEC + CLIP_SEGMENT_SEC + 1.0,
+)
+CLIP_SEGMENT_MIN_AGE_SEC = parse_float(
+    os.getenv("NUVION_CLIP_SEGMENT_MIN_AGE_SEC"),
+    max(CLIP_SEGMENT_SEC * 1.5, 2.0),
+)
+CLIP_SEGMENT_MIN_SIZE_BYTES = parse_int_with_default(
+    os.getenv("NUVION_CLIP_SEGMENT_MIN_SIZE_BYTES"),
+    64 * 1024,
+)
 
 LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
@@ -307,6 +319,29 @@ def resolve_ffmpeg_path() -> str | None:
             _FFMPEG_PATH = path
             log.info("[CLIP] Using ffmpeg at %s", path)
             return _FFMPEG_PATH
+
+    return None
+
+
+def resolve_ffprobe_path() -> str | None:
+    custom = os.getenv("NUVION_FFPROBE_PATH", "").strip()
+    if custom:
+        if os.path.isfile(custom) and os.access(custom, os.X_OK):
+            log.info("[CLIP] Using ffprobe from NUVION_FFPROBE_PATH=%s", custom)
+            return custom
+        log.warning("[CLIP] NUVION_FFPROBE_PATH is not executable: %s", custom)
+
+    candidate = shutil.which("ffprobe")
+    if candidate:
+        log.info("[CLIP] Using ffprobe at %s", candidate)
+        return candidate
+
+    ffmpeg_path = resolve_ffmpeg_path()
+    if ffmpeg_path:
+        sibling = os.path.join(os.path.dirname(ffmpeg_path), "ffprobe")
+        if os.path.isfile(sibling) and os.access(sibling, os.X_OK):
+            log.info("[CLIP] Using ffprobe at %s", sibling)
+            return sibling
 
     return None
 
@@ -1017,6 +1052,7 @@ async def signaling_client_main():
 
 class NuvionEventState:
     def __init__(self, overlay_callback=None):
+        self.pipeline_started_at = time.time()
         self.running = True
         self.last_anomaly_at = 0.0
         self.last_production_at = 0.0
@@ -1131,6 +1167,12 @@ class NuvionEventState:
         if not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
+        if now - self.pipeline_started_at < CLIP_WARMUP_SEC:
+            log.info(
+                "[CLIP] Warm-up guard active. Skip clip creation for %.1fs after startup.",
+                CLIP_WARMUP_SEC,
+            )
+            return None
         with self.clip_lock:
             if self.clip_in_progress:
                 return None
@@ -1184,7 +1226,46 @@ class NuvionEventState:
         segments.sort(key=os.path.getmtime)
         if len(segments) > 1:
             segments = segments[:-1]
-        return segments
+        now = time.time()
+        return [segment for segment in segments if self._is_stable_segment(segment, now)]
+
+    def _is_stable_segment(self, path: str, now: float | None = None) -> bool:
+        current = now if now is not None else time.time()
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return False
+
+        if current - stat.st_mtime < CLIP_SEGMENT_MIN_AGE_SEC:
+            return False
+
+        if stat.st_size < CLIP_SEGMENT_MIN_SIZE_BYTES:
+            return False
+
+        ffprobe_path = resolve_ffprobe_path()
+        if not ffprobe_path:
+            return True
+
+        cmd = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            log.warning("[CLIP] Skip unstable segment %s: %s", path, result.stderr.strip())
+            return False
+
+        try:
+            duration = float((result.stdout or "").strip())
+        except ValueError:
+            return False
+        return duration > 0
 
     def _collect_segments(self, before: float | None = None, after: float | None = None, count: int = 5) -> list[str]:
         segments = self._list_segments()
@@ -1210,8 +1291,13 @@ class NuvionEventState:
         post_segments = self._collect_segments(after=detected_at, count=post_count)
 
         segments = pre_segments + [s for s in post_segments if s not in pre_segments]
-        if not segments:
-            log.warning("[CLIP] No segments available for clip.")
+        minimum_segments = max(2, pre_count)
+        if len(segments) < minimum_segments:
+            log.warning(
+                "[CLIP] Not enough stable segments for clip. need>=%s actual=%s",
+                minimum_segments,
+                len(segments),
+            )
             return None
 
         ts = int(detected_at)
