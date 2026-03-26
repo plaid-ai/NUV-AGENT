@@ -35,6 +35,35 @@ BASE_REQUIRED_KEYS = {
     "NUVION_DEVICE_PASSWORD",
 }
 PLACEHOLDER_VALUES = {"***"}
+ADVANCED_SECTION_ORDER = [
+    "streaming",
+    "detection",
+    "connectivity",
+    "clips",
+    "runtime",
+]
+ADVANCED_SECTION_META = {
+    "streaming": (
+        "Streaming & Video",
+        "H264, relay fallback, and camera-related transport settings.",
+    ),
+    "detection": (
+        "Detection & Labels",
+        "Inference thresholds, labels, and optional line/process overrides.",
+    ),
+    "connectivity": (
+        "Health & Connectivity",
+        "Heartbeat cadence and network quality reporting.",
+    ),
+    "clips": (
+        "Clip Capture",
+        "Pre/post buffer recording and ffmpeg-based clip upload.",
+    ),
+    "runtime": (
+        "Runtime & Models",
+        "Bootstrap, Triton, model bundle, and local runtime behavior.",
+    ),
+}
 
 _LOADED = False
 _LOADED_PATH: Optional[Path] = None
@@ -158,6 +187,56 @@ def _is_placeholder(value: Optional[str]) -> bool:
 
 def _is_secret_key(key: str) -> bool:
     return any(marker in key for marker in SECRET_KEY_MARKERS)
+
+
+def _is_basic_setup_field(key: str) -> bool:
+    return key in {
+        "NUVION_SERVER_BASE_URL",
+        "NUVION_DEVICE_USERNAME",
+        "NUVION_DEVICE_PASSWORD",
+        "NUVION_VIDEO_SOURCE",
+        "NUVION_DEMO_MODE",
+    }
+
+
+def _field_section(key: str) -> str:
+    if key.startswith("NUVION_CLIP_"):
+        return "clips"
+    if key.startswith("NUVION_CONNECTIVITY_") or key == "NUVION_DEVICE_STATE_INTERVAL_SEC":
+        return "connectivity"
+    if key.startswith("NUVION_ZERO_SHOT_"):
+        return "detection"
+    if key.startswith("NUVION_TRITON_"):
+        return "runtime"
+    if key.startswith("NUVION_MODEL_") or key.startswith("NUVION_RUNTIME_") or key.startswith("NUVION_BOOTSTRAP_"):
+        return "runtime"
+    if key.startswith("NUVION_DOCKER_") or key.startswith("NUVION_HOMEBREW_"):
+        return "runtime"
+    if key.startswith("NUVION_ANOMALY_") or key.startswith("NUVION_PRODUCTION_"):
+        return "detection"
+    if key.startswith("NUVION_H264_") or key.startswith("NUVION_WEBRTC_") or key == "NUVION_VIDEO_SOURCE":
+        return "streaming"
+    if key in {"NUVION_LINE_ID", "NUVION_PROCESS_ID"}:
+        return "detection"
+    return "runtime"
+
+
+def _field_note(key: str) -> str:
+    notes = {
+        "NUVION_DEVICE_USERNAME": "Usually auto-filled by Auto Provision. You rarely need to type this manually.",
+        "NUVION_DEVICE_PASSWORD": "Usually auto-filled by Auto Provision. Leave blank on save to keep the current secret.",
+        "NUVION_DEMO_MODE": "Turn this on only when testing without a real camera.",
+        "NUVION_WEBRTC_FORCE_RELAY": "Fallback only. Live sessions can be overridden by the backend, so most users should leave this as-is.",
+        "NUVION_CLIP_ENABLED": "Stores short video evidence around anomaly events. Disable only when debugging clip-related issues.",
+    }
+    return notes.get(key, "")
+
+
+def _is_boolean_like(default_value: str, value: str) -> bool:
+    allowed = {"true", "false"}
+    default_norm = (default_value or "").strip().lower()
+    value_norm = (value or "").strip().lower()
+    return default_norm in allowed and (not value_norm or value_norm in allowed)
 
 
 def effective_required_keys(values: Optional[Dict[str, str]] = None) -> set[str]:
@@ -459,7 +538,8 @@ def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced:
         key = field["key"]
         default = values.get(key, "")
         required = key in required_keys
-        if not advanced and not required:
+        basic = _is_basic_setup_field(key)
+        if not advanced and not required and not basic:
             continue
 
         if key == "NUVION_VIDEO_SOURCE":
@@ -688,7 +768,8 @@ def _render_form(
     if siglip_device_value not in {"auto", "mps", "cuda", "cpu"}:
         siglip_device_value = "auto"
 
-    rows: List[str] = []
+    basic_rows: List[str] = []
+    advanced_sections: Dict[str, List[str]] = {section: [] for section in ADVANCED_SECTION_ORDER}
     hidden_inputs: List[str] = []
     for field in fields:
         key = field["key"]
@@ -707,13 +788,21 @@ def _render_form(
         is_secret = _is_secret_key(key)
         input_type = "password" if is_secret else "text"
         placeholder = ""
-        note = ""
+        note_parts: List[str] = []
         if is_secret and values.get(key):
             value = ""
-            note = "<div class=\"note\">Leave blank to keep current value.</div>"
+            note_parts.append("Leave blank to keep current value.")
+        extra_note = _field_note(key)
+        if extra_note:
+            note_parts.append(extra_note)
         required_attr = "required" if (key in required_keys and _is_placeholder(values.get(key))) else ""
         if key in missing:
             placeholder = " required"
+        note_html = ""
+        if note_parts:
+            note_html = "<div class=\"note\">{note}</div>".format(note=html.escape(" ".join(note_parts)))
+        is_basic = _is_basic_setup_field(key)
+        target_rows = basic_rows if is_basic else advanced_sections.setdefault(_field_section(key), [])
         if key == "NUVION_VIDEO_SOURCE" and video_source_options:
             options = list(video_source_options)
             if value and all(option["value"] != value for option in options):
@@ -735,7 +824,7 @@ def _render_form(
                 )
                 for option in options
             )
-            rows.append(
+            target_rows.append(
                 """
                 <div class="field field-row group-{group}" data-group="{group}">
                   <label>{label}<span class="key">{key}</span></label>
@@ -752,8 +841,32 @@ def _render_form(
                 )
             )
             continue
+        if _is_boolean_like(field["default"], value):
+            normalized = (value or field["default"] or "false").strip().lower()
+            if normalized not in {"true", "false"}:
+                normalized = "false"
+            target_rows.append(
+                """
+                <div class="field field-row group-{group}" data-group="{group}">
+                  <label>{label}<span class="key">{key}</span></label>
+                  <select name="{key}">
+                    <option value="false" {false_selected}>Off</option>
+                    <option value="true" {true_selected}>On</option>
+                  </select>
+                  {note}
+                </div>
+                """.format(
+                    group=html.escape(group),
+                    label=html.escape(comment),
+                    key=html.escape(key),
+                    false_selected="selected" if normalized == "false" else "",
+                    true_selected="selected" if normalized == "true" else "",
+                    note=note_html,
+                )
+            )
+            continue
 
-        rows.append(
+        target_rows.append(
             """
             <div class="field field-row group-{group}" data-group="{group}">
               <label>{label}<span class="key">{key}</span></label>
@@ -768,9 +881,45 @@ def _render_form(
                 value=html.escape(value or ""),
                 required=required_attr,
                 placeholder=html.escape(placeholder.strip()),
-                note=note,
+                note=note_html,
             )
         )
+
+    basic_block = "\n".join(basic_rows)
+    advanced_count = sum(len(rows) for rows in advanced_sections.values())
+    advanced_blocks: List[str] = []
+    for section in ADVANCED_SECTION_ORDER:
+        rows = advanced_sections.get(section, [])
+        if not rows:
+            continue
+        title, description = ADVANCED_SECTION_META[section]
+        advanced_blocks.append(
+            """
+            <section class="advanced-section" data-section="{section}">
+              <div class="section-heading">
+                <h3>{title}</h3>
+                <p>{description}</p>
+              </div>
+              {rows}
+            </section>
+            """.format(
+                section=html.escape(section),
+                title=html.escape(title),
+                description=html.escape(description),
+                rows="\n".join(rows),
+            )
+        )
+
+    advanced_block = """
+        <details class="advanced-card">
+          <summary>Advanced Options <span class="summary-meta">{count} fields</span></summary>
+          <p class="muted">
+            These settings are for debugging, local runtime tuning, or environment-specific overrides.
+            Most devices do not need changes here after initial setup.
+          </p>
+          {sections}
+        </details>
+    """.format(count=advanced_count, sections="\n".join(advanced_blocks))
 
     error_block = ""
     if missing:
@@ -921,6 +1070,10 @@ def _render_form(
           .card + .card {{
             margin-top: 20px;
           }}
+          .card h2 {{
+            margin-top: 0;
+            margin-bottom: 8px;
+          }}
           .field {{
             display: flex;
             flex-direction: column;
@@ -992,6 +1145,45 @@ def _render_form(
             font-size: 13px;
             color: var(--muted);
           }}
+          .summary-meta {{
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 500;
+            margin-left: 8px;
+          }}
+          .quick-start {{
+            background: linear-gradient(180deg, #fffdf8 0%, #ffffff 100%);
+          }}
+          .advanced-card {{
+            margin-top: 20px;
+            border-top: 1px solid var(--border);
+            padding-top: 16px;
+          }}
+          .advanced-card summary {{
+            cursor: pointer;
+            font-weight: 700;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+          }}
+          .advanced-card summary::-webkit-details-marker {{
+            display: none;
+          }}
+          .advanced-section + .advanced-section {{
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+          }}
+          .section-heading h3 {{
+            margin: 0 0 6px;
+            font-size: 16px;
+          }}
+          .section-heading p {{
+            margin: 0 0 16px;
+            color: var(--muted);
+            font-size: 13px;
+          }}
           .checks {{
             margin: 0;
             padding-left: 18px;
@@ -1033,21 +1225,29 @@ def _render_form(
         <div class="wrap">
           <header>
             <h1>Nuvion Agent Setup</h1>
-            <p>Enter device settings and save.</p>
+            <p>Start with the essentials, then open advanced options only if you need local tuning.</p>
           </header>
           {override_block}
-          {inference_block}
-          {provision_block}
-          <div class="card">
-            {error_block}
-            <form id="config-form" method="post" action="/save">
-              {hidden_inputs}
+          <form id="config-form" method="post" action="/save">
+            {hidden_inputs}
+            <div class="card quick-start">
+              <h2>Quick Start</h2>
+              <p class="muted">
+                Most devices only need the server address, device credential, camera source, and demo mode.
+              </p>
+              {error_block}
+              {basic_rows}
+            </div>
+            {provision_block}
+            {inference_block}
+            <div class="card">
+              {advanced_block}
               {rows}
               <div class="actions">
                 <button type="submit">Save</button>
               </div>
-            </form>
-          </div>
+            </div>
+          </form>
         </div>
         <script>
           async function loadSpaces() {{
@@ -1239,11 +1439,13 @@ def _render_form(
     </html>
     """.format(
         error_block=error_block,
-        rows="\n".join(rows),
+        rows="",
+        basic_rows=basic_block,
         hidden_inputs="\n".join(hidden_inputs),
         override_block=override_block,
         inference_block=inference_block,
         provision_block=provision_block,
+        advanced_block=advanced_block,
     )
 
 

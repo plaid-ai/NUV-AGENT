@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from nuvion_app.config import _parse_gst_device_monitor_output, discover_video_source_options
+from nuvion_app.config import _parse_gst_device_monitor_output, _render_form, discover_video_source_options
 
 
 class ConfigVideoSourceTest(unittest.TestCase):
@@ -41,6 +41,48 @@ Device found:
         self.assertEqual(options[0]["value"], "/dev/video0")
         self.assertEqual(options[1]["value"], "/dev/video2")
         self.assertEqual(options[-1]["value"], "rpi")
+
+    def test_render_form_groups_advanced_fields_and_renders_boolean_selects(self) -> None:
+        fields = [
+            {"key": "NUVION_SERVER_BASE_URL", "default": "https://api.example.com", "comment": "Server URL"},
+            {"key": "NUVION_DEVICE_USERNAME", "default": "device-1", "comment": "Device username"},
+            {"key": "NUVION_DEVICE_PASSWORD", "default": "***", "comment": "Device password"},
+            {"key": "NUVION_VIDEO_SOURCE", "default": "/dev/video0", "comment": "Video source"},
+            {"key": "NUVION_DEMO_MODE", "default": "false", "comment": "Demo mode"},
+            {"key": "NUVION_WEBRTC_FORCE_RELAY", "default": "true", "comment": "Force relay"},
+            {"key": "NUVION_CLIP_ENABLED", "default": "true", "comment": "Clip enabled"},
+            {"key": "NUVION_ZSAD_BACKEND", "default": "triton", "comment": "Backend"},
+            {"key": "NUVION_ZERO_SHOT_DEVICE", "default": "auto", "comment": "SigLIP device"},
+        ]
+        values = {
+            "NUVION_SERVER_BASE_URL": "https://api.example.com",
+            "NUVION_DEVICE_USERNAME": "device-1",
+            "NUVION_DEVICE_PASSWORD": "secret",
+            "NUVION_VIDEO_SOURCE": "avf:2",
+            "NUVION_DEMO_MODE": "false",
+            "NUVION_WEBRTC_FORCE_RELAY": "true",
+            "NUVION_CLIP_ENABLED": "true",
+            "NUVION_ZSAD_BACKEND": "triton",
+            "NUVION_ZERO_SHOT_DEVICE": "auto",
+        }
+
+        html = _render_form(
+            fields,
+            values,
+            missing=[],
+            device_name="nuvion-pro-1",
+            video_source_options=[
+                {"value": "avf:2", "label": "MacBook Pro Camera", "detail": "macOS camera #2"},
+            ],
+        )
+
+        self.assertIn("Quick Start", html)
+        self.assertIn("Advanced Options", html)
+        self.assertIn("Most devices only need the server address", html)
+        self.assertIn("Use detected camera names instead of typing /dev/video0 or avf:2 manually.", html)
+        self.assertIn("Live sessions can be overridden by the backend", html)
+        self.assertIn('<option value="true" selected>On</option>', html)
+        self.assertIn('<option value="false" selected>Off</option>', html)
 
 
 if __name__ == "__main__":
