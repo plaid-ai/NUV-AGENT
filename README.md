@@ -195,7 +195,7 @@ device credentials automatically (your account credentials are not stored on the
 It also includes:
 - **Inference Mode** quick selector (`Triton | SigLIP | SigLIP+MPS | None`)
 - **Conditional settings view** (only backend-relevant fields are shown)
-- **Preflight Check** button (server login / triton health / camera source or demo video source / RTP target)
+- **Preflight Check** button (server login / triton health / camera source or demo video source)
 - **Environment override warning** when shell env values override file values
 
 For headless devices:
@@ -231,7 +231,7 @@ For dev, `.env` in the repo is used automatically.
 - macOS: use Homebrew service definition in `packaging/homebrew/nuv-agent.rb`.
 
 ## Device configuration
-- `NUVION_VIDEO_SOURCE`: USB webcam path (e.g., `/dev/video0`) or `rpi` for Pi camera
+- `NUVION_VIDEO_SOURCE`: camera source. Linux는 `/dev/video0`, macOS는 `avf` 또는 `avf:<index>`, Raspberry Pi는 `rpi`
 - `NUVION_DEMO_MODE`: 데모 모드 활성화 (`true|false`)
 - `NUVION_DEMO_MVTEC_BASE_URL`: MVTec archive base URL
 - `NUVION_DEMO_MVTEC_CATEGORIES`: 랜덤 선택 후보 category CSV

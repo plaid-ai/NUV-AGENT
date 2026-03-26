@@ -21,9 +21,6 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
-from nuvion_app.inference.webrtc_signaling import UPLINK_MODE_RTP, normalize_uplink_mode
-
-
 DEFAULT_PORT = 8088
 SECRET_KEY_MARKERS = ("PASSWORD",)
 DEVICE_TYPE = "NUV_AGENT"
@@ -37,10 +34,6 @@ BASE_REQUIRED_KEYS = {
     "NUVION_DEVICE_USERNAME",
     "NUVION_DEVICE_PASSWORD",
 }
-LEGACY_RTP_REQUIRED_KEYS = {
-    "NUVION_RTP_REMOTE_IP",
-}
-REQUIRED_KEYS = BASE_REQUIRED_KEYS | LEGACY_RTP_REQUIRED_KEYS
 PLACEHOLDER_VALUES = {"***"}
 
 _LOADED = False
@@ -168,11 +161,8 @@ def _is_secret_key(key: str) -> bool:
 
 
 def effective_required_keys(values: Optional[Dict[str, str]] = None) -> set[str]:
-    resolved = set(BASE_REQUIRED_KEYS)
-    uplink_mode = normalize_uplink_mode((values or {}).get("NUVION_UPLINK_MODE"))
-    if uplink_mode == UPLINK_MODE_RTP:
-        resolved.update(LEGACY_RTP_REQUIRED_KEYS)
-    return resolved
+    _ = values
+    return set(BASE_REQUIRED_KEYS)
 
 
 def template_path() -> Path:
@@ -668,29 +658,6 @@ def _check_demo_video_source(values: Dict[str, str]) -> Dict[str, str]:
     return {"name": "Demo dataset source", "status": "pass", "detail": detail}
 
 
-def _check_rtp_target(values: Dict[str, str]) -> Dict[str, str]:
-    rtp_ip = (values.get("NUVION_RTP_REMOTE_IP") or "").strip()
-    if not rtp_ip:
-        return {
-            "name": "RTP target",
-            "status": "warn",
-            "detail": "NUVION_RTP_REMOTE_IP is empty.",
-        }
-    try:
-        resolved = socket.gethostbyname(rtp_ip)
-    except Exception as exc:
-        return {
-            "name": "RTP target",
-            "status": "fail",
-            "detail": f"Failed to resolve host '{rtp_ip}': {exc}",
-        }
-    return {
-        "name": "RTP target",
-        "status": "pass",
-        "detail": f"Host resolves to {resolved}.",
-    }
-
-
 def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
     demo_mode = _is_truthy(values.get("NUVION_DEMO_MODE", "false"))
     source_check = _check_demo_video_source(values) if demo_mode else _check_camera_source(values)
@@ -699,8 +666,6 @@ def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
         _check_triton_health(values),
         source_check,
     ]
-    if normalize_uplink_mode(values.get("NUVION_UPLINK_MODE")) == UPLINK_MODE_RTP:
-        checks.append(_check_rtp_target(values))
     has_fail = any(check["status"] == "fail" for check in checks)
     return {"ok": not has_fail, "checks": checks}
 
@@ -1166,15 +1131,11 @@ def _render_form(
               }}
               const deviceUsername = data.deviceUsername || data.username || "";
               const devicePassword = data.devicePassword || data.password || data.deviceSecret || "";
-              const rtpIp = data.rtpRemoteIp || data.rtpIp || "";
               if (deviceUsername) {{
                 document.querySelector('input[name="NUVION_DEVICE_USERNAME"]').value = deviceUsername;
               }}
               if (devicePassword) {{
                 document.querySelector('input[name="NUVION_DEVICE_PASSWORD"]').value = devicePassword;
-              }}
-              if (rtpIp) {{
-                document.querySelector('input[name="NUVION_RTP_REMOTE_IP"]').value = rtpIp;
               }}
               statusEl.textContent = "Device credentials created. Review and click Save.";
             }} catch (err) {{
@@ -1528,14 +1489,10 @@ def run_qr_setup(config_path: Path, advanced: bool) -> None:
         or result.get("deviceSecret")
         or result.get("secret")
     )
-    rtp_ip = result.get("rtpRemoteIp") or result.get("rtpIp")
-
     if device_username:
         values["NUVION_DEVICE_USERNAME"] = str(device_username)
     if device_password:
         values["NUVION_DEVICE_PASSWORD"] = str(device_password)
-    if rtp_ip:
-        values["NUVION_RTP_REMOTE_IP"] = str(rtp_ip)
 
     missing = _validate_required(values)
     if missing:

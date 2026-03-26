@@ -6,9 +6,7 @@ from urllib.parse import quote, urlparse
 
 
 UPLINK_MODE_WEBRTC = "webrtc"
-UPLINK_MODE_RTP = "rtp"
 DEFAULT_UPLINK_MODE = UPLINK_MODE_WEBRTC
-VALID_UPLINK_MODES = {UPLINK_MODE_WEBRTC, UPLINK_MODE_RTP}
 
 WEBRTC_UPLINK_START = "WEBRTC_UPLINK_START"
 WEBRTC_UPLINK_ANSWER = "WEBRTC_UPLINK_ANSWER"
@@ -23,10 +21,8 @@ WEBRTC_UPLINK_STOP_DEST = "/app/webrtc/uplink/stop"
 
 
 def normalize_uplink_mode(value: str | None, default: str = DEFAULT_UPLINK_MODE) -> str:
-    candidate = (value or default).strip().lower()
-    if candidate in VALID_UPLINK_MODES:
-        return candidate
-    return default
+    _ = value, default
+    return UPLINK_MODE_WEBRTC
 
 
 def parse_command_payload(body: str) -> dict[str, Any] | None:

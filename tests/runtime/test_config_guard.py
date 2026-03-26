@@ -19,7 +19,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_TRITON_INPUT=images",
                         "NUVION_TRITON_INPUT_FORMAT=INVALID",
                         "NUVION_MODEL_SOURCE=invalid",
@@ -46,7 +45,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=***",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "",
                     ]
                 )
@@ -55,7 +53,7 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(issue.key == "NUVION_DEVICE_PASSWORD" for issue in report.errors))
 
-    def test_guard_accepts_missing_rtp_target_in_webrtc_mode(self) -> None:
+    def test_guard_accepts_webrtc_only_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
             config_path.write_text(
@@ -64,8 +62,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_UPLINK_MODE=webrtc",
-                        "NUVION_RTP_REMOTE_IP=",
                         "NUVION_ZSAD_BACKEND=none",
                         "",
                     ]
@@ -83,7 +79,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_TRITON_INPUT=image",
                         "",
                     ]
@@ -102,7 +97,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_DEMO_MODE=true",
                         "",
                     ]
@@ -120,7 +114,6 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_SERVER_BASE_URL=https://api.example.com",
                         "NUVION_DEVICE_USERNAME=device-1",
                         "NUVION_DEVICE_PASSWORD=secret",
-                        "NUVION_RTP_REMOTE_IP=1.2.3.4",
                         "NUVION_DEMO_MODE=true",
                         "NUVION_DEMO_MVTEC_BASE_URL=ftp://invalid",
                         "",
