@@ -4,7 +4,9 @@ import html
 import json
 import os
 import platform
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -43,6 +45,109 @@ PLACEHOLDER_VALUES = {"***"}
 
 _LOADED = False
 _LOADED_PATH: Optional[Path] = None
+
+
+def _video_source_sort_key(value: str) -> tuple[int, str]:
+    match = re.search(r"(\d+)$", value)
+    if match:
+        return int(match.group(1)), value
+    return 10_000, value
+
+
+def _parse_gst_device_monitor_output(output: str) -> List[Dict[str, str]]:
+    options: List[Dict[str, str]] = []
+    for block in output.split("Device found:"):
+        name_match = re.search(r"^\s*name\s*:\s*(.+)$", block, re.MULTILINE)
+        launch_match = re.search(r"gst-launch-1\.0\s+avfvideosrc(?:\s+device-index=(\d+))?", block)
+        if not name_match or not launch_match:
+            continue
+        name = name_match.group(1).strip()
+        device_index = launch_match.group(1)
+        if device_index is None:
+            continue
+        options.append(
+            {
+                "value": f"avf:{device_index}",
+                "label": name,
+                "detail": f"macOS camera #{device_index}",
+            }
+        )
+    return options
+
+
+def discover_video_source_options(platform_name: Optional[str] = None) -> List[Dict[str, str]]:
+    current_platform = platform_name or sys.platform
+    options: List[Dict[str, str]] = []
+
+    if current_platform == "darwin":
+        options.append(
+            {
+                "value": "avf",
+                "label": "Default macOS camera",
+                "detail": "Uses AVFoundation default device.",
+            }
+        )
+        try:
+            result = subprocess.run(
+                ["gst-device-monitor-1.0", "Video/Source"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            options.extend(_parse_gst_device_monitor_output(result.stdout))
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+        return options
+
+    video_devices = sorted(Path("/dev").glob("video*"), key=lambda path: _video_source_sort_key(path.name))
+    for device in video_devices:
+        options.append(
+            {
+                "value": str(device),
+                "label": device.name,
+                "detail": "Linux V4L2 camera device",
+            }
+        )
+
+    if current_platform.startswith("linux"):
+        options.append(
+            {
+                "value": "rpi",
+                "label": "Raspberry Pi camera",
+                "detail": "Uses libcamerasrc.",
+            }
+        )
+
+    return options
+
+
+def _prompt_video_source(default: str, platform_name: Optional[str] = None) -> str:
+    options = discover_video_source_options(platform_name)
+    if options:
+        print("Available camera sources:")
+        for index, option in enumerate(options, start=1):
+            suffix = " (current)" if option["value"] == default else ""
+            detail = f" - {option['detail']}" if option.get("detail") else ""
+            print(f"  {index}. {option['label']} [{option['value']}] {detail}{suffix}")
+        print("Enter a number to select a camera, or type a custom source value.")
+
+    prompt = "Camera source (NUVION_VIDEO_SOURCE)"
+    if default:
+        prompt += f" [{default}]"
+    prompt += ": "
+
+    while True:
+        entered = input(prompt).strip()
+        if not entered:
+            return default
+        if entered.isdigit():
+            selected_index = int(entered) - 1
+            if 0 <= selected_index < len(options):
+                return options[selected_index]["value"]
+            print("Invalid selection number.")
+            continue
+        return entered
 
 
 def _is_placeholder(value: Optional[str]) -> bool:
@@ -367,6 +472,10 @@ def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced:
         if not advanced and not required:
             continue
 
+        if key == "NUVION_VIDEO_SOURCE":
+            values[key] = _prompt_video_source(default)
+            continue
+
         label = field["comment"] or key
         prompt = f"{label} ({key})"
         if default:
@@ -602,8 +711,10 @@ def _render_form(
     missing: List[str],
     device_name: str,
     env_overrides: Optional[Dict[str, str]] = None,
+    video_source_options: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     env_overrides = env_overrides or {}
+    video_source_options = video_source_options or []
     required_keys = effective_required_keys(values)
     backend_value = (values.get("NUVION_ZSAD_BACKEND") or "triton").strip().lower() or "triton"
     if backend_value not in {"triton", "siglip", "mps", "none"}:
@@ -638,6 +749,45 @@ def _render_form(
         required_attr = "required" if (key in required_keys and _is_placeholder(values.get(key))) else ""
         if key in missing:
             placeholder = " required"
+        if key == "NUVION_VIDEO_SOURCE" and video_source_options:
+            options = list(video_source_options)
+            if value and all(option["value"] != value for option in options):
+                options.append(
+                    {
+                        "value": value,
+                        "label": f"Current: {value}",
+                        "detail": "Custom source",
+                    }
+                )
+
+            option_rows = "\n".join(
+                '<option value="{value}" {selected}>{label}</option>'.format(
+                    value=html.escape(option["value"]),
+                    selected="selected" if option["value"] == value else "",
+                    label=html.escape(
+                        option["label"] + (f" ({option['detail']})" if option.get("detail") else "")
+                    ),
+                )
+                for option in options
+            )
+            rows.append(
+                """
+                <div class="field field-row group-{group}" data-group="{group}">
+                  <label>{label}<span class="key">{key}</span></label>
+                  <select name="{key}">
+                    {options}
+                  </select>
+                  <div class="note">Use detected camera names instead of typing /dev/video0 or avf:2 manually.</div>
+                </div>
+                """.format(
+                    group=html.escape(group),
+                    label=html.escape(comment),
+                    key=html.escape(key),
+                    options=option_rows,
+                )
+            )
+            continue
+
         rows.append(
             """
             <div class="field field-row group-{group}" data-group="{group}">
@@ -1145,6 +1295,7 @@ def run_web_setup(
     lines, fields = load_template()
     existing = _merge_defaults(fields, read_env(config_path))
     device_name = socket.gethostname()
+    video_source_options = discover_video_source_options()
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return
@@ -1174,6 +1325,7 @@ def run_web_setup(
                     missing,
                     device_name,
                     env_overrides=_collect_env_overrides(fields, existing),
+                    video_source_options=video_source_options,
                 )
                 self._send_html(HTTPStatus.OK, body)
                 return
@@ -1288,6 +1440,7 @@ def run_web_setup(
                     missing,
                     device_name,
                     env_overrides=_collect_env_overrides(fields, values),
+                    video_source_options=video_source_options,
                 )
                 self._send_html(HTTPStatus.BAD_REQUEST, body)
                 return
