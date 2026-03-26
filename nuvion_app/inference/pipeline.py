@@ -1417,7 +1417,7 @@ class GStreamerInferenceApp:
             "x264enc "
             "tune=zerolatency "
             "speed-preset=faster "
-            "bitrate=8000 "
+            "bitrate=1000 "
             "vbv-buf-capacity=10000 "
             "key-int-max=30 "
             "bframes=0 "
