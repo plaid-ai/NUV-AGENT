@@ -42,10 +42,41 @@ def _is_darwin() -> bool:
     return os.uname().sysname.lower() == "darwin"
 
 
+def _is_raspberry_pi_linux() -> bool:
+    try:
+        if os.uname().sysname.lower() != "linux":
+            return False
+    except Exception:
+        return False
+
+    probe_paths = (
+        Path("/proc/device-tree/model"),
+        Path("/sys/firmware/devicetree/base/model"),
+        Path("/proc/device-tree/compatible"),
+        Path("/sys/firmware/devicetree/base/compatible"),
+    )
+    for probe_path in probe_paths:
+        try:
+            content = probe_path.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").lower()
+        except OSError:
+            continue
+        if "raspberry pi" in content or "raspberrypi" in content:
+            return True
+    return False
+
+
+def _should_use_full_triton_profile() -> bool:
+    return _is_darwin() or _is_raspberry_pi_linux()
+
+
 def resolve_effective_profile() -> str:
     default_profile = (os.getenv("NUVION_MODEL_PROFILE", DEFAULT_MODEL_PROFILE) or DEFAULT_MODEL_PROFILE).strip().lower()
-    if _is_darwin():
-        profile = (os.getenv("NUVION_TRITON_MAC_PROFILE", "full") or "full").strip().lower()
+    if _should_use_full_triton_profile():
+        if _is_darwin():
+            profile_env_name = "NUVION_TRITON_MAC_PROFILE"
+        else:
+            profile_env_name = "NUVION_TRITON_RPI_PROFILE"
+        profile = (os.getenv(profile_env_name, "full") or "full").strip().lower()
     else:
         # Jetson/Linux Triton path should default to the minimal runtime bundle
         # (text_features + plan + triton_config + manifest) unless explicitly overridden.

@@ -51,6 +51,37 @@ def _emit_progress(message: str) -> None:
     sys.stderr.flush()
 
 
+def _is_darwin() -> bool:
+    return os.uname().sysname.lower() == "darwin"
+
+
+def _is_raspberry_pi_linux() -> bool:
+    try:
+        if os.uname().sysname.lower() != "linux":
+            return False
+    except Exception:
+        return False
+
+    probe_paths = (
+        Path("/proc/device-tree/model"),
+        Path("/sys/firmware/devicetree/base/model"),
+        Path("/proc/device-tree/compatible"),
+        Path("/sys/firmware/devicetree/base/compatible"),
+    )
+    for probe_path in probe_paths:
+        try:
+            content = probe_path.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").lower()
+        except OSError:
+            continue
+        if "raspberry pi" in content or "raspberrypi" in content:
+            return True
+    return False
+
+
+def _should_use_onnx_repository() -> bool:
+    return _is_darwin() or _is_raspberry_pi_linux()
+
+
 def _should_autostop() -> bool:
     return _truthy(os.getenv("NUVION_TRITON_AUTOSTOP_ON_EXIT"), default=True)
 
@@ -103,7 +134,7 @@ def _health_ready(host: str, port: int, timeout_sec: int) -> bool:
     return False
 
 
-def _ensure_macos_onnx_repository(model_dir: Path, repository_root: Path) -> Path:
+def _ensure_cpu_onnx_repository(model_dir: Path, repository_root: Path) -> Path:
     model_repo = repository_root / "image_encoder" / "1"
     model_repo.mkdir(parents=True, exist_ok=True)
 
@@ -111,7 +142,7 @@ def _ensure_macos_onnx_repository(model_dir: Path, repository_root: Path) -> Pat
     if not onnx_src.exists():
         raise BootstrapError(
             "triton_health_failed",
-            f"Missing ONNX model for macOS fallback: {onnx_src}",
+            f"Missing ONNX model for CPU fallback: {onnx_src}",
         )
 
     target_onnx = model_repo / "model.onnx"
@@ -121,7 +152,7 @@ def _ensure_macos_onnx_repository(model_dir: Path, repository_root: Path) -> Pat
     target_config_dir = repository_root / "image_encoder"
     target_config_dir.mkdir(parents=True, exist_ok=True)
     target_config = target_config_dir / "config.pbtxt"
-    # macOS always uses ONNXRuntime config to avoid TensorRT(GPU-only) bootstrap failure.
+    # CPU-only fallback uses ONNXRuntime config to avoid TensorRT(GPU-only) bootstrap failure.
     target_config.write_text(_FALLBACK_CONFIG)
 
     return repository_root
@@ -129,13 +160,13 @@ def _ensure_macos_onnx_repository(model_dir: Path, repository_root: Path) -> Pat
 
 def resolve_repository_for_runtime(model_dir: Path) -> Path:
     default_repo = model_dir / "triton" / "model_repository"
-    if os.uname().sysname.lower() != "darwin":
+    if not _should_use_onnx_repository():
         if not default_repo.exists():
             raise BootstrapError("triton_health_failed", f"Triton model repository is missing: {default_repo}")
         return default_repo
 
     fallback = model_dir / "triton" / "model_repository_onnx"
-    return _ensure_macos_onnx_repository(model_dir=model_dir, repository_root=fallback)
+    return _ensure_cpu_onnx_repository(model_dir=model_dir, repository_root=fallback)
 
 
 def ensure_triton_ready(stage: str, model_dir: Path) -> None:

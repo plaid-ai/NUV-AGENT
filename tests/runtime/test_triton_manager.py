@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from nuvion_app.runtime import triton_manager
-
-
-class _Uname:
-    def __init__(self, sysname: str):
-        self.sysname = sysname
 
 
 class TritonManagerTest(unittest.TestCase):
@@ -22,7 +16,7 @@ class TritonManagerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "triton" / "model_repository"
             repo.mkdir(parents=True, exist_ok=True)
-            with mock.patch.object(os, "uname", return_value=_Uname("Linux")):
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=False):
                 resolved = triton_manager.resolve_repository_for_runtime(Path(tmp))
                 self.assertEqual(resolved, repo)
 
@@ -33,7 +27,7 @@ class TritonManagerTest(unittest.TestCase):
             (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
             (model_dir / "onnx" / "image_encoder_simplified.onnx").write_bytes(b"onnx")
 
-            with mock.patch.object(os, "uname", return_value=_Uname("Darwin")):
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=True):
                 resolved = triton_manager.resolve_repository_for_runtime(model_dir)
 
             self.assertTrue((resolved / "image_encoder" / "1" / "model.onnx").exists())
@@ -49,13 +43,26 @@ class TritonManagerTest(unittest.TestCase):
             (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
             (model_dir / "onnx" / "image_encoder_simplified.onnx").write_bytes(b"fallback-onnx")
 
-            with mock.patch.object(os, "uname", return_value=_Uname("Darwin")):
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=True):
                 resolved = triton_manager.resolve_repository_for_runtime(model_dir)
 
             self.assertEqual(resolved, model_dir / "triton" / "model_repository_onnx")
             config = (resolved / "image_encoder" / "config.pbtxt").read_text()
             self.assertIn('platform: "onnxruntime_onnx"', config)
             self.assertNotIn('name: "images"', config)
+
+    def test_resolve_repository_uses_onnx_repo_on_raspberry_pi(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "triton" / "model_repository" / "image_encoder" / "1").mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx" / "image_encoder_simplified.onnx").write_bytes(b"fallback-onnx")
+
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=True):
+                resolved = triton_manager.resolve_repository_for_runtime(model_dir)
+
+            self.assertEqual(resolved, model_dir / "triton" / "model_repository_onnx")
+            self.assertTrue((resolved / "image_encoder" / "1" / "model.onnx").exists())
 
     def test_cleanup_managed_triton_stops_running_container(self) -> None:
         triton_manager._managed_triton_container = "triton-nuv"
