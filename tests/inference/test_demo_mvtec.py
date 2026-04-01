@@ -7,6 +7,8 @@ from unittest import mock
 
 from nuvion_app.inference.demo_mvtec import build_slideshow_caps
 from nuvion_app.inference.demo_mvtec import build_stage_dir
+from nuvion_app.inference.demo_mvtec import collect_mvtec_demo_images
+from nuvion_app.inference.demo_mvtec import infer_mvtec_ground_truth_label
 from nuvion_app.inference.demo_mvtec import parse_mvtec_categories
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 
@@ -42,6 +44,38 @@ class DemoMvtecTest(unittest.TestCase):
     def test_build_slideshow_caps_uses_fractional_rate(self) -> None:
         caps = build_slideshow_caps(".png", 2.0)
         self.assertEqual(caps, "image/png,framerate=1/2")
+
+    def test_collect_mvtec_demo_images_prefers_test_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "metal_nut" / "test"
+            (root / "good").mkdir(parents=True)
+            (root / "scratch").mkdir(parents=True)
+            (root / "good" / "000.png").write_bytes(b"good")
+            (root / "scratch" / "001.png").write_bytes(b"defect")
+
+            image_paths = collect_mvtec_demo_images(Path(tmp), "metal_nut")
+
+            self.assertEqual(
+                [path.relative_to(Path(tmp)).as_posix() for path in image_paths],
+                [
+                    "metal_nut/test/good/000.png",
+                    "metal_nut/test/scratch/001.png",
+                ],
+            )
+
+    def test_infer_mvtec_ground_truth_label_uses_good_as_normal(self) -> None:
+        self.assertEqual(
+            infer_mvtec_ground_truth_label(Path("/tmp/capsule/train/good/000.png")),
+            "normal",
+        )
+        self.assertEqual(
+            infer_mvtec_ground_truth_label(Path("/tmp/capsule/test/good/001.png")),
+            "normal",
+        )
+        self.assertEqual(
+            infer_mvtec_ground_truth_label(Path("/tmp/capsule/test/scratch/002.png")),
+            "defect",
+        )
 
 
 if __name__ == "__main__":

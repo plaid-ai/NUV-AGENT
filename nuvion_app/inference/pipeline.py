@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import numpy as np
@@ -28,6 +29,8 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.demo_mvtec import MvtecDemoSource
+from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -71,6 +74,34 @@ except Exception:
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+
+OVERLAY_COLOR_WHITE = 0xFFFFFFFF
+OVERLAY_COLOR_GREEN = 0xFF00FF00
+OVERLAY_COLOR_RED = 0xFFFF0000
+DEMO_OVERLAY_STATUS_XPAD = 25
+DEMO_OVERLAY_LABEL_XPAD = 175
+DEMO_OVERLAY_SCORE_XPAD = 360
+DEMO_OVERLAY_GT_XPAD = 470
+
+
+@dataclass(frozen=True)
+class OverlayPayload:
+    status: str
+    label: str
+    score: float
+    ground_truth: str | None = None
+
+    @property
+    def score_text(self) -> str:
+        return f"{self.score:.2f}"
+
+    @property
+    def matches_ground_truth(self) -> bool | None:
+        if self.ground_truth == "normal":
+            return self.status == "NORMAL"
+        if self.ground_truth == "defect":
+            return self.status == "DEFECT"
+        return None
 
 
 def parse_csv(value: str) -> list[str]:
@@ -847,7 +878,7 @@ async def signaling_client_main():
 
 
 class NuvionEventState:
-    def __init__(self, overlay_callback=None):
+    def __init__(self, overlay_callback=None, demo_source: MvtecDemoSource | None = None):
         self.pipeline_started_at = time.time()
         self.running = True
         self.last_anomaly_at = 0.0
@@ -861,6 +892,11 @@ class NuvionEventState:
         self.clip_enabled = CLIP_ENABLED
         self.demo_mode = DEMO_MODE
         self.demo_tag = DEMO_TAG
+        self.demo_source = demo_source
+        self.demo_ground_truth_labels = tuple(demo_source.ground_truth_labels) if demo_source else ()
+        self.demo_image_duration_sec = float(demo_source.image_duration_sec) if demo_source else 0.0
+        self.demo_started_at = time.time()
+        self.current_demo_ground_truth = self.demo_ground_truth_labels[0] if self.demo_ground_truth_labels else None
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
@@ -890,6 +926,28 @@ class NuvionEventState:
 
         self.worker_thread = threading.Thread(target=self._zsad_worker, daemon=True)
         self.worker_thread.start()
+
+    def reset_demo_timing(self) -> None:
+        self.demo_started_at = time.time()
+        if self.demo_ground_truth_labels:
+            self.current_demo_ground_truth = self.demo_ground_truth_labels[0]
+
+    def update_demo_ground_truth(self, pts_ns: int | None) -> None:
+        if not self.demo_mode or not self.demo_ground_truth_labels:
+            return
+
+        index: int | None = None
+        if pts_ns is not None and pts_ns != Gst.CLOCK_TIME_NONE and self.demo_image_duration_sec > 0:
+            duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
+            index = int(pts_ns // duration_ns)
+        elif self.demo_image_duration_sec > 0:
+            elapsed = max(0.0, time.time() - self.demo_started_at)
+            index = int(elapsed / self.demo_image_duration_sec)
+
+        if index is None:
+            return
+
+        self.current_demo_ground_truth = self.demo_ground_truth_labels[index % len(self.demo_ground_truth_labels)]
 
     def _get_or_create_triton_client(self):
         if TritonAnomalyClient is None:
@@ -1176,7 +1234,13 @@ class NuvionEventState:
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
-                    self._emit_overlay(f"{status} {label} {score:.2f}")
+                    overlay = OverlayPayload(
+                        status=status,
+                        label=label,
+                        score=score,
+                        ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
+                    )
+                    self._emit_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
                     if status == "DEFECT":
                         self.send_status("DEFECT", label, f"Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
                     else:
@@ -1203,7 +1267,13 @@ class NuvionEventState:
                 score = float(result.get("score", 0.0))
                 is_anomaly = score >= TRITON_THRESHOLD
                 status = "DEFECT" if is_anomaly else "NORMAL"
-                self._emit_overlay(f"{status} {label} {score:.2f}")
+                overlay = OverlayPayload(
+                    status=status,
+                    label=label,
+                    score=score,
+                    ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
+                )
+                self._emit_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
 
                 if status == "DEFECT":
                     self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING")
@@ -1241,6 +1311,7 @@ def on_new_sample(appsink, user_data: NuvionEventState):
         return Gst.FlowReturn.OK
 
     buffer.unmap(mapinfo)
+    user_data.update_demo_ground_truth(int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None)
     user_data.maybe_enqueue_frame(frame)
     return Gst.FlowReturn.OK
 
@@ -1253,9 +1324,14 @@ class GStreamerInferenceApp:
         self.video_source = video_source
         self.demo_mode = DEMO_MODE
         self.demo_loop = DEMO_LOOP
+        self.demo_source = self._prepare_demo_source() if self.demo_mode else None
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
-        self.user_data = NuvionEventState(self.update_overlay_text)
+        self.status_overlay = None
+        self.label_overlay = None
+        self.score_overlay = None
+        self.gt_overlay = None
+        self.user_data = NuvionEventState(self.update_overlay_text, demo_source=self.demo_source)
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
             default_force_relay=WEBRTC_FORCE_RELAY,
@@ -1271,6 +1347,14 @@ class GStreamerInferenceApp:
         global g_app
         g_app = self
 
+    def _prepare_demo_source(self) -> MvtecDemoSource | None:
+        return prepare_mvtec_demo_source(
+            base_url=os.getenv("NUVION_DEMO_MVTEC_BASE_URL"),
+            categories=os.getenv("NUVION_DEMO_MVTEC_CATEGORIES"),
+            cache_dir=os.getenv("NUVION_DEMO_MVTEC_CACHE_DIR"),
+            image_duration_sec=float(os.getenv("NUVION_DEMO_IMAGE_DURATION_SEC", "1.0")),
+        )
+
     def create_pipeline(self):
         Gst.init(None)
         source_pipeline = build_video_source_pipeline(
@@ -1280,17 +1364,62 @@ class GStreamerInferenceApp:
             self.frame_rate,
             gst_source_override=GST_SOURCE_OVERRIDE,
             demo_mode=self.demo_mode,
+            demo_source=self.demo_source,
         )
 
-        overlay_pipeline = (
-            "videoconvert ! "
-            "textoverlay name=zsad_overlay "
-            "font-desc=\"Sans 24\" "
-            "halignment=left valignment=top "
-            "shaded-background=true "
-            "text=\"\" "
-            "! "
-        )
+        if self.demo_mode:
+            overlay_pipeline = (
+                "videoconvert ! "
+                "textoverlay name=zsad_overlay "
+                "font-desc=\"Sans 24\" "
+                "halignment=left valignment=top "
+                "shaded-background=true "
+                "xpad=25 "
+                "text=\"\" "
+                "! "
+                "textoverlay name=zsad_status_overlay "
+                "font-desc=\"Monospace 24\" "
+                "halignment=left valignment=top "
+                f"xpad={DEMO_OVERLAY_STATUS_XPAD} "
+                "shaded-background=true "
+                "color=4294967295 "
+                "text=\"\" "
+                "! "
+                "textoverlay name=zsad_label_overlay "
+                "font-desc=\"Monospace 24\" "
+                "halignment=left valignment=top "
+                f"xpad={DEMO_OVERLAY_LABEL_XPAD} "
+                "shaded-background=true "
+                "color=4294967295 "
+                "text=\"\" "
+                "! "
+                "textoverlay name=zsad_score_overlay "
+                "font-desc=\"Monospace 24\" "
+                "halignment=left valignment=top "
+                f"xpad={DEMO_OVERLAY_SCORE_XPAD} "
+                "shaded-background=true "
+                "color=4294967295 "
+                "text=\"\" "
+                "! "
+                "textoverlay name=zsad_gt_overlay "
+                "font-desc=\"Monospace 24\" "
+                "halignment=left valignment=top "
+                f"xpad={DEMO_OVERLAY_GT_XPAD} "
+                "shaded-background=true "
+                "color=4294967295 "
+                "text=\"\" "
+                "! "
+            )
+        else:
+            overlay_pipeline = (
+                "videoconvert ! "
+                "textoverlay name=zsad_overlay "
+                "font-desc=\"Sans 24\" "
+                "halignment=left valignment=top "
+                "shaded-background=true "
+                "text=\"\" "
+                "! "
+            )
 
         encoder_pipeline = (
             "videoconvert ! "
@@ -1376,6 +1505,10 @@ class GStreamerInferenceApp:
             log.warning("[PIPELINE] zsad_overlay not found.")
         else:
             self.update_overlay_text(self._default_overlay_text())
+        self.status_overlay = self.pipeline.get_by_name("zsad_status_overlay")
+        self.label_overlay = self.pipeline.get_by_name("zsad_label_overlay")
+        self.score_overlay = self.pipeline.get_by_name("zsad_score_overlay")
+        self.gt_overlay = self.pipeline.get_by_name("zsad_gt_overlay")
 
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None
@@ -1399,6 +1532,7 @@ class GStreamerInferenceApp:
             restart_result = self.pipeline.set_state(Gst.State.PLAYING)
             if restart_result == Gst.StateChangeReturn.FAILURE:
                 return False
+            self.user_data.reset_demo_timing()
             self.update_overlay_text(self._default_overlay_text())
             log.info("[DEMO] Restarted demo video (%s).", reason)
             return True
@@ -1431,13 +1565,43 @@ class GStreamerInferenceApp:
     def send_webrtc_signal(self, destination: str, payload: dict, remember: bool) -> bool:
         return enqueue_stomp_message(destination, payload, remember=remember)
 
-    def update_overlay_text(self, text: str):
+    def _set_overlay_field(self, overlay, text: str, color: int = OVERLAY_COLOR_WHITE) -> None:
+        if overlay is None:
+            return
+        overlay.set_property("text", text)
+        overlay.set_property("color", color)
+
+    def update_overlay_text(self, text: str | OverlayPayload):
         if not self.overlay:
             return
+
         def _apply():
-            if self.overlay:
-                self.overlay.set_property("text", text)
+            if not self.overlay:
+                return False
+
+            if self.demo_mode and isinstance(text, OverlayPayload):
+                match = text.matches_ground_truth
+                match_color = OVERLAY_COLOR_WHITE
+                if match is True:
+                    match_color = OVERLAY_COLOR_GREEN
+                elif match is False:
+                    match_color = OVERLAY_COLOR_RED
+
+                self.overlay.set_property("text", "")
+                self._set_overlay_field(self.status_overlay, text.status, match_color)
+                self._set_overlay_field(self.label_overlay, text.label)
+                self._set_overlay_field(self.score_overlay, text.score_text)
+                self._set_overlay_field(self.gt_overlay, text.ground_truth or "", match_color)
+                return False
+
+            resolved_text = text if isinstance(text, str) else f"{text.status} {text.label} {text.score_text}"
+            self.overlay.set_property("text", resolved_text)
+            self._set_overlay_field(self.status_overlay, "")
+            self._set_overlay_field(self.label_overlay, "")
+            self._set_overlay_field(self.score_overlay, "")
+            self._set_overlay_field(self.gt_overlay, "")
             return False
+
         GLib.idle_add(_apply)
 
     def _default_overlay_text(self) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 
+from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
 
@@ -21,6 +22,7 @@ def build_video_source_pipeline(
     gst_source_override: str | None = None,
     demo_mode: bool = False,
     platform_name: str | None = None,
+    demo_source: MvtecDemoSource | None = None,
 ) -> str:
     if gst_source_override and gst_source_override.strip():
         return gst_source_override.strip()
@@ -28,7 +30,7 @@ def build_video_source_pipeline(
     current_platform = platform_name or sys.platform
 
     if demo_mode:
-        mvtec_source = prepare_mvtec_demo_source(
+        mvtec_source = demo_source or prepare_mvtec_demo_source(
             base_url=os.getenv("NUVION_DEMO_MVTEC_BASE_URL"),
             categories=os.getenv("NUVION_DEMO_MVTEC_CATEGORIES"),
             cache_dir=os.getenv("NUVION_DEMO_MVTEC_CACHE_DIR"),

@@ -28,6 +28,8 @@ class MvtecDemoSource:
     extension: str
     slideshow_caps: str
     decoder: str
+    image_duration_sec: float
+    ground_truth_labels: tuple[str, ...]
 
 
 def parse_mvtec_categories(raw: str | None) -> tuple[str, ...]:
@@ -72,10 +74,9 @@ def prepare_mvtec_demo_source(
     rng = chooser or random.SystemRandom()
     category = rng.choice(resolved_categories)
     extracted_dir = ensure_mvtec_category_cached(resolved_base_url, resolved_cache_dir, category)
-    image_dir = resolve_mvtec_good_image_dir(extracted_dir, category)
-    image_paths = sorted(path for path in image_dir.iterdir() if path.is_file())
+    image_paths = collect_mvtec_demo_images(extracted_dir, category)
     if not image_paths:
-        raise ValueError(f"No images found for category '{category}' in {image_dir}")
+        raise ValueError(f"No demo images found for category '{category}' in {extracted_dir}")
 
     extension = image_paths[0].suffix.lower()
     if extension not in {".png", ".jpg", ".jpeg"}:
@@ -83,8 +84,10 @@ def prepare_mvtec_demo_source(
 
     stage_dir = build_stage_dir(resolved_cache_dir, category, image_paths, extension)
     stage_pattern = str(stage_dir / f"%05d{extension}")
-    slideshow_caps = build_slideshow_caps(extension, image_duration_sec or DEFAULT_DEMO_IMAGE_DURATION_SEC)
+    resolved_image_duration_sec = image_duration_sec or DEFAULT_DEMO_IMAGE_DURATION_SEC
+    slideshow_caps = build_slideshow_caps(extension, resolved_image_duration_sec)
     decoder = "pngdec" if extension == ".png" else "jpegdec"
+    ground_truth_labels = tuple(infer_mvtec_ground_truth_label(path) for path in image_paths)
     log.info("[DEMO] selected mvtec category=%s images=%s", category, len(image_paths))
     return MvtecDemoSource(
         category=category,
@@ -93,6 +96,8 @@ def prepare_mvtec_demo_source(
         extension=extension,
         slideshow_caps=slideshow_caps,
         decoder=decoder,
+        image_duration_sec=resolved_image_duration_sec,
+        ground_truth_labels=ground_truth_labels,
     )
 
 
@@ -140,20 +145,44 @@ def download_to_path(url: str, target_path: Path) -> None:
         raise
 
 
-def resolve_mvtec_good_image_dir(extracted_dir: Path, category: str) -> Path:
-    direct = extracted_dir / category / "train" / "good"
-    if direct.is_dir():
-        return direct
+def collect_mvtec_demo_images(extracted_dir: Path, category: str) -> list[Path]:
+    candidate_roots = [
+        extracted_dir / category / "test",
+        extracted_dir / "test",
+        extracted_dir / category / "train" / "good",
+        extracted_dir / "train" / "good",
+    ]
 
-    nested = extracted_dir / "train" / "good"
-    if nested.is_dir():
-        return nested
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+        if root.name == "test":
+            image_paths = sorted(path for path in root.rglob("*") if path.is_file())
+        else:
+            image_paths = sorted(path for path in root.iterdir() if path.is_file())
+        if image_paths:
+            return image_paths
+
+    for path in extracted_dir.rglob("test"):
+        if not path.is_dir():
+            continue
+        image_paths = sorted(file_path for file_path in path.rglob("*") if file_path.is_file())
+        if image_paths:
+            return image_paths
 
     for path in extracted_dir.rglob("train/good"):
-        if path.is_dir():
-            return path
+        if not path.is_dir():
+            continue
+        image_paths = sorted(file_path for file_path in path.iterdir() if file_path.is_file())
+        if image_paths:
+            return image_paths
 
-    raise ValueError(f"Could not locate train/good images for category '{category}' in {extracted_dir}")
+    raise ValueError(f"Could not locate demo images for category '{category}' in {extracted_dir}")
+
+
+def infer_mvtec_ground_truth_label(image_path: Path) -> str:
+    normalized_parts = {part.lower() for part in image_path.parts}
+    return "normal" if "good" in normalized_parts else "defect"
 
 
 def build_stage_dir(cache_dir: Path, category: str, image_paths: list[Path], extension: str) -> Path:
