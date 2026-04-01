@@ -48,6 +48,25 @@ class VideoSourceTest(unittest.TestCase):
         self.assertIn(fake_source.stage_pattern, pipeline)
         self.assertIn(fake_source.decoder, pipeline)
 
+    def test_demo_mode_uses_provided_demo_source(self) -> None:
+        fake_source = mock.Mock(
+            stage_pattern="/tmp/mvtec/slides/cable/%05d.png",
+            slideshow_caps="image/png,framerate=1/2",
+            decoder="pngdec",
+        )
+        with mock.patch("nuvion_app.inference.video_source.prepare_mvtec_demo_source") as prepare_mock:
+            pipeline = build_video_source_pipeline(
+                "/dev/video0",
+                640,
+                480,
+                30,
+                demo_mode=True,
+                platform_name="linux",
+                demo_source=fake_source,
+            )
+        prepare_mock.assert_not_called()
+        self.assertIn(fake_source.stage_pattern, pipeline)
+
     def test_gst_override_takes_priority(self) -> None:
         pipeline = build_video_source_pipeline(
             "/dev/video0",
