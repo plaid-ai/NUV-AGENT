@@ -16,13 +16,10 @@ from nuvion_app.config import (
 from nuvion_app.model_store import (
     DEFAULT_MODEL_POINTER,
     DEFAULT_MODEL_PRESIGN_TTL_SECONDS,
-    DEFAULT_MODEL_GCS_POINTER_URI,
     DEFAULT_MODEL_SERVER_BASE_URL,
-    DEFAULT_MODEL_SOURCE,
     DEFAULT_MODEL_PROFILE,
     anomalyclip_text_features_path,
     anomalyclip_triton_repository_path,
-    pull_model_from_gcs,
     pull_model_from_server,
     resolve_default_model_dir,
 )
@@ -78,24 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pull_parser = subparsers.add_parser(
         "pull-model",
-        help="Download model artifacts for Triton/AnomalyCLIP runtime (source=gcs|server)",
+        help="Download model artifacts for Triton/AnomalyCLIP runtime via server presigned URLs",
     )
     pull_parser.add_argument("--config", help="Path to config env file")
     pull_parser.add_argument(
-        "--source",
-        choices=("gcs", "server"),
-        default=os.getenv("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE),
-        help="Model artifact source",
-    )
-    pull_parser.add_argument(
-        "--gcs-pointer-uri",
-        default=os.getenv("NUVION_MODEL_GCS_POINTER_URI", DEFAULT_MODEL_GCS_POINTER_URI),
-        help="GCS pointer JSON URI (used when --source gcs)",
-    )
-    pull_parser.add_argument(
         "--pointer",
         default=os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER),
-        help="Pointer identifier (used when --source server), e.g. anomalyclip/prod",
+        help="Pointer identifier resolved by the server, e.g. anomalyclip/prod",
     )
     pull_parser.add_argument(
         "--server-base-url",
@@ -227,33 +213,23 @@ def main() -> None:
     if args.command == "pull-model":
         load_env(args.config)
         try:
-            source = (args.source or DEFAULT_MODEL_SOURCE).strip().lower()
-            if source == "server":
-                pointer = (args.pointer or DEFAULT_MODEL_POINTER).strip()
-                local_dir = args.local_dir.strip() or str(resolve_default_model_dir(f"server:{pointer}:{args.profile}"))
-                server_base_url = (args.server_base_url or os.getenv("NUVION_SERVER_BASE_URL", "")).strip()
-                access_token = (args.access_token or "").strip() or None
-                username = (args.username or "").strip() or None
-                password = (args.password or "").strip() or None
+            pointer = (args.pointer or DEFAULT_MODEL_POINTER).strip()
+            local_dir = args.local_dir.strip() or str(resolve_default_model_dir(f"server:{pointer}:{args.profile}"))
+            server_base_url = (args.server_base_url or os.getenv("NUVION_SERVER_BASE_URL", "")).strip()
+            access_token = (args.access_token or "").strip() or None
+            username = (args.username or "").strip() or None
+            password = (args.password or "").strip() or None
 
-                model_dir, _ = pull_model_from_server(
-                    server_base_url=server_base_url,
-                    pointer=pointer,
-                    profile=args.profile,
-                    local_dir=local_dir,
-                    ttl_seconds=args.ttl_seconds,
-                    access_token=access_token,
-                    username=username,
-                    password=password,
-                )
-            else:
-                pointer_uri = args.gcs_pointer_uri.strip() or DEFAULT_MODEL_GCS_POINTER_URI
-                local_dir = args.local_dir.strip() or str(resolve_default_model_dir(pointer_uri))
-                model_dir, _ = pull_model_from_gcs(
-                    pointer_uri=pointer_uri,
-                    local_dir=local_dir,
-                    profile=args.profile,
-                )
+            model_dir, _ = pull_model_from_server(
+                server_base_url=server_base_url,
+                pointer=pointer,
+                profile=args.profile,
+                local_dir=local_dir,
+                ttl_seconds=args.ttl_seconds,
+                access_token=access_token,
+                username=username,
+                password=password,
+            )
         except Exception as exc:
             sys.stderr.write(f"Failed to pull model artifacts: {exc}\n")
             sys.exit(1)
@@ -262,7 +238,7 @@ def main() -> None:
         triton_repo = anomalyclip_triton_repository_path(model_dir)
 
         sys.stdout.write(f"Model artifacts downloaded to: {model_dir}\n")
-        sys.stdout.write(f"Source: {args.source}\n")
+        sys.stdout.write("Source: server\n")
         if text_features.exists():
             sys.stdout.write("Suggested env for AnomalyCLIP Triton backend:\n")
             sys.stdout.write("  NUVION_ZSAD_BACKEND=triton\n")

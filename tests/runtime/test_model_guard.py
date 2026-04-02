@@ -72,11 +72,9 @@ class ModelGuardTest(unittest.TestCase):
             ):
                 with mock.patch.object(model_guard, "ensure_default_face_tracking_model") as ensure_face_model:
                     with mock.patch.object(model_guard, "pull_model_from_server") as pull_server:
-                        with mock.patch.object(model_guard, "pull_model_from_gcs") as pull_gcs:
-                            model_guard._pull_model("runtime", Path(tmp))
+                        model_guard._pull_model("runtime", Path(tmp))
         ensure_face_model.assert_called_once()
         pull_server.assert_not_called()
-        pull_gcs.assert_not_called()
 
 
 if __name__ == "__main__":
