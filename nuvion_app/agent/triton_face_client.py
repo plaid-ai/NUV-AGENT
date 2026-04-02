@@ -98,8 +98,19 @@ class TritonFaceClient:
         self.nms_iou = float(os.getenv("NUVION_FACE_TRACKING_NMS_IOU", "0.3") or "0.3")
 
         self.client = httpclient.InferenceServerClient(url=self.url)
+        self._ensure_model_ready()
         self._sync_output_names_from_metadata()
         self._sync_input_shape_from_config()
+
+    def _ensure_model_ready(self) -> None:
+        try:
+            if hasattr(self.client, "is_model_ready"):
+                ready = self.client.is_model_ready(model_name=self.model_name)
+                if ready is False:
+                    raise RuntimeError("model is not ready")
+            self.client.get_model_metadata(model_name=self.model_name)
+        except Exception as exc:
+            raise RuntimeError(f"Triton model '{self.model_name}' is not ready: {exc}") from exc
 
     def _sync_input_shape_from_config(self) -> None:
         try:
