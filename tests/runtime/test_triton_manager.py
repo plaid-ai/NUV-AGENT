@@ -64,6 +64,41 @@ class TritonManagerTest(unittest.TestCase):
             self.assertEqual(resolved, model_dir / "triton" / "model_repository_onnx")
             self.assertTrue((resolved / "image_encoder" / "1" / "model.onnx").exists())
 
+    def test_resolve_repository_builds_face_detector_onnx_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx" / "image_encoder_simplified.onnx").write_bytes(b"image")
+            (model_dir / "onnx" / "face_detector.onnx").write_bytes(b"face")
+
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=True):
+                with mock.patch.object(triton_manager, "face_tracking_uses_triton", return_value=True):
+                    resolved = triton_manager.resolve_repository_for_runtime(model_dir)
+
+            self.assertTrue((resolved / "face_detector" / "1" / "model.onnx").exists())
+            config = (resolved / "face_detector" / "config.pbtxt").read_text()
+            self.assertIn('platform: "onnxruntime_onnx"', config)
+            self.assertIn('name: "face_detector"', config)
+
+    def test_resolve_repository_jetson_face_detector_falls_back_to_onnx_when_plan_build_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            default_repo = model_dir / "triton" / "model_repository"
+            default_repo.mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx" / "face_detector.onnx").write_bytes(b"face")
+
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=False):
+                with mock.patch.object(triton_manager, "_is_jetson_linux", return_value=True):
+                    with mock.patch.object(triton_manager, "face_tracking_uses_triton", return_value=True):
+                        with mock.patch.object(triton_manager, "_build_face_detector_trt_plan", return_value=False):
+                            resolved = triton_manager.resolve_repository_for_runtime(model_dir)
+
+            self.assertEqual(resolved, default_repo)
+            self.assertTrue((resolved / "face_detector" / "1" / "model.onnx").exists())
+            config = (resolved / "face_detector" / "config.pbtxt").read_text()
+            self.assertIn('platform: "onnxruntime_onnx"', config)
+
     def test_cleanup_managed_triton_stops_running_container(self) -> None:
         triton_manager._managed_triton_container = "triton-nuv"
         with mock.patch.object(triton_manager, "container_exists", return_value=True):
