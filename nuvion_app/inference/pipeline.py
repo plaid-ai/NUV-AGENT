@@ -1413,7 +1413,21 @@ class NuvionEventState:
             if frame is None or not self.face_tracking_enabled or self.tracking_controller is None:
                 continue
 
-            decision = self.tracking_controller.process_frame(frame)
+            try:
+                decision = self.tracking_controller.process_frame(frame)
+            except Exception as exc:
+                log.warning("[TRACK] face tracking inference failed: %s", exc)
+                error_text = f"TRACK error: {exc}"
+                self.tracking_overlay_state.update(
+                    TrackingOverlaySnapshot(
+                        enabled=self.face_tracking_enabled,
+                        show_bbox=False,
+                        status_text=error_text,
+                        updated_at=time.time(),
+                    )
+                )
+                self._set_tracking_status(error_text)
+                continue
             snapshot = build_overlay_snapshot(
                 decision,
                 enabled=self.face_tracking_enabled,

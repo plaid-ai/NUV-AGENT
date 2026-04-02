@@ -21,6 +21,12 @@ class _FakeClient:
     def __init__(self, outputs: dict[str, np.ndarray]) -> None:
         self._outputs = outputs
 
+    def is_model_ready(self, **_kwargs):
+        return True
+
+    def get_model_metadata(self, **_kwargs):
+        return {"outputs": []}
+
     def infer(self, **_kwargs):
         return _FakeResponse(self._outputs)
 
@@ -39,6 +45,26 @@ class _FakeRequestedOutput:
 
 
 class TritonFaceClientTest(unittest.TestCase):
+    def test_init_fails_when_triton_model_is_not_ready(self) -> None:
+        fake_http = type(
+            "FakeHttpClient",
+            (),
+            {
+                "InferenceServerClient": lambda **_kwargs: type(
+                    "Client",
+                    (),
+                    {
+                        "is_model_ready": staticmethod(lambda **_kw: False),
+                        "get_model_metadata": staticmethod(lambda **_kw: {"outputs": []}),
+                    },
+                )(),
+            },
+        )
+
+        with mock.patch.object(face_client_module, "httpclient", fake_http):
+            with self.assertRaises(RuntimeError):
+                TritonFaceClient()
+
     def test_ultraface_scores_use_face_channel_and_decode_boxes(self) -> None:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
         priors = TritonFaceClient._ultraface_priors(640, 480)

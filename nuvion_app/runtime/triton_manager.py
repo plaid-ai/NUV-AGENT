@@ -188,6 +188,42 @@ def _health_ready(host: str, port: int, timeout_sec: int) -> bool:
     return False
 
 
+def _model_ready(host: str, port: int, model_name: str, timeout_sec: int) -> bool:
+    url = f"http://{host}:{port}/v2/models/{model_name}/ready"
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                if 200 <= response.getcode() < 300:
+                    return True
+        except urllib.error.HTTPError:
+            return False
+        except urllib.error.URLError:
+            pass
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def _required_models() -> list[str]:
+    models: list[str] = []
+    if normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton":
+        models.append("image_encoder")
+    if face_tracking_uses_triton():
+        model_name = (os.getenv("NUVION_FACE_TRACKING_MODEL", "face_detector") or "face_detector").strip() or "face_detector"
+        if model_name not in models:
+            models.append(model_name)
+    return models
+
+
+def _required_models_ready(host: str, port: int, timeout_sec: int) -> bool:
+    for model_name in _required_models():
+        if not _model_ready(host, port, model_name, timeout_sec=timeout_sec):
+            return False
+    return True
+
+
 def _copy_if_needed(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.stat().st_size == src.stat().st_size:
@@ -236,30 +272,31 @@ def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, 
     if not face_tracking_uses_triton():
         return
 
-    onnx_src = model_dir / "onnx" / "face_detector.onnx"
-    if not onnx_src.exists():
-        raise BootstrapError(
-            "triton_health_failed",
-            f"Missing face tracking ONNX model: {onnx_src}",
-        )
-
     config_src = model_dir / "triton" / "model_repository" / "face_detector" / "config.pbtxt"
     model_repo = repository_root / "face_detector" / "1"
     model_repo.mkdir(parents=True, exist_ok=True)
+    onnx_src = model_dir / "onnx" / "face_detector.onnx"
+    plan_path = model_repo / "model.plan"
+    packaged_plan = model_dir / "triton" / "model_repository" / "face_detector" / "1" / "model.plan"
 
     if prefer_tensorrt:
-        plan_path = model_repo / "model.plan"
-        packaged_plan = model_dir / "triton" / "model_repository" / "face_detector" / "1" / "model.plan"
         if packaged_plan.exists():
             _copy_if_needed(packaged_plan, plan_path)
-        elif not plan_path.exists() and not _build_face_detector_trt_plan(onnx_src, plan_path):
+            log.info("[TRACK] Using packaged TensorRT face detector plan: %s", packaged_plan)
+        elif not plan_path.exists() and onnx_src.exists() and not _build_face_detector_trt_plan(onnx_src, plan_path):
             _copy_if_needed(onnx_src, model_repo / "model.onnx")
             _write_face_detector_config_if_missing(
                 model_repo.parent / "config.pbtxt",
                 "onnxruntime_onnx",
                 None,
             )
+            log.warning("[TRACK] Falling back to ONNXRuntime face detector on Jetson because TensorRT plan build failed.")
             return
+        elif not plan_path.exists():
+            raise BootstrapError(
+                "triton_health_failed",
+                f"Missing face tracking TensorRT artifacts: {packaged_plan} (and no ONNX fallback at {onnx_src})",
+            )
 
         _write_face_detector_config_if_missing(
             model_repo.parent / "config.pbtxt",
@@ -268,6 +305,11 @@ def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, 
         )
         return
 
+    if not onnx_src.exists():
+        raise BootstrapError(
+            "triton_health_failed",
+            f"Missing face tracking ONNX model: {onnx_src}",
+        )
     _copy_if_needed(onnx_src, model_repo / "model.onnx")
     _write_face_detector_config_if_missing(
         model_repo.parent / "config.pbtxt",
@@ -334,27 +376,31 @@ def ensure_triton_ready(stage: str, model_dir: Path) -> None:
     if local_only and host not in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
         return
 
+    repository = resolve_repository_for_runtime(model_dir).resolve()
+
     if _health_ready(host, port, timeout_sec=3):
-        _emit_progress(f"Triton 이미 준비됨: {host}:{port}")
-        return
+        if _required_models_ready(host, port, timeout_sec=3):
+            _emit_progress(f"Triton 이미 준비됨: {host}:{port}")
+            return
+        _emit_progress("Triton은 응답하지만 필요한 모델이 없어 컨테이너를 다시 올립니다.")
+        log.warning("[TRACK] Triton is healthy but required models are missing. Reloading container.")
 
     _emit_progress("Triton이 준비되지 않아 Docker/Triton 자동 복구를 시작합니다.")
     ensure_docker_ready(triton_url)
 
-    repository = resolve_repository_for_runtime(model_dir).resolve()
     container_name = os.getenv("NUVION_TRITON_CONTAINER_NAME", "triton-nuv").strip() or "triton-nuv"
     image = os.getenv("NUVION_TRITON_IMAGE", "nvcr.io/nvidia/tritonserver:24.10-py3").strip() or "nvcr.io/nvidia/tritonserver:24.10-py3"
 
     if container_exists(container_name):
         _emit_progress(f"기존 Triton 컨테이너 확인: {container_name}")
         if container_running(container_name):
-            if _health_ready(host, port, timeout_sec=5):
+            if _health_ready(host, port, timeout_sec=5) and _required_models_ready(host, port, timeout_sec=5):
                 _emit_progress("기존 Triton 컨테이너 재사용 성공")
                 return
             remove_container(container_name)
         else:
             start_container(container_name)
-            if _health_ready(host, port, timeout_sec=10):
+            if _health_ready(host, port, timeout_sec=10) and _required_models_ready(host, port, timeout_sec=10):
                 _emit_progress("중지된 Triton 컨테이너 재기동 성공")
                 _register_managed_triton_container(container_name)
                 return
@@ -373,6 +419,12 @@ def ensure_triton_ready(stage: str, model_dir: Path) -> None:
         raise BootstrapError(
             "triton_health_failed",
             f"Triton health check failed at http://{host}:{port}/v2/health/ready",
+        )
+    if not _required_models_ready(host, port, timeout_sec=10):
+        missing = ", ".join(_required_models()) or "unknown"
+        raise BootstrapError(
+            "triton_health_failed",
+            f"Triton started but required models are not ready: {missing}",
         )
     _register_managed_triton_container(container_name)
 

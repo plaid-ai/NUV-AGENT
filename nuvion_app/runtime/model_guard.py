@@ -65,6 +65,13 @@ def _is_raspberry_pi_linux() -> bool:
     return False
 
 
+def _is_jetson_linux() -> bool:
+    try:
+        return os.uname().sysname.lower() == "linux" and Path("/etc/nv_tegra_release").exists()
+    except Exception:
+        return False
+
+
 def _should_use_full_triton_profile() -> bool:
     return _is_darwin() or _is_raspberry_pi_linux()
 
@@ -132,6 +139,8 @@ def _pull_model(profile: str, model_dir: Path) -> None:
     anomaly_uses_triton = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton"
     tracking_uses_triton = face_tracking_uses_triton()
     optional_tracking_keys = _FACE_TRACKING_REQUIRED_KEYS if tracking_uses_triton else []
+    if tracking_uses_triton and _is_jetson_linux():
+        optional_tracking_keys = merge_required_keys(optional_tracking_keys, ["face_plan", "face_triton_config"])
 
     if not anomaly_uses_triton and tracking_uses_triton:
         ensure_default_face_tracking_model(model_dir)

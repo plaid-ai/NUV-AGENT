@@ -76,6 +76,28 @@ class ModelGuardTest(unittest.TestCase):
         ensure_face_model.assert_called_once()
         pull_server.assert_not_called()
 
+    def test_pull_model_requests_jetson_face_plan_as_optional_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NUVION_ZSAD_BACKEND": "triton",
+                    "NUVION_FACE_TRACKING_ENABLED": "true",
+                    "NUVION_FACE_TRACKING_BACKEND": "triton",
+                    "NUVION_DEVICE_USERNAME": "device",
+                    "NUVION_DEVICE_PASSWORD": "secret",
+                },
+                clear=False,
+            ):
+                with mock.patch.object(model_guard, "_is_jetson_linux", return_value=True):
+                    with mock.patch.object(model_guard, "pull_model_from_server") as pull_server:
+                        model_guard._pull_model("runtime", Path(tmp))
+
+        _, kwargs = pull_server.call_args
+        self.assertIn("face_onnx", kwargs["optional_keys"])
+        self.assertIn("face_plan", kwargs["optional_keys"])
+        self.assertIn("face_triton_config", kwargs["optional_keys"])
+
 
 if __name__ == "__main__":
     unittest.main()
