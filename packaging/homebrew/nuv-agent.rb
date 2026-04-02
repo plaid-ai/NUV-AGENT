@@ -5,7 +5,7 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.90"
+  version "0.1.91"
   license "Proprietary"
 
   depends_on "python@3.14"
@@ -78,6 +78,11 @@ class NuvAgent < Formula
   resource "propcache" do
     url "https://files.pythonhosted.org/packages/b2/fa/89a8ef0468d5833a23fff277b143d0573897cf75bd56670a6d28126c7d68/propcache-0.4.1-cp314-cp314-macosx_11_0_arm64.whl"
     sha256 "9f302f4783709a78240ebc311b793f123328716a60911d667e0c036bc5dcbded"
+  end
+
+  resource "pyserial" do
+    url "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629a4f8b426ffc869ebe6b18799d846c8dc592ef7d/pyserial-3.5-py2.py3-none-any.whl"
+    sha256 "c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0"
   end
 
   resource "yarl" do

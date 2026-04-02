@@ -14,7 +14,7 @@ def main():
     ensure_gstreamer_runtime(require_webrtc=True)
     from nuvion_app.inference.pipeline import GStreamerInferenceApp
 
-    video_source = os.getenv("NUVION_VIDEO_SOURCE", "/dev/video0")
+    video_source = os.getenv("NUVION_VIDEO_SOURCE", "auto")
     app = GStreamerInferenceApp(video_source)
     try:
         app.run()

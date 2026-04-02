@@ -10,11 +10,12 @@ from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
-CURRENT_CONFIG_SCHEMA_VERSION = "3"
+CURRENT_CONFIG_SCHEMA_VERSION = "4"
 _VALID_MODEL_SOURCES = {"server", "gcs"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
+_VALID_MOTOR_BACKENDS = {"auto", "uart", "pwm", "none"}
 _SECRET_MARKERS = ("PASSWORD", "TOKEN", "SECRET")
 
 
@@ -82,6 +83,16 @@ def _normalize_int(value: str, default: int) -> int:
     return parsed
 
 
+def _normalize_float(value: str, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
 def _apply_migrations(values: Dict[str, str]) -> List[str]:
     changed: List[str] = []
 
@@ -142,6 +153,30 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if raw_rotation not in _VALID_VIDEO_ROTATIONS:
         update("NUVION_VIDEO_ROTATION", "0", "normalize video rotation")
 
+    motor_backend = (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower()
+    if motor_backend not in _VALID_MOTOR_BACKENDS:
+        update("NUVION_MOTOR_BACKEND", "auto", "normalize motor backend")
+
+    uart_baud = _normalize_int(values.get("NUVION_MOTOR_UART_BAUD", ""), 115200)
+    if str(uart_baud) != str(values.get("NUVION_MOTOR_UART_BAUD", "")):
+        update("NUVION_MOTOR_UART_BAUD", str(uart_baud), "normalize motor uart baud")
+
+    for key, default in (
+        ("NUVION_MOTOR_UART_TIMEOUT_SEC", 1.0),
+        ("NUVION_TRACKING_SAMPLE_SEC", 0.1),
+        ("NUVION_TRACKING_LOST_TIMEOUT_SEC", 1.0),
+        ("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.1),
+    ):
+        normalized = _normalize_float(values.get(key, ""), default)
+        if str(normalized) != str(values.get(key, "")):
+            update(key, str(normalized), f"normalize {key.lower()}")
+
+    deadzone = _normalize_float(values.get("NUVION_TRACKING_DEADZONE_PCT", ""), 0.12)
+    if deadzone > 0.45:
+        deadzone = 0.45
+    if str(deadzone) != str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")):
+        update("NUVION_TRACKING_DEADZONE_PCT", str(deadzone), "normalize tracking deadzone")
+
     return changed
 
 
@@ -186,6 +221,30 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
 
     if (values.get("NUVION_VIDEO_ROTATION", "0") or "0").strip() not in _VALID_VIDEO_ROTATIONS:
         errors.append(ConfigIssue(key="NUVION_VIDEO_ROTATION", message="허용 값은 0, 90, 180, 270 입니다."))
+
+    if (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower() not in _VALID_MOTOR_BACKENDS:
+        errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, uart, pwm, none 중 하나여야 합니다."))
+
+    for key in (
+        "NUVION_MOTOR_UART_BAUD",
+        "NUVION_MOTOR_UART_TIMEOUT_SEC",
+        "NUVION_TRACKING_SAMPLE_SEC",
+        "NUVION_TRACKING_LOST_TIMEOUT_SEC",
+        "NUVION_MOTOR_COMMAND_INTERVAL_SEC",
+    ):
+        try:
+            parsed = float(str(values.get(key, "")).strip())
+            if parsed <= 0:
+                raise ValueError
+        except Exception:
+            errors.append(ConfigIssue(key=key, message="양수 값이어야 합니다."))
+
+    try:
+        deadzone = float(str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")).strip())
+        if deadzone <= 0 or deadzone > 0.45:
+            raise ValueError
+    except Exception:
+        errors.append(ConfigIssue(key="NUVION_TRACKING_DEADZONE_PCT", message="0보다 크고 0.45 이하이어야 합니다."))
 
     if backend == "triton":
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()

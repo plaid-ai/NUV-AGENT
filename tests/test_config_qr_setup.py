@@ -18,6 +18,10 @@ class QrSetupTest(unittest.TestCase):
             {"key": "NUVION_VIDEO_ROTATION", "default": "0", "comment": "Video rotation"},
             {"key": "NUVION_VIDEO_FLIP_HORIZONTAL", "default": "false", "comment": "Flip horizontal"},
             {"key": "NUVION_VIDEO_FLIP_VERTICAL", "default": "false", "comment": "Flip vertical"},
+            {"key": "NUVION_FACE_TRACKING_ENABLED", "default": "false", "comment": "Face tracking"},
+            {"key": "NUVION_FACE_TRACKING_SHOW_BBOX", "default": "true", "comment": "Show tracking bbox"},
+            {"key": "NUVION_MOTOR_ENABLED", "default": "false", "comment": "Motor enabled"},
+            {"key": "NUVION_MOTOR_BACKEND", "default": "auto", "comment": "Motor backend"},
         ]
         lines = [f"{field['key']}={field['default']}" for field in fields]
         existing = {"NUVION_SERVER_BASE_URL": "https://api.example.com"}
@@ -29,6 +33,10 @@ class QrSetupTest(unittest.TestCase):
             "NUVION_VIDEO_ROTATION": "180",
             "NUVION_VIDEO_FLIP_HORIZONTAL": "true",
             "NUVION_VIDEO_FLIP_VERTICAL": "false",
+            "NUVION_FACE_TRACKING_ENABLED": "true",
+            "NUVION_FACE_TRACKING_SHOW_BBOX": "true",
+            "NUVION_MOTOR_ENABLED": "true",
+            "NUVION_MOTOR_BACKEND": "uart",
         }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,17 +61,25 @@ class QrSetupTest(unittest.TestCase):
                                 with mock.patch.object(
                                     config_module,
                                     "_prompt_camera_setup",
-                                    return_value=prompted_values,
+                                    return_value=dict(prompted_values),
                                 ) as prompt_camera_setup:
-                                    with mock.patch.object(config_module, "write_env") as write_env:
-                                        config_module.run_qr_setup(config_path, advanced=False)
+                                    with mock.patch.object(
+                                        config_module,
+                                        "_prompt_tracking_motor_setup",
+                                        return_value=prompted_values,
+                                    ) as prompt_tracking_motor_setup:
+                                        with mock.patch.object(config_module, "write_env") as write_env:
+                                            config_module.run_qr_setup(config_path, advanced=False)
 
         prompt_camera_setup.assert_called_once()
+        prompt_tracking_motor_setup.assert_called_once()
         write_env.assert_called_once()
         saved_values = write_env.call_args.args[2]
         self.assertEqual(saved_values["NUVION_VIDEO_SOURCE"], "jetson")
         self.assertEqual(saved_values["NUVION_VIDEO_ROTATION"], "180")
         self.assertEqual(saved_values["NUVION_VIDEO_FLIP_HORIZONTAL"], "true")
+        self.assertEqual(saved_values["NUVION_FACE_TRACKING_ENABLED"], "true")
+        self.assertEqual(saved_values["NUVION_MOTOR_BACKEND"], "uart")
 
 
 if __name__ == "__main__":

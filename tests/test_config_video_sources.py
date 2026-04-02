@@ -65,6 +65,10 @@ Device found:
             {"key": "NUVION_VIDEO_ROTATION", "default": "0", "comment": "Video rotation"},
             {"key": "NUVION_VIDEO_FLIP_HORIZONTAL", "default": "false", "comment": "Flip horizontal"},
             {"key": "NUVION_VIDEO_FLIP_VERTICAL", "default": "false", "comment": "Flip vertical"},
+            {"key": "NUVION_FACE_TRACKING_ENABLED", "default": "false", "comment": "Face tracking"},
+            {"key": "NUVION_FACE_TRACKING_SHOW_BBOX", "default": "true", "comment": "Show tracking bbox"},
+            {"key": "NUVION_MOTOR_ENABLED", "default": "false", "comment": "Motor enabled"},
+            {"key": "NUVION_MOTOR_BACKEND", "default": "auto", "comment": "Motor backend"},
             {"key": "NUVION_DEMO_MODE", "default": "false", "comment": "Demo mode"},
             {"key": "NUVION_WEBRTC_FORCE_RELAY", "default": "true", "comment": "Force relay"},
             {"key": "NUVION_CLIP_ENABLED", "default": "true", "comment": "Clip enabled"},
@@ -79,6 +83,10 @@ Device found:
             "NUVION_VIDEO_ROTATION": "90",
             "NUVION_VIDEO_FLIP_HORIZONTAL": "true",
             "NUVION_VIDEO_FLIP_VERTICAL": "false",
+            "NUVION_FACE_TRACKING_ENABLED": "true",
+            "NUVION_FACE_TRACKING_SHOW_BBOX": "true",
+            "NUVION_MOTOR_ENABLED": "true",
+            "NUVION_MOTOR_BACKEND": "uart",
             "NUVION_DEMO_MODE": "false",
             "NUVION_WEBRTC_FORCE_RELAY": "true",
             "NUVION_CLIP_ENABLED": "true",
@@ -102,6 +110,8 @@ Device found:
         self.assertIn("Use detected camera names instead of typing /dev/video0 or avf:2 manually.", html)
         self.assertIn('name="NUVION_VIDEO_ROTATION"', html)
         self.assertIn('value="90" selected', html)
+        self.assertIn('name="NUVION_MOTOR_BACKEND"', html)
+        self.assertIn("Motor Test", html)
         self.assertIn("Live sessions can be overridden by the backend", html)
         self.assertIn('<option value="true" selected>On</option>', html)
         self.assertIn('<option value="false" selected>Off</option>', html)
