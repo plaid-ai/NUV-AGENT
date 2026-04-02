@@ -164,20 +164,30 @@ class TritonFaceDetector:
         self.ready = False
         self.error = ""
         self._client = None
+        self._client_thread_id: int | None = None
         if TritonFaceClient is None:
             self.error = f"triton face client unavailable: {_TRITON_FACE_IMPORT_ERROR}"
             return
         try:
-            self._client = TritonFaceClient()
+            # Validate the Triton detector once up front, but create the long-lived
+            # client lazily in the worker thread that will actually use it.
+            TritonFaceClient()
         except Exception as exc:
             self.error = str(exc)
             return
         self.ready = True
 
+    def _get_or_create_client(self):
+        current_thread_id = threading.get_ident()
+        if self._client is None or self._client_thread_id != current_thread_id:
+            self._client = TritonFaceClient()
+            self._client_thread_id = current_thread_id
+        return self._client
+
     def detect(self, frame_rgb) -> list[FaceBox]:
-        if not self.ready or self._client is None:
+        if not self.ready:
             return []
-        detections = self._client.predict(frame_rgb)
+        detections = self._get_or_create_client().predict(frame_rgb)
         return [FaceBox(x=item.x, y=item.y, width=item.width, height=item.height) for item in detections]
 
 

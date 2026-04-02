@@ -1490,6 +1490,8 @@ class GStreamerInferenceApp:
         self.label_overlay = None
         self.score_overlay = None
         self.gt_overlay = None
+        self._overlay_update_lock = threading.Lock()
+        self._pending_overlay_text: str | OverlayPayload | None = None
         self.user_data = NuvionEventState(self.update_overlay_text, demo_source=self.demo_source)
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
@@ -1678,7 +1680,9 @@ class GStreamerInferenceApp:
         if not self.overlay:
             log.warning("[PIPELINE] zsad_overlay not found.")
         else:
-            self.update_overlay_text(self._default_overlay_text())
+            self._queue_overlay_text(self._default_overlay_text())
+            self._flush_pending_overlay_text()
+            GLib.timeout_add(100, self._flush_pending_overlay_text)
         self.tracking_overlay = self.pipeline.get_by_name("tracking_overlay")
         if self.tracking_overlay:
             self.tracking_overlay.connect("draw", self._draw_tracking_overlay)
@@ -1754,38 +1758,46 @@ class GStreamerInferenceApp:
         overlay.set_property("text", text)
         overlay.set_property("color", color)
 
-    def update_overlay_text(self, text: str | OverlayPayload):
+    def _queue_overlay_text(self, text: str | OverlayPayload) -> None:
+        with self._overlay_update_lock:
+            self._pending_overlay_text = text
+
+    def _flush_pending_overlay_text(self) -> bool:
         if not self.overlay:
-            return
+            return True
 
-        def _apply():
-            if not self.overlay:
-                return False
+        with self._overlay_update_lock:
+            text = self._pending_overlay_text
+            self._pending_overlay_text = None
 
-            if self.demo_mode and isinstance(text, OverlayPayload):
-                match = text.matches_ground_truth
-                match_color = OVERLAY_COLOR_WHITE
-                if match is True:
-                    match_color = OVERLAY_COLOR_GREEN
-                elif match is False:
-                    match_color = OVERLAY_COLOR_RED
+        if text is None:
+            return True
 
-                self.overlay.set_property("text", "")
-                self._set_overlay_field(self.status_overlay, text.status, match_color)
-                self._set_overlay_field(self.label_overlay, text.label)
-                self._set_overlay_field(self.score_overlay, text.score_text)
-                self._set_overlay_field(self.gt_overlay, text.ground_truth or "", match_color)
-                return False
+        if self.demo_mode and isinstance(text, OverlayPayload):
+            match = text.matches_ground_truth
+            match_color = OVERLAY_COLOR_WHITE
+            if match is True:
+                match_color = OVERLAY_COLOR_GREEN
+            elif match is False:
+                match_color = OVERLAY_COLOR_RED
 
-            resolved_text = text if isinstance(text, str) else f"{text.status} {text.label} {text.score_text}"
-            self.overlay.set_property("text", resolved_text)
-            self._set_overlay_field(self.status_overlay, "")
-            self._set_overlay_field(self.label_overlay, "")
-            self._set_overlay_field(self.score_overlay, "")
-            self._set_overlay_field(self.gt_overlay, "")
-            return False
+            self.overlay.set_property("text", "")
+            self._set_overlay_field(self.status_overlay, text.status, match_color)
+            self._set_overlay_field(self.label_overlay, text.label)
+            self._set_overlay_field(self.score_overlay, text.score_text)
+            self._set_overlay_field(self.gt_overlay, text.ground_truth or "", match_color)
+            return True
 
-        GLib.idle_add(_apply)
+        resolved_text = text if isinstance(text, str) else f"{text.status} {text.label} {text.score_text}"
+        self.overlay.set_property("text", resolved_text)
+        self._set_overlay_field(self.status_overlay, "")
+        self._set_overlay_field(self.label_overlay, "")
+        self._set_overlay_field(self.score_overlay, "")
+        self._set_overlay_field(self.gt_overlay, "")
+        return True
+
+    def update_overlay_text(self, text: str | OverlayPayload):
+        self._queue_overlay_text(text)
 
     def _default_overlay_text(self) -> str:
         backend = getattr(self.user_data, "backend", "none")
