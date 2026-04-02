@@ -12,6 +12,13 @@ class TritonManagerTest(unittest.TestCase):
     def tearDown(self) -> None:
         triton_manager._managed_triton_container = None
 
+    def test_default_face_tracking_config_matches_ultraface_io(self) -> None:
+        config = triton_manager._default_face_tracking_config("onnxruntime_onnx")
+        self.assertIn('name: "input"', config)
+        self.assertIn('name: "boxes"', config)
+        self.assertIn('name: "scores"', config)
+        self.assertNotIn('name: "num_detections"', config)
+
     def test_resolve_repository_uses_default_on_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "triton" / "model_repository"
@@ -79,6 +86,10 @@ class TritonManagerTest(unittest.TestCase):
             config = (resolved / "face_detector" / "config.pbtxt").read_text()
             self.assertIn('platform: "onnxruntime_onnx"', config)
             self.assertIn('name: "face_detector"', config)
+            self.assertIn('name: "input"', config)
+            self.assertIn('name: "boxes"', config)
+            self.assertIn('name: "scores"', config)
+            self.assertNotIn('name: "num_detections"', config)
 
     def test_resolve_repository_jetson_face_detector_falls_back_to_onnx_when_plan_build_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +109,26 @@ class TritonManagerTest(unittest.TestCase):
             self.assertTrue((resolved / "face_detector" / "1" / "model.onnx").exists())
             config = (resolved / "face_detector" / "config.pbtxt").read_text()
             self.assertIn('platform: "onnxruntime_onnx"', config)
+
+    def test_resolve_repository_rewrites_stale_face_config_in_default_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            default_repo = model_dir / "triton" / "model_repository"
+            stale_config = default_repo / "face_detector" / "config.pbtxt"
+            stale_config.parent.mkdir(parents=True, exist_ok=True)
+            stale_config.write_text('name: "face_detector"\ninput [{ name: "images" }]\n')
+            (model_dir / "onnx").mkdir(parents=True, exist_ok=True)
+            (model_dir / "onnx" / "face_detector.onnx").write_bytes(b"face")
+
+            with mock.patch.object(triton_manager, "_should_use_onnx_repository", return_value=False):
+                with mock.patch.object(triton_manager, "_is_jetson_linux", return_value=True):
+                    with mock.patch.object(triton_manager, "face_tracking_uses_triton", return_value=True):
+                        with mock.patch.object(triton_manager, "_build_face_detector_trt_plan", return_value=False):
+                            triton_manager.resolve_repository_for_runtime(model_dir)
+
+            config = stale_config.read_text()
+            self.assertIn('name: "input"', config)
+            self.assertNotIn('name: "images"', config)
 
     def test_resolve_repository_jetson_uses_packaged_face_plan_without_onnx(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
