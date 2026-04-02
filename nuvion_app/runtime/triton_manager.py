@@ -43,13 +43,34 @@ instance_group [
 
 def _default_face_tracking_config(platform: str) -> str:
     model_name = (os.getenv("NUVION_FACE_TRACKING_MODEL", "face_detector") or "face_detector").strip() or "face_detector"
-    input_name = (os.getenv("NUVION_FACE_TRACKING_INPUT_NAME", "images") or "images").strip() or "images"
-    boxes_output = (os.getenv("NUVION_FACE_TRACKING_BOXES_OUTPUT", "detection_boxes") or "detection_boxes").strip() or "detection_boxes"
-    scores_output = (os.getenv("NUVION_FACE_TRACKING_SCORES_OUTPUT", "detection_scores") or "detection_scores").strip() or "detection_scores"
-    num_output = (os.getenv("NUVION_FACE_TRACKING_NUM_DETECTIONS_OUTPUT", "num_detections") or "num_detections").strip() or "num_detections"
+    input_name = (os.getenv("NUVION_FACE_TRACKING_INPUT_NAME", "input") or "input").strip() or "input"
+    boxes_output = (os.getenv("NUVION_FACE_TRACKING_BOXES_OUTPUT", "boxes") or "boxes").strip() or "boxes"
+    scores_output = (os.getenv("NUVION_FACE_TRACKING_SCORES_OUTPUT", "scores") or "scores").strip() or "scores"
+    num_output = (os.getenv("NUVION_FACE_TRACKING_NUM_DETECTIONS_OUTPUT", "") or "").strip()
     width = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_WIDTH", "640") or "640"), 1)
     height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "640") or "640"), 1)
     instance_kind = "KIND_CPU" if platform == "onnxruntime_onnx" else "KIND_GPU"
+    output_blocks = [
+        f"""  {{
+    name: "{boxes_output}"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]
+  }}""",
+        f"""  {{
+    name: "{scores_output}"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }}""",
+    ]
+    if num_output:
+        output_blocks.append(
+            f"""  {{
+    name: "{num_output}"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }}"""
+        )
+    outputs = ",\n".join(output_blocks)
     return f"""name: "{model_name}"
 platform: "{platform}"
 max_batch_size: 0
@@ -62,21 +83,7 @@ input [
   }}
 ]
 output [
-  {{
-    name: "{boxes_output}"
-    data_type: TYPE_FP32
-    dims: [ -1, 4 ]
-  }},
-  {{
-    name: "{scores_output}"
-    data_type: TYPE_FP32
-    dims: [ -1 ]
-  }},
-  {{
-    name: "{num_output}"
-    data_type: TYPE_INT32
-    dims: [ 1 ]
-  }}
+{outputs}
 ]
 instance_group [
   {{
@@ -233,7 +240,11 @@ def _copy_if_needed(src: Path, dst: Path) -> None:
 
 def _write_face_detector_config_if_missing(target_config: Path, platform: str, config_src: Path | None = None) -> None:
     target_config.parent.mkdir(parents=True, exist_ok=True)
-    if config_src is not None and config_src.exists():
+    if (
+        config_src is not None
+        and config_src.exists()
+        and config_src.resolve() != target_config.resolve()
+    ):
         _copy_if_needed(config_src, target_config)
         return
     target_config.write_text(_default_face_tracking_config(platform))
