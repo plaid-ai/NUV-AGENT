@@ -6,17 +6,14 @@ import sys
 from pathlib import Path
 
 from nuvion_app.model_store import (
-    DEFAULT_MODEL_GCS_POINTER_URI,
     DEFAULT_MODEL_POINTER,
     DEFAULT_MODEL_PRESIGN_TTL_SECONDS,
     DEFAULT_MODEL_PROFILE,
     DEFAULT_MODEL_SERVER_BASE_URL,
-    DEFAULT_MODEL_SOURCE,
     _DEFAULT_LOCAL_PATHS,
     _PROFILE_KEYS,
     ensure_default_face_tracking_model,
     merge_required_keys,
-    pull_model_from_gcs,
     pull_model_from_server,
     resolve_default_model_dir,
 )
@@ -95,14 +92,9 @@ def resolve_model_dir(profile: str) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
 
-    source = (os.getenv("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE) or DEFAULT_MODEL_SOURCE).strip().lower()
-    if source == "server":
-        pointer = (os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER) or DEFAULT_MODEL_POINTER).strip()
-        identifier = f"server:{pointer}:{profile}"
-        return resolve_default_model_dir(identifier)
-
-    gcs_pointer_uri = (os.getenv("NUVION_MODEL_GCS_POINTER_URI", DEFAULT_MODEL_GCS_POINTER_URI) or DEFAULT_MODEL_GCS_POINTER_URI).strip()
-    return resolve_default_model_dir(gcs_pointer_uri)
+    pointer = (os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER) or DEFAULT_MODEL_POINTER).strip()
+    identifier = f"server:{pointer}:{profile}"
+    return resolve_default_model_dir(identifier)
 
 
 def _required_model_keys(profile: str) -> list[str]:
@@ -145,26 +137,17 @@ def _pull_model(profile: str, model_dir: Path) -> None:
         ensure_default_face_tracking_model(model_dir)
         return
 
-    source = (os.getenv("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE) or DEFAULT_MODEL_SOURCE).strip().lower()
-    if source == "server":
-        pull_model_from_server(
-            server_base_url=(os.getenv("NUVION_MODEL_SERVER_BASE_URL", os.getenv("NUVION_SERVER_BASE_URL", DEFAULT_MODEL_SERVER_BASE_URL)) or DEFAULT_MODEL_SERVER_BASE_URL).strip(),
-            pointer=(os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER) or DEFAULT_MODEL_POINTER).strip(),
-            profile=profile,
-            local_dir=str(model_dir),
-            ttl_seconds=int(os.getenv("NUVION_MODEL_PRESIGN_TTL_SECONDS", str(DEFAULT_MODEL_PRESIGN_TTL_SECONDS))),
-            access_token=(os.getenv("NUVION_MODEL_SERVER_ACCESS_TOKEN") or "").strip() or None,
-            username=(os.getenv("NUVION_DEVICE_USERNAME") or "").strip() or None,
-            password=(os.getenv("NUVION_DEVICE_PASSWORD") or "").strip() or None,
-            optional_keys=optional_tracking_keys,
-        )
-    else:
-        pull_model_from_gcs(
-            pointer_uri=(os.getenv("NUVION_MODEL_GCS_POINTER_URI", DEFAULT_MODEL_GCS_POINTER_URI) or DEFAULT_MODEL_GCS_POINTER_URI).strip(),
-            local_dir=str(model_dir),
-            profile=profile,
-            optional_keys=optional_tracking_keys,
-        )
+    pull_model_from_server(
+        server_base_url=(os.getenv("NUVION_MODEL_SERVER_BASE_URL", os.getenv("NUVION_SERVER_BASE_URL", DEFAULT_MODEL_SERVER_BASE_URL)) or DEFAULT_MODEL_SERVER_BASE_URL).strip(),
+        pointer=(os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER) or DEFAULT_MODEL_POINTER).strip(),
+        profile=profile,
+        local_dir=str(model_dir),
+        ttl_seconds=int(os.getenv("NUVION_MODEL_PRESIGN_TTL_SECONDS", str(DEFAULT_MODEL_PRESIGN_TTL_SECONDS))),
+        access_token=(os.getenv("NUVION_MODEL_SERVER_ACCESS_TOKEN") or "").strip() or None,
+        username=(os.getenv("NUVION_DEVICE_USERNAME") or "").strip() or None,
+        password=(os.getenv("NUVION_DEVICE_PASSWORD") or "").strip() or None,
+        optional_keys=optional_tracking_keys,
+    )
 
     if tracking_uses_triton:
         _ensure_optional_face_tracking_assets(model_dir)
@@ -189,15 +172,13 @@ def ensure_model_ready(stage: str) -> Path:
 
     try:
         log.info(
-            "[BOOTSTRAP] Missing model artifacts detected (%s). Pulling profile=%s source=%s",
+            "[BOOTSTRAP] Missing model artifacts detected (%s). Pulling profile=%s via server presign",
             ", ".join(missing_before),
             os.getenv("NUVION_MODEL_PROFILE", DEFAULT_MODEL_PROFILE),
-            os.getenv("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE),
         )
         _emit_progress(
             f"모델 파일 누락 감지({len(missing_before)}개). "
-            f"자동 다운로드 시작: source={os.getenv('NUVION_MODEL_SOURCE', DEFAULT_MODEL_SOURCE)} "
-            f"profile={profile}"
+            f"자동 다운로드 시작: source=server profile={profile}"
         )
         _pull_model(profile=profile, model_dir=model_dir)
         _emit_progress("모델 다운로드 완료. 무결성 점검 중...")

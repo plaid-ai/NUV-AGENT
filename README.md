@@ -67,15 +67,6 @@ nuv-agent pull-model \
 - 결과 메타데이터: `metadata/downloaded_from_server.json`
 
 ## Pull model bundle (GCS fallback)
-개발/운영 점검용 fallback으로 GCS 직접 pull도 유지됩니다.
-```bash
-nuv-agent pull-model \
-  --source gcs \
-  --gcs-pointer-uri gs://nuv-model/pointers/anomalyclip/prod.json \
-  --local-dir ~/.cache/nuvion/models/anomalyclip-current \
-  --profile runtime
-```
-
 Profiles:
 - `runtime`: Triton + text features 실행에 필요한 파일만 다운로드
 - `light`: text features/metadata 중심의 경량 다운로드
@@ -86,11 +77,9 @@ Profiles:
 - `artifacts.<key>.path`를 사용하는 v2 포맷을 모두 지원합니다.
 
 기본값:
-- `NUVION_MODEL_SOURCE=server`
 - `NUVION_MODEL_POINTER=anomalyclip/prod`
 - `NUVION_MODEL_PRESIGN_TTL_SECONDS=300`
 - `NUVION_MODEL_SERVER_BASE_URL=https://api.nuvion-dev.plaidai.io`
-- `NUVION_MODEL_GCS_POINTER_URI=gs://nuv-model/pointers/anomalyclip/prod.json`
 - `NUVION_MODEL_PROFILE=runtime`
 - `NUVION_MODEL_LOCAL_DIR=~/.cache/nuvion/models/anomalyclip-current`
 
@@ -255,12 +244,10 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ZSAD_BACKEND`: `triton|siglip|mps|none` (`mps`는 `siglip + NUVION_ZERO_SHOT_DEVICE=mps` alias)
 - `NUVION_ZERO_SHOT_MODEL`: 기본 ZSAD 모델 (`google/siglip2-base-patch16-224`)
 - `NUVION_ZERO_SHOT_DEVICE`: SigLIP 디바이스 우선순위 (`auto|mps|cuda|cpu`, 기본 `auto`)
-- `NUVION_MODEL_SOURCE`: `server`(권장) | `gcs`(fallback)
-- `NUVION_MODEL_POINTER`: server source에서 사용할 pointer (`anomalyclip/prod`)
-- `NUVION_MODEL_PRESIGN_TTL_SECONDS`: server source presign 요청 TTL
-- `NUVION_MODEL_SERVER_BASE_URL`: server source presign API base URL
-- `NUVION_MODEL_SERVER_ACCESS_TOKEN`: server source에서 사용할 사전 발급 토큰(선택)
-- `NUVION_MODEL_GCS_POINTER_URI`: GCS pointer JSON URI (default: `gs://nuv-model/pointers/anomalyclip/prod.json`)
+- `NUVION_MODEL_POINTER`: 서버가 해석할 model pointer (`anomalyclip/prod`)
+- `NUVION_MODEL_PRESIGN_TTL_SECONDS`: server presign 요청 TTL
+- `NUVION_MODEL_SERVER_BASE_URL`: server presign API base URL
+- `NUVION_MODEL_SERVER_ACCESS_TOKEN`: 사전 발급 토큰(선택). 미지정 시 setup에서 저장된 device credential로 로그인 후 다운로드
 - `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
 - `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
 - `NUVION_CONFIG_SCHEMA_VERSION`: config schema 버전 (`doctor --fix`로 자동 보정)

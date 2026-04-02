@@ -17,7 +17,6 @@ DEFAULT_MODEL_PROFILE = "runtime"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PRESIGN_TTL_SECONDS = 300
 DEFAULT_MODEL_SERVER_BASE_URL = "https://api.nuvion-dev.plaidai.io"
-DEFAULT_MODEL_GCS_POINTER_URI = "gs://nuv-model/pointers/anomalyclip/prod.json"
 DEFAULT_MODEL_PRESIGN_REFRESH_RETRIES = 2
 DEFAULT_FACE_TRACKING_MODEL_URL = (
     "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/ultraface/models/version-RFB-640.onnx"
@@ -110,34 +109,6 @@ def _run_command(cmd: list[str], capture_output: bool = False) -> subprocess.Com
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() if exc.stderr else str(exc)
         raise RuntimeError(detail) from exc
-
-
-def _parse_gs_uri(uri: str) -> tuple[str, str]:
-    if not uri.startswith("gs://"):
-        raise ValueError(f"Expected gs:// URI, got: {uri}")
-    trimmed = uri[5:]
-    bucket, _, object_path = trimmed.partition("/")
-    if not bucket:
-        raise ValueError(f"Invalid gs:// URI (missing bucket): {uri}")
-    return bucket, object_path
-
-
-def _gcs_uri(bucket: str, object_path: str) -> str:
-    object_path = object_path.lstrip("/")
-    return f"gs://{bucket}/{object_path}"
-
-
-def _gcs_cat_json(uri: str) -> dict[str, Any]:
-    result = _run_command(["gcloud", "storage", "cat", uri], capture_output=True)
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON in pointer: {uri}") from exc
-
-
-def _copy_gcs_object(src_uri: str, dst_path: Path) -> None:
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_command(["gcloud", "storage", "cp", src_uri, str(dst_path)])
 
 
 def _sha256_file(path: Path) -> str:
@@ -457,63 +428,6 @@ def _download_http_file(
                 time.sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
 
     raise RuntimeError(f"Download failed after {max_retries} attempts: {url} ({last_error})")
-
-
-def pull_model_from_gcs(
-    pointer_uri: str,
-    local_dir: Optional[str] = None,
-    profile: str = DEFAULT_MODEL_PROFILE,
-    extra_keys: Optional[list[str]] = None,
-    optional_keys: Optional[list[str]] = None,
-) -> tuple[Path, dict[str, Any]]:
-    _ensure_profile(profile)
-
-    bucket, _ = _parse_gs_uri(pointer_uri)
-    pointer = _gcs_cat_json(pointer_uri)
-
-    artifacts = pointer.get("artifacts")
-    if not isinstance(artifacts, dict):
-        raise RuntimeError("Pointer JSON must include 'artifacts' object")
-
-    runtime_layout = pointer.get("runtime_layout")
-    local_paths: dict[str, str] = {}
-    if isinstance(runtime_layout, dict):
-        lp = runtime_layout.get("local_paths")
-        if isinstance(lp, dict):
-            local_paths = {str(k): str(v) for k, v in lp.items()}
-
-    target_dir = _resolve_local_dir(identifier=pointer_uri, local_dir=local_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    required_keys = merge_required_keys(_resolve_profile_keys(pointer, profile), extra_keys)
-    fetch_keys = merge_required_keys(required_keys, [key for key in (optional_keys or []) if key in artifacts])
-    missing = [key for key in required_keys if key not in artifacts]
-    if missing:
-        raise RuntimeError(f"Pointer is missing required artifacts for profile '{profile}': {', '.join(missing)}")
-
-    downloaded: list[dict[str, Any]] = []
-    for key in fetch_keys:
-        src_obj, expected_sha256, expected_size = _artifact_path_from_pointer(artifacts[key], key)
-        # Support both relative object paths and absolute gs:// URIs from pointer artifacts.
-        src_uri = src_obj if src_obj.startswith("gs://") else _gcs_uri(bucket, src_obj)
-        local_rel = local_paths.get(key, _resolve_local_rel_path(key, src_obj))
-        dst = (target_dir / local_rel).resolve()
-        _copy_gcs_object(src_uri=src_uri, dst_path=dst)
-        _validate_download_integrity(dst, expected_sha256, expected_size, key)
-        downloaded.append({
-            "key": key,
-            "src": src_uri,
-            "dst": str(dst),
-            "sha256": expected_sha256,
-            "sizeBytes": expected_size,
-        })
-
-    metadata_dir = (target_dir / "metadata").resolve()
-    metadata_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(metadata_dir / "gcs_pointer.json", pointer)
-    _write_json(metadata_dir / "downloaded_from_gcs.json", downloaded)
-
-    return target_dir, pointer
 
 
 def pull_model_from_server(

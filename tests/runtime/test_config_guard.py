@@ -184,6 +184,26 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertTrue(report.ok)
             self.assertEqual(report.values["NUVION_FACE_TRACKING_BACKEND"], "auto")
 
+    def test_guard_requires_device_credentials_or_access_token_for_model_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=***",
+                        "NUVION_ZSAD_BACKEND=triton",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(any("device credential" in issue.message for issue in report.errors))
+
 
 if __name__ == "__main__":
     unittest.main()

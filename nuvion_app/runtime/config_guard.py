@@ -8,10 +8,15 @@ from typing import Dict, List, Tuple
 from nuvion_app.config import effective_required_keys, load_template, read_env, write_env
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
-from nuvion_app.runtime.inference_mode import normalize_backend, normalize_face_tracking_backend, normalize_siglip_device
+from nuvion_app.runtime.inference_mode import (
+    face_tracking_uses_triton,
+    normalize_backend,
+    normalize_face_tracking_backend,
+    normalize_siglip_device,
+)
 
 CURRENT_CONFIG_SCHEMA_VERSION = "5"
-_VALID_MODEL_SOURCES = {"server", "gcs"}
+_VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
@@ -117,7 +122,7 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
 
     source = (values.get("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE) or DEFAULT_MODEL_SOURCE).strip().lower()
     if source not in _VALID_MODEL_SOURCES:
-        update("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE, "invalid model source fallback")
+        update("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE, "force server-only model source")
 
     profile = (values.get("NUVION_MODEL_PROFILE", DEFAULT_MODEL_PROFILE) or DEFAULT_MODEL_PROFILE).strip().lower()
     if profile not in _VALID_MODEL_PROFILES:
@@ -223,10 +228,10 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             errors.append(ConfigIssue(key=key, message="필수 값이 비어있거나 placeholder입니다."))
 
     backend = normalize_backend(values.get("NUVION_ZSAD_BACKEND", "triton"), default="triton")
-    source = (values.get("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE) or DEFAULT_MODEL_SOURCE).strip().lower()
+    source = "server"
 
     if source not in _VALID_MODEL_SOURCES:
-        errors.append(ConfigIssue(key="NUVION_MODEL_SOURCE", message="지원하지 않는 모델 source입니다. (server|gcs)"))
+        errors.append(ConfigIssue(key="NUVION_MODEL_SOURCE", message="모델 다운로드는 server source만 지원합니다."))
 
     if _is_truthy(values.get("NUVION_DEMO_MODE", "false")):
         try:
@@ -278,7 +283,12 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     except Exception:
         errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_THRESHOLD", message="0보다 크고 1 이하이어야 합니다."))
 
-    if backend == "triton":
+    requires_server_model_auth = backend == "triton" or face_tracking_uses_triton(
+        enabled=_is_truthy(values.get("NUVION_FACE_TRACKING_ENABLED", "false")),
+        backend=values.get("NUVION_FACE_TRACKING_BACKEND", "auto"),
+    )
+
+    if requires_server_model_auth:
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()
         if not triton_url:
             errors.append(ConfigIssue(key="NUVION_TRITON_URL", message="Triton backend 사용 시 NUVION_TRITON_URL이 필요합니다."))
@@ -299,18 +309,23 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             except Exception:
                 errors.append(ConfigIssue(key=key, message="양수 정수여야 합니다."))
 
-        if source == "server":
-            pointer = (values.get("NUVION_MODEL_POINTER", "") or "").strip()
-            if not pointer:
-                errors.append(ConfigIssue(key="NUVION_MODEL_POINTER", message="server source 사용 시 pointer가 필요합니다."))
-            server_url = (values.get("NUVION_MODEL_SERVER_BASE_URL", "") or "").strip()
-            if not server_url:
-                errors.append(ConfigIssue(key="NUVION_MODEL_SERVER_BASE_URL", message="server source 사용 시 base URL이 필요합니다."))
+        pointer = (values.get("NUVION_MODEL_POINTER", "") or "").strip()
+        if not pointer:
+            errors.append(ConfigIssue(key="NUVION_MODEL_POINTER", message="모델 presign 요청에는 pointer가 필요합니다."))
+        server_url = (values.get("NUVION_MODEL_SERVER_BASE_URL", "") or "").strip()
+        if not server_url:
+            errors.append(ConfigIssue(key="NUVION_MODEL_SERVER_BASE_URL", message="모델 presign 요청에는 server base URL이 필요합니다."))
 
-        if source == "gcs":
-            pointer_uri = (values.get("NUVION_MODEL_GCS_POINTER_URI", "") or "").strip()
-            if not pointer_uri.startswith("gs://"):
-                errors.append(ConfigIssue(key="NUVION_MODEL_GCS_POINTER_URI", message="gcs source 사용 시 gs:// URI가 필요합니다."))
+        access_token = (values.get("NUVION_MODEL_SERVER_ACCESS_TOKEN", "") or "").strip()
+        username = (values.get("NUVION_DEVICE_USERNAME", "") or "").strip()
+        password = values.get("NUVION_DEVICE_PASSWORD", "") or ""
+        if not access_token and (not username or _is_placeholder(password)):
+            errors.append(
+                ConfigIssue(
+                    key="NUVION_DEVICE_PASSWORD",
+                    message="모델 다운로드는 setup에서 저장된 device credential 또는 NUVION_MODEL_SERVER_ACCESS_TOKEN이 필요합니다.",
+                )
+            )
 
         mode = (values.get("NUVION_TRITON_MODE", "generic") or "generic").strip().lower()
         if mode == "anomalyclip":

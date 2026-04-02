@@ -91,51 +91,5 @@ class ModelStoreSelfHealTest(unittest.TestCase):
             self.assertTrue((Path(target_dir) / "onnx" / "text_features.npy").exists())
             self.assertTrue((Path(target_dir) / "metadata" / "gcs_manifest.json").exists())
 
-    def test_pull_model_from_gcs_supports_absolute_gs_uri(self) -> None:
-        pointer = {
-            "artifacts": {
-                "text_features": {
-                    "path": "gs://alt-bucket/path/text_features.npy",
-                    "sha256": "a" * 64,
-                    "sizeBytes": 8,
-                },
-                "manifest": {
-                    "path": "nuvion/anomalyclip/v0001/source/gcs_manifest.json",
-                    "sha256": "b" * 64,
-                    "sizeBytes": 8,
-                },
-            },
-            "profiles": {
-                "light": ["text_features", "manifest"],
-            },
-        }
-        copied: list[str] = []
-
-        def fake_copy(src_uri: str, dst_path: Path) -> None:
-            copied.append(src_uri)
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            dst_path.write_bytes(b"12345678")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(model_store, "_gcs_cat_json", return_value=pointer):
-                with mock.patch.object(model_store, "_copy_gcs_object", side_effect=fake_copy):
-                    with mock.patch.object(model_store, "_validate_download_integrity", return_value=None):
-                        target_dir, _ = model_store.pull_model_from_gcs(
-                            pointer_uri="gs://nuv-model/pointers/anomalyclip/prod.json",
-                            local_dir=tmp,
-                            profile="light",
-                        )
-                        self.assertTrue((Path(target_dir) / "onnx" / "text_features.npy").exists())
-                        self.assertTrue((Path(target_dir) / "metadata" / "gcs_manifest.json").exists())
-
-        self.assertEqual(
-            copied,
-            [
-                "gs://alt-bucket/path/text_features.npy",
-                "gs://nuv-model/nuvion/anomalyclip/v0001/source/gcs_manifest.json",
-            ],
-        )
-
-
 if __name__ == "__main__":
     unittest.main()
