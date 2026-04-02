@@ -10,10 +10,11 @@ from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
-CURRENT_CONFIG_SCHEMA_VERSION = "2"
+CURRENT_CONFIG_SCHEMA_VERSION = "3"
 _VALID_MODEL_SOURCES = {"server", "gcs"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
+_VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
 _SECRET_MARKERS = ("PASSWORD", "TOKEN", "SECRET")
 
 
@@ -137,6 +138,10 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if raw_siglip_device != normalized_siglip:
         update("NUVION_ZERO_SHOT_DEVICE", normalized_siglip, "normalize zero-shot device")
 
+    raw_rotation = (values.get("NUVION_VIDEO_ROTATION", "0") or "0").strip()
+    if raw_rotation not in _VALID_VIDEO_ROTATIONS:
+        update("NUVION_VIDEO_ROTATION", "0", "normalize video rotation")
+
     return changed
 
 
@@ -178,6 +183,9 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             )
         except ValueError as exc:
             errors.append(ConfigIssue(key="NUVION_DEMO_MVTEC_BASE_URL", message=str(exc)))
+
+    if (values.get("NUVION_VIDEO_ROTATION", "0") or "0").strip() not in _VALID_VIDEO_ROTATIONS:
+        errors.append(ConfigIssue(key="NUVION_VIDEO_ROTATION", message="허용 값은 0, 90, 180, 270 입니다."))
 
     if backend == "triton":
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()

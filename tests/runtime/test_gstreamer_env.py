@@ -70,10 +70,36 @@ class GStreamerEnvTest(unittest.TestCase):
 
     def test_configure_gstreamer_environment_noops_off_macos(self) -> None:
         with mock.patch.object(gstreamer_env.sys, "platform", "linux"):
-            with mock.patch.dict(os.environ, {}, clear=True):
-                changes = gstreamer_env.configure_gstreamer_environment()
-                self.assertEqual(changes, {})
-                self.assertNotIn("GI_TYPELIB_PATH", os.environ)
+            with mock.patch.object(gstreamer_env, "_resolve_linux_runtime_dir", return_value=Path("/tmp/nuv-agent-runtime-123")):
+                fake_user = mock.Mock(pw_dir="/home/camera", pw_name="camera")
+                with mock.patch.object(gstreamer_env.pwd, "getpwuid", return_value=fake_user):
+                    with mock.patch.object(gstreamer_env.os, "getuid", return_value=123):
+                        with mock.patch.dict(os.environ, {}, clear=True):
+                            changes = gstreamer_env.configure_gstreamer_environment()
+
+                            self.assertEqual(os.environ["HOME"], "/home/camera")
+                            self.assertEqual(os.environ["USER"], "camera")
+                            self.assertEqual(os.environ["LOGNAME"], "camera")
+                            self.assertEqual(os.environ["XDG_RUNTIME_DIR"], "/tmp/nuv-agent-runtime-123")
+                            self.assertEqual(changes["XDG_RUNTIME_DIR"], "/tmp/nuv-agent-runtime-123")
+                            self.assertNotIn("GI_TYPELIB_PATH", os.environ)
+
+    def test_configure_gstreamer_environment_preserves_existing_linux_runtime_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(gstreamer_env.sys, "platform", "linux"):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "XDG_RUNTIME_DIR": tmp,
+                        "HOME": "/home/camera",
+                        "USER": "camera",
+                        "LOGNAME": "camera",
+                    },
+                    clear=True,
+                ):
+                    changes = gstreamer_env.configure_gstreamer_environment()
+                    self.assertEqual(changes, {})
+                    self.assertEqual(os.environ["XDG_RUNTIME_DIR"], tmp)
 
 
 if __name__ == "__main__":

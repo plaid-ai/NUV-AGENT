@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import sys
 from pathlib import Path
@@ -76,9 +77,55 @@ def _candidate_plugin_paths(prefixes: list[Path]) -> list[str]:
     return paths
 
 
+def _resolve_linux_runtime_dir(uid: int) -> Path:
+    run_dir = Path("/run/user") / str(uid)
+    if run_dir.is_dir():
+        return run_dir
+
+    fallback_dir = Path("/tmp") / f"nuv-agent-runtime-{uid}"
+    fallback_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(fallback_dir, 0o700)
+    except OSError:
+        pass
+    return fallback_dir
+
+
+def _configure_linux_user_environment() -> dict[str, str]:
+    changes: dict[str, str] = {}
+    uid = os.getuid()
+
+    try:
+        user_info = pwd.getpwuid(uid)
+    except KeyError:
+        user_info = None
+
+    if user_info is not None:
+        defaults = {
+            "HOME": user_info.pw_dir,
+            "USER": user_info.pw_name,
+            "LOGNAME": user_info.pw_name,
+        }
+        for key, value in defaults.items():
+            if value and not os.environ.get(key):
+                os.environ[key] = value
+                changes[key] = value
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    runtime_path = Path(runtime_dir) if runtime_dir else None
+    if runtime_path is None or not runtime_path.is_dir():
+        resolved = _resolve_linux_runtime_dir(uid)
+        os.environ["XDG_RUNTIME_DIR"] = str(resolved)
+        changes["XDG_RUNTIME_DIR"] = str(resolved)
+
+    return changes
+
+
 def configure_gstreamer_environment() -> dict[str, str]:
     changes: dict[str, str] = {}
     if sys.platform != "darwin":
+        if sys.platform.startswith("linux"):
+            return _configure_linux_user_environment()
         return changes
 
     prefixes = _candidate_prefixes()

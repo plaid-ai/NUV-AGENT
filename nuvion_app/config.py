@@ -97,6 +97,24 @@ def _parse_gst_device_monitor_output(output: str) -> List[Dict[str, str]]:
     return options
 
 
+def _is_jetson_platform() -> bool:
+    return Path("/etc/nv_tegra_release").exists()
+
+
+def _gst_element_available(element_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["gst-inspect-1.0", element_name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def discover_video_source_options(platform_name: Optional[str] = None) -> List[Dict[str, str]]:
     current_platform = platform_name or sys.platform
     options: List[Dict[str, str]] = []
@@ -133,6 +151,15 @@ def discover_video_source_options(platform_name: Optional[str] = None) -> List[D
         )
 
     if current_platform.startswith("linux"):
+        if _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
+            options.insert(
+                0,
+                {
+                    "value": "jetson",
+                    "label": "Jetson CSI camera",
+                    "detail": "Uses nvarguscamerasrc.",
+                },
+            )
         options.append(
             {
                 "value": "rpi",
@@ -195,6 +222,9 @@ def _is_basic_setup_field(key: str) -> bool:
         "NUVION_DEVICE_USERNAME",
         "NUVION_DEVICE_PASSWORD",
         "NUVION_VIDEO_SOURCE",
+        "NUVION_VIDEO_ROTATION",
+        "NUVION_VIDEO_FLIP_HORIZONTAL",
+        "NUVION_VIDEO_FLIP_VERTICAL",
         "NUVION_DEMO_MODE",
     }
 
@@ -214,7 +244,7 @@ def _field_section(key: str) -> str:
         return "runtime"
     if key.startswith("NUVION_ANOMALY_") or key.startswith("NUVION_PRODUCTION_"):
         return "detection"
-    if key.startswith("NUVION_H264_") or key.startswith("NUVION_WEBRTC_") or key == "NUVION_VIDEO_SOURCE":
+    if key.startswith("NUVION_H264_") or key.startswith("NUVION_WEBRTC_") or key.startswith("NUVION_VIDEO_"):
         return "streaming"
     if key in {"NUVION_LINE_ID", "NUVION_PROCESS_ID"}:
         return "detection"
@@ -226,10 +256,78 @@ def _field_note(key: str) -> str:
         "NUVION_DEVICE_USERNAME": "Usually auto-filled by Auto Provision. You rarely need to type this manually.",
         "NUVION_DEVICE_PASSWORD": "Usually auto-filled by Auto Provision. Leave blank on save to keep the current secret.",
         "NUVION_DEMO_MODE": "Turn this on only when testing without a real camera.",
+        "NUVION_VIDEO_SOURCE": "Use auto-detect unless you need to force a specific USB/CSI source.",
+        "NUVION_VIDEO_ROTATION": "Allowed values: 0, 90, 180, 270.",
+        "NUVION_VIDEO_FLIP_HORIZONTAL": "Mirror the image left-to-right after source capture.",
+        "NUVION_VIDEO_FLIP_VERTICAL": "Flip the image upside-down after source capture.",
         "NUVION_WEBRTC_FORCE_RELAY": "Fallback only. Live sessions can be overridden by the backend, so most users should leave this as-is.",
         "NUVION_CLIP_ENABLED": "Stores short video evidence around anomaly events. Disable only when debugging clip-related issues.",
     }
     return notes.get(key, "")
+
+
+def _is_rotation_field(key: str) -> bool:
+    return key == "NUVION_VIDEO_ROTATION"
+
+
+def _prompt_boolean_setting(label: str, key: str, default: str) -> str:
+    normalized_default = "true" if _is_truthy(default) else "false"
+    prompt = f"{label} ({key}) ["
+    prompt += "On" if normalized_default == "true" else "Off"
+    prompt += "]: "
+
+    while True:
+        entered = input(prompt).strip().lower()
+        if not entered:
+            return normalized_default
+        if entered in {"1", "true", "yes", "y", "on"}:
+            return "true"
+        if entered in {"0", "false", "no", "n", "off"}:
+            return "false"
+        print("Enter on/off, yes/no, or true/false.")
+
+
+def _prompt_rotation_setting(label: str, key: str, default: str) -> str:
+    options = ("0", "90", "180", "270")
+    prompt = f"{label} ({key}) [{default or '0'}]: "
+    while True:
+        entered = input(prompt).strip()
+        if not entered:
+            return default or "0"
+        if entered in options:
+            return entered
+        print("Enter one of: 0, 90, 180, 270.")
+
+
+def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str]) -> Dict[str, str]:
+    values = dict(existing)
+    camera_fields = {
+        "NUVION_VIDEO_SOURCE",
+        "NUVION_VIDEO_ROTATION",
+        "NUVION_VIDEO_FLIP_HORIZONTAL",
+        "NUVION_VIDEO_FLIP_VERTICAL",
+    }
+
+    print("Camera setup (press Enter to keep current value)")
+    for field in fields:
+        key = field["key"]
+        if key not in camera_fields:
+            continue
+
+        default = values.get(key, field["default"])
+        label = field["comment"] or key
+
+        if key == "NUVION_VIDEO_SOURCE":
+            values[key] = _prompt_video_source(default)
+            continue
+        if _is_rotation_field(key):
+            values[key] = _prompt_rotation_setting(label, key, default)
+            continue
+        if _is_boolean_like(field["default"], default):
+            values[key] = _prompt_boolean_setting(label, key, default)
+            continue
+
+    return values
 
 
 def _is_boolean_like(default_value: str, value: str) -> bool:
@@ -545,6 +643,12 @@ def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced:
         if key == "NUVION_VIDEO_SOURCE":
             values[key] = _prompt_video_source(default)
             continue
+        if _is_rotation_field(key):
+            values[key] = _prompt_rotation_setting(field["comment"] or key, key, default)
+            continue
+        if _is_boolean_like(field["default"], default):
+            values[key] = _prompt_boolean_setting(field["comment"] or key, key, default)
+            continue
 
         label = field["comment"] or key
         prompt = f"{label} ({key})"
@@ -673,11 +777,24 @@ def _check_triton_health(values: Dict[str, str]) -> Dict[str, str]:
 
 def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
     source = (values.get("NUVION_VIDEO_SOURCE") or "").strip()
+    gst_source_override = (values.get("NUVION_GST_SOURCE") or "").strip()
+    if gst_source_override:
+        return {
+            "name": "Camera source",
+            "status": "pass",
+            "detail": "Custom GStreamer source override configured.",
+        }
     if not source:
         return {
             "name": "Camera source",
             "status": "warn",
             "detail": "NUVION_VIDEO_SOURCE is empty.",
+        }
+    if source == "auto":
+        return {
+            "name": "Camera source",
+            "status": "pass",
+            "detail": "Automatic camera detection is enabled.",
         }
     if sys.platform == "darwin":
         if source.startswith("avf"):
@@ -702,6 +819,12 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
             "name": "Camera source",
             "status": "pass",
             "detail": "Raspberry Pi camera source selected.",
+        }
+    if source in {"jetson", "argus", "csi"}:
+        return {
+            "name": "Camera source",
+            "status": "pass",
+            "detail": "Jetson CSI camera source selected.",
         }
     if source.startswith("/dev/"):
         if Path(source).exists():
@@ -838,6 +961,33 @@ def _render_form(
                     label=html.escape(comment),
                     key=html.escape(key),
                     options=option_rows,
+                )
+            )
+            continue
+        if _is_rotation_field(key):
+            rotation_options = ("0", "90", "180", "270")
+            target_rows.append(
+                """
+                <div class="field field-row group-{group}" data-group="{group}">
+                  <label>{label}<span class="key">{key}</span></label>
+                  <select name="{key}">
+                    {options}
+                  </select>
+                  {note}
+                </div>
+                """.format(
+                    group=html.escape(group),
+                    label=html.escape(comment),
+                    key=html.escape(key),
+                    options="\n".join(
+                        '<option value="{value}" {selected}>{label}</option>'.format(
+                            value=option,
+                            selected="selected" if option == (value or "0") else "",
+                            label=f"{option}°",
+                        )
+                        for option in rotation_options
+                    ),
+                    note=note_html,
                 )
             )
             continue
@@ -1695,6 +1845,8 @@ def run_qr_setup(config_path: Path, advanced: bool) -> None:
         values["NUVION_DEVICE_USERNAME"] = str(device_username)
     if device_password:
         values["NUVION_DEVICE_PASSWORD"] = str(device_password)
+
+    values = _prompt_camera_setup(fields, values)
 
     missing = _validate_required(values)
     if missing:

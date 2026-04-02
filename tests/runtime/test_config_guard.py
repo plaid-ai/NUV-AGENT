@@ -124,6 +124,26 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertTrue(any(issue.key == "NUVION_DEMO_MVTEC_BASE_URL" for issue in report.errors))
 
+    def test_guard_normalizes_invalid_video_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_VIDEO_ROTATION=45",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_VIDEO_ROTATION"], "0")
+
 
 if __name__ == "__main__":
     unittest.main()

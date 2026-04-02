@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from nuvion_app.config import _parse_gst_device_monitor_output, _render_form, discover_video_source_options
+from nuvion_app.config import _check_camera_source, _parse_gst_device_monitor_output, _render_form, discover_video_source_options
 
 
 class ConfigVideoSourceTest(unittest.TestCase):
@@ -36,11 +36,25 @@ Device found:
         fake_paths[1].__str__ = lambda self=fake_paths[1]: "/dev/video0"
 
         with mock.patch("nuvion_app.config.Path.glob", return_value=fake_paths):
-            options = discover_video_source_options(platform_name="linux")
+            with mock.patch("nuvion_app.config._is_jetson_platform", return_value=False):
+                options = discover_video_source_options(platform_name="linux")
 
         self.assertEqual(options[0]["value"], "/dev/video0")
         self.assertEqual(options[1]["value"], "/dev/video2")
         self.assertEqual(options[-1]["value"], "rpi")
+
+    def test_discover_video_source_options_linux_includes_jetson_option(self) -> None:
+        with mock.patch("nuvion_app.config.Path.glob", return_value=[]):
+            with mock.patch("nuvion_app.config._is_jetson_platform", return_value=True):
+                with mock.patch("nuvion_app.config._gst_element_available", return_value=True):
+                    options = discover_video_source_options(platform_name="linux")
+
+        self.assertEqual(options[0]["value"], "jetson")
+        self.assertEqual(options[0]["detail"], "Uses nvarguscamerasrc.")
+
+    def test_check_camera_source_accepts_auto(self) -> None:
+        check = _check_camera_source({"NUVION_VIDEO_SOURCE": "auto"})
+        self.assertEqual(check["status"], "pass")
 
     def test_render_form_groups_advanced_fields_and_renders_boolean_selects(self) -> None:
         fields = [
@@ -48,6 +62,9 @@ Device found:
             {"key": "NUVION_DEVICE_USERNAME", "default": "device-1", "comment": "Device username"},
             {"key": "NUVION_DEVICE_PASSWORD", "default": "***", "comment": "Device password"},
             {"key": "NUVION_VIDEO_SOURCE", "default": "/dev/video0", "comment": "Video source"},
+            {"key": "NUVION_VIDEO_ROTATION", "default": "0", "comment": "Video rotation"},
+            {"key": "NUVION_VIDEO_FLIP_HORIZONTAL", "default": "false", "comment": "Flip horizontal"},
+            {"key": "NUVION_VIDEO_FLIP_VERTICAL", "default": "false", "comment": "Flip vertical"},
             {"key": "NUVION_DEMO_MODE", "default": "false", "comment": "Demo mode"},
             {"key": "NUVION_WEBRTC_FORCE_RELAY", "default": "true", "comment": "Force relay"},
             {"key": "NUVION_CLIP_ENABLED", "default": "true", "comment": "Clip enabled"},
@@ -59,6 +76,9 @@ Device found:
             "NUVION_DEVICE_USERNAME": "device-1",
             "NUVION_DEVICE_PASSWORD": "secret",
             "NUVION_VIDEO_SOURCE": "avf:2",
+            "NUVION_VIDEO_ROTATION": "90",
+            "NUVION_VIDEO_FLIP_HORIZONTAL": "true",
+            "NUVION_VIDEO_FLIP_VERTICAL": "false",
             "NUVION_DEMO_MODE": "false",
             "NUVION_WEBRTC_FORCE_RELAY": "true",
             "NUVION_CLIP_ENABLED": "true",
@@ -80,6 +100,8 @@ Device found:
         self.assertIn("Advanced Options", html)
         self.assertIn("Most devices only need the server address", html)
         self.assertIn("Use detected camera names instead of typing /dev/video0 or avf:2 manually.", html)
+        self.assertIn('name="NUVION_VIDEO_ROTATION"', html)
+        self.assertIn('value="90" selected', html)
         self.assertIn("Live sessions can be overridden by the backend", html)
         self.assertIn('<option value="true" selected>On</option>', html)
         self.assertIn('<option value="false" selected>Off</option>', html)
