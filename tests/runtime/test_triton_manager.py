@@ -14,10 +14,13 @@ class TritonManagerTest(unittest.TestCase):
 
     def test_default_face_tracking_config_matches_ultraface_io(self) -> None:
         config = triton_manager._default_face_tracking_config("onnxruntime_onnx")
-        self.assertIn('name: "input"', config)
-        self.assertIn('name: "boxes"', config)
         self.assertIn('name: "scores"', config)
+        self.assertIn('name: "boxes"', config)
+        self.assertIn('dims: [ 1, 3, 480, 640 ]', config)
+        self.assertIn('dims: [ 1, 17640, 2 ]', config)
+        self.assertIn('dims: [ 1, 17640, 4 ]', config)
         self.assertNotIn('name: "num_detections"', config)
+        self.assertNotIn('format: FORMAT_NCHW', config)
 
     def test_resolve_repository_uses_default_on_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,8 +90,11 @@ class TritonManagerTest(unittest.TestCase):
             self.assertIn('platform: "onnxruntime_onnx"', config)
             self.assertIn('name: "face_detector"', config)
             self.assertIn('name: "input"', config)
-            self.assertIn('name: "boxes"', config)
             self.assertIn('name: "scores"', config)
+            self.assertIn('name: "boxes"', config)
+            self.assertIn('dims: [ 1, 3, 480, 640 ]', config)
+            self.assertIn('dims: [ 1, 17640, 2 ]', config)
+            self.assertIn('dims: [ 1, 17640, 4 ]', config)
             self.assertNotIn('name: "num_detections"', config)
 
     def test_resolve_repository_jetson_face_detector_falls_back_to_onnx_when_plan_build_fails(self) -> None:
