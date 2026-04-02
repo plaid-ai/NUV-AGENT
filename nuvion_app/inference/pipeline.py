@@ -900,7 +900,6 @@ class NuvionEventState:
         self.zero_shot_queue = queue.Queue(maxsize=1)
         self.tracking_last_sample = 0.0
         self.tracking_queue = queue.Queue(maxsize=1)
-        self.tracking_centered = False
         self.overlay_callback = overlay_callback
         self.overlay_lock = threading.Lock()
         self.last_anomaly_overlay: str | OverlayPayload | None = None
@@ -1423,17 +1422,9 @@ class NuvionEventState:
             self.tracking_overlay_state.update(snapshot)
             self._set_tracking_status(decision.status_text)
 
-            if decision.primary_face is None:
-                self.tracking_centered = False
+            if decision.primary_face is None or decision.centered:
                 continue
 
-            if decision.centered:
-                if not self.tracking_centered:
-                    self.motor_controller.center()
-                self.tracking_centered = True
-                continue
-
-            self.tracking_centered = False
             if decision.pan_command is not None:
                 self.motor_controller.send_pan(decision.pan_command)
             if decision.tilt_command is not None:
