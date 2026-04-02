@@ -8,6 +8,7 @@ import numpy as np
 from nuvion_app.inference.face_tracking import FaceBox
 from nuvion_app.inference.face_tracking import FaceTrackingController
 from nuvion_app.inference.face_tracking import TrackingOverlayState
+from nuvion_app.inference.face_tracking import TritonFaceDetector
 from nuvion_app.inference.face_tracking import build_overlay_snapshot
 from nuvion_app.inference.face_tracking import draw_tracking_overlay
 
@@ -137,6 +138,27 @@ class FaceTrackingTest(unittest.TestCase):
         self.assertEqual(len(context.arcs), 1)
         self.assertGreaterEqual(context.stroke_calls, 2)
         self.assertEqual(context.fill_calls, 1)
+
+    def test_triton_face_detector_recreates_client_on_thread_change(self) -> None:
+        created_clients = []
+
+        class FakeClient:
+            def __init__(self) -> None:
+                created_clients.append(self)
+
+            def predict(self, _frame):
+                return []
+
+        with mock.patch("nuvion_app.inference.face_tracking.TritonFaceClient", FakeClient):
+            detector = TritonFaceDetector()
+            self.assertTrue(detector.ready)
+            detector.detect(self.frame)
+            first_client = detector._client
+            detector._client_thread_id = -1
+            detector.detect(self.frame)
+
+        self.assertEqual(len(created_clients), 3)
+        self.assertIsNot(first_client, detector._client)
 
 
 if __name__ == "__main__":
