@@ -41,28 +41,69 @@ instance_group [
 """
 
 
+def _ultraface_box_count(width: int, height: int) -> int:
+    min_boxes = ((10.0, 16.0, 24.0), (32.0, 48.0), (64.0, 96.0), (128.0, 192.0, 256.0))
+    strides = (8.0, 16.0, 32.0, 64.0)
+    total = 0
+    for min_sizes, stride in zip(min_boxes, strides):
+        feature_map_w = int((width + stride - 1) // stride)
+        feature_map_h = int((height + stride - 1) // stride)
+        total += feature_map_w * feature_map_h * len(min_sizes)
+    return total
+
+
 def _default_face_tracking_config(platform: str) -> str:
     model_name = (os.getenv("NUVION_FACE_TRACKING_MODEL", "face_detector") or "face_detector").strip() or "face_detector"
     input_name = (os.getenv("NUVION_FACE_TRACKING_INPUT_NAME", "input") or "input").strip() or "input"
     boxes_output = (os.getenv("NUVION_FACE_TRACKING_BOXES_OUTPUT", "boxes") or "boxes").strip() or "boxes"
     scores_output = (os.getenv("NUVION_FACE_TRACKING_SCORES_OUTPUT", "scores") or "scores").strip() or "scores"
     num_output = (os.getenv("NUVION_FACE_TRACKING_NUM_DETECTIONS_OUTPUT", "") or "").strip()
+    model_kind = (os.getenv("NUVION_FACE_TRACKING_MODEL_KIND", "ultraface_rfb_640") or "ultraface_rfb_640").strip().lower()
     width = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_WIDTH", "640") or "640"), 1)
-    height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "640") or "640"), 1)
+    height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "480") or "480"), 1)
     instance_kind = "KIND_CPU" if platform == "onnxruntime_onnx" else "KIND_GPU"
-    output_blocks = [
-        f"""  {{
+    use_fixed_ultraface_shapes = model_kind.startswith("ultraface")
+
+    if use_fixed_ultraface_shapes:
+        input_block = f"""  {{
+    name: "{input_name}"
+    data_type: TYPE_FP32
+    dims: [ 1, 3, {height}, {width} ]
+  }}"""
+        box_count = _ultraface_box_count(width, height)
+        output_blocks = [
+            f"""  {{
+    name: "{scores_output}"
+    data_type: TYPE_FP32
+    dims: [ 1, {box_count}, 2 ]
+  }}""",
+            f"""  {{
+    name: "{boxes_output}"
+    data_type: TYPE_FP32
+    dims: [ 1, {box_count}, 4 ]
+  }}""",
+        ]
+    else:
+        input_block = f"""  {{
+    name: "{input_name}"
+    data_type: TYPE_FP32
+    dims: [ 3, {height}, {width} ]
+    format: FORMAT_NCHW
+  }}"""
+        output_blocks = [
+            f"""  {{
     name: "{boxes_output}"
     data_type: TYPE_FP32
     dims: [ -1, 4 ]
   }}""",
-        f"""  {{
+            f"""  {{
     name: "{scores_output}"
     data_type: TYPE_FP32
     dims: [ -1 ]
   }}""",
-    ]
-    if num_output:
+        ]
+
+    if num_output and not use_fixed_ultraface_shapes:
         output_blocks.append(
             f"""  {{
     name: "{num_output}"
@@ -75,12 +116,7 @@ def _default_face_tracking_config(platform: str) -> str:
 platform: "{platform}"
 max_batch_size: 0
 input [
-  {{
-    name: "{input_name}"
-    data_type: TYPE_FP32
-    dims: [ 3, {height}, {width} ]
-    format: FORMAT_NCHW
-  }}
+{input_block}
 ]
 output [
 {outputs}
