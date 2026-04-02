@@ -4,6 +4,7 @@ import atexit
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -21,7 +22,7 @@ from nuvion_app.runtime.docker_manager import (
     stop_container,
 )
 from nuvion_app.runtime.errors import BootstrapError
-from nuvion_app.runtime.inference_mode import normalize_backend
+from nuvion_app.runtime.inference_mode import face_tracking_uses_triton, normalize_backend
 
 log = logging.getLogger(__name__)
 _managed_triton_container: str | None = None
@@ -36,6 +37,52 @@ instance_group [
     kind: KIND_CPU
     count: 2
   }
+]
+"""
+
+
+def _default_face_tracking_config(platform: str) -> str:
+    model_name = (os.getenv("NUVION_FACE_TRACKING_MODEL", "face_detector") or "face_detector").strip() or "face_detector"
+    input_name = (os.getenv("NUVION_FACE_TRACKING_INPUT_NAME", "images") or "images").strip() or "images"
+    boxes_output = (os.getenv("NUVION_FACE_TRACKING_BOXES_OUTPUT", "detection_boxes") or "detection_boxes").strip() or "detection_boxes"
+    scores_output = (os.getenv("NUVION_FACE_TRACKING_SCORES_OUTPUT", "detection_scores") or "detection_scores").strip() or "detection_scores"
+    num_output = (os.getenv("NUVION_FACE_TRACKING_NUM_DETECTIONS_OUTPUT", "num_detections") or "num_detections").strip() or "num_detections"
+    width = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_WIDTH", "640") or "640"), 1)
+    height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "640") or "640"), 1)
+    instance_kind = "KIND_CPU" if platform == "onnxruntime_onnx" else "KIND_GPU"
+    return f"""name: "{model_name}"
+platform: "{platform}"
+max_batch_size: 0
+input [
+  {{
+    name: "{input_name}"
+    data_type: TYPE_FP32
+    dims: [ 3, {height}, {width} ]
+    format: FORMAT_NCHW
+  }}
+]
+output [
+  {{
+    name: "{boxes_output}"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]
+  }},
+  {{
+    name: "{scores_output}"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }},
+  {{
+    name: "{num_output}"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  }}
+]
+instance_group [
+  {{
+    kind: {instance_kind}
+    count: 1
+  }}
 ]
 """
 
@@ -76,6 +123,13 @@ def _is_raspberry_pi_linux() -> bool:
         if "raspberry pi" in content or "raspberrypi" in content:
             return True
     return False
+
+
+def _is_jetson_linux() -> bool:
+    try:
+        return os.uname().sysname.lower() == "linux" and Path("/etc/nv_tegra_release").exists()
+    except Exception:
+        return False
 
 
 def _should_use_onnx_repository() -> bool:
@@ -134,6 +188,94 @@ def _health_ready(host: str, port: int, timeout_sec: int) -> bool:
     return False
 
 
+def _copy_if_needed(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and dst.stat().st_size == src.stat().st_size:
+        return
+    shutil.copy2(src, dst)
+
+
+def _write_face_detector_config_if_missing(target_config: Path, platform: str, config_src: Path | None = None) -> None:
+    target_config.parent.mkdir(parents=True, exist_ok=True)
+    if config_src is not None and config_src.exists():
+        _copy_if_needed(config_src, target_config)
+        return
+    target_config.write_text(_default_face_tracking_config(platform))
+
+
+def _build_face_detector_trt_plan(onnx_src: Path, plan_dst: Path) -> bool:
+    trtexec = shutil.which("trtexec")
+    if not trtexec:
+        log.warning("[TRACK] trtexec not found. Falling back to ONNX face detector runtime.")
+        return False
+
+    plan_dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        trtexec,
+        f"--onnx={onnx_src}",
+        f"--saveEngine={plan_dst}",
+        "--skipInference",
+    ]
+    if _truthy(os.getenv("NUVION_FACE_TRACKING_TRT_FP16"), default=True):
+        cmd.append("--fp16")
+
+    extra_args = (os.getenv("NUVION_FACE_TRACKING_TRTEXEC_ARGS") or "").strip()
+    if extra_args:
+        cmd.extend(extra_args.split())
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        log.info("[TRACK] Built TensorRT face detector plan: %s", plan_dst)
+        return True
+    except Exception as exc:
+        log.warning("[TRACK] Failed to build TensorRT face detector plan: %s", exc)
+        return False
+
+
+def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, prefer_tensorrt: bool) -> None:
+    if not face_tracking_uses_triton():
+        return
+
+    onnx_src = model_dir / "onnx" / "face_detector.onnx"
+    if not onnx_src.exists():
+        raise BootstrapError(
+            "triton_health_failed",
+            f"Missing face tracking ONNX model: {onnx_src}",
+        )
+
+    config_src = model_dir / "triton" / "model_repository" / "face_detector" / "config.pbtxt"
+    model_repo = repository_root / "face_detector" / "1"
+    model_repo.mkdir(parents=True, exist_ok=True)
+
+    if prefer_tensorrt:
+        plan_path = model_repo / "model.plan"
+        packaged_plan = model_dir / "triton" / "model_repository" / "face_detector" / "1" / "model.plan"
+        if packaged_plan.exists():
+            _copy_if_needed(packaged_plan, plan_path)
+        elif not plan_path.exists() and not _build_face_detector_trt_plan(onnx_src, plan_path):
+            _copy_if_needed(onnx_src, model_repo / "model.onnx")
+            _write_face_detector_config_if_missing(
+                model_repo.parent / "config.pbtxt",
+                "onnxruntime_onnx",
+                None,
+            )
+            return
+
+        _write_face_detector_config_if_missing(
+            model_repo.parent / "config.pbtxt",
+            "tensorrt_plan",
+            config_src if config_src.exists() else None,
+        )
+        return
+
+    _copy_if_needed(onnx_src, model_repo / "model.onnx")
+    _write_face_detector_config_if_missing(
+        model_repo.parent / "config.pbtxt",
+        "onnxruntime_onnx",
+        None,
+    )
+
+
 def _ensure_cpu_onnx_repository(model_dir: Path, repository_root: Path) -> Path:
     model_repo = repository_root / "image_encoder" / "1"
     model_repo.mkdir(parents=True, exist_ok=True)
@@ -154,6 +296,7 @@ def _ensure_cpu_onnx_repository(model_dir: Path, repository_root: Path) -> Path:
     target_config = target_config_dir / "config.pbtxt"
     # CPU-only fallback uses ONNXRuntime config to avoid TensorRT(GPU-only) bootstrap failure.
     target_config.write_text(_FALLBACK_CONFIG)
+    _ensure_face_detector_repository(model_dir=model_dir, repository_root=repository_root, prefer_tensorrt=False)
 
     return repository_root
 
@@ -162,7 +305,14 @@ def resolve_repository_for_runtime(model_dir: Path) -> Path:
     default_repo = model_dir / "triton" / "model_repository"
     if not _should_use_onnx_repository():
         if not default_repo.exists():
-            raise BootstrapError("triton_health_failed", f"Triton model repository is missing: {default_repo}")
+            if normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton":
+                raise BootstrapError("triton_health_failed", f"Triton model repository is missing: {default_repo}")
+            default_repo.mkdir(parents=True, exist_ok=True)
+        _ensure_face_detector_repository(
+            model_dir=model_dir,
+            repository_root=default_repo,
+            prefer_tensorrt=_is_jetson_linux(),
+        )
         return default_repo
 
     fallback = model_dir / "triton" / "model_repository_onnx"
@@ -171,7 +321,7 @@ def resolve_repository_for_runtime(model_dir: Path) -> Path:
 
 def ensure_triton_ready(stage: str, model_dir: Path) -> None:
     backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
-    if backend != "triton":
+    if backend != "triton" and not face_tracking_uses_triton():
         return
 
     if not _truthy(os.getenv("NUVION_TRITON_AUTOSTART"), default=True):

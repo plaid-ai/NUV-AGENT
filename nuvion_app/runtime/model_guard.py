@@ -14,17 +14,20 @@ from nuvion_app.model_store import (
     DEFAULT_MODEL_SOURCE,
     _DEFAULT_LOCAL_PATHS,
     _PROFILE_KEYS,
+    ensure_default_face_tracking_model,
+    merge_required_keys,
     pull_model_from_gcs,
     pull_model_from_server,
     resolve_default_model_dir,
 )
 from nuvion_app.runtime.errors import BootstrapError
-from nuvion_app.runtime.inference_mode import normalize_backend
+from nuvion_app.runtime.inference_mode import face_tracking_uses_triton, normalize_backend
 
 log = logging.getLogger(__name__)
 
 
 _VALID_PROFILES = {"runtime", "light", "full"}
+_FACE_TRACKING_REQUIRED_KEYS = ["face_onnx"]
 
 
 def _truthy(value: str | None, default: bool = False) -> bool:
@@ -102,9 +105,28 @@ def resolve_model_dir(profile: str) -> Path:
     return resolve_default_model_dir(gcs_pointer_uri)
 
 
+def _required_model_keys(profile: str) -> list[str]:
+    keys: list[str] = []
+    if normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton":
+        keys = merge_required_keys(keys, _PROFILE_KEYS[profile])
+    if face_tracking_uses_triton():
+        keys = merge_required_keys(keys, _FACE_TRACKING_REQUIRED_KEYS)
+    return keys
+
+
+def _ensure_optional_face_tracking_assets(model_dir: Path) -> None:
+    if not face_tracking_uses_triton():
+        return
+    face_model_path = (model_dir / _DEFAULT_LOCAL_PATHS["face_onnx"]).resolve()
+    if face_model_path.exists():
+        return
+    ensure_default_face_tracking_model(model_dir)
+
+
 def _missing_required_files(model_dir: Path, profile: str) -> list[str]:
     missing: list[str] = []
-    for key in _PROFILE_KEYS[profile]:
+    required_keys = _required_model_keys(profile)
+    for key in required_keys:
         rel_path = _DEFAULT_LOCAL_PATHS.get(key)
         if not rel_path:
             continue
@@ -115,6 +137,14 @@ def _missing_required_files(model_dir: Path, profile: str) -> list[str]:
 
 
 def _pull_model(profile: str, model_dir: Path) -> None:
+    anomaly_uses_triton = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton"
+    tracking_uses_triton = face_tracking_uses_triton()
+    optional_tracking_keys = _FACE_TRACKING_REQUIRED_KEYS if tracking_uses_triton else []
+
+    if not anomaly_uses_triton and tracking_uses_triton:
+        ensure_default_face_tracking_model(model_dir)
+        return
+
     source = (os.getenv("NUVION_MODEL_SOURCE", DEFAULT_MODEL_SOURCE) or DEFAULT_MODEL_SOURCE).strip().lower()
     if source == "server":
         pull_model_from_server(
@@ -126,19 +156,23 @@ def _pull_model(profile: str, model_dir: Path) -> None:
             access_token=(os.getenv("NUVION_MODEL_SERVER_ACCESS_TOKEN") or "").strip() or None,
             username=(os.getenv("NUVION_DEVICE_USERNAME") or "").strip() or None,
             password=(os.getenv("NUVION_DEVICE_PASSWORD") or "").strip() or None,
+            optional_keys=optional_tracking_keys,
         )
-        return
+    else:
+        pull_model_from_gcs(
+            pointer_uri=(os.getenv("NUVION_MODEL_GCS_POINTER_URI", DEFAULT_MODEL_GCS_POINTER_URI) or DEFAULT_MODEL_GCS_POINTER_URI).strip(),
+            local_dir=str(model_dir),
+            profile=profile,
+            optional_keys=optional_tracking_keys,
+        )
 
-    pull_model_from_gcs(
-        pointer_uri=(os.getenv("NUVION_MODEL_GCS_POINTER_URI", DEFAULT_MODEL_GCS_POINTER_URI) or DEFAULT_MODEL_GCS_POINTER_URI).strip(),
-        local_dir=str(model_dir),
-        profile=profile,
-    )
+    if tracking_uses_triton:
+        _ensure_optional_face_tracking_assets(model_dir)
 
 
 def ensure_model_ready(stage: str) -> Path:
     backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
-    if backend != "triton":
+    if backend != "triton" and not face_tracking_uses_triton():
         return resolve_model_dir(resolve_effective_profile())
 
     if stage == "setup" and not _truthy(os.getenv("NUVION_MODEL_AUTO_PULL_ON_SETUP"), default=True):

@@ -6,7 +6,7 @@ import sys
 import time
 
 from nuvion_app.runtime.errors import BootstrapError
-from nuvion_app.runtime.inference_mode import normalize_backend
+from nuvion_app.runtime.inference_mode import face_tracking_uses_triton, normalize_backend
 from nuvion_app.runtime.model_guard import ensure_model_ready
 from nuvion_app.runtime.triton_manager import ensure_triton_ready
 
@@ -30,7 +30,7 @@ def ensure_ready(stage: str = "run") -> bool:
         return True
 
     backend = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
-    if backend != "triton":
+    if backend != "triton" and not face_tracking_uses_triton():
         return True
 
     max_retries = int(os.getenv("NUVION_BOOTSTRAP_MAX_RETRIES", "3"))

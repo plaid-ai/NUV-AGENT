@@ -8,14 +8,15 @@ from typing import Dict, List, Tuple
 from nuvion_app.config import effective_required_keys, load_template, read_env, write_env
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
-from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
+from nuvion_app.runtime.inference_mode import normalize_backend, normalize_face_tracking_backend, normalize_siglip_device
 
-CURRENT_CONFIG_SCHEMA_VERSION = "4"
+CURRENT_CONFIG_SCHEMA_VERSION = "5"
 _VALID_MODEL_SOURCES = {"server", "gcs"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
 _VALID_MOTOR_BACKENDS = {"auto", "uart", "pwm", "none"}
+_VALID_FACE_TRACKING_BACKENDS = {"auto", "triton", "opencv"}
 _SECRET_MARKERS = ("PASSWORD", "TOKEN", "SECRET")
 
 
@@ -149,6 +150,11 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if raw_siglip_device != normalized_siglip:
         update("NUVION_ZERO_SHOT_DEVICE", normalized_siglip, "normalize zero-shot device")
 
+    raw_tracking_backend = (values.get("NUVION_FACE_TRACKING_BACKEND", "auto") or "auto").strip().lower()
+    normalized_tracking_backend = normalize_face_tracking_backend(raw_tracking_backend, default="auto")
+    if raw_tracking_backend != normalized_tracking_backend:
+        update("NUVION_FACE_TRACKING_BACKEND", normalized_tracking_backend, "normalize face tracking backend")
+
     raw_rotation = (values.get("NUVION_VIDEO_ROTATION", "0") or "0").strip()
     if raw_rotation not in _VALID_VIDEO_ROTATIONS:
         update("NUVION_VIDEO_ROTATION", "0", "normalize video rotation")
@@ -162,14 +168,27 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
         update("NUVION_MOTOR_UART_BAUD", str(uart_baud), "normalize motor uart baud")
 
     for key, default in (
+        ("NUVION_FACE_TRACKING_INPUT_WIDTH", 640),
+        ("NUVION_FACE_TRACKING_INPUT_HEIGHT", 640),
+        ("NUVION_FACE_TRACKING_MAX_DETECTIONS", 8),
         ("NUVION_MOTOR_UART_TIMEOUT_SEC", 1.0),
         ("NUVION_TRACKING_SAMPLE_SEC", 0.1),
         ("NUVION_TRACKING_LOST_TIMEOUT_SEC", 1.0),
         ("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.1),
     ):
-        normalized = _normalize_float(values.get(key, ""), default)
+        if key in {"NUVION_FACE_TRACKING_INPUT_WIDTH", "NUVION_FACE_TRACKING_INPUT_HEIGHT", "NUVION_FACE_TRACKING_MAX_DETECTIONS"}:
+            normalized = _normalize_int(values.get(key, ""), int(default))
+        else:
+            normalized = _normalize_float(values.get(key, ""), float(default))
         if str(normalized) != str(values.get(key, "")):
             update(key, str(normalized), f"normalize {key.lower()}")
+
+    try:
+        tracking_threshold = float(values.get("NUVION_FACE_TRACKING_THRESHOLD", "0.45") or "0.45")
+    except Exception:
+        tracking_threshold = 0.45
+    if tracking_threshold <= 0 or tracking_threshold > 1:
+        update("NUVION_FACE_TRACKING_THRESHOLD", "0.45", "normalize face tracking threshold")
 
     deadzone = _normalize_float(values.get("NUVION_TRACKING_DEADZONE_PCT", ""), 0.12)
     if deadzone > 0.45:
@@ -225,7 +244,13 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     if (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower() not in _VALID_MOTOR_BACKENDS:
         errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, uart, pwm, none 중 하나여야 합니다."))
 
+    if (values.get("NUVION_FACE_TRACKING_BACKEND", "auto") or "auto").strip().lower() not in _VALID_FACE_TRACKING_BACKENDS:
+        errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_BACKEND", message="face tracking backend는 auto, triton, opencv 중 하나여야 합니다."))
+
     for key in (
+        "NUVION_FACE_TRACKING_INPUT_WIDTH",
+        "NUVION_FACE_TRACKING_INPUT_HEIGHT",
+        "NUVION_FACE_TRACKING_MAX_DETECTIONS",
         "NUVION_MOTOR_UART_BAUD",
         "NUVION_MOTOR_UART_TIMEOUT_SEC",
         "NUVION_TRACKING_SAMPLE_SEC",
@@ -245,6 +270,13 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_TRACKING_DEADZONE_PCT", message="0보다 크고 0.45 이하이어야 합니다."))
+
+    try:
+        threshold = float(str(values.get("NUVION_FACE_TRACKING_THRESHOLD", "")).strip())
+        if threshold <= 0 or threshold > 1:
+            raise ValueError
+    except Exception:
+        errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_THRESHOLD", message="0보다 크고 1 이하이어야 합니다."))
 
     if backend == "triton":
         triton_url = (values.get("NUVION_TRITON_URL", "") or "").strip()

@@ -19,6 +19,9 @@ DEFAULT_MODEL_PRESIGN_TTL_SECONDS = 300
 DEFAULT_MODEL_SERVER_BASE_URL = "https://api.nuvion-dev.plaidai.io"
 DEFAULT_MODEL_GCS_POINTER_URI = "gs://nuv-model/pointers/anomalyclip/prod.json"
 DEFAULT_MODEL_PRESIGN_REFRESH_RETRIES = 2
+DEFAULT_FACE_TRACKING_MODEL_URL = (
+    "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/ultraface/models/version-RFB-640.onnx"
+)
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +30,13 @@ _PROFILE_KEYS: dict[str, list[str]] = {
     "light": ["text_features", "manifest"],
     "full": [
         "onnx",
+        "face_onnx",
         "text_features",
         "pytorch",
         "plan",
         "triton_config",
+        "face_triton_config",
+        "face_plan",
         "onnx_eval",
         "triton_eval",
         "manifest",
@@ -40,9 +46,12 @@ _PROFILE_KEYS: dict[str, list[str]] = {
 _DEFAULT_LOCAL_PATHS = {
     "text_features": "onnx/text_features.npy",
     "onnx": "onnx/image_encoder_simplified.onnx",
+    "face_onnx": "onnx/face_detector.onnx",
     "pytorch": "pytorch/epoch_15.pth",
     "plan": "triton/model_repository/image_encoder/1/model.plan",
     "triton_config": "triton/model_repository/image_encoder/config.pbtxt",
+    "face_plan": "triton/model_repository/face_detector/1/model.plan",
+    "face_triton_config": "triton/model_repository/face_detector/config.pbtxt",
     "onnx_eval": "metadata/onnx_eval_results.txt",
     "triton_eval": "metadata/triton_eval_results.txt",
     "manifest": "metadata/gcs_manifest.json",
@@ -227,13 +236,12 @@ def _build_artifact_map(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _ensure_required_artifacts(
     *,
     artifact_by_key: dict[str, dict[str, Any]],
-    profile: str,
+    required_keys: list[str],
 ) -> list[str]:
-    required_keys = _PROFILE_KEYS[profile]
     missing = [key for key in required_keys if key not in artifact_by_key]
     if missing:
         raise RuntimeError(
-            f"Presign response is missing required artifacts for profile '{profile}': {', '.join(missing)}"
+            f"Presign response is missing required artifacts: {', '.join(missing)}"
         )
     return required_keys
 
@@ -292,6 +300,24 @@ def _resolve_profile_keys(pointer: dict[str, Any], profile: str) -> list[str]:
             if keys:
                 return keys
     return list(_PROFILE_KEYS[profile])
+
+
+def resolve_required_keys(profile: str, extra_keys: Optional[list[str]] = None) -> list[str]:
+    keys = list(_PROFILE_KEYS[profile])
+    for key in extra_keys or []:
+        normalized = str(key).strip()
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+    return keys
+
+
+def merge_required_keys(base_keys: list[str], extra_keys: Optional[list[str]] = None) -> list[str]:
+    keys = [str(key).strip() for key in base_keys if str(key).strip()]
+    for key in extra_keys or []:
+        normalized = str(key).strip()
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+    return keys
 
 
 def _resolve_local_rel_path(key: str, path_hint: Optional[str] = None) -> str:
@@ -437,6 +463,8 @@ def pull_model_from_gcs(
     pointer_uri: str,
     local_dir: Optional[str] = None,
     profile: str = DEFAULT_MODEL_PROFILE,
+    extra_keys: Optional[list[str]] = None,
+    optional_keys: Optional[list[str]] = None,
 ) -> tuple[Path, dict[str, Any]]:
     _ensure_profile(profile)
 
@@ -457,13 +485,14 @@ def pull_model_from_gcs(
     target_dir = _resolve_local_dir(identifier=pointer_uri, local_dir=local_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    required_keys = _resolve_profile_keys(pointer, profile)
+    required_keys = merge_required_keys(_resolve_profile_keys(pointer, profile), extra_keys)
+    fetch_keys = merge_required_keys(required_keys, [key for key in (optional_keys or []) if key in artifacts])
     missing = [key for key in required_keys if key not in artifacts]
     if missing:
         raise RuntimeError(f"Pointer is missing required artifacts for profile '{profile}': {', '.join(missing)}")
 
     downloaded: list[dict[str, Any]] = []
-    for key in required_keys:
+    for key in fetch_keys:
         src_obj, expected_sha256, expected_size = _artifact_path_from_pointer(artifacts[key], key)
         # Support both relative object paths and absolute gs:// URIs from pointer artifacts.
         src_uri = src_obj if src_obj.startswith("gs://") else _gcs_uri(bucket, src_obj)
@@ -496,6 +525,8 @@ def pull_model_from_server(
     access_token: Optional[str] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    extra_keys: Optional[list[str]] = None,
+    optional_keys: Optional[list[str]] = None,
 ) -> tuple[Path, dict[str, Any]]:
     _ensure_profile(profile)
 
@@ -525,7 +556,11 @@ def pull_model_from_server(
         ttl_seconds=ttl_seconds,
     )
     artifact_by_key = _build_artifact_map(data)
-    required_keys = _ensure_required_artifacts(artifact_by_key=artifact_by_key, profile=profile)
+    required_keys = _ensure_required_artifacts(
+        artifact_by_key=artifact_by_key,
+        required_keys=resolve_required_keys(profile, extra_keys),
+    )
+    fetch_keys = merge_required_keys(required_keys, [key for key in (optional_keys or []) if key in artifact_by_key])
 
     identifier = f"server:{normalized_pointer}:{profile}"
     target_dir = _resolve_local_dir(identifier=identifier, local_dir=local_dir)
@@ -539,8 +574,8 @@ def pull_model_from_server(
     refresh_attempts = 0
 
     downloaded: list[dict[str, Any]] = []
-    total_artifacts = len(required_keys)
-    for index, key in enumerate(required_keys, start=1):
+    total_artifacts = len(fetch_keys)
+    for index, key in enumerate(fetch_keys, start=1):
         retried_integrity = False
         while True:
             artifact = artifact_by_key[key]
@@ -634,7 +669,11 @@ def pull_model_from_server(
                         ttl_seconds=ttl_seconds,
                     )
                     artifact_by_key = _build_artifact_map(data)
-                    _ensure_required_artifacts(artifact_by_key=artifact_by_key, profile=profile)
+                    _ensure_required_artifacts(
+                        artifact_by_key=artifact_by_key,
+                        required_keys=required_keys,
+                    )
+                    fetch_keys = merge_required_keys(required_keys, [key for key in (optional_keys or []) if key in artifact_by_key])
                     continue
 
                 raise
@@ -653,3 +692,26 @@ def anomalyclip_text_features_path(model_dir: Path) -> Path:
 
 def anomalyclip_triton_repository_path(model_dir: Path) -> Path:
     return model_dir / "triton" / "model_repository"
+
+
+def ensure_default_face_tracking_model(model_dir: Path) -> Path:
+    target = (model_dir / "onnx" / "face_detector.onnx").resolve()
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    url = (os.getenv("NUVION_FACE_TRACKING_MODEL_URL", DEFAULT_FACE_TRACKING_MODEL_URL) or DEFAULT_FACE_TRACKING_MODEL_URL).strip()
+    if not url:
+        raise RuntimeError("NUVION_FACE_TRACKING_MODEL_URL is empty.")
+
+    _emit_model_progress("face tracking model missing. Downloading default face detector artifact...")
+    _download_http_file(url=url, dst_path=target, progress_label="[face-tracking] default model")
+    metadata_dir = (model_dir / "metadata").resolve()
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        metadata_dir / "face_tracking_default_model.json",
+        {
+            "url": url,
+            "dst": str(target),
+        },
+    )
+    return target

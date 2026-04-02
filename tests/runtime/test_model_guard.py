@@ -45,6 +45,39 @@ class ModelGuardTest(unittest.TestCase):
             missing = model_guard._missing_required_files(Path(tmp), "runtime")
             self.assertTrue(any(path.endswith("text_features.npy") for path in missing))
 
+    def test_missing_required_files_face_tracking_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NUVION_ZSAD_BACKEND": "none",
+                    "NUVION_FACE_TRACKING_ENABLED": "true",
+                    "NUVION_FACE_TRACKING_BACKEND": "triton",
+                },
+                clear=False,
+            ):
+                missing = model_guard._missing_required_files(Path(tmp), "runtime")
+        self.assertEqual(missing, ["onnx/face_detector.onnx"])
+
+    def test_pull_model_face_tracking_only_uses_default_face_model_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NUVION_ZSAD_BACKEND": "none",
+                    "NUVION_FACE_TRACKING_ENABLED": "true",
+                    "NUVION_FACE_TRACKING_BACKEND": "triton",
+                },
+                clear=False,
+            ):
+                with mock.patch.object(model_guard, "ensure_default_face_tracking_model") as ensure_face_model:
+                    with mock.patch.object(model_guard, "pull_model_from_server") as pull_server:
+                        with mock.patch.object(model_guard, "pull_model_from_gcs") as pull_gcs:
+                            model_guard._pull_model("runtime", Path(tmp))
+        ensure_face_model.assert_called_once()
+        pull_server.assert_not_called()
+        pull_gcs.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

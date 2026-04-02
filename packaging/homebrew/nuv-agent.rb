@@ -5,7 +5,7 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.92"
+  version "0.1.93"
   license "Proprietary"
 
   depends_on "python@3.14"
@@ -81,7 +81,7 @@ class NuvAgent < Formula
   end
 
   resource "pyserial" do
-    url "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629a4f8b426ffc869ebe6b18799d846c8dc592ef7d/pyserial-3.5-py2.py3-none-any.whl"
+    url "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl"
     sha256 "c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0"
   end
 

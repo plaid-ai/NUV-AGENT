@@ -31,10 +31,10 @@ from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
-from nuvion_app.inference.face_tracking import FaceDetector
 from nuvion_app.inference.face_tracking import FaceTrackingController
 from nuvion_app.inference.face_tracking import TrackingOverlaySnapshot
 from nuvion_app.inference.face_tracking import TrackingOverlayState
+from nuvion_app.inference.face_tracking import build_face_detector
 from nuvion_app.inference.face_tracking import build_overlay_snapshot
 from nuvion_app.inference.face_tracking import draw_tracking_overlay
 from nuvion_app.inference.motor import MotorController
@@ -929,7 +929,7 @@ class NuvionEventState:
                 updated_at=time.time(),
             )
         )
-        self.face_detector = FaceDetector() if self.face_tracking_enabled else None
+        self.face_detector = build_face_detector() if self.face_tracking_enabled else None
         self.motor_controller = MotorController(motor_config_from_env())
         self.tracking_controller = None
 

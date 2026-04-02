@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import dotenv_values, load_dotenv
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
+from nuvion_app.runtime.inference_mode import face_tracking_uses_triton
 DEFAULT_PORT = 8088
 SECRET_KEY_MARKERS = ("PASSWORD",)
 DEVICE_TYPE = "NUV_AGENT"
@@ -266,7 +267,13 @@ def _field_note(key: str) -> str:
         "NUVION_VIDEO_FLIP_HORIZONTAL": "Mirror the image left-to-right after source capture.",
         "NUVION_VIDEO_FLIP_VERTICAL": "Flip the image upside-down after source capture.",
         "NUVION_FACE_TRACKING_ENABLED": "Track the face closest to the frame center and optionally steer the motor.",
+        "NUVION_FACE_TRACKING_BACKEND": "auto prefers Triton. Jetson uses TensorRT when available, macOS/Raspberry Pi use ONNX fallback.",
+        "NUVION_FACE_TRACKING_MODEL": "Triton model name for the face detector runtime.",
         "NUVION_FACE_TRACKING_SHOW_BBOX": "Draw detected face boxes and deadzone overlay on the stream.",
+        "NUVION_FACE_TRACKING_INPUT_WIDTH": "Detector input width. Larger values improve accuracy at higher compute cost.",
+        "NUVION_FACE_TRACKING_INPUT_HEIGHT": "Detector input height. Larger values improve accuracy at higher compute cost.",
+        "NUVION_FACE_TRACKING_THRESHOLD": "Minimum detector confidence for a face to be tracked.",
+        "NUVION_FACE_TRACKING_MAX_DETECTIONS": "Maximum face boxes kept per frame before primary target selection.",
         "NUVION_MOTOR_ENABLED": "Enable motor control if the device has a supported motor backend.",
         "NUVION_MOTOR_BACKEND": "Allowed values: auto, uart, pwm, none.",
         "NUVION_MOTOR_UART_PORT": "UART serial device for the external motor controller.",
@@ -885,11 +892,15 @@ def _check_server_login(values: Dict[str, str]) -> Dict[str, str]:
 
 def _check_triton_health(values: Dict[str, str]) -> Dict[str, str]:
     backend = (values.get("NUVION_ZSAD_BACKEND") or "triton").strip().lower()
-    if backend not in {"triton"}:
+    tracking_uses_triton = face_tracking_uses_triton(
+        enabled=_is_truthy(values.get("NUVION_FACE_TRACKING_ENABLED", "false")),
+        backend=values.get("NUVION_FACE_TRACKING_BACKEND", "auto"),
+    )
+    if backend not in {"triton"} and not tracking_uses_triton:
         return {
             "name": "Triton health",
             "status": "skip",
-            "detail": f"Skipped because backend={backend}.",
+            "detail": f"Skipped because backend={backend} and face tracking does not use Triton.",
         }
     health_url = _parse_triton_health_url(values.get("NUVION_TRITON_URL") or "localhost:8000")
     req = urllib.request.Request(health_url, method="GET")

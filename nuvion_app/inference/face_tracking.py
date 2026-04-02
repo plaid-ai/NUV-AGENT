@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
+import logging
 import threading
 import time
 from dataclasses import dataclass
 
 from nuvion_app.inference.motor import MotorCommand
+from nuvion_app.runtime.inference_mode import normalize_face_tracking_backend
+
+log = logging.getLogger(__name__)
 
 try:
     import cv2
@@ -14,6 +20,14 @@ except Exception as exc:  # pragma: no cover - depends on runtime extras
     _CV2_IMPORT_ERROR = exc
 else:
     _CV2_IMPORT_ERROR = None
+
+try:
+    from nuvion_app.agent.triton_face_client import TritonFaceClient
+except Exception as exc:  # pragma: no cover - optional runtime path
+    TritonFaceClient = None
+    _TRITON_FACE_IMPORT_ERROR = exc
+else:
+    _TRITON_FACE_IMPORT_ERROR = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,43 @@ class TrackingOverlayState:
             return self._snapshot
 
 
+def _is_darwin() -> bool:
+    try:
+        return os.uname().sysname.lower() == "darwin"
+    except Exception:
+        return False
+
+
+def _is_raspberry_pi_linux() -> bool:
+    probe_paths = (
+        Path("/proc/device-tree/model"),
+        Path("/sys/firmware/devicetree/base/model"),
+        Path("/proc/device-tree/compatible"),
+        Path("/sys/firmware/devicetree/base/compatible"),
+    )
+    for probe_path in probe_paths:
+        try:
+            content = probe_path.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").lower()
+        except OSError:
+            continue
+        if "raspberry pi" in content or "raspberrypi" in content:
+            return True
+    return False
+
+
+def _is_jetson_linux() -> bool:
+    return Path("/etc/nv_tegra_release").exists()
+
+
+def resolve_face_tracking_backend() -> str:
+    configured = normalize_face_tracking_backend(os.getenv("NUVION_FACE_TRACKING_BACKEND", "auto"), default="auto")
+    if configured != "auto":
+        return configured
+    if _is_jetson_linux() or _is_darwin() or _is_raspberry_pi_linux():
+        return "triton"
+    return "triton"
+
+
 class FaceDetector:
     def __init__(self) -> None:
         self.ready = False
@@ -106,6 +157,47 @@ class FaceDetector:
         results = self._classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         faces = [FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in results]
         return faces
+
+
+class TritonFaceDetector:
+    def __init__(self) -> None:
+        self.ready = False
+        self.error = ""
+        self._client = None
+        if TritonFaceClient is None:
+            self.error = f"triton face client unavailable: {_TRITON_FACE_IMPORT_ERROR}"
+            return
+        try:
+            self._client = TritonFaceClient()
+        except Exception as exc:
+            self.error = str(exc)
+            return
+        self.ready = True
+
+    def detect(self, frame_rgb) -> list[FaceBox]:
+        if not self.ready or self._client is None:
+            return []
+        detections = self._client.predict(frame_rgb)
+        return [FaceBox(x=item.x, y=item.y, width=item.width, height=item.height) for item in detections]
+
+
+def build_face_detector() -> FaceDetector | TritonFaceDetector:
+    backend = resolve_face_tracking_backend()
+    if backend == "opencv":
+        return FaceDetector()
+
+    triton_detector = TritonFaceDetector()
+    if triton_detector.ready:
+        return triton_detector
+
+    fallback = FaceDetector()
+    if fallback.ready:
+        log.warning("[TRACK] Triton face detector unavailable. Falling back to OpenCV: %s", triton_detector.error)
+        return fallback
+
+    if triton_detector.error and fallback.error:
+        fallback.error = f"{triton_detector.error}; fallback failed: {fallback.error}"
+    return fallback
 
 
 class FaceTrackingController:
