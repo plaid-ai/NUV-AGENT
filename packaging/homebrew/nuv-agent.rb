@@ -80,6 +80,11 @@ class NuvAgent < Formula
     sha256 "9f302f4783709a78240ebc311b793f123328716a60911d667e0c036bc5dcbded"
   end
 
+  resource "pyserial" do
+    url "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629a4f8b426ffc869ebe6b18799d846c8dc592ef7d/pyserial-3.5-py2.py3-none-any.whl"
+    sha256 "c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0"
+  end
+
   resource "yarl" do
     url "https://files.pythonhosted.org/packages/11/63/ff458113c5c2dac9a9719ac68ee7c947cb621432bcf28c9972b1c0e83938/yarl-1.22.0-cp314-cp314-macosx_11_0_arm64.whl"
     sha256 "594fcab1032e2d2cc3321bb2e51271e7cd2b516c7d9aee780ece81b07ff8244b"

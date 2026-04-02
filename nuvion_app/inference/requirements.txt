@@ -1,5 +1,6 @@
 numpy
 python-dotenv
+pyserial
 websockets
 stomper
 aiohttp

@@ -31,6 +31,14 @@ from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
+from nuvion_app.inference.face_tracking import FaceDetector
+from nuvion_app.inference.face_tracking import FaceTrackingController
+from nuvion_app.inference.face_tracking import TrackingOverlaySnapshot
+from nuvion_app.inference.face_tracking import TrackingOverlayState
+from nuvion_app.inference.face_tracking import build_overlay_snapshot
+from nuvion_app.inference.face_tracking import draw_tracking_overlay
+from nuvion_app.inference.motor import MotorController
+from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -140,7 +148,7 @@ SERVER_BASE_URL = os.getenv("NUVION_SERVER_BASE_URL", "http://localhost:8080")
 DEVICE_USERNAME = os.getenv("NUVION_DEVICE_USERNAME", "device")
 DEVICE_PASSWORD = os.getenv("NUVION_DEVICE_PASSWORD", "password")
 
-VIDEO_SOURCE_ENV = os.getenv("NUVION_VIDEO_SOURCE", "/dev/video0")
+VIDEO_SOURCE_ENV = os.getenv("NUVION_VIDEO_SOURCE", "auto")
 GST_SOURCE_OVERRIDE = os.getenv("NUVION_GST_SOURCE")
 DEMO_MODE = is_truthy(os.getenv("NUVION_DEMO_MODE", "false"))
 DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
@@ -168,6 +176,11 @@ ZERO_SHOT_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect
 ZERO_SHOT_ANOMALY_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS", "defect,broken,crack,scratch"))
 ZERO_SHOT_THRESHOLD = parse_float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD"), 0.7)
 ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0)
+FACE_TRACKING_ENABLED = is_truthy(os.getenv("NUVION_FACE_TRACKING_ENABLED", "false"))
+FACE_TRACKING_SHOW_BBOX = is_truthy(os.getenv("NUVION_FACE_TRACKING_SHOW_BBOX", "true"))
+TRACKING_SAMPLE_SEC = parse_float(os.getenv("NUVION_TRACKING_SAMPLE_SEC"), 0.1)
+TRACKING_DEADZONE_PCT = parse_float(os.getenv("NUVION_TRACKING_DEADZONE_PCT"), 0.12)
+TRACKING_LOST_TIMEOUT_SEC = parse_float(os.getenv("NUVION_TRACKING_LOST_TIMEOUT_SEC"), 1.0)
 
 LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
 
@@ -885,7 +898,13 @@ class NuvionEventState:
         self.last_production_at = 0.0
         self.zero_shot_last_sample = 0.0
         self.zero_shot_queue = queue.Queue(maxsize=1)
+        self.tracking_last_sample = 0.0
+        self.tracking_queue = queue.Queue(maxsize=1)
+        self.tracking_centered = False
         self.overlay_callback = overlay_callback
+        self.overlay_lock = threading.Lock()
+        self.last_anomaly_overlay: str | OverlayPayload | None = None
+        self.tracking_status_text = ""
         self.last_status = None
         self.last_sent_status = None
         self.last_sent_at = 0.0
@@ -900,6 +919,20 @@ class NuvionEventState:
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
+        self.face_tracking_enabled = FACE_TRACKING_ENABLED
+        self.face_tracking_show_bbox = FACE_TRACKING_SHOW_BBOX
+        self.tracking_overlay_state = TrackingOverlayState()
+        self.tracking_overlay_state.update(
+            TrackingOverlaySnapshot(
+                enabled=self.face_tracking_enabled,
+                show_bbox=self.face_tracking_show_bbox,
+                status_text="TRACK disabled" if not self.face_tracking_enabled else "TRACK idle",
+                updated_at=time.time(),
+            )
+        )
+        self.face_detector = FaceDetector() if self.face_tracking_enabled else None
+        self.motor_controller = MotorController(motor_config_from_env())
+        self.tracking_controller = None
 
         self.backend = ZSAD_BACKEND
         self.zero_shot = None
@@ -924,8 +957,32 @@ class NuvionEventState:
         else:
             self.backend = "none"
 
+        if self.face_tracking_enabled:
+            if self.face_detector is None or not self.face_detector.ready:
+                reason = self.face_detector.error if self.face_detector is not None else "detector unavailable"
+                log.warning("[TRACK] Face tracking disabled: %s", reason)
+                self.face_tracking_enabled = False
+                self.tracking_status_text = f"TRACK unavailable: {reason}"
+                self.tracking_overlay_state.update(
+                    TrackingOverlaySnapshot(
+                        enabled=False,
+                        show_bbox=False,
+                        status_text=self.tracking_status_text,
+                        updated_at=time.time(),
+                    )
+                )
+            else:
+                self.tracking_controller = FaceTrackingController(
+                    detector=self.face_detector,
+                    deadzone_pct=TRACKING_DEADZONE_PCT,
+                    lost_timeout_sec=TRACKING_LOST_TIMEOUT_SEC,
+                )
+                self.tracking_status_text = "TRACK idle"
+
         self.worker_thread = threading.Thread(target=self._zsad_worker, daemon=True)
         self.worker_thread.start()
+        self.tracking_thread = threading.Thread(target=self._tracking_worker, daemon=True)
+        self.tracking_thread.start()
 
     def reset_demo_timing(self) -> None:
         self.demo_started_at = time.time()
@@ -948,6 +1005,62 @@ class NuvionEventState:
             return
 
         self.current_demo_ground_truth = self.demo_ground_truth_labels[index % len(self.demo_ground_truth_labels)]
+
+    def _resolve_tracking_status(self) -> str:
+        if not self.face_tracking_enabled:
+            return self.tracking_status_text
+        if self.tracking_status_text:
+            return self.tracking_status_text
+        if self.motor_controller.available:
+            return "TRACK ready"
+        if self.motor_controller.config.enabled:
+            return f"TRACK overlay only ({self.motor_controller.reason or 'motor unavailable'})"
+        return "TRACK overlay only"
+
+    def _emit_combined_overlay(self) -> None:
+        if not self.overlay_callback:
+            return
+
+        with self.overlay_lock:
+            anomaly_overlay = self.last_anomaly_overlay
+            tracking_status = self._resolve_tracking_status()
+
+        if self.demo_mode:
+            payload = anomaly_overlay
+            if payload is None:
+                return
+            self._emit_overlay(payload)
+            return
+
+        lines: list[str] = []
+        if isinstance(anomaly_overlay, OverlayPayload):
+            lines.append(f"{anomaly_overlay.status} {anomaly_overlay.label} {anomaly_overlay.score_text}")
+        elif isinstance(anomaly_overlay, str) and anomaly_overlay.strip():
+            lines.append(anomaly_overlay.strip())
+
+        if tracking_status:
+            lines.append(tracking_status)
+
+        if not lines:
+            return
+
+        self._emit_overlay("\n".join(lines))
+
+    def _set_anomaly_overlay(self, overlay: str | OverlayPayload) -> None:
+        with self.overlay_lock:
+            self.last_anomaly_overlay = overlay
+        self._emit_combined_overlay()
+
+    def _set_tracking_status(self, status: str) -> None:
+        resolved = status
+        if self.face_tracking_enabled and not self.motor_controller.available:
+            if self.motor_controller.config.enabled:
+                resolved = f"{status} | motor unavailable"
+            else:
+                resolved = f"{status} | overlay only"
+        with self.overlay_lock:
+            self.tracking_status_text = resolved
+        self._emit_combined_overlay()
 
     def _get_or_create_triton_client(self):
         if TritonAnomalyClient is None:
@@ -1204,19 +1317,24 @@ class NuvionEventState:
                 pass
 
     def maybe_enqueue_frame(self, frame_rgb):
-        if self.backend == "none":
-            return
         now = time.time()
-        if now - self.zero_shot_last_sample < ZERO_SHOT_SAMPLE_SEC:
-            return
-        self.zero_shot_last_sample = now
+        if self.backend != "none":
+            if now - self.zero_shot_last_sample >= ZERO_SHOT_SAMPLE_SEC:
+                self.zero_shot_last_sample = now
+                if not self.zero_shot_queue.full():
+                    try:
+                        self.zero_shot_queue.put_nowait(frame_rgb)
+                    except queue.Full:
+                        pass
 
-        if self.zero_shot_queue.full():
-            return
-        try:
-            self.zero_shot_queue.put_nowait(frame_rgb)
-        except queue.Full:
-            pass
+        if self.face_tracking_enabled and self.tracking_controller is not None:
+            if now - self.tracking_last_sample >= TRACKING_SAMPLE_SEC:
+                self.tracking_last_sample = now
+                if not self.tracking_queue.full():
+                    try:
+                        self.tracking_queue.put_nowait(frame_rgb)
+                    except queue.Full:
+                        pass
 
     def _zsad_worker(self):
         while self.running:
@@ -1240,7 +1358,7 @@ class NuvionEventState:
                         score=score,
                         ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
                     )
-                    self._emit_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
+                    self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
                     if status == "DEFECT":
                         self.send_status("DEFECT", label, f"Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
                     else:
@@ -1273,7 +1391,7 @@ class NuvionEventState:
                     score=score,
                     ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
                 )
-                self._emit_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
+                self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
 
                 if status == "DEFECT":
                     self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING")
@@ -1281,10 +1399,45 @@ class NuvionEventState:
                     self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO")
 
                 if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
-                    now = time.time()
-                    if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
-                        self.last_production_at = now
-                        self.report_production(1)
+                        now = time.time()
+                        if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
+                            self.last_production_at = now
+                            self.report_production(1)
+
+    def _tracking_worker(self):
+        while self.running:
+            try:
+                frame = self.tracking_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if frame is None or not self.face_tracking_enabled or self.tracking_controller is None:
+                continue
+
+            decision = self.tracking_controller.process_frame(frame)
+            snapshot = build_overlay_snapshot(
+                decision,
+                enabled=self.face_tracking_enabled,
+                show_bbox=self.face_tracking_show_bbox,
+            )
+            self.tracking_overlay_state.update(snapshot)
+            self._set_tracking_status(decision.status_text)
+
+            if decision.primary_face is None:
+                self.tracking_centered = False
+                continue
+
+            if decision.centered:
+                if not self.tracking_centered:
+                    self.motor_controller.center()
+                self.tracking_centered = True
+                continue
+
+            self.tracking_centered = False
+            if decision.pan_command is not None:
+                self.motor_controller.send_pan(decision.pan_command)
+            if decision.tilt_command is not None:
+                self.motor_controller.send_tilt(decision.tilt_command)
 
 def on_new_sample(appsink, user_data: NuvionEventState):
     sample = appsink.emit("pull-sample")
@@ -1327,6 +1480,7 @@ class GStreamerInferenceApp:
         self.demo_source = self._prepare_demo_source() if self.demo_mode else None
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
+        self.tracking_overlay = None
         self.status_overlay = None
         self.label_overlay = None
         self.score_overlay = None
@@ -1367,8 +1521,22 @@ class GStreamerInferenceApp:
             demo_source=self.demo_source,
         )
 
+        tracking_overlay_pipeline = ""
+        if (
+            self.user_data.face_tracking_enabled
+            and self.user_data.face_tracking_show_bbox
+            and Gst.ElementFactory.find("cairooverlay") is not None
+        ):
+            tracking_overlay_pipeline = (
+                "videoconvert ! "
+                "video/x-raw,format=BGRx ! "
+                "cairooverlay name=tracking_overlay ! "
+                "videoconvert ! "
+            )
+
         if self.demo_mode:
             overlay_pipeline = (
+                f"{tracking_overlay_pipeline}"
                 "videoconvert ! "
                 "textoverlay name=zsad_overlay "
                 "font-desc=\"Sans 24\" "
@@ -1412,6 +1580,7 @@ class GStreamerInferenceApp:
             )
         else:
             overlay_pipeline = (
+                f"{tracking_overlay_pipeline}"
                 "videoconvert ! "
                 "textoverlay name=zsad_overlay "
                 "font-desc=\"Sans 24\" "
@@ -1505,6 +1674,11 @@ class GStreamerInferenceApp:
             log.warning("[PIPELINE] zsad_overlay not found.")
         else:
             self.update_overlay_text(self._default_overlay_text())
+        self.tracking_overlay = self.pipeline.get_by_name("tracking_overlay")
+        if self.tracking_overlay:
+            self.tracking_overlay.connect("draw", self._draw_tracking_overlay)
+        elif self.user_data.face_tracking_enabled and self.user_data.face_tracking_show_bbox:
+            log.warning("[TRACK] cairooverlay not available. Bounding boxes will be disabled.")
         self.status_overlay = self.pipeline.get_by_name("zsad_status_overlay")
         self.label_overlay = self.pipeline.get_by_name("zsad_label_overlay")
         self.score_overlay = self.pipeline.get_by_name("zsad_score_overlay")
@@ -1565,6 +1739,10 @@ class GStreamerInferenceApp:
     def send_webrtc_signal(self, destination: str, payload: dict, remember: bool) -> bool:
         return enqueue_stomp_message(destination, payload, remember=remember)
 
+    def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
+        snapshot = self.user_data.tracking_overlay_state.snapshot()
+        draw_tracking_overlay(context, snapshot)
+
     def _set_overlay_field(self, overlay, text: str, color: int = OVERLAY_COLOR_WHITE) -> None:
         if overlay is None:
             return
@@ -1607,11 +1785,12 @@ class GStreamerInferenceApp:
     def _default_overlay_text(self) -> str:
         backend = getattr(self.user_data, "backend", "none")
         prefix = "DEMO | " if self.demo_mode else ""
+        tracking_suffix = " | TRACK" if self.user_data.face_tracking_enabled else ""
         if backend == "triton":
-            return f"{prefix}ZSAD TRITON ON | WEBRTC"
+            return f"{prefix}ZSAD TRITON ON | WEBRTC{tracking_suffix}"
         if backend == "siglip":
-            return f"{prefix}ZSAD ON | WEBRTC"
-        return f"{prefix}ZSAD OFF | WEBRTC"
+            return f"{prefix}ZSAD ON | WEBRTC{tracking_suffix}"
+        return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
 
     def run(self):
         def _start():
@@ -1639,6 +1818,7 @@ class GStreamerInferenceApp:
 
     def shutdown(self):
         self.user_data.running = False
+        self.user_data.motor_controller.close()
         if self.webrtc_uplink:
             self.webrtc_uplink.stop(send_signal=True)
         if self.pipeline:
@@ -1648,7 +1828,7 @@ class GStreamerInferenceApp:
 
 
 def main():
-    video_source = os.getenv("NUVION_VIDEO_SOURCE", "/dev/video0")
+    video_source = os.getenv("NUVION_VIDEO_SOURCE", "auto")
     app = GStreamerInferenceApp(video_source)
     app.run()
 

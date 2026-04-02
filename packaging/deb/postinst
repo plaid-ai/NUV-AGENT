@@ -17,6 +17,9 @@ fi
 if getent group video >/dev/null 2>&1; then
   usermod -a -G video nuvion || true
 fi
+if getent group dialout >/dev/null 2>&1; then
+  usermod -a -G dialout nuvion || true
+fi
 if getent group docker >/dev/null 2>&1; then
   usermod -a -G docker nuvion || true
 fi
@@ -34,6 +37,9 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   usermod -a -G nuvion "$SUDO_USER" || true
   if getent group video >/dev/null 2>&1; then
     usermod -a -G video "$SUDO_USER" || true
+  fi
+  if getent group dialout >/dev/null 2>&1; then
+    usermod -a -G dialout "$SUDO_USER" || true
   fi
   if getent group docker >/dev/null 2>&1; then
     usermod -a -G docker "$SUDO_USER" || true

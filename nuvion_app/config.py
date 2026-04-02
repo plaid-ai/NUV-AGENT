@@ -225,6 +225,9 @@ def _is_basic_setup_field(key: str) -> bool:
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
+        "NUVION_FACE_TRACKING_ENABLED",
+        "NUVION_FACE_TRACKING_SHOW_BBOX",
+        "NUVION_MOTOR_ENABLED",
         "NUVION_DEMO_MODE",
     }
 
@@ -234,8 +237,10 @@ def _field_section(key: str) -> str:
         return "clips"
     if key.startswith("NUVION_CONNECTIVITY_") or key == "NUVION_DEVICE_STATE_INTERVAL_SEC":
         return "connectivity"
-    if key.startswith("NUVION_ZERO_SHOT_"):
+    if key.startswith("NUVION_ZERO_SHOT_") or key.startswith("NUVION_FACE_TRACKING_"):
         return "detection"
+    if key.startswith("NUVION_MOTOR_"):
+        return "runtime"
     if key.startswith("NUVION_TRITON_"):
         return "runtime"
     if key.startswith("NUVION_MODEL_") or key.startswith("NUVION_RUNTIME_") or key.startswith("NUVION_BOOTSTRAP_"):
@@ -260,6 +265,14 @@ def _field_note(key: str) -> str:
         "NUVION_VIDEO_ROTATION": "Allowed values: 0, 90, 180, 270.",
         "NUVION_VIDEO_FLIP_HORIZONTAL": "Mirror the image left-to-right after source capture.",
         "NUVION_VIDEO_FLIP_VERTICAL": "Flip the image upside-down after source capture.",
+        "NUVION_FACE_TRACKING_ENABLED": "Track the face closest to the frame center and optionally steer the motor.",
+        "NUVION_FACE_TRACKING_SHOW_BBOX": "Draw detected face boxes and deadzone overlay on the stream.",
+        "NUVION_MOTOR_ENABLED": "Enable motor control if the device has a supported motor backend.",
+        "NUVION_MOTOR_BACKEND": "Allowed values: auto, uart, pwm, none.",
+        "NUVION_MOTOR_UART_PORT": "UART serial device for the external motor controller.",
+        "NUVION_MOTOR_UART_BAUD": "Serial baud rate for UART motor control.",
+        "NUVION_MOTOR_PAN_INVERT": "Invert left/right commands when motor wiring is reversed.",
+        "NUVION_MOTOR_TILT_INVERT": "Invert up/down commands when motor wiring is reversed.",
         "NUVION_WEBRTC_FORCE_RELAY": "Fallback only. Live sessions can be overridden by the backend, so most users should leave this as-is.",
         "NUVION_CLIP_ENABLED": "Stores short video evidence around anomaly events. Disable only when debugging clip-related issues.",
     }
@@ -268,6 +281,10 @@ def _field_note(key: str) -> str:
 
 def _is_rotation_field(key: str) -> bool:
     return key == "NUVION_VIDEO_ROTATION"
+
+
+def _is_motor_backend_field(key: str) -> bool:
+    return key == "NUVION_MOTOR_BACKEND"
 
 
 def _prompt_boolean_setting(label: str, key: str, default: str) -> str:
@@ -299,6 +316,48 @@ def _prompt_rotation_setting(label: str, key: str, default: str) -> str:
         print("Enter one of: 0, 90, 180, 270.")
 
 
+def _prompt_choice_setting(label: str, key: str, default: str, choices: tuple[str, ...]) -> str:
+    prompt = f"{label} ({key}) [{default or choices[0]}]: "
+    while True:
+        entered = input(prompt).strip().lower()
+        if not entered:
+            return default or choices[0]
+        if entered in choices:
+            return entered
+        print(f"Enter one of: {', '.join(choices)}.")
+
+
+def _parse_int_or_default(value: str, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _parse_float_or_default(value: str, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _build_motor_config_from_values(values: Dict[str, str]):
+    from nuvion_app.inference.motor import MotorConfig
+
+    return MotorConfig(
+        enabled=_is_truthy(values.get("NUVION_MOTOR_ENABLED", "false")),
+        backend=(values.get("NUVION_MOTOR_BACKEND") or "auto").strip().lower() or "auto",
+        uart_port=(values.get("NUVION_MOTOR_UART_PORT") or "/dev/ttyTHS1").strip() or "/dev/ttyTHS1",
+        uart_baud=_parse_int_or_default(values.get("NUVION_MOTOR_UART_BAUD", "115200"), 115200),
+        uart_timeout_sec=_parse_float_or_default(values.get("NUVION_MOTOR_UART_TIMEOUT_SEC", "1.0"), 1.0),
+        pan_invert=_is_truthy(values.get("NUVION_MOTOR_PAN_INVERT", "false")),
+        tilt_invert=_is_truthy(values.get("NUVION_MOTOR_TILT_INVERT", "false")),
+        command_interval_sec=_parse_float_or_default(values.get("NUVION_MOTOR_COMMAND_INTERVAL_SEC", "0.1"), 0.1),
+    )
+
+
 def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str]) -> Dict[str, str]:
     values = dict(existing)
     camera_fields = {
@@ -327,6 +386,77 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
             values[key] = _prompt_boolean_setting(label, key, default)
             continue
 
+    return values
+
+
+def _maybe_run_motor_test(values: Dict[str, str]) -> None:
+    from nuvion_app.inference.motor import MotorController, run_motor_test
+
+    answer = input("Run motor test now? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return
+
+    controller = MotorController(_build_motor_config_from_values(values))
+    run_motor_test(controller)
+
+
+def _prompt_tracking_motor_setup(fields: List[Dict[str, str]], existing: Dict[str, str]) -> Dict[str, str]:
+    values = dict(existing)
+    field_map = {field["key"]: field for field in fields}
+
+    print("Tracking + motor setup (press Enter to keep current value)")
+    values["NUVION_FACE_TRACKING_ENABLED"] = _prompt_boolean_setting(
+        field_map["NUVION_FACE_TRACKING_ENABLED"]["comment"] or "Face tracking",
+        "NUVION_FACE_TRACKING_ENABLED",
+        values.get("NUVION_FACE_TRACKING_ENABLED", field_map["NUVION_FACE_TRACKING_ENABLED"]["default"]),
+    )
+
+    if _is_truthy(values.get("NUVION_FACE_TRACKING_ENABLED", "false")):
+        values["NUVION_FACE_TRACKING_SHOW_BBOX"] = _prompt_boolean_setting(
+            field_map["NUVION_FACE_TRACKING_SHOW_BBOX"]["comment"] or "Show tracking bbox",
+            "NUVION_FACE_TRACKING_SHOW_BBOX",
+            values.get("NUVION_FACE_TRACKING_SHOW_BBOX", field_map["NUVION_FACE_TRACKING_SHOW_BBOX"]["default"]),
+        )
+
+    values["NUVION_MOTOR_ENABLED"] = _prompt_boolean_setting(
+        field_map["NUVION_MOTOR_ENABLED"]["comment"] or "Motor enabled",
+        "NUVION_MOTOR_ENABLED",
+        values.get("NUVION_MOTOR_ENABLED", field_map["NUVION_MOTOR_ENABLED"]["default"]),
+    )
+
+    if not _is_truthy(values.get("NUVION_MOTOR_ENABLED", "false")):
+        return values
+
+    values["NUVION_MOTOR_BACKEND"] = _prompt_choice_setting(
+        field_map["NUVION_MOTOR_BACKEND"]["comment"] or "Motor backend",
+        "NUVION_MOTOR_BACKEND",
+        values.get("NUVION_MOTOR_BACKEND", field_map["NUVION_MOTOR_BACKEND"]["default"]),
+        ("auto", "uart", "pwm", "none"),
+    )
+
+    for key in (
+        "NUVION_MOTOR_UART_PORT",
+        "NUVION_MOTOR_UART_BAUD",
+        "NUVION_MOTOR_UART_TIMEOUT_SEC",
+        "NUVION_MOTOR_PAN_INVERT",
+        "NUVION_MOTOR_TILT_INVERT",
+    ):
+        field = field_map[key]
+        default = values.get(key, field["default"])
+        if _is_boolean_like(field["default"], default):
+            values[key] = _prompt_boolean_setting(field["comment"] or key, key, default)
+            continue
+        if _is_motor_backend_field(key):
+            values[key] = _prompt_choice_setting(field["comment"] or key, key, default, ("auto", "uart", "pwm", "none"))
+            continue
+        prompt = f"{field['comment'] or key} ({key})"
+        if default:
+            prompt += f" [{default}]"
+        prompt += ": "
+        entered = input(prompt).strip()
+        values[key] = entered or default
+
+    _maybe_run_motor_test(values)
     return values
 
 
@@ -631,23 +761,32 @@ def _validate_required(values: Dict[str, str]) -> List[str]:
 
 def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced: bool) -> Dict[str, str]:
     values = _merge_defaults(fields, existing)
+    values = _prompt_camera_setup(fields, values)
+    values = _prompt_tracking_motor_setup(fields, values)
     required_keys = effective_required_keys(values)
+    handled_keys = {
+        "NUVION_VIDEO_SOURCE",
+        "NUVION_VIDEO_ROTATION",
+        "NUVION_VIDEO_FLIP_HORIZONTAL",
+        "NUVION_VIDEO_FLIP_VERTICAL",
+        "NUVION_FACE_TRACKING_ENABLED",
+        "NUVION_FACE_TRACKING_SHOW_BBOX",
+        "NUVION_MOTOR_ENABLED",
+        "NUVION_MOTOR_BACKEND",
+        "NUVION_MOTOR_UART_PORT",
+        "NUVION_MOTOR_UART_BAUD",
+        "NUVION_MOTOR_UART_TIMEOUT_SEC",
+        "NUVION_MOTOR_PAN_INVERT",
+        "NUVION_MOTOR_TILT_INVERT",
+    }
     for field in fields:
         key = field["key"]
+        if key in handled_keys:
+            continue
         default = values.get(key, "")
         required = key in required_keys
         basic = _is_basic_setup_field(key)
         if not advanced and not required and not basic:
-            continue
-
-        if key == "NUVION_VIDEO_SOURCE":
-            values[key] = _prompt_video_source(default)
-            continue
-        if _is_rotation_field(key):
-            values[key] = _prompt_rotation_setting(field["comment"] or key, key, default)
-            continue
-        if _is_boolean_like(field["default"], default):
-            values[key] = _prompt_boolean_setting(field["comment"] or key, key, default)
             continue
 
         label = field["comment"] or key
@@ -861,6 +1000,37 @@ def _check_demo_video_source(values: Dict[str, str]) -> Dict[str, str]:
     return {"name": "Demo dataset source", "status": "pass", "detail": detail}
 
 
+def _check_tracking_overlay(values: Dict[str, str]) -> Dict[str, str]:
+    if not _is_truthy(values.get("NUVION_FACE_TRACKING_ENABLED", "false")):
+        return {"name": "Tracking overlay", "status": "skip", "detail": "Face tracking is disabled."}
+    if _is_truthy(values.get("NUVION_FACE_TRACKING_SHOW_BBOX", "true")):
+        return {"name": "Tracking overlay", "status": "pass", "detail": "Face tracking and bbox overlay are enabled."}
+    return {"name": "Tracking overlay", "status": "warn", "detail": "Face tracking is enabled, but bbox overlay is hidden."}
+
+
+def _check_motor_backend(values: Dict[str, str]) -> Dict[str, str]:
+    from nuvion_app.inference.motor import MotorController
+
+    if not _is_truthy(values.get("NUVION_MOTOR_ENABLED", "false")):
+        return {"name": "Motor backend", "status": "skip", "detail": "Motor control is disabled."}
+
+    controller = MotorController(_build_motor_config_from_values(values))
+    try:
+        if controller.available:
+            return {
+                "name": "Motor backend",
+                "status": "pass",
+                "detail": f"Motor backend ready: {controller.config.backend}",
+            }
+        return {
+            "name": "Motor backend",
+            "status": "warn",
+            "detail": controller.reason or "Motor backend unavailable. Tracking will stay overlay-only.",
+        }
+    finally:
+        controller.close()
+
+
 def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
     demo_mode = _is_truthy(values.get("NUVION_DEMO_MODE", "false"))
     source_check = _check_demo_video_source(values) if demo_mode else _check_camera_source(values)
@@ -868,6 +1038,8 @@ def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
         _check_server_login(values),
         _check_triton_health(values),
         source_check,
+        _check_tracking_overlay(values),
+        _check_motor_backend(values),
     ]
     has_fail = any(check["status"] == "fail" for check in checks)
     return {"ok": not has_fail, "checks": checks}
@@ -961,6 +1133,32 @@ def _render_form(
                     label=html.escape(comment),
                     key=html.escape(key),
                     options=option_rows,
+                )
+            )
+            continue
+        if _is_motor_backend_field(key):
+            backend_options = ("auto", "uart", "pwm", "none")
+            target_rows.append(
+                """
+                <div class="field field-row group-{group}" data-group="{group}">
+                  <label>{label}<span class="key">{key}</span></label>
+                  <select name="{key}">
+                    {options}
+                  </select>
+                  {note}
+                </div>
+                """.format(
+                    group=html.escape(group),
+                    label=html.escape(comment),
+                    key=html.escape(key),
+                    options="\n".join(
+                        '<option value="{value}" {selected}>{value}</option>'.format(
+                            value=option,
+                            selected="selected" if option == (value or "auto") else "",
+                        )
+                        for option in backend_options
+                    ),
+                    note=note_html,
                 )
             )
             continue
@@ -1173,6 +1371,21 @@ def _render_form(
             <div id="provision-status" class="status"></div>
           </div>
     """.format(device_name=html.escape(device_name))
+
+    motor_test_block = """
+          <div class="card">
+            <h2>Motor Test</h2>
+            <p class="muted">Send a single movement command using the current form values before saving.</p>
+            <div class="actions left">
+              <button type="button" onclick="sendMotorCommand('LEFT')">Left</button>
+              <button type="button" onclick="sendMotorCommand('RIGHT')">Right</button>
+              <button type="button" onclick="sendMotorCommand('UP')">Up</button>
+              <button type="button" onclick="sendMotorCommand('DOWN')">Down</button>
+              <button type="button" onclick="sendMotorCommand('CENTER')">Center</button>
+            </div>
+            <div id="motor-test-status" class="status"></div>
+          </div>
+    """
 
     return """
     <!doctype html>
@@ -1388,9 +1601,10 @@ def _render_form(
               {error_block}
               {basic_rows}
             </div>
-            {provision_block}
-            {inference_block}
-            <div class="card">
+          {provision_block}
+          {inference_block}
+          {motor_test_block}
+          <div class="card">
               {advanced_block}
               {rows}
               <div class="actions">
@@ -1575,6 +1789,35 @@ def _render_form(
             }}
           }}
 
+          async function sendMotorCommand(command) {{
+            const statusEl = document.getElementById("motor-test-status");
+            const form = document.getElementById("config-form");
+            if (!statusEl || !form) {{
+              return;
+            }}
+            const values = {{}};
+            const data = new FormData(form);
+            data.forEach((value, key) => {{
+              values[key] = String(value);
+            }});
+            statusEl.textContent = `Sending ${{command}}...`;
+            try {{
+              const resp = await fetch("/api/motor-test", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ values, command }})
+              }});
+              const result = await resp.json();
+              if (!resp.ok || result.error) {{
+                statusEl.textContent = result.error || "Motor test failed.";
+                return;
+              }}
+              statusEl.textContent = result.detail || `Sent ${{command}}`;
+            }} catch (err) {{
+              statusEl.textContent = "Motor test error: " + err;
+            }}
+          }}
+
           const backendSelect = document.getElementById("inference-backend");
           const deviceSelect = document.getElementById("siglip-device");
           if (backendSelect) {{
@@ -1595,6 +1838,7 @@ def _render_form(
         override_block=override_block,
         inference_block=inference_block,
         provision_block=provision_block,
+        motor_test_block=motor_test_block,
         advanced_block=advanced_block,
     )
 
@@ -1728,6 +1972,53 @@ def run_web_setup(
                 self._send_json(HTTPStatus.OK, _run_preflight(values))
                 return
 
+            if self.path == "/api/motor-test":
+                from nuvion_app.inference.motor import MotorCommand, MotorController
+
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                try:
+                    payload = json.loads(body) if body else {}
+                except json.JSONDecodeError:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
+                    return
+
+                incoming_values = payload.get("values")
+                command_name = str(payload.get("command") or "").strip().upper()
+                if not isinstance(incoming_values, dict):
+                    incoming_values = {}
+
+                values = dict(existing)
+                for field in fields:
+                    key = field["key"]
+                    raw = incoming_values.get(key)
+                    if raw is None:
+                        continue
+                    posted = str(raw).strip()
+                    if not posted and _is_secret_key(key) and existing.get(key):
+                        values[key] = existing[key]
+                    else:
+                        values[key] = posted
+
+                if command_name not in MotorCommand.__members__:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"Unsupported command: {command_name}"})
+                    return
+
+                controller = MotorController(_build_motor_config_from_values(values))
+                try:
+                    if not controller.available:
+                        self._send_json(
+                            HTTPStatus.OK,
+                            {"detail": controller.reason or "Motor backend unavailable. Tracking will stay overlay-only."},
+                        )
+                        return
+                    sent = controller.send(MotorCommand[command_name])
+                    detail = f"Sent {command_name}" if sent else f"Skipped {command_name} due to command throttling."
+                    self._send_json(HTTPStatus.OK, {"detail": detail})
+                finally:
+                    controller.close()
+                return
+
             if self.path != "/save":
                 self.send_response(HTTPStatus.NOT_FOUND)
                 self.end_headers()
@@ -1847,6 +2138,7 @@ def run_qr_setup(config_path: Path, advanced: bool) -> None:
         values["NUVION_DEVICE_PASSWORD"] = str(device_password)
 
     values = _prompt_camera_setup(fields, values)
+    values = _prompt_tracking_motor_setup(fields, values)
 
     missing = _validate_required(values)
     if missing:
