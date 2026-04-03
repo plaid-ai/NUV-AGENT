@@ -53,7 +53,7 @@ class MotorConfig:
     uart_timeout_sec: float = 1.0
     pan_invert: bool = False
     tilt_invert: bool = False
-    command_interval_sec: float = 0.1
+    command_interval_sec: float = 0.05
 
 
 def _truthy(value: str | None) -> bool:
@@ -93,7 +93,7 @@ def motor_config_from_env() -> MotorConfig:
         uart_timeout_sec=_env_float("NUVION_MOTOR_UART_TIMEOUT_SEC", 1.0),
         pan_invert=_truthy(os.getenv("NUVION_MOTOR_PAN_INVERT", "false")),
         tilt_invert=_truthy(os.getenv("NUVION_MOTOR_TILT_INVERT", "false")),
-        command_interval_sec=_env_float("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.1),
+        command_interval_sec=_env_float("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.05),
     )
 
 
@@ -173,7 +173,7 @@ class MotorController:
         self.config = config
         self.backend = backend or build_motor_backend(config)
         self._lock = threading.Lock()
-        self._last_sent_at = 0.0
+        self._last_sent_at: dict[str, float] = {}
 
     @property
     def available(self) -> bool:
@@ -183,7 +183,7 @@ class MotorController:
     def reason(self) -> str:
         return getattr(self.backend, "reason", "")
 
-    def send(self, command: MotorCommand, *, force: bool = False) -> bool:
+    def send(self, command: MotorCommand, *, force: bool = False, lane: str = "generic") -> bool:
         if not self.config.enabled:
             return False
         if not self.backend.available:
@@ -191,11 +191,12 @@ class MotorController:
 
         now = time.time()
         with self._lock:
-            if not force and now - self._last_sent_at < self.config.command_interval_sec:
+            last_sent_at = self._last_sent_at.get(lane, 0.0)
+            if not force and now - last_sent_at < self.config.command_interval_sec:
                 return False
 
             self.backend.send_command(command)
-            self._last_sent_at = now
+            self._last_sent_at[lane] = now
             return True
 
     def send_pan(self, command: MotorCommand | None) -> bool:
@@ -207,7 +208,7 @@ class MotorController:
                 mapped = MotorCommand.RIGHT
             elif command == MotorCommand.RIGHT:
                 mapped = MotorCommand.LEFT
-        return self.send(mapped)
+        return self.send(mapped, lane="pan")
 
     def send_tilt(self, command: MotorCommand | None) -> bool:
         if command is None:
@@ -218,7 +219,7 @@ class MotorController:
                 mapped = MotorCommand.DOWN
             elif command == MotorCommand.DOWN:
                 mapped = MotorCommand.UP
-        return self.send(mapped)
+        return self.send(mapped, lane="tilt")
 
     def center(self) -> bool:
         return self.send(MotorCommand.CENTER)
