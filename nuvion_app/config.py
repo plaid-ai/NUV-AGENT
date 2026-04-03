@@ -361,7 +361,7 @@ def _build_motor_config_from_values(values: Dict[str, str]):
         uart_timeout_sec=_parse_float_or_default(values.get("NUVION_MOTOR_UART_TIMEOUT_SEC", "1.0"), 1.0),
         pan_invert=_is_truthy(values.get("NUVION_MOTOR_PAN_INVERT", "false")),
         tilt_invert=_is_truthy(values.get("NUVION_MOTOR_TILT_INVERT", "false")),
-        command_interval_sec=_parse_float_or_default(values.get("NUVION_MOTOR_COMMAND_INTERVAL_SEC", "0.1"), 0.1),
+        command_interval_sec=_parse_float_or_default(values.get("NUVION_MOTOR_COMMAND_INTERVAL_SEC", "0.05"), 0.05),
     )
 
 

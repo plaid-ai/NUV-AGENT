@@ -105,6 +105,31 @@ class ConfigGuardTest(unittest.TestCase):
             report = guard_config(config_path=config_path, apply_fixes=True)
             self.assertTrue(report.ok)
 
+    def test_guard_migrates_legacy_tracking_responsiveness_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_CONFIG_SCHEMA_VERSION=5",
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_TRACKING_SAMPLE_SEC=0.1",
+                        "NUVION_TRACKING_DEADZONE_PCT=0.12",
+                        "NUVION_MOTOR_COMMAND_INTERVAL_SEC=0.1",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_TRACKING_SAMPLE_SEC"], "0.05")
+            self.assertEqual(report.values["NUVION_TRACKING_DEADZONE_PCT"], "0.08")
+            self.assertEqual(report.values["NUVION_MOTOR_COMMAND_INTERVAL_SEC"], "0.05")
+
     def test_guard_rejects_invalid_mvtec_base_url_when_demo_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"

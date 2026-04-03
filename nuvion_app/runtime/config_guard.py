@@ -15,7 +15,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "5"
+CURRENT_CONFIG_SCHEMA_VERSION = "6"
 _VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
@@ -101,6 +101,7 @@ def _normalize_float(value: str, default: float) -> float:
 
 def _apply_migrations(values: Dict[str, str]) -> List[str]:
     changed: List[str] = []
+    previous_schema = (values.get("NUVION_CONFIG_SCHEMA_VERSION", "") or "").strip()
 
     def update(key: str, new_value: str, reason: str) -> None:
         old_value = values.get(key, "")
@@ -111,6 +112,16 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
 
     if values.get("NUVION_CONFIG_SCHEMA_VERSION", "").strip() != CURRENT_CONFIG_SCHEMA_VERSION:
         update("NUVION_CONFIG_SCHEMA_VERSION", CURRENT_CONFIG_SCHEMA_VERSION, "schema version update")
+
+    if previous_schema != CURRENT_CONFIG_SCHEMA_VERSION:
+        legacy_responsiveness_defaults = {
+            "NUVION_TRACKING_SAMPLE_SEC": ("0.1", "0.05"),
+            "NUVION_TRACKING_DEADZONE_PCT": ("0.12", "0.08"),
+            "NUVION_MOTOR_COMMAND_INTERVAL_SEC": ("0.1", "0.05"),
+        }
+        for key, (old_value, new_value) in legacy_responsiveness_defaults.items():
+            if (values.get(key, "") or "").strip() == old_value:
+                update(key, new_value, "apply faster tracking defaults")
 
     raw_backend = (values.get("NUVION_ZSAD_BACKEND", "triton") or "triton").strip().lower()
     backend = normalize_backend(raw_backend, default="triton")
@@ -180,9 +191,9 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
         ("NUVION_FACE_TRACKING_OPT_BATCH_SIZE", 2),
         ("NUVION_MOTOR_UART_TIMEOUT_SEC", 1.0),
         ("NUVION_FACE_TRACKING_TRT_WORKSPACE_GIB", 1.0),
-        ("NUVION_TRACKING_SAMPLE_SEC", 0.1),
+        ("NUVION_TRACKING_SAMPLE_SEC", 0.05),
         ("NUVION_TRACKING_LOST_TIMEOUT_SEC", 1.0),
-        ("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.1),
+        ("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.05),
     ):
         if key in {
             "NUVION_FACE_TRACKING_INPUT_WIDTH",
@@ -204,7 +215,7 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if tracking_threshold <= 0 or tracking_threshold > 1:
         update("NUVION_FACE_TRACKING_THRESHOLD", "0.45", "normalize face tracking threshold")
 
-    deadzone = _normalize_float(values.get("NUVION_TRACKING_DEADZONE_PCT", ""), 0.12)
+    deadzone = _normalize_float(values.get("NUVION_TRACKING_DEADZONE_PCT", ""), 0.08)
     if deadzone > 0.45:
         deadzone = 0.45
     if str(deadzone) != str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")):

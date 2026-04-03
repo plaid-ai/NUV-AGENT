@@ -50,6 +50,29 @@ class MotorTest(unittest.TestCase):
             [motor_module.MotorCommand.RIGHT, motor_module.MotorCommand.DOWN],
         )
 
+    def test_pan_and_tilt_have_independent_rate_limits(self) -> None:
+        backend = FakeBackend()
+        config = motor_module.MotorConfig(enabled=True, command_interval_sec=0.5)
+        controller = motor_module.MotorController(config, backend=backend)
+
+        with mock.patch("nuvion_app.inference.motor.time.time", side_effect=[10.0, 10.0, 10.1, 10.1, 10.7, 10.7]):
+            self.assertTrue(controller.send_pan(motor_module.MotorCommand.LEFT))
+            self.assertTrue(controller.send_tilt(motor_module.MotorCommand.UP))
+            self.assertFalse(controller.send_pan(motor_module.MotorCommand.LEFT))
+            self.assertFalse(controller.send_tilt(motor_module.MotorCommand.UP))
+            self.assertTrue(controller.send_pan(motor_module.MotorCommand.LEFT))
+            self.assertTrue(controller.send_tilt(motor_module.MotorCommand.UP))
+
+        self.assertEqual(
+            backend.commands,
+            [
+                motor_module.MotorCommand.LEFT,
+                motor_module.MotorCommand.UP,
+                motor_module.MotorCommand.LEFT,
+                motor_module.MotorCommand.UP,
+            ],
+        )
+
     def test_build_motor_backend_returns_noop_when_serial_unavailable(self) -> None:
         config = motor_module.MotorConfig(enabled=True, backend="uart")
         with mock.patch.object(motor_module, "serial", None):
