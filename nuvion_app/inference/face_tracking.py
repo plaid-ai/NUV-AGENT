@@ -169,7 +169,7 @@ class TritonFaceDetector:
         self.error = ""
         self._client = None
         self._client_thread_id: int | None = None
-        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
+        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "2") or "2"), 1)
         if TritonFaceClient is None:
             self.error = f"triton face client unavailable: {_TRITON_FACE_IMPORT_ERROR}"
             return

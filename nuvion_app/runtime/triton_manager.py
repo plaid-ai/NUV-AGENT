@@ -47,7 +47,7 @@ instance_group [
 
 
 def _face_tracking_max_batch_size() -> int:
-    return max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
+    return max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "2") or "2"), 1)
 
 
 def _ultraface_box_count(width: int, height: int) -> int:
@@ -221,7 +221,7 @@ def _should_use_onnx_repository() -> bool:
 
 
 def _should_autostop() -> bool:
-    return _truthy(os.getenv("NUVION_TRITON_AUTOSTOP_ON_EXIT"), default=True)
+    return _truthy(os.getenv("NUVION_TRITON_AUTOSTOP_ON_EXIT"), default=False)
 
 
 def _register_managed_triton_container(container_name: str) -> None:

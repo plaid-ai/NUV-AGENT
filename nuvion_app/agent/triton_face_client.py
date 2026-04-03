@@ -96,7 +96,7 @@ class TritonFaceClient:
         self.threshold = float(os.getenv("NUVION_FACE_TRACKING_THRESHOLD", "0.7") or "0.7")
         self.max_detections = max(int(os.getenv("NUVION_FACE_TRACKING_MAX_DETECTIONS", "8") or "8"), 1)
         self.nms_iou = float(os.getenv("NUVION_FACE_TRACKING_NMS_IOU", "0.3") or "0.3")
-        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
+        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "2") or "2"), 1)
 
         self.client = httpclient.InferenceServerClient(url=self.url)
         self._ensure_model_ready()

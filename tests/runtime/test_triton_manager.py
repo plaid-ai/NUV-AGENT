@@ -14,7 +14,7 @@ class TritonManagerTest(unittest.TestCase):
 
     def test_default_face_tracking_config_matches_ultraface_io(self) -> None:
         config = triton_manager._default_face_tracking_config("onnxruntime_onnx")
-        self.assertIn('max_batch_size: 4', config)
+        self.assertIn('max_batch_size: 2', config)
         self.assertIn('name: "scores"', config)
         self.assertIn('name: "boxes"', config)
         self.assertIn('dims: [ 3, 480, 640 ]', config)
@@ -93,7 +93,7 @@ class TritonManagerTest(unittest.TestCase):
             self.assertIn('name: "input"', config)
             self.assertIn('name: "scores"', config)
             self.assertIn('name: "boxes"', config)
-            self.assertIn('max_batch_size: 4', config)
+            self.assertIn('max_batch_size: 2', config)
             self.assertIn('dims: [ 3, 480, 640 ]', config)
             self.assertIn('dims: [ 17640, 2 ]', config)
             self.assertIn('dims: [ 17640, 4 ]', config)
@@ -233,10 +233,11 @@ class TritonManagerTest(unittest.TestCase):
 
     def test_cleanup_managed_triton_stops_running_container(self) -> None:
         triton_manager._managed_triton_container = "triton-nuv"
-        with mock.patch.object(triton_manager, "container_exists", return_value=True):
-            with mock.patch.object(triton_manager, "container_running", return_value=True):
-                with mock.patch.object(triton_manager, "stop_container") as stop_mock:
-                    triton_manager.cleanup_managed_triton(reason="unit_test")
+        with mock.patch.dict("os.environ", {"NUVION_TRITON_AUTOSTOP_ON_EXIT": "true"}, clear=False):
+            with mock.patch.object(triton_manager, "container_exists", return_value=True):
+                with mock.patch.object(triton_manager, "container_running", return_value=True):
+                    with mock.patch.object(triton_manager, "stop_container") as stop_mock:
+                        triton_manager.cleanup_managed_triton(reason="unit_test")
         stop_mock.assert_called_once_with("triton-nuv")
         self.assertIsNone(triton_manager._managed_triton_container)
 
