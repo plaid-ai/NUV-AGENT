@@ -15,13 +15,26 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "6"
+CURRENT_CONFIG_SCHEMA_VERSION = "7"
 _VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
 _VALID_MOTOR_BACKENDS = {"auto", "uart", "pwm", "none"}
 _VALID_FACE_TRACKING_BACKENDS = {"auto", "triton", "opencv"}
+_VALID_CAMERA_PREFERENCES = {"auto", "csi", "usb"}
+_VALID_CAMERA_WB_MODES = {
+    "auto",
+    "off",
+    "incandescent",
+    "fluorescent",
+    "warm-fluorescent",
+    "daylight",
+    "cloudy-daylight",
+    "twilight",
+    "shade",
+    "manual",
+}
 _SECRET_MARKERS = ("PASSWORD", "TOKEN", "SECRET")
 
 
@@ -96,6 +109,18 @@ def _normalize_float(value: str, default: float) -> float:
         return default
     if parsed <= 0:
         return default
+    return parsed
+
+
+def _normalize_float_in_range(value: str, default: float, *, lower: float, upper: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    if parsed < lower:
+        return lower
+    if parsed > upper:
+        return upper
     return parsed
 
 
@@ -175,6 +200,14 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if raw_rotation not in _VALID_VIDEO_ROTATIONS:
         update("NUVION_VIDEO_ROTATION", "0", "normalize video rotation")
 
+    camera_preference = (values.get("NUVION_CAMERA_PREFERENCE", "auto") or "auto").strip().lower()
+    if camera_preference not in _VALID_CAMERA_PREFERENCES:
+        update("NUVION_CAMERA_PREFERENCE", "auto", "normalize camera preference")
+
+    camera_wb_mode = (values.get("NUVION_CAMERA_WB_MODE", "auto") or "auto").strip().lower()
+    if camera_wb_mode not in _VALID_CAMERA_WB_MODES:
+        update("NUVION_CAMERA_WB_MODE", "auto", "normalize camera white balance mode")
+
     motor_backend = (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower()
     if motor_backend not in _VALID_MOTOR_BACKENDS:
         update("NUVION_MOTOR_BACKEND", "auto", "normalize motor backend")
@@ -221,6 +254,27 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if str(deadzone) != str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")):
         update("NUVION_TRACKING_DEADZONE_PCT", str(deadzone), "normalize tracking deadzone")
 
+    camera_brightness = _normalize_float_in_range(values.get("NUVION_CAMERA_BRIGHTNESS", ""), 0.0, lower=-1.0, upper=1.0)
+    if str(camera_brightness) != str(values.get("NUVION_CAMERA_BRIGHTNESS", "")):
+        update("NUVION_CAMERA_BRIGHTNESS", str(camera_brightness), "normalize camera brightness")
+
+    camera_contrast = _normalize_float_in_range(values.get("NUVION_CAMERA_CONTRAST", ""), 1.0, lower=0.0, upper=2.0)
+    if str(camera_contrast) != str(values.get("NUVION_CAMERA_CONTRAST", "")):
+        update("NUVION_CAMERA_CONTRAST", str(camera_contrast), "normalize camera contrast")
+
+    camera_saturation = _normalize_float_in_range(values.get("NUVION_CAMERA_SATURATION", ""), 1.0, lower=0.0, upper=2.0)
+    if str(camera_saturation) != str(values.get("NUVION_CAMERA_SATURATION", "")):
+        update("NUVION_CAMERA_SATURATION", str(camera_saturation), "normalize camera saturation")
+
+    exposure_compensation = _normalize_float_in_range(
+        values.get("NUVION_CAMERA_EXPOSURE_COMPENSATION", ""),
+        0.0,
+        lower=-2.0,
+        upper=2.0,
+    )
+    if str(exposure_compensation) != str(values.get("NUVION_CAMERA_EXPOSURE_COMPENSATION", "")):
+        update("NUVION_CAMERA_EXPOSURE_COMPENSATION", str(exposure_compensation), "normalize camera exposure compensation")
+
     return changed
 
 
@@ -266,6 +320,12 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     if (values.get("NUVION_VIDEO_ROTATION", "0") or "0").strip() not in _VALID_VIDEO_ROTATIONS:
         errors.append(ConfigIssue(key="NUVION_VIDEO_ROTATION", message="허용 값은 0, 90, 180, 270 입니다."))
 
+    if (values.get("NUVION_CAMERA_PREFERENCE", "auto") or "auto").strip().lower() not in _VALID_CAMERA_PREFERENCES:
+        errors.append(ConfigIssue(key="NUVION_CAMERA_PREFERENCE", message="camera preference는 auto, csi, usb 중 하나여야 합니다."))
+
+    if (values.get("NUVION_CAMERA_WB_MODE", "auto") or "auto").strip().lower() not in _VALID_CAMERA_WB_MODES:
+        errors.append(ConfigIssue(key="NUVION_CAMERA_WB_MODE", message="camera wb mode 값이 지원되지 않습니다."))
+
     if (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower() not in _VALID_MOTOR_BACKENDS:
         errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, uart, pwm, none 중 하나여야 합니다."))
 
@@ -305,6 +365,19 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_THRESHOLD", message="0보다 크고 1 이하이어야 합니다."))
+
+    for key, lower, upper in (
+        ("NUVION_CAMERA_BRIGHTNESS", -1.0, 1.0),
+        ("NUVION_CAMERA_CONTRAST", 0.0, 2.0),
+        ("NUVION_CAMERA_SATURATION", 0.0, 2.0),
+        ("NUVION_CAMERA_EXPOSURE_COMPENSATION", -2.0, 2.0),
+    ):
+        try:
+            parsed = float(str(values.get(key, "")).strip())
+            if parsed < lower or parsed > upper:
+                raise ValueError
+        except Exception:
+            errors.append(ConfigIssue(key=key, message=f"{lower} 이상 {upper} 이하 값이어야 합니다."))
 
     requires_server_model_auth = backend == "triton" or face_tracking_uses_triton(
         enabled=_is_truthy(values.get("NUVION_FACE_TRACKING_ENABLED", "false")),

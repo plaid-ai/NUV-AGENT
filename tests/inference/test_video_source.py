@@ -53,6 +53,26 @@ class VideoSourceTest(unittest.TestCase):
         self.assertIn("nvarguscamerasrc sensor-id=0", pipeline)
         self.assertIn("nvvidconv", pipeline)
 
+    def test_build_camera_source_linux_auto_prefers_usb_when_requested(self) -> None:
+        fake_devices = [
+            LinuxVideoDeviceInfo(path="/dev/video0", name="vi-output, imx477 9-001a"),
+            LinuxVideoDeviceInfo(path="/dev/video2", name="USB Camera"),
+        ]
+        with mock.patch.dict("os.environ", {"NUVION_CAMERA_PREFERENCE": "usb"}, clear=False):
+            with mock.patch("nuvion_app.inference.video_source._linux_video_devices", return_value=fake_devices):
+                with mock.patch("nuvion_app.inference.video_source._is_jetson_platform", return_value=True):
+                    with mock.patch("nuvion_app.inference.video_source._gst_element_available", return_value=True):
+                        pipeline = build_video_source_pipeline(
+                            "auto",
+                            640,
+                            480,
+                            30,
+                            platform_name="linux",
+                        )
+
+        self.assertIn("v4l2src device=/dev/video2", pipeline)
+        self.assertNotIn("nvarguscamerasrc", pipeline)
+
     def test_build_camera_source_linux_explicit_jetson_csi_device_uses_argus(self) -> None:
         fake_device = LinuxVideoDeviceInfo(path="/dev/video0", name="vi-output, imx477 9-001a")
         with mock.patch("nuvion_app.inference.video_source._is_jetson_platform", return_value=True):
@@ -82,6 +102,17 @@ class VideoSourceTest(unittest.TestCase):
                     )
 
         self.assertIn("v4l2src device=/dev/video0", pipeline)
+
+    def test_build_camera_source_linux_supports_v4l_alias_path(self) -> None:
+        pipeline = build_video_source_pipeline(
+            "/dev/v4l/by-id/usb-test-camera",
+            640,
+            480,
+            30,
+            platform_name="linux",
+        )
+
+        self.assertIn("v4l2src device=/dev/v4l/by-id/usb-test-camera", pipeline)
 
     def test_build_camera_source_macos_auto(self) -> None:
         pipeline = build_video_source_pipeline(
@@ -187,6 +218,35 @@ class VideoSourceTest(unittest.TestCase):
             pipeline,
             "videotestsrc pattern=smpte ! videoconvert ! videoflip method=vertical-flip ! videoflip method=rotate-180 ! video/x-raw,format=RGB",
         )
+
+    def test_jetson_pipeline_applies_camera_controls_and_balance(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "NUVION_CAMERA_AUTO_EXPOSURE": "false",
+                "NUVION_CAMERA_EXPOSURE_COMPENSATION": "0.5",
+                "NUVION_CAMERA_AUTO_WHITE_BALANCE": "false",
+                "NUVION_CAMERA_WB_MODE": "daylight",
+                "NUVION_CAMERA_BRIGHTNESS": "0.1",
+                "NUVION_CAMERA_CONTRAST": "1.2",
+                "NUVION_CAMERA_SATURATION": "1.3",
+            },
+            clear=False,
+        ):
+            with mock.patch("nuvion_app.inference.video_source._gst_element_available", return_value=True):
+                pipeline = build_video_source_pipeline(
+                    "jetson",
+                    640,
+                    480,
+                    30,
+                    platform_name="linux",
+                )
+
+        self.assertIn("aelock=true", pipeline)
+        self.assertIn("awblock=true", pipeline)
+        self.assertIn("exposurecompensation=0.500", pipeline)
+        self.assertIn("wbmode=daylight", pipeline)
+        self.assertIn("videobalance brightness=0.100 contrast=1.200 saturation=1.300", pipeline)
 
 
 if __name__ == "__main__":

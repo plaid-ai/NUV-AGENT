@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from nuvion_app.config import _check_camera_source, _parse_gst_device_monitor_output, _render_form, discover_video_source_options
+from nuvion_app.config import _check_camera_source, _parse_gst_device_monitor_output, _render_form, _run_preflight, discover_video_source_options
 
 
 class ConfigVideoSourceTest(unittest.TestCase):
@@ -53,8 +53,32 @@ Device found:
         self.assertEqual(options[0]["detail"], "Uses nvarguscamerasrc.")
 
     def test_check_camera_source_accepts_auto(self) -> None:
-        check = _check_camera_source({"NUVION_VIDEO_SOURCE": "auto"})
+        check = _check_camera_source({"NUVION_VIDEO_SOURCE": "auto", "NUVION_CAMERA_PREFERENCE": "usb"})
         self.assertEqual(check["status"], "pass")
+        self.assertIn("preference=usb", check["detail"])
+
+    def test_preflight_runs_live_camera_probe(self) -> None:
+        values = {
+            "NUVION_SERVER_BASE_URL": "https://api.example.com",
+            "NUVION_DEVICE_USERNAME": "device-1",
+            "NUVION_DEVICE_PASSWORD": "secret",
+            "NUVION_ZSAD_BACKEND": "none",
+            "NUVION_VIDEO_SOURCE": "auto",
+            "NUVION_CAMERA_PREFERENCE": "auto",
+            "NUVION_FACE_TRACKING_ENABLED": "false",
+            "NUVION_MOTOR_ENABLED": "false",
+        }
+
+        with mock.patch("nuvion_app.config.shutil.which", return_value="/usr/bin/gst-launch-1.0"):
+            with mock.patch("nuvion_app.config._check_server_login", return_value={"name": "Server login", "status": "pass", "detail": "ok"}):
+                with mock.patch("nuvion_app.config._check_triton_health", return_value={"name": "Triton health", "status": "skip", "detail": "skip"}):
+                    with mock.patch("nuvion_app.inference.video_source.build_video_source_pipeline", return_value="videotestsrc"):
+                        with mock.patch("nuvion_app.config.subprocess.run") as run_mock:
+                            run_mock.return_value = mock.Mock(returncode=0, stderr="", stdout="")
+                            result = _run_preflight(values)
+
+        checks = {check["name"]: check for check in result["checks"]}
+        self.assertEqual(checks["Camera probe"]["status"], "pass")
 
     def test_render_form_groups_advanced_fields_and_renders_boolean_selects(self) -> None:
         fields = [

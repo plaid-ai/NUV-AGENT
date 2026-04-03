@@ -5,6 +5,8 @@ import json
 import os
 import platform
 import re
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -68,6 +70,19 @@ ADVANCED_SECTION_META = {
 
 _LOADED = False
 _LOADED_PATH: Optional[Path] = None
+_CAMERA_PREFERENCE_CHOICES = ("auto", "csi", "usb")
+_CAMERA_WB_MODE_CHOICES = (
+    "auto",
+    "off",
+    "incandescent",
+    "fluorescent",
+    "warm-fluorescent",
+    "daylight",
+    "cloudy-daylight",
+    "twilight",
+    "shade",
+    "manual",
+)
 
 
 def _video_source_sort_key(value: str) -> tuple[int, str]:
@@ -100,6 +115,14 @@ def _parse_gst_device_monitor_output(output: str) -> List[Dict[str, str]]:
 
 def _is_jetson_platform() -> bool:
     return Path("/etc/nv_tegra_release").exists()
+
+
+def _camera_choice_values(key: str) -> tuple[str, ...]:
+    if key == "NUVION_CAMERA_PREFERENCE":
+        return _CAMERA_PREFERENCE_CHOICES
+    if key == "NUVION_CAMERA_WB_MODE":
+        return _CAMERA_WB_MODE_CHOICES
+    return ()
 
 
 def _gst_element_available(element_name: str) -> bool:
@@ -140,6 +163,17 @@ def discover_video_source_options(platform_name: Optional[str] = None) -> List[D
         except (FileNotFoundError, subprocess.SubprocessError):
             pass
         return options
+
+    stable_alias_dir = Path("/dev/v4l/by-id")
+    if stable_alias_dir.exists():
+        for alias in sorted(stable_alias_dir.iterdir(), key=lambda path: path.name):
+            options.append(
+                {
+                    "value": str(alias),
+                    "label": alias.name,
+                    "detail": "Stable Linux camera alias",
+                }
+            )
 
     video_devices = sorted(Path("/dev").glob("video*"), key=lambda path: _video_source_sort_key(path.name))
     for device in video_devices:
@@ -223,6 +257,7 @@ def _is_basic_setup_field(key: str) -> bool:
         "NUVION_DEVICE_USERNAME",
         "NUVION_DEVICE_PASSWORD",
         "NUVION_VIDEO_SOURCE",
+        "NUVION_CAMERA_PREFERENCE",
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
@@ -252,6 +287,8 @@ def _field_section(key: str) -> str:
         return "detection"
     if key.startswith("NUVION_H264_") or key.startswith("NUVION_WEBRTC_") or key.startswith("NUVION_VIDEO_"):
         return "streaming"
+    if key.startswith("NUVION_CAMERA_"):
+        return "streaming"
     if key in {"NUVION_LINE_ID", "NUVION_PROCESS_ID"}:
         return "detection"
     return "runtime"
@@ -263,9 +300,17 @@ def _field_note(key: str) -> str:
         "NUVION_DEVICE_PASSWORD": "Usually auto-filled by Auto Provision. Leave blank on save to keep the current secret.",
         "NUVION_DEMO_MODE": "Turn this on only when testing without a real camera.",
         "NUVION_VIDEO_SOURCE": "Use auto-detect unless you need to force a specific USB/CSI source.",
+        "NUVION_CAMERA_PREFERENCE": "When NUVION_VIDEO_SOURCE=auto, choose whether CSI or USB should win first.",
         "NUVION_VIDEO_ROTATION": "Allowed values: 0, 90, 180, 270.",
         "NUVION_VIDEO_FLIP_HORIZONTAL": "Mirror the image left-to-right after source capture.",
         "NUVION_VIDEO_FLIP_VERTICAL": "Flip the image upside-down after source capture.",
+        "NUVION_CAMERA_AUTO_EXPOSURE": "Jetson: Off locks the current exposure unless a manual range is configured separately.",
+        "NUVION_CAMERA_EXPOSURE_COMPENSATION": "Jetson exposure compensation. Range: -2.0 to 2.0.",
+        "NUVION_CAMERA_AUTO_WHITE_BALANCE": "Jetson: Off locks the current white balance unless wb mode is set manually.",
+        "NUVION_CAMERA_WB_MODE": "Jetson white balance mode. auto is recommended unless color temperature is fixed.",
+        "NUVION_CAMERA_BRIGHTNESS": "Post-capture brightness adjustment. Range: -1.0 to 1.0.",
+        "NUVION_CAMERA_CONTRAST": "Post-capture contrast adjustment. Range: 0.0 to 2.0.",
+        "NUVION_CAMERA_SATURATION": "Post-capture saturation adjustment. Range: 0.0 to 2.0.",
         "NUVION_FACE_TRACKING_ENABLED": "Track the face closest to the frame center and optionally steer the motor.",
         "NUVION_FACE_TRACKING_BACKEND": "auto prefers Triton. Jetson uses TensorRT when available, macOS/Raspberry Pi use ONNX fallback.",
         "NUVION_FACE_TRACKING_MODEL": "Triton model name for the face detector runtime.",
@@ -369,6 +414,7 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
     values = dict(existing)
     camera_fields = {
         "NUVION_VIDEO_SOURCE",
+        "NUVION_CAMERA_PREFERENCE",
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
@@ -385,6 +431,10 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
 
         if key == "NUVION_VIDEO_SOURCE":
             values[key] = _prompt_video_source(default)
+            continue
+        choice_values = _camera_choice_values(key)
+        if choice_values:
+            values[key] = _prompt_choice_setting(label, key, default, choice_values)
             continue
         if _is_rotation_field(key):
             values[key] = _prompt_rotation_setting(label, key, default)
@@ -802,6 +852,11 @@ def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced:
             prompt += f" [{default}]"
         prompt += ": "
 
+        choice_values = _camera_choice_values(key)
+        if choice_values:
+            values[key] = _prompt_choice_setting(label, key, default, choice_values)
+            continue
+
         while True:
             if _is_secret_key(key):
                 import getpass
@@ -928,6 +983,7 @@ def _check_triton_health(values: Dict[str, str]) -> Dict[str, str]:
 def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
     source = (values.get("NUVION_VIDEO_SOURCE") or "").strip()
     gst_source_override = (values.get("NUVION_GST_SOURCE") or "").strip()
+    preference = (values.get("NUVION_CAMERA_PREFERENCE") or "auto").strip().lower() or "auto"
     if gst_source_override:
         return {
             "name": "Camera source",
@@ -941,10 +997,16 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
             "detail": "NUVION_VIDEO_SOURCE is empty.",
         }
     if source == "auto":
+        if preference not in _CAMERA_PREFERENCE_CHOICES:
+            return {
+                "name": "Camera source",
+                "status": "warn",
+                "detail": f"Automatic camera detection is enabled, but camera preference is invalid: {preference}",
+            }
         return {
             "name": "Camera source",
             "status": "pass",
-            "detail": "Automatic camera detection is enabled.",
+            "detail": f"Automatic camera detection is enabled (preference={preference}).",
         }
     if sys.platform == "darwin":
         if source.startswith("avf"):
@@ -992,6 +1054,88 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
         "name": "Camera source",
         "status": "warn",
         "detail": f"Custom source configured: {source}",
+    }
+
+
+def _check_camera_probe(values: Dict[str, str]) -> Dict[str, str]:
+    gst_launch = shutil.which("gst-launch-1.0")
+    if not gst_launch:
+        return {
+            "name": "Camera probe",
+            "status": "skip",
+            "detail": "gst-launch-1.0 not found. Skipping live camera probe.",
+        }
+
+    try:
+        from nuvion_app.inference.video_source import build_video_source_pipeline
+    except Exception as exc:
+        return {
+            "name": "Camera probe",
+            "status": "warn",
+            "detail": f"Unable to import video source builder: {exc}",
+        }
+
+    try:
+        pipeline = build_video_source_pipeline(
+            values.get("NUVION_VIDEO_SOURCE", "auto") or "auto",
+            640,
+            480,
+            30,
+            gst_source_override=values.get("NUVION_GST_SOURCE"),
+            demo_mode=False,
+            platform_name=sys.platform,
+        )
+    except Exception as exc:
+        return {
+            "name": "Camera probe",
+            "status": "fail",
+            "detail": f"Failed to build camera pipeline: {exc}",
+        }
+
+    cmd = [
+        gst_launch,
+        "-q",
+        *shlex.split(pipeline),
+        "!",
+        "fakesink",
+        "num-buffers=1",
+        "sync=false",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "name": "Camera probe",
+            "status": "fail",
+            "detail": "Timed out while waiting for the camera to produce a frame.",
+        }
+    except Exception as exc:
+        return {
+            "name": "Camera probe",
+            "status": "fail",
+            "detail": f"Camera probe failed: {exc}",
+        }
+
+    if result.returncode == 0:
+        source = (values.get("NUVION_VIDEO_SOURCE") or "auto").strip() or "auto"
+        return {
+            "name": "Camera probe",
+            "status": "pass",
+            "detail": f"Camera opened successfully and produced at least one frame ({source}).",
+        }
+
+    detail = (result.stderr or result.stdout or "").strip().splitlines()
+    summary = detail[-1] if detail else "Unknown gst-launch error."
+    return {
+        "name": "Camera probe",
+        "status": "fail",
+        "detail": f"Failed to open camera: {summary}",
     }
 
 
@@ -1049,6 +1193,7 @@ def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
         _check_server_login(values),
         _check_triton_health(values),
         source_check,
+        *([] if demo_mode else [_check_camera_probe(values)]),
         _check_tracking_overlay(values),
         _check_motor_backend(values),
     ]
@@ -1168,6 +1313,32 @@ def _render_form(
                             selected="selected" if option == (value or "auto") else "",
                         )
                         for option in backend_options
+                    ),
+                    note=note_html,
+                )
+            )
+            continue
+        choice_values = _camera_choice_values(key)
+        if choice_values:
+            target_rows.append(
+                """
+                <div class="field field-row group-{group}" data-group="{group}">
+                  <label>{label}<span class="key">{key}</span></label>
+                  <select name="{key}">
+                    {options}
+                  </select>
+                  {note}
+                </div>
+                """.format(
+                    group=html.escape(group),
+                    label=html.escape(comment),
+                    key=html.escape(key),
+                    options="\n".join(
+                        '<option value="{value}" {selected}>{value}</option>'.format(
+                            value=html.escape(option),
+                            selected="selected" if option == (value or field["default"] or choice_values[0]) else "",
+                        )
+                        for option in choice_values
                     ),
                     note=note_html,
                 )
