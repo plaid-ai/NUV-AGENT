@@ -96,6 +96,7 @@ class TritonFaceClient:
         self.threshold = float(os.getenv("NUVION_FACE_TRACKING_THRESHOLD", "0.7") or "0.7")
         self.max_detections = max(int(os.getenv("NUVION_FACE_TRACKING_MAX_DETECTIONS", "8") or "8"), 1)
         self.nms_iou = float(os.getenv("NUVION_FACE_TRACKING_NMS_IOU", "0.3") or "0.3")
+        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
 
         self.client = httpclient.InferenceServerClient(url=self.url)
         self._ensure_model_ready()
@@ -118,6 +119,10 @@ class TritonFaceClient:
         except Exception:
             return
         model_config = _parse_model_config(raw_config)
+        try:
+            self.max_batch_size = max(int(model_config.get("max_batch_size", self.max_batch_size)), 1)
+        except Exception:
+            pass
         inputs = model_config.get("input")
         if not isinstance(inputs, list) or not inputs:
             return
@@ -152,7 +157,11 @@ class TritonFaceClient:
         tensor = (resized.astype(np.float32) - self.input_mean.reshape((1, 1, 3))) / self.input_scale
         if self.input_format == "NCHW":
             tensor = np.transpose(tensor, (2, 0, 1))
-        return np.expand_dims(tensor, axis=0)
+        return tensor
+
+    def _preprocess_many(self, frames_rgb: list[np.ndarray]) -> np.ndarray:
+        tensors = [self._preprocess(frame) for frame in frames_rgb]
+        return np.stack(tensors, axis=0)
 
     @staticmethod
     def _reshape_boxes(raw: np.ndarray | None) -> np.ndarray:
@@ -298,9 +307,34 @@ class TritonFaceClient:
             order = rest[iou <= threshold]
         return keep
 
-    def predict(self, frame_rgb: np.ndarray) -> list[FaceDetection]:
-        frame_height, frame_width = frame_rgb.shape[:2]
-        tensor = self._preprocess(frame_rgb)
+    @staticmethod
+    def _ensure_batched_boxes(raw: np.ndarray | None) -> np.ndarray:
+        boxes = np.asarray(raw, dtype=np.float32) if raw is not None else np.empty((0, 0, 4), dtype=np.float32)
+        if boxes.ndim == 2 and boxes.shape[-1] == 4:
+            boxes = np.expand_dims(boxes, axis=0)
+        if boxes.ndim != 3 or boxes.shape[-1] != 4:
+            return np.empty((0, 0, 4), dtype=np.float32)
+        return boxes
+
+    @staticmethod
+    def _ensure_batched_scores(raw: np.ndarray | None) -> np.ndarray:
+        scores = np.asarray(raw, dtype=np.float32) if raw is not None else np.empty((0, 0), dtype=np.float32)
+        if scores.ndim == 1:
+            scores = np.expand_dims(scores, axis=0)
+        if scores.ndim == 2:
+            return scores
+        if scores.ndim == 3 and scores.shape[-1] == 2:
+            return scores[:, :, 1]
+        return np.empty((0, 0), dtype=np.float32)
+
+    def predict_many(self, frames_rgb: list[np.ndarray]) -> list[list[FaceDetection]]:
+        if not frames_rgb:
+            return []
+
+        frame_count = min(len(frames_rgb), self.max_batch_size)
+        frames = frames_rgb[:frame_count]
+        frame_shapes = [frame.shape[:2] for frame in frames]
+        tensor = self._preprocess_many(frames)
 
         infer_input = httpclient.InferInput(self.input_name, list(tensor.shape), self.input_dtype)
         infer_input.set_data_from_numpy(tensor)
@@ -312,54 +346,72 @@ class TritonFaceClient:
             outputs.append(httpclient.InferRequestedOutput(self.num_output))
 
         response = self.client.infer(model_name=self.model_name, inputs=[infer_input], outputs=outputs)
-        boxes = self._reshape_boxes(response.as_numpy(self.boxes_output))
-        scores = self._reshape_scores(response.as_numpy(self.scores_output))
+        boxes_raw = response.as_numpy(self.boxes_output)
+        scores_raw = response.as_numpy(self.scores_output)
 
         if self.model_kind.startswith("ultraface"):
-            decoded = self._decode_ultraface_boxes(boxes, frame_width, frame_height)
-            scores = scores[: len(decoded)]
-            mask = scores >= self.threshold
-            filtered_boxes = decoded[mask]
-            filtered_scores = scores[mask]
-            keep = self._nms(filtered_boxes, filtered_scores, self.nms_iou, self.max_detections)
+            boxes = self._ensure_batched_boxes(boxes_raw)
+            scores = self._ensure_batched_scores(scores_raw)
+            batched_detections: list[list[FaceDetection]] = []
+            for batch_index, (frame_height, frame_width) in enumerate(frame_shapes):
+                sample_boxes = boxes[min(batch_index, len(boxes) - 1)] if len(boxes) else np.empty((0, 4), dtype=np.float32)
+                sample_scores = scores[min(batch_index, len(scores) - 1)] if len(scores) else np.empty((0,), dtype=np.float32)
+                decoded = self._decode_ultraface_boxes(sample_boxes, frame_width, frame_height)
+                sample_scores = sample_scores[: len(decoded)]
+                mask = sample_scores >= self.threshold
+                filtered_boxes = decoded[mask]
+                filtered_scores = sample_scores[mask]
+                keep = self._nms(filtered_boxes, filtered_scores, self.nms_iou, self.max_detections)
+                detections: list[FaceDetection] = []
+                for index in keep:
+                    x1, y1, x2, y2 = filtered_boxes[index]
+                    left = max(int(round(x1)), 0)
+                    top = max(int(round(y1)), 0)
+                    right = min(int(round(x2)), frame_width)
+                    bottom = min(int(round(y2)), frame_height)
+                    width = max(right - left, 0)
+                    height = max(bottom - top, 0)
+                    if width <= 0 or height <= 0:
+                        continue
+                    detections.append(
+                        FaceDetection(
+                            x=left,
+                            y=top,
+                            width=width,
+                            height=height,
+                            score=float(filtered_scores[index]),
+                        )
+                    )
+                batched_detections.append(detections)
+            return batched_detections
+
+        boxes = self._ensure_batched_boxes(boxes_raw)
+        scores = self._ensure_batched_scores(scores_raw)
+        count = self._resolve_num_detections(response.as_numpy(self.num_output), boxes, scores)
+        batched_detections: list[list[FaceDetection]] = []
+        for batch_index, (frame_height, frame_width) in enumerate(frame_shapes):
+            sample_boxes = boxes[min(batch_index, len(boxes) - 1)] if len(boxes) else np.empty((0, 4), dtype=np.float32)
+            sample_scores = scores[min(batch_index, len(scores) - 1)] if len(scores) else np.empty((0,), dtype=np.float32)
+            sample_count = max(0, min(count, len(sample_boxes), len(sample_scores)))
+
             detections: list[FaceDetection] = []
-            for index in keep:
-                x1, y1, x2, y2 = filtered_boxes[index]
-                left = max(int(round(x1)), 0)
-                top = max(int(round(y1)), 0)
-                right = min(int(round(x2)), frame_width)
-                bottom = min(int(round(y2)), frame_height)
-                width = max(right - left, 0)
-                height = max(bottom - top, 0)
+            order = np.argsort(sample_scores[:sample_count])[::-1]
+            for index in order:
+                score = float(sample_scores[index])
+                if score < self.threshold:
+                    continue
+                x, y, width, height = self._decode_box(sample_boxes[index], frame_width, frame_height)
                 if width <= 0 or height <= 0:
                     continue
-                detections.append(
-                    FaceDetection(
-                        x=left,
-                        y=top,
-                        width=width,
-                        height=height,
-                        score=float(filtered_scores[index]),
-                    )
-                )
-            return detections
+                detections.append(FaceDetection(x=x, y=y, width=width, height=height, score=score))
+                if len(detections) >= self.max_detections:
+                    break
+            batched_detections.append(detections)
+        return batched_detections
 
-        count = self._resolve_num_detections(response.as_numpy(self.num_output), boxes, scores)
-        count = max(0, min(count, len(boxes), len(scores)))
-
-        detections: list[FaceDetection] = []
-        order = np.argsort(scores[:count])[::-1]
-        for index in order:
-            score = float(scores[index])
-            if score < self.threshold:
-                continue
-            x, y, width, height = self._decode_box(boxes[index], frame_width, frame_height)
-            if width <= 0 or height <= 0:
-                continue
-            detections.append(FaceDetection(x=x, y=y, width=width, height=height, score=score))
-            if len(detections) >= self.max_detections:
-                break
-        return detections
+    def predict(self, frame_rgb: np.ndarray) -> list[FaceDetection]:
+        results = self.predict_many([frame_rgb])
+        return results[0] if results else []
     def _sync_output_names_from_metadata(self) -> None:
         try:
             metadata = self.client.get_model_metadata(model_name=self.model_name)

@@ -174,14 +174,23 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
 
     for key, default in (
         ("NUVION_FACE_TRACKING_INPUT_WIDTH", 640),
-        ("NUVION_FACE_TRACKING_INPUT_HEIGHT", 640),
+        ("NUVION_FACE_TRACKING_INPUT_HEIGHT", 480),
         ("NUVION_FACE_TRACKING_MAX_DETECTIONS", 8),
+        ("NUVION_FACE_TRACKING_BATCH_SIZE", 4),
+        ("NUVION_FACE_TRACKING_OPT_BATCH_SIZE", 2),
         ("NUVION_MOTOR_UART_TIMEOUT_SEC", 1.0),
+        ("NUVION_FACE_TRACKING_TRT_WORKSPACE_GIB", 1.0),
         ("NUVION_TRACKING_SAMPLE_SEC", 0.1),
         ("NUVION_TRACKING_LOST_TIMEOUT_SEC", 1.0),
         ("NUVION_MOTOR_COMMAND_INTERVAL_SEC", 0.1),
     ):
-        if key in {"NUVION_FACE_TRACKING_INPUT_WIDTH", "NUVION_FACE_TRACKING_INPUT_HEIGHT", "NUVION_FACE_TRACKING_MAX_DETECTIONS"}:
+        if key in {
+            "NUVION_FACE_TRACKING_INPUT_WIDTH",
+            "NUVION_FACE_TRACKING_INPUT_HEIGHT",
+            "NUVION_FACE_TRACKING_MAX_DETECTIONS",
+            "NUVION_FACE_TRACKING_BATCH_SIZE",
+            "NUVION_FACE_TRACKING_OPT_BATCH_SIZE",
+        }:
             normalized = _normalize_int(values.get(key, ""), int(default))
         else:
             normalized = _normalize_float(values.get(key, ""), float(default))
@@ -256,8 +265,11 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
         "NUVION_FACE_TRACKING_INPUT_WIDTH",
         "NUVION_FACE_TRACKING_INPUT_HEIGHT",
         "NUVION_FACE_TRACKING_MAX_DETECTIONS",
+        "NUVION_FACE_TRACKING_BATCH_SIZE",
+        "NUVION_FACE_TRACKING_OPT_BATCH_SIZE",
         "NUVION_MOTOR_UART_BAUD",
         "NUVION_MOTOR_UART_TIMEOUT_SEC",
+        "NUVION_FACE_TRACKING_TRT_WORKSPACE_GIB",
         "NUVION_TRACKING_SAMPLE_SEC",
         "NUVION_TRACKING_LOST_TIMEOUT_SEC",
         "NUVION_MOTOR_COMMAND_INTERVAL_SEC",

@@ -145,6 +145,7 @@ class FaceTrackingTest(unittest.TestCase):
         class FakeClient:
             def __init__(self) -> None:
                 created_clients.append(self)
+                self.max_batch_size = 2
 
             def predict(self, _frame):
                 return []

@@ -11,6 +11,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+try:
+    import onnx
+except Exception:  # pragma: no cover - optional runtime dependency
+    onnx = None
+
 from nuvion_app.runtime.docker_manager import (
     container_exists,
     container_running,
@@ -41,6 +46,10 @@ instance_group [
 """
 
 
+def _face_tracking_max_batch_size() -> int:
+    return max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
+
+
 def _ultraface_box_count(width: int, height: int) -> int:
     min_boxes = ((10.0, 16.0, 24.0), (32.0, 48.0), (64.0, 96.0), (128.0, 192.0, 256.0))
     strides = (8.0, 16.0, 32.0, 64.0)
@@ -63,24 +72,25 @@ def _default_face_tracking_config(platform: str) -> str:
     height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "480") or "480"), 1)
     instance_kind = "KIND_CPU" if platform == "onnxruntime_onnx" else "KIND_GPU"
     use_fixed_ultraface_shapes = model_kind.startswith("ultraface")
+    max_batch_size = _face_tracking_max_batch_size() if use_fixed_ultraface_shapes else 0
 
     if use_fixed_ultraface_shapes:
         input_block = f"""  {{
     name: "{input_name}"
     data_type: TYPE_FP32
-    dims: [ 1, 3, {height}, {width} ]
+    dims: [ 3, {height}, {width} ]
   }}"""
         box_count = _ultraface_box_count(width, height)
         output_blocks = [
             f"""  {{
     name: "{scores_output}"
     data_type: TYPE_FP32
-    dims: [ 1, {box_count}, 2 ]
+    dims: [ {box_count}, 2 ]
   }}""",
             f"""  {{
     name: "{boxes_output}"
     data_type: TYPE_FP32
-    dims: [ 1, {box_count}, 4 ]
+    dims: [ {box_count}, 4 ]
   }}""",
         ]
     else:
@@ -114,7 +124,7 @@ def _default_face_tracking_config(platform: str) -> str:
     outputs = ",\n".join(output_blocks)
     return f"""name: "{model_name}"
 platform: "{platform}"
-max_batch_size: 0
+max_batch_size: {max_batch_size}
 input [
 {input_block}
 ]
@@ -128,6 +138,37 @@ instance_group [
   }}
 ]
 """
+
+
+def _prepare_face_detector_onnx_for_runtime(onnx_src: Path, prepared_onnx: Path) -> Path:
+    if not onnx_src.exists():
+        raise BootstrapError("triton_health_failed", f"Missing face tracking ONNX model: {onnx_src}")
+
+    prepared_onnx.parent.mkdir(parents=True, exist_ok=True)
+    if onnx is None:
+        _copy_if_needed(onnx_src, prepared_onnx)
+        return prepared_onnx
+
+    if prepared_onnx.exists() and prepared_onnx.stat().st_mtime >= onnx_src.stat().st_mtime:
+        return prepared_onnx
+
+    try:
+        model = onnx.load(str(onnx_src))
+        graph = model.graph
+        if graph.input:
+            dim = graph.input[0].type.tensor_type.shape.dim[0]
+            dim.ClearField("dim_value")
+            dim.dim_param = "batch"
+        for output in graph.output:
+            if not output.type.tensor_type.shape.dim:
+                continue
+            dim = output.type.tensor_type.shape.dim[0]
+            dim.ClearField("dim_value")
+            dim.dim_param = "batch"
+        onnx.save(model, str(prepared_onnx))
+    except Exception:
+        _copy_if_needed(onnx_src, prepared_onnx)
+    return prepared_onnx
 
 
 def _truthy(value: str | None, default: bool = False) -> bool:
@@ -287,27 +328,45 @@ def _write_face_detector_config_if_missing(target_config: Path, platform: str, c
 
 
 def _build_face_detector_trt_plan(onnx_src: Path, plan_dst: Path) -> bool:
-    trtexec = shutil.which("trtexec")
-    if not trtexec:
-        log.warning("[TRACK] trtexec not found. Falling back to ONNX face detector runtime.")
+    try:
+        import tensorrt as trt
+    except Exception as exc:
+        log.warning("[TRACK] TensorRT Python bindings not available. Falling back to ONNX face detector runtime: %s", exc)
         return False
 
     plan_dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        trtexec,
-        f"--onnx={onnx_src}",
-        f"--saveEngine={plan_dst}",
-        "--skipInference",
-    ]
-    if _truthy(os.getenv("NUVION_FACE_TRACKING_TRT_FP16"), default=True):
-        cmd.append("--fp16")
-
-    extra_args = (os.getenv("NUVION_FACE_TRACKING_TRTEXEC_ARGS") or "").strip()
-    if extra_args:
-        cmd.extend(extra_args.split())
-
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logger = trt.Logger(trt.Logger.WARNING)
+        builder = trt.Builder(logger)
+        flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        network = builder.create_network(flags)
+        parser = trt.OnnxParser(network, logger)
+        with onnx_src.open("rb") as handle:
+            if not parser.parse(handle.read()):
+                errors = []
+                for index in range(parser.num_errors):
+                    errors.append(str(parser.get_error(index)))
+                raise RuntimeError("; ".join(errors) or "failed to parse ONNX")
+
+        config = builder.create_builder_config()
+        workspace_gib = max(float(os.getenv("NUVION_FACE_TRACKING_TRT_WORKSPACE_GIB", "1") or "1"), 0.25)
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gib * (1 << 30)))
+        if _truthy(os.getenv("NUVION_FACE_TRACKING_TRT_FP16"), default=True) and builder.platform_has_fast_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+
+        max_batch = _face_tracking_max_batch_size()
+        opt_batch = min(max(int(os.getenv("NUVION_FACE_TRACKING_OPT_BATCH_SIZE", "2") or "2"), 1), max_batch)
+        height = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_HEIGHT", "480") or "480"), 1)
+        width = max(int(os.getenv("NUVION_FACE_TRACKING_INPUT_WIDTH", "640") or "640"), 1)
+
+        profile = builder.create_optimization_profile()
+        profile.set_shape("input", (1, 3, height, width), (opt_batch, 3, height, width), (max_batch, 3, height, width))
+        config.add_optimization_profile(profile)
+
+        serialized = builder.build_serialized_network(network, config)
+        if serialized is None:
+            raise RuntimeError("build_serialized_network returned None")
+        plan_dst.write_bytes(bytes(serialized))
         log.info("[TRACK] Built TensorRT face detector plan: %s", plan_dst)
         return True
     except Exception as exc:
@@ -323,6 +382,7 @@ def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, 
     model_repo = repository_root / "face_detector" / "1"
     model_repo.mkdir(parents=True, exist_ok=True)
     onnx_src = model_dir / "onnx" / "face_detector.onnx"
+    prepared_onnx = model_dir / "onnx" / "face_detector_runtime.onnx"
     plan_path = model_repo / "model.plan"
     packaged_plan = model_dir / "triton" / "model_repository" / "face_detector" / "1" / "model.plan"
 
@@ -330,20 +390,22 @@ def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, 
         if packaged_plan.exists():
             _copy_if_needed(packaged_plan, plan_path)
             log.info("[TRACK] Using packaged TensorRT face detector plan: %s", packaged_plan)
-        elif not plan_path.exists() and onnx_src.exists() and not _build_face_detector_trt_plan(onnx_src, plan_path):
-            _copy_if_needed(onnx_src, model_repo / "model.onnx")
-            _write_face_detector_config_if_missing(
-                model_repo.parent / "config.pbtxt",
-                "onnxruntime_onnx",
-                None,
-            )
-            log.warning("[TRACK] Falling back to ONNXRuntime face detector on Jetson because TensorRT plan build failed.")
-            return
         elif not plan_path.exists():
-            raise BootstrapError(
-                "triton_health_failed",
-                f"Missing face tracking TensorRT artifacts: {packaged_plan} (and no ONNX fallback at {onnx_src})",
-            )
+            prepared_onnx = _prepare_face_detector_onnx_for_runtime(onnx_src, prepared_onnx)
+            if prepared_onnx.exists() and not _build_face_detector_trt_plan(prepared_onnx, plan_path):
+                _copy_if_needed(prepared_onnx, model_repo / "model.onnx")
+                _write_face_detector_config_if_missing(
+                    model_repo.parent / "config.pbtxt",
+                    "onnxruntime_onnx",
+                    None,
+                )
+                log.warning("[TRACK] Falling back to ONNXRuntime face detector on Jetson because TensorRT plan build failed.")
+                return
+            if not plan_path.exists():
+                raise BootstrapError(
+                    "triton_health_failed",
+                    f"Missing face tracking TensorRT artifacts: {packaged_plan} (and no ONNX fallback at {prepared_onnx})",
+                )
 
         _write_face_detector_config_if_missing(
             model_repo.parent / "config.pbtxt",
@@ -352,12 +414,8 @@ def _ensure_face_detector_repository(model_dir: Path, repository_root: Path, *, 
         )
         return
 
-    if not onnx_src.exists():
-        raise BootstrapError(
-            "triton_health_failed",
-            f"Missing face tracking ONNX model: {onnx_src}",
-        )
-    _copy_if_needed(onnx_src, model_repo / "model.onnx")
+    prepared_onnx = _prepare_face_detector_onnx_for_runtime(onnx_src, prepared_onnx)
+    _copy_if_needed(prepared_onnx, model_repo / "model.onnx")
     _write_face_detector_config_if_missing(
         model_repo.parent / "config.pbtxt",
         "onnxruntime_onnx",

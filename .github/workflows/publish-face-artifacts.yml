@@ -1,0 +1,71 @@
+name: publish-face-artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub release tag containing face_detector assets"
+        required: true
+      model_name:
+        description: "Model family name"
+        required: true
+        default: "anomalyclip"
+      model_version:
+        description: "Resolved model version (e.g. v0001)"
+        required: true
+        default: "v0001"
+      channel_pointer:
+        description: "Optional channel pointer to overwrite after version pointer update"
+        required: false
+        default: "gs://nuv-model/pointers/anomalyclip/prod.json"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BUCKET: nuv-model
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Download face artifacts from GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts \
+            --pattern "face_detector.onnx" \
+            --pattern "face_detector.plan" \
+            --pattern "face_detector.config.pbtxt"
+          ls -la artifacts
+
+      - name: Publish to GCS and update pointers
+        run: |
+          python packaging/release/publish-model-artifacts.py \
+            --bucket "${BUCKET}" \
+            --model-name "${{ inputs.model_name }}" \
+            --version "${{ inputs.model_version }}" \
+            --version-pointer "gs://${BUCKET}/nuvion/${{ inputs.model_name }}/${{ inputs.model_version }}/pointer.json" \
+            --channel-pointer "${{ inputs.channel_pointer }}" \
+            --face-onnx artifacts/face_detector.onnx \
+            --face-plan artifacts/face_detector.plan \
+            --face-triton-config artifacts/face_detector.config.pbtxt
