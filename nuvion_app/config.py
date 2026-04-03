@@ -319,6 +319,7 @@ def _field_note(key: str) -> str:
         "NUVION_FACE_TRACKING_INPUT_HEIGHT": "Detector input height. Larger values improve accuracy at higher compute cost.",
         "NUVION_FACE_TRACKING_THRESHOLD": "Minimum detector confidence for a face to be tracked.",
         "NUVION_FACE_TRACKING_MAX_DETECTIONS": "Maximum face boxes kept per frame before primary target selection.",
+        "NUVION_TRACKING_HYSTERESIS_PCT": "Additional margin before motion starts again near the center. Increase this to reduce twitching.",
         "NUVION_MOTOR_ENABLED": "Enable motor control if the device has a supported motor backend.",
         "NUVION_MOTOR_BACKEND": "Allowed values: auto, uart, pwm, none.",
         "NUVION_MOTOR_UART_PORT": "UART serial device for the external motor controller.",

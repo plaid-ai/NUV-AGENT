@@ -15,7 +15,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "7"
+CURRENT_CONFIG_SCHEMA_VERSION = "8"
 _VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
@@ -254,6 +254,10 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if str(deadzone) != str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")):
         update("NUVION_TRACKING_DEADZONE_PCT", str(deadzone), "normalize tracking deadzone")
 
+    hysteresis = _normalize_float_in_range(values.get("NUVION_TRACKING_HYSTERESIS_PCT", ""), 0.05, lower=0.0, upper=0.2)
+    if str(hysteresis) != str(values.get("NUVION_TRACKING_HYSTERESIS_PCT", "")):
+        update("NUVION_TRACKING_HYSTERESIS_PCT", str(hysteresis), "normalize tracking hysteresis")
+
     camera_brightness = _normalize_float_in_range(values.get("NUVION_CAMERA_BRIGHTNESS", ""), 0.0, lower=-1.0, upper=1.0)
     if str(camera_brightness) != str(values.get("NUVION_CAMERA_BRIGHTNESS", "")):
         update("NUVION_CAMERA_BRIGHTNESS", str(camera_brightness), "normalize camera brightness")
@@ -342,6 +346,7 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
         "NUVION_MOTOR_UART_TIMEOUT_SEC",
         "NUVION_FACE_TRACKING_TRT_WORKSPACE_GIB",
         "NUVION_TRACKING_SAMPLE_SEC",
+        "NUVION_TRACKING_HYSTERESIS_PCT",
         "NUVION_TRACKING_LOST_TIMEOUT_SEC",
         "NUVION_MOTOR_COMMAND_INTERVAL_SEC",
     ):
@@ -358,6 +363,13 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_TRACKING_DEADZONE_PCT", message="0보다 크고 0.45 이하이어야 합니다."))
+
+    try:
+        hysteresis = float(str(values.get("NUVION_TRACKING_HYSTERESIS_PCT", "")).strip())
+        if hysteresis < 0 or hysteresis > 0.2:
+            raise ValueError
+    except Exception:
+        errors.append(ConfigIssue(key="NUVION_TRACKING_HYSTERESIS_PCT", message="0 이상 0.2 이하이어야 합니다."))
 
     try:
         threshold = float(str(values.get("NUVION_FACE_TRACKING_THRESHOLD", "")).strip())
