@@ -157,6 +157,18 @@ class TritonManagerTest(unittest.TestCase):
             config = (resolved / "face_detector" / "config.pbtxt").read_text()
             self.assertIn('platform: "tensorrt_plan"', config)
 
+    def test_write_face_detector_config_if_missing_keeps_matching_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "face_detector" / "config.pbtxt"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(triton_manager._default_face_tracking_config("tensorrt_plan"))
+
+            before = config_path.read_text()
+            triton_manager._write_face_detector_config_if_missing(config_path, "tensorrt_plan", config_path)
+            after = config_path.read_text()
+
+        self.assertEqual(before, after)
+
     def test_prepare_face_detector_onnx_for_runtime_marks_batch_dimension_dynamic(self) -> None:
         try:
             import onnx

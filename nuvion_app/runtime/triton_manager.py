@@ -317,6 +317,15 @@ def _copy_if_needed(src: Path, dst: Path) -> None:
 
 def _write_face_detector_config_if_missing(target_config: Path, platform: str, config_src: Path | None = None) -> None:
     target_config.parent.mkdir(parents=True, exist_ok=True)
+    desired_content = _default_face_tracking_config(platform)
+    if target_config.exists():
+        if config_src is None or not config_src.exists() or config_src.resolve() == target_config.resolve():
+            try:
+                existing_content = target_config.read_text()
+            except OSError:
+                existing_content = None
+            if existing_content == desired_content:
+                return
     if (
         config_src is not None
         and config_src.exists()
@@ -324,7 +333,7 @@ def _write_face_detector_config_if_missing(target_config: Path, platform: str, c
     ):
         _copy_if_needed(config_src, target_config)
         return
-    target_config.write_text(_default_face_tracking_config(platform))
+    target_config.write_text(desired_content)
 
 
 def _build_face_detector_trt_plan(onnx_src: Path, plan_dst: Path) -> bool:
