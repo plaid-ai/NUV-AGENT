@@ -1244,7 +1244,7 @@ def _render_form(
             )
         )
 
-    basic_block = "\n".join(basic_rows)
+    basic_block = '<div class="field-grid quick-grid">{rows}</div>'.format(rows="\n".join(basic_rows))
     advanced_count = sum(len(rows) for rows in advanced_sections.values())
     advanced_blocks: List[str] = []
     for section in ADVANCED_SECTION_ORDER:
@@ -1256,10 +1256,13 @@ def _render_form(
             """
             <section class="advanced-section" data-section="{section}">
               <div class="section-heading">
+                <div class="section-kicker">Advanced</div>
                 <h3>{title}</h3>
                 <p>{description}</p>
               </div>
-              {rows}
+              <div class="field-grid advanced-grid">
+                {rows}
+              </div>
             </section>
             """.format(
                 section=html.escape(section),
@@ -1271,7 +1274,10 @@ def _render_form(
 
     advanced_block = """
         <details class="advanced-card">
-          <summary>Advanced Options <span class="summary-meta">{count} fields</span></summary>
+          <summary>
+            <span>Advanced Options</span>
+            <span class="summary-meta">{count} fields</span>
+          </summary>
           <p class="muted">
             These settings are for debugging, local runtime tuning, or environment-specific overrides.
             Most devices do not need changes here after initial setup.
@@ -1297,7 +1303,8 @@ def _render_form(
                 )
             )
         override_block = """
-          <div class="card warning">
+          <div class="card warning spotlight-card">
+            <div class="section-kicker">Heads up</div>
             <h2>Environment Override Detected</h2>
             <p class="muted">
               These shell environment variables differ from the file values and will take precedence at runtime.
@@ -1309,11 +1316,12 @@ def _render_form(
         """.format(rows="\n".join(override_rows))
 
     inference_block = """
-          <div class="card">
+          <div class="card setup-card">
+            <div class="section-kicker">Runtime</div>
             <h2>Inference Mode</h2>
             <p class="muted">Choose backend first, then tune backend-specific options below.</p>
-            <div class="grid">
-              <div class="field">
+            <div class="field-grid">
+              <div class="field field-row">
                 <label>Backend</label>
                 <select id="inference-backend">
                   <option value="triton" {triton_selected}>Triton (server/runtime)</option>
@@ -1322,7 +1330,7 @@ def _render_form(
                   <option value="none" {none_selected}>None (streaming only)</option>
                 </select>
               </div>
-              <div class="field">
+              <div class="field field-row">
                 <label>SigLIP Device</label>
                 <select id="siglip-device">
                   <option value="auto" {dev_auto_selected}>auto</option>
@@ -1333,7 +1341,7 @@ def _render_form(
               </div>
             </div>
             <div class="actions left">
-              <button type="button" id="preflight-btn" onclick="runPreflight()">Run Preflight Check</button>
+              <button type="button" class="secondary-button" id="preflight-btn" onclick="runPreflight()">Run Preflight Check</button>
             </div>
             <div id="preflight-status" class="status"></div>
           </div>
@@ -1349,50 +1357,52 @@ def _render_form(
     )
 
     provision_block = """
-          <div class="card">
-            <h2>Auto Provision (recommended)</h2>
+          <div class="card setup-card">
+            <div class="section-kicker">Credentials</div>
+            <h2>Auto Provision</h2>
             <p class="muted">
               Login with a space owner/admin account to create a device credential.
               Your account is not stored on the device.
             </p>
-            <div class="grid">
-              <div class="field">
+            <div class="field-grid">
+              <div class="field field-row">
                 <label>Account username</label>
                 <input type="text" id="prov-username" autocomplete="username">
               </div>
-              <div class="field">
+              <div class="field field-row">
                 <label>Account password</label>
                 <input type="password" id="prov-password" autocomplete="current-password">
               </div>
-              <div class="field">
+              <div class="field field-row">
                 <label>Space</label>
                 <select id="prov-space-select" disabled>
                   <option value="">Login to load spaces</option>
                 </select>
               </div>
-              <div class="field">
+              <div class="field field-row">
                 <label>Device name</label>
                 <input type="text" id="prov-device" value="{device_name}">
               </div>
             </div>
             <div class="actions">
-              <button type="button" id="prov-login" onclick="loadSpaces()">Login & Load Spaces</button>
-              <button type="button" id="prov-create" onclick="provisionDevice()" disabled>Create Device</button>
+              <button type="button" class="secondary-button" id="prov-login" onclick="loadSpaces()">Login & Load Spaces</button>
+              <button type="button" class="accent-button" id="prov-create" onclick="provisionDevice()" disabled>Create Device</button>
             </div>
             <div id="provision-status" class="status"></div>
           </div>
     """.format(device_name=html.escape(device_name))
 
     motor_test_block = """
-          <div class="card">
+          <div class="card setup-card">
+            <div class="section-kicker">Hardware</div>
             <h2>Motor Test</h2>
             <p class="muted">Send a single movement command using the current form values before saving.</p>
-            <div class="actions left">
-              <button type="button" onclick="sendMotorCommand('LEFT')">Left</button>
-              <button type="button" onclick="sendMotorCommand('RIGHT')">Right</button>
-              <button type="button" onclick="sendMotorCommand('UP')">Up</button>
-              <button type="button" onclick="sendMotorCommand('DOWN')">Down</button>
-              <button type="button" onclick="sendMotorCommand('CENTER')">Center</button>
+            <div class="motor-grid">
+              <button type="button" class="surface-button" onclick="sendMotorCommand('LEFT')">Left</button>
+              <button type="button" class="surface-button" onclick="sendMotorCommand('RIGHT')">Right</button>
+              <button type="button" class="surface-button" onclick="sendMotorCommand('UP')">Up</button>
+              <button type="button" class="surface-button" onclick="sendMotorCommand('DOWN')">Down</button>
+              <button type="button" class="surface-button accent-surface" onclick="sendMotorCommand('CENTER')">Center</button>
             </div>
             <div id="motor-test-status" class="status"></div>
           </div>
@@ -1405,40 +1415,165 @@ def _render_form(
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Nuvion Agent Setup</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
         <style>
           :root {{
             color-scheme: light;
-            --bg: #f6f4f0;
-            --card: #ffffff;
-            --ink: #1a1a1a;
-            --muted: #606060;
-            --accent: #2f6b4f;
-            --border: #e3ded7;
+            --white: #ffffff;
+            --near-black: #222222;
+            --rausch: #ff385c;
+            --deep-rausch: #e00b41;
+            --secondary: #6a6a6a;
+            --disabled: #929292;
+            --border: #c1c1c1;
+            --surface: #f2f2f2;
+            --surface-warm: #fff8f6;
+            --warning: #fff3ea;
+            --warning-border: #ffd1bb;
+            --shadow-card: rgba(0,0,0,0.02) 0px 0px 0px 1px, rgba(0,0,0,0.04) 0px 2px 6px, rgba(0,0,0,0.1) 0px 4px 8px;
+            --shadow-hover: rgba(0,0,0,0.08) 0px 4px 12px;
+            --font: "Nunito Sans", Circular, -apple-system, system-ui, Roboto, "Helvetica Neue", sans-serif;
+          }}
+          * {{
+            box-sizing: border-box;
+          }}
+          html {{
+            scroll-behavior: smooth;
           }}
           body {{
             margin: 0;
-            font-family: "Avenir Next", "Helvetica Neue", Helvetica, Arial, sans-serif;
-            background: var(--bg);
-            color: var(--ink);
+            font-family: var(--font);
+            background: var(--white);
+            color: var(--near-black);
+            font-size: 14px;
+            line-height: 1.43;
+            -webkit-font-smoothing: antialiased;
+          }}
+          a {{
+            color: inherit;
+          }}
+          .setup-nav {{
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 16px 24px;
+            border-bottom: 1px solid #ebebeb;
+            background: rgba(255, 255, 255, 0.94);
+            backdrop-filter: blur(12px);
+          }}
+          .brand-lockup {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+          }}
+          .brand-mark {{
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: var(--rausch);
+            color: var(--white);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 18px;
+            box-shadow: var(--shadow-hover);
+          }}
+          .brand-copy {{
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+          }}
+          .brand-title {{
+            font-size: 14px;
+            font-weight: 700;
+          }}
+          .brand-subtitle {{
+            font-size: 12px;
+            color: var(--secondary);
+          }}
+          .nav-meta {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+          }}
+          .nav-pill {{
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--near-black);
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 600;
+          }}
+          .nav-pill.accent {{
+            background: rgba(255, 56, 92, 0.12);
+            color: var(--deep-rausch);
           }}
           .wrap {{
-            max-width: 820px;
-            margin: 40px auto 80px;
-            padding: 0 20px;
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 32px 24px 96px;
           }}
-          header h1 {{
-            font-size: 28px;
-            margin-bottom: 6px;
+          .hero {{
+            display: grid;
+            grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.8fr);
+            gap: 24px;
+            align-items: stretch;
+            padding: 24px 0 32px;
           }}
-          header p {{
-            color: var(--muted);
-            margin-top: 0;
+          .hero-copy {{
+            padding: 18px 4px 0;
+          }}
+          .section-kicker {{
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.32px;
+            margin-bottom: 10px;
+          }}
+          .hero h1 {{
+            margin: 0 0 14px;
+            font-size: 36px;
+            line-height: 1.1;
+            letter-spacing: -0.44px;
+            font-weight: 700;
+            max-width: 12ch;
+          }}
+          .hero p {{
+            margin: 0;
+            max-width: 60ch;
+            font-size: 16px;
+            line-height: 1.45;
+            color: var(--secondary);
+          }}
+          .hero-card {{
+            background: linear-gradient(180deg, var(--surface-warm) 0%, var(--white) 100%);
+          }}
+          .hero-list {{
+            margin: 16px 0 0;
+            padding-left: 18px;
+            color: var(--secondary);
+          }}
+          .hero-list li + li {{
+            margin-top: 8px;
+          }}
+          .layout {{
+            display: grid;
+            gap: 20px;
           }}
           .card {{
-            background: var(--card);
-            border-radius: 16px;
+            background: var(--white);
+            border-radius: 20px;
             padding: 24px;
-            box-shadow: 0 12px 30px rgba(0,0,0,0.08);
+            box-shadow: var(--shadow-card);
             border: 1px solid var(--border);
           }}
           .card + .card {{
@@ -1447,91 +1582,123 @@ def _render_form(
           .card h2 {{
             margin-top: 0;
             margin-bottom: 8px;
+            font-size: 22px;
+            line-height: 1.18;
+            letter-spacing: -0.44px;
+            font-weight: 600;
           }}
           .field {{
             display: flex;
             flex-direction: column;
-            margin-bottom: 18px;
+          }}
+          .field-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+          }}
+          .quick-grid {{
+            margin-top: 18px;
+          }}
+          .advanced-grid {{
+            margin-top: 12px;
+          }}
+          .field-row {{
+            padding: 16px;
+            border-radius: 20px;
+            background: linear-gradient(180deg, #ffffff 0%, #fcfcfc 100%);
+            border: 1px solid #ededed;
+            box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
           }}
           .warning {{
-            border-color: #f2c979;
-            background: #fff8ea;
+            border-color: var(--warning-border);
+            background: var(--warning);
           }}
           .override-list {{
             margin: 0;
             padding-left: 18px;
             font-size: 13px;
+            color: var(--secondary);
           }}
           label {{
-            font-weight: 600;
-            margin-bottom: 6px;
+            font-weight: 700;
+            font-size: 12px;
+            margin-bottom: 8px;
             display: flex;
             justify-content: space-between;
             gap: 12px;
           }}
           .key {{
             font-size: 12px;
-            color: var(--muted);
-            font-weight: 400;
+            color: var(--disabled);
+            font-weight: 600;
           }}
-          input {{
-            padding: 10px 12px;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 14px;
-          }}
+          input,
           select {{
-            padding: 10px 12px;
+            width: 100%;
+            padding: 14px 16px;
             border: 1px solid var(--border);
-            border-radius: 8px;
-            font-size: 14px;
-            background: white;
+            border-radius: 16px;
+            font-size: 16px;
+            font-family: var(--font);
+            background: var(--white);
+            color: var(--near-black);
+            outline: none;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+          }}
+          input:focus,
+          select:focus {{
+            border-color: var(--near-black);
+            box-shadow: 0 0 0 2px var(--near-black);
           }}
           code {{
             font-family: "SFMono-Regular", Menlo, Consolas, monospace;
           }}
           .note {{
             font-size: 12px;
-            color: var(--muted);
-            margin-top: 6px;
+            color: var(--secondary);
+            margin-top: 8px;
           }}
           .actions {{
             display: flex;
             justify-content: flex-end;
+            align-items: center;
+            flex-wrap: wrap;
             margin-top: 18px;
             gap: 10px;
           }}
           .actions.left {{
             justify-content: flex-start;
           }}
-          .grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 12px;
-          }}
           .muted {{
-            color: var(--muted);
+            color: var(--secondary);
             margin-top: 4px;
             margin-bottom: 16px;
           }}
           .status {{
             margin-top: 12px;
             font-size: 13px;
-            color: var(--muted);
+            color: var(--secondary);
+            padding: 14px 16px;
+            border-radius: 16px;
+            background: var(--surface);
+            min-height: 18px;
           }}
           .summary-meta {{
-            color: var(--muted);
-            font-size: 13px;
-            font-weight: 500;
-            margin-left: 8px;
-          }}
-          .quick-start {{
-            background: linear-gradient(180deg, #fffdf8 0%, #ffffff 100%);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 88px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--secondary);
+            font-size: 12px;
+            font-weight: 700;
           }}
           .advanced-card {{
             margin-top: 20px;
-            border-top: 1px solid var(--border);
-            padding-top: 16px;
+            border-top: 1px solid #ededed;
+            padding-top: 18px;
           }}
           .advanced-card summary {{
             cursor: pointer;
@@ -1540,22 +1707,26 @@ def _render_form(
             display: flex;
             align-items: center;
             justify-content: space-between;
+            gap: 14px;
+            font-size: 16px;
           }}
           .advanced-card summary::-webkit-details-marker {{
             display: none;
           }}
           .advanced-section + .advanced-section {{
             margin-top: 24px;
-            padding-top: 20px;
-            border-top: 1px solid var(--border);
+            padding-top: 24px;
+            border-top: 1px solid #ededed;
           }}
           .section-heading h3 {{
             margin: 0 0 6px;
-            font-size: 16px;
+            font-size: 20px;
+            line-height: 1.2;
+            letter-spacing: -0.18px;
           }}
           .section-heading p {{
             margin: 0 0 16px;
-            color: var(--muted);
+            color: var(--secondary);
             font-size: 13px;
           }}
           .checks {{
@@ -1578,34 +1749,142 @@ def _render_form(
             color: #555;
           }}
           button {{
-            background: var(--accent);
-            color: white;
+            background: var(--near-black);
+            color: var(--white);
             border: none;
-            padding: 12px 18px;
-            border-radius: 10px;
+            padding: 12px 20px;
+            border-radius: 12px;
             font-weight: 600;
+            font-size: 16px;
+            font-family: var(--font);
             cursor: pointer;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+          }}
+          button:hover {{
+            box-shadow: var(--shadow-hover);
+          }}
+          button:disabled {{
+            cursor: not-allowed;
+            opacity: 0.55;
+            box-shadow: none;
+          }}
+          button:focus {{
+            outline: none;
+            box-shadow: 0 0 0 2px var(--near-black);
+            transform: scale(0.98);
+          }}
+          .secondary-button {{
+            background: var(--white);
+            color: var(--near-black);
+            border: 1px solid var(--near-black);
+          }}
+          .accent-button {{
+            background: var(--rausch);
+          }}
+          .accent-button:hover,
+          .accent-surface:hover {{
+            background: var(--deep-rausch);
+            color: var(--white);
+          }}
+          .surface-button {{
+            background: var(--surface);
+            color: var(--near-black);
+            min-width: 0;
+          }}
+          .accent-surface {{
+            background: rgba(255, 56, 92, 0.12);
+            color: var(--deep-rausch);
+          }}
+          .motor-grid {{
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 10px;
           }}
           .error {{
-            background: #ffe3e3;
+            background: #fff1f2;
             color: #8a1f1f;
-            padding: 12px 14px;
-            border-radius: 8px;
-            margin-bottom: 18px;
+            padding: 14px 16px;
+            border-radius: 16px;
+            margin-bottom: 20px;
+            border: 1px solid #ffd5db;
+          }}
+          .spotlight-card {{
+            margin-bottom: 20px;
+          }}
+          .setup-card {{
+            position: relative;
+          }}
+          .save-bar {{
+            margin-top: 24px;
+            padding-top: 20px;
+            border-top: 1px solid #ededed;
+          }}
+          @media (max-width: 950px) {{
+            .hero {{
+              grid-template-columns: 1fr;
+            }}
+          }}
+          @media (max-width: 744px) {{
+            .setup-nav {{
+              padding: 14px 16px;
+            }}
+            .wrap {{
+              padding: 24px 16px 80px;
+            }}
+            .hero h1 {{
+              font-size: 30px;
+              max-width: none;
+            }}
+            .motor-grid {{
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
+            .nav-meta {{
+              display: none;
+            }}
           }}
         </style>
       </head>
       <body>
+        <div class="setup-nav">
+          <div class="brand-lockup">
+            <div class="brand-mark">N</div>
+            <div class="brand-copy">
+              <div class="brand-title">Nuvion Agent</div>
+              <div class="brand-subtitle">Setup</div>
+            </div>
+          </div>
+          <div class="nav-meta">
+            <span class="nav-pill accent">Airbnb-inspired</span>
+            <span class="nav-pill">Device: {device_name}</span>
+          </div>
+        </div>
         <div class="wrap">
-          <header>
-            <h1>Nuvion Agent Setup</h1>
-            <p>Start with the essentials, then open advanced options only if you need local tuning.</p>
-          </header>
+          <section class="hero">
+            <div class="hero-copy">
+              <div class="section-kicker">Configure your device</div>
+              <h1>Set up credentials, camera, inference, and tracking in one warm control surface.</h1>
+              <p>
+                Start with the essential fields, use auto-provision if you want the device credential created for you,
+                and only open advanced options when you need environment-specific tuning.
+              </p>
+            </div>
+            <div class="card hero-card">
+              <div class="section-kicker">Before you save</div>
+              <h2>Recommended flow</h2>
+              <ul class="hero-list">
+                <li>Set the server URL and device credential first.</li>
+                <li>Choose the camera source, then validate runtime with preflight.</li>
+                <li>Use motor test before enabling tracking on physical hardware.</li>
+              </ul>
+            </div>
+          </section>
           {override_block}
           <form id="config-form" method="post" action="/save">
             {hidden_inputs}
-            <div class="card quick-start">
-              <h2>Quick Start</h2>
+            <div class="layout">
+            <div class="card setup-card">
+              <div class="section-kicker">Quick Start</div>
+              <h2>Essentials</h2>
               <p class="muted">
                 Most devices only need the server address, device credential, camera source, and demo mode.
               </p>
@@ -1615,12 +1894,14 @@ def _render_form(
           {provision_block}
           {inference_block}
           {motor_test_block}
-          <div class="card">
+          <div class="card setup-card">
+              <div class="section-kicker">Optional tuning</div>
+              <h2>Advanced Configuration</h2>
               {advanced_block}
-              {rows}
-              <div class="actions">
-                <button type="submit">Save</button>
+              <div class="save-bar actions">
+                <button type="submit" class="accent-button">Save Configuration</button>
               </div>
+            </div>
             </div>
           </form>
         </div>
@@ -1842,8 +2123,8 @@ def _render_form(
       </body>
     </html>
     """.format(
+        device_name=html.escape(device_name),
         error_block=error_block,
-        rows="",
         basic_rows=basic_block,
         hidden_inputs="\n".join(hidden_inputs),
         override_block=override_block,
@@ -2066,11 +2347,90 @@ def run_web_setup(
             <html lang="en">
               <head>
                 <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
                 <title>Saved</title>
+                <link rel="preconnect" href="https://fonts.googleapis.com" />
+                <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+                <link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+                <style>
+                  :root {{
+                    --white: #ffffff;
+                    --near-black: #222222;
+                    --rausch: #ff385c;
+                    --secondary: #6a6a6a;
+                    --surface: #f2f2f2;
+                    --border: #c1c1c1;
+                    --shadow-card: rgba(0,0,0,0.02) 0px 0px 0px 1px, rgba(0,0,0,0.04) 0px 2px 6px, rgba(0,0,0,0.1) 0px 4px 8px;
+                    --font: "Nunito Sans", Circular, -apple-system, system-ui, Roboto, "Helvetica Neue", sans-serif;
+                  }}
+                  * {{ box-sizing: border-box; }}
+                  body {{
+                    margin: 0;
+                    min-height: 100vh;
+                    display: grid;
+                    place-items: center;
+                    padding: 24px;
+                    background: var(--white);
+                    color: var(--near-black);
+                    font-family: var(--font);
+                  }}
+                  .shell {{
+                    width: min(560px, 100%);
+                    background: var(--white);
+                    border: 1px solid var(--border);
+                    border-radius: 24px;
+                    padding: 32px;
+                    box-shadow: var(--shadow-card);
+                  }}
+                  .kicker {{
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: var(--secondary);
+                    text-transform: uppercase;
+                    letter-spacing: 0.32px;
+                    margin-bottom: 12px;
+                  }}
+                  h2 {{
+                    margin: 0 0 12px;
+                    font-size: 28px;
+                    line-height: 1.2;
+                    letter-spacing: -0.44px;
+                  }}
+                  p {{
+                    margin: 0;
+                    color: var(--secondary);
+                    line-height: 1.5;
+                  }}
+                  .dot {{
+                    width: 42px;
+                    height: 42px;
+                    border-radius: 50%;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    background: var(--rausch);
+                    color: var(--white);
+                    font-weight: 700;
+                    margin-bottom: 20px;
+                  }}
+                  .notice {{
+                    margin-top: 20px;
+                    padding: 14px 16px;
+                    border-radius: 16px;
+                    background: var(--surface);
+                    color: var(--secondary);
+                    font-size: 14px;
+                  }}
+                </style>
               </head>
               <body>
-                <h2>Saved</h2>
-                <p>Settings saved. Restart the service to apply.</p>
+                <div class="shell">
+                  <div class="dot">N</div>
+                  <div class="kicker">Configuration saved</div>
+                  <h2>Your setup is ready.</h2>
+                  <p>Settings were written successfully. Restart the service to apply the new runtime configuration.</p>
+                  <div class="notice">You can close this tab now.</div>
+                </div>
               </body>
             </html>
             """
