@@ -18,6 +18,32 @@ def is_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def normalize_camera_preference(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in {"auto", "csi", "usb"}:
+        return value
+    return "auto"
+
+
+def normalize_camera_wb_mode(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    valid_modes = {
+        "auto",
+        "off",
+        "incandescent",
+        "fluorescent",
+        "warm-fluorescent",
+        "daylight",
+        "cloudy-daylight",
+        "twilight",
+        "shade",
+        "manual",
+    }
+    if value in valid_modes:
+        return value
+    return "auto"
+
+
 def _normalize_rotation(raw: str | None) -> int:
     value = (raw or "").strip().lower()
     mapping = {
@@ -136,37 +162,109 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _camera_preference() -> str:
+    return normalize_camera_preference(os.getenv("NUVION_CAMERA_PREFERENCE", "auto"))
+
+
+def _build_camera_balance_chain() -> str:
+    brightness = _clamp(_env_float("NUVION_CAMERA_BRIGHTNESS", 0.0), -1.0, 1.0)
+    contrast = _clamp(_env_float("NUVION_CAMERA_CONTRAST", 1.0), 0.0, 2.0)
+    saturation = _clamp(_env_float("NUVION_CAMERA_SATURATION", 1.0), 0.0, 2.0)
+    if brightness == 0.0 and contrast == 1.0 and saturation == 1.0:
+        return ""
+    return (
+        "videobalance "
+        f"brightness={brightness:.3f} "
+        f"contrast={contrast:.3f} "
+        f"saturation={saturation:.3f}"
+    )
+
+
+def _finalize_camera_pipeline(base_pipeline: str) -> str:
+    balance = _build_camera_balance_chain()
+    if balance:
+        base_pipeline = f"{base_pipeline} ! {balance}"
+    pipeline = f"{base_pipeline} ! video/x-raw,format=RGB"
+    return _append_video_transforms(pipeline)
+
+
+def _build_jetson_camera_source_prefix() -> str:
+    sensor_id = _env_int("NUVION_JETSON_SENSOR_ID", 0)
+    properties = [f"sensor-id={sensor_id}"]
+
+    if not is_truthy(os.getenv("NUVION_CAMERA_AUTO_EXPOSURE", "true")):
+        properties.append("aelock=true")
+
+    exposure_compensation = _clamp(_env_float("NUVION_CAMERA_EXPOSURE_COMPENSATION", 0.0), -2.0, 2.0)
+    if exposure_compensation != 0.0:
+        properties.append(f"exposurecompensation={exposure_compensation:.3f}")
+
+    if not is_truthy(os.getenv("NUVION_CAMERA_AUTO_WHITE_BALANCE", "true")):
+        properties.append("awblock=true")
+
+    white_balance_mode = normalize_camera_wb_mode(os.getenv("NUVION_CAMERA_WB_MODE", "auto"))
+    if white_balance_mode != "auto":
+        properties.append(f"wbmode={white_balance_mode}")
+
+    return f"nvarguscamerasrc {' '.join(properties)}"
+
+
+def _pick_linux_v4l2_device(
+    devices: list[LinuxVideoDeviceInfo],
+    *,
+    preference: str,
+) -> LinuxVideoDeviceInfo | None:
+    usb_devices = [device for device in devices if not _is_probable_jetson_csi_device(device)]
+    if preference == "usb" and usb_devices:
+        return usb_devices[0]
+    if preference == "usb":
+        return None
+    return devices[0] if devices else None
+
+
 def _build_standard_camera_pipeline(source: str, width: int, height: int, fps: int) -> str:
-    pipeline = (
+    base_pipeline = (
         f"{source} ! "
         f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
-        "videoconvert ! "
-        "video/x-raw,format=RGB"
+        "videoconvert"
     )
-    return _append_video_transforms(pipeline)
+    return _finalize_camera_pipeline(base_pipeline)
 
 
 def _build_jetson_argus_pipeline(width: int, height: int, fps: int) -> str:
-    sensor_id = _env_int("NUVION_JETSON_SENSOR_ID", 0)
     capture_width = max(width, _env_int("NUVION_JETSON_CAPTURE_WIDTH", 1920))
     capture_height = max(height, _env_int("NUVION_JETSON_CAPTURE_HEIGHT", 1080))
     capture_fps = max(fps, _env_int("NUVION_JETSON_CAPTURE_FPS", 30))
-    pipeline = (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+    base_pipeline = (
+        f"{_build_jetson_camera_source_prefix()} ! "
         f"video/x-raw(memory:NVMM),width={capture_width},height={capture_height},framerate={capture_fps}/1,format=NV12 ! "
         "nvvidconv ! "
         f"video/x-raw,width={width},height={height},format=BGRx ! "
-        "videoconvert ! "
-        "video/x-raw,format=RGB"
+        "videoconvert"
     )
-    return _append_video_transforms(pipeline)
+    return _finalize_camera_pipeline(base_pipeline)
 
 
 def _build_linux_camera_pipeline(video_source: str, width: int, height: int, fps: int) -> str:
     resolved_source = video_source.strip() if video_source else "auto"
     lowered_source = resolved_source.lower()
     linux_devices = _linux_video_devices()
-    default_video_device = linux_devices[0].path if linux_devices else "/dev/video0"
+    preference = _camera_preference()
+    default_video_device = _pick_linux_v4l2_device(linux_devices, preference=preference)
 
     if lowered_source in {"jetson", "argus", "csi"}:
         if _gst_element_available("nvarguscamerasrc"):
@@ -176,21 +274,28 @@ def _build_linux_camera_pipeline(video_source: str, width: int, height: int, fps
     if lowered_source in {"rpi", "libcamera"}:
         return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
 
-    if resolved_source.startswith("/dev/video"):
+    if resolved_source.startswith("/dev/"):
         if _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
-            if _is_probable_jetson_csi_device(_find_linux_video_device(resolved_source)):
+            if resolved_source.startswith("/dev/video") and _is_probable_jetson_csi_device(_find_linux_video_device(resolved_source)):
                 return _build_jetson_argus_pipeline(width, height, fps)
         return _build_standard_camera_pipeline(f"v4l2src device={resolved_source}", width, height, fps)
 
     if lowered_source == "auto":
-        if _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
+        if preference != "usb" and _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
             if any(_is_probable_jetson_csi_device(device) for device in linux_devices):
                 return _build_jetson_argus_pipeline(width, height, fps)
 
-        if linux_devices:
-            return _build_standard_camera_pipeline(f"v4l2src device={default_video_device}", width, height, fps)
+        if default_video_device is not None:
+            return _build_standard_camera_pipeline(f"v4l2src device={default_video_device.path}", width, height, fps)
 
-        if _gst_element_available("libcamerasrc"):
+        if preference == "usb" and _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
+            if any(_is_probable_jetson_csi_device(device) for device in linux_devices):
+                return _build_jetson_argus_pipeline(width, height, fps)
+
+        if preference != "usb" and _gst_element_available("libcamerasrc"):
+            return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
+
+        if preference == "usb" and _gst_element_available("libcamerasrc"):
             return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
 
     return _build_standard_camera_pipeline("autovideosrc", width, height, fps)

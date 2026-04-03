@@ -209,6 +209,36 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertTrue(report.ok)
             self.assertEqual(report.values["NUVION_FACE_TRACKING_BACKEND"], "auto")
 
+    def test_guard_normalizes_invalid_camera_preferences_and_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_CAMERA_PREFERENCE=sideways",
+                        "NUVION_CAMERA_WB_MODE=moonlight",
+                        "NUVION_CAMERA_BRIGHTNESS=4",
+                        "NUVION_CAMERA_CONTRAST=-1",
+                        "NUVION_CAMERA_SATURATION=4",
+                        "NUVION_CAMERA_EXPOSURE_COMPENSATION=9",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_CAMERA_PREFERENCE"], "auto")
+            self.assertEqual(report.values["NUVION_CAMERA_WB_MODE"], "auto")
+            self.assertEqual(report.values["NUVION_CAMERA_BRIGHTNESS"], "1.0")
+            self.assertEqual(report.values["NUVION_CAMERA_CONTRAST"], "0.0")
+            self.assertEqual(report.values["NUVION_CAMERA_SATURATION"], "2.0")
+            self.assertEqual(report.values["NUVION_CAMERA_EXPOSURE_COMPENSATION"], "2.0")
+
     def test_guard_requires_device_credentials_or_access_token_for_model_download(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
