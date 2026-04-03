@@ -179,6 +179,7 @@ ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0
 FACE_TRACKING_ENABLED = is_truthy(os.getenv("NUVION_FACE_TRACKING_ENABLED", "false"))
 FACE_TRACKING_SHOW_BBOX = is_truthy(os.getenv("NUVION_FACE_TRACKING_SHOW_BBOX", "true"))
 TRACKING_SAMPLE_SEC = parse_float(os.getenv("NUVION_TRACKING_SAMPLE_SEC"), 0.1)
+TRACKING_BATCH_SIZE = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
 TRACKING_DEADZONE_PCT = parse_float(os.getenv("NUVION_TRACKING_DEADZONE_PCT"), 0.12)
 TRACKING_LOST_TIMEOUT_SEC = parse_float(os.getenv("NUVION_TRACKING_LOST_TIMEOUT_SEC"), 1.0)
 
@@ -899,7 +900,7 @@ class NuvionEventState:
         self.zero_shot_last_sample = 0.0
         self.zero_shot_queue = queue.Queue(maxsize=1)
         self.tracking_last_sample = 0.0
-        self.tracking_queue = queue.Queue(maxsize=1)
+        self.tracking_queue = queue.Queue(maxsize=TRACKING_BATCH_SIZE)
         self.overlay_callback = overlay_callback
         self.overlay_lock = threading.Lock()
         self.last_anomaly_overlay: str | OverlayPayload | None = None
@@ -1403,6 +1404,16 @@ class NuvionEventState:
                             self.last_production_at = now
                             self.report_production(1)
 
+    @staticmethod
+    def _drain_queue_batch(work_queue: queue.Queue, first_item, max_items: int) -> list:
+        batch = [first_item]
+        while len(batch) < max_items:
+            try:
+                batch.append(work_queue.get_nowait())
+            except queue.Empty:
+                break
+        return batch
+
     def _tracking_worker(self):
         while self.running:
             try:
@@ -1414,7 +1425,13 @@ class NuvionEventState:
                 continue
 
             try:
-                decision = self.tracking_controller.process_frame(frame)
+                detector = getattr(self.tracking_controller, "detector", None)
+                batch_limit = max(1, int(getattr(detector, "max_batch_size", TRACKING_BATCH_SIZE)))
+                frame_batch = self._drain_queue_batch(self.tracking_queue, frame, min(TRACKING_BATCH_SIZE, batch_limit))
+                if detector is not None and hasattr(detector, "detect_many"):
+                    faces_batch = detector.detect_many(frame_batch)
+                else:
+                    faces_batch = [self.tracking_controller.detector.detect(item) for item in frame_batch]
             except Exception as exc:
                 log.warning("[TRACK] face tracking inference failed: %s", exc)
                 error_text = f"TRACK error: {exc}"
@@ -1428,21 +1445,24 @@ class NuvionEventState:
                 )
                 self._set_tracking_status(error_text)
                 continue
-            snapshot = build_overlay_snapshot(
-                decision,
-                enabled=self.face_tracking_enabled,
-                show_bbox=self.face_tracking_show_bbox,
-            )
-            self.tracking_overlay_state.update(snapshot)
-            self._set_tracking_status(decision.status_text)
 
-            if decision.primary_face is None or decision.centered:
-                continue
+            for batch_frame, faces in zip(frame_batch, faces_batch):
+                decision = self.tracking_controller.process_detections(batch_frame.shape[:2], list(faces))
+                snapshot = build_overlay_snapshot(
+                    decision,
+                    enabled=self.face_tracking_enabled,
+                    show_bbox=self.face_tracking_show_bbox,
+                )
+                self.tracking_overlay_state.update(snapshot)
+                self._set_tracking_status(decision.status_text)
 
-            if decision.pan_command is not None:
-                self.motor_controller.send_pan(decision.pan_command)
-            if decision.tilt_command is not None:
-                self.motor_controller.send_tilt(decision.tilt_command)
+                if decision.primary_face is None or decision.centered:
+                    continue
+
+                if decision.pan_command is not None:
+                    self.motor_controller.send_pan(decision.pan_command)
+                if decision.tilt_command is not None:
+                    self.motor_controller.send_tilt(decision.tilt_command)
 
 def on_new_sample(appsink, user_data: NuvionEventState):
     sample = appsink.emit("pull-sample")

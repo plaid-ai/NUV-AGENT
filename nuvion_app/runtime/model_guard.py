@@ -12,7 +12,6 @@ from nuvion_app.model_store import (
     DEFAULT_MODEL_SERVER_BASE_URL,
     _DEFAULT_LOCAL_PATHS,
     _PROFILE_KEYS,
-    ensure_default_face_tracking_model,
     merge_required_keys,
     pull_model_from_server,
     resolve_default_model_dir,
@@ -25,6 +24,7 @@ log = logging.getLogger(__name__)
 
 _VALID_PROFILES = {"runtime", "light", "full"}
 _FACE_TRACKING_REQUIRED_KEYS = ["face_onnx"]
+_JETSON_FACE_TRACKING_REQUIRED_KEYS = ["face_plan", "face_triton_config"]
 
 
 def _truthy(value: str | None, default: bool = False) -> bool:
@@ -110,16 +110,9 @@ def _required_model_keys(profile: str) -> list[str]:
         keys = merge_required_keys(keys, _PROFILE_KEYS[profile])
     if face_tracking_uses_triton():
         keys = merge_required_keys(keys, _FACE_TRACKING_REQUIRED_KEYS)
+        if _is_jetson_linux():
+            keys = merge_required_keys(keys, _JETSON_FACE_TRACKING_REQUIRED_KEYS)
     return keys
-
-
-def _ensure_optional_face_tracking_assets(model_dir: Path) -> None:
-    if not face_tracking_uses_triton():
-        return
-    face_model_path = (model_dir / _DEFAULT_LOCAL_PATHS["face_onnx"]).resolve()
-    if face_model_path.exists():
-        return
-    ensure_default_face_tracking_model(model_dir)
 
 
 def _missing_required_files(model_dir: Path, profile: str) -> list[str]:
@@ -138,13 +131,9 @@ def _missing_required_files(model_dir: Path, profile: str) -> list[str]:
 def _pull_model(profile: str, model_dir: Path) -> None:
     anomaly_uses_triton = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton") == "triton"
     tracking_uses_triton = face_tracking_uses_triton()
-    optional_tracking_keys = _FACE_TRACKING_REQUIRED_KEYS if tracking_uses_triton else []
+    required_tracking_keys = _FACE_TRACKING_REQUIRED_KEYS if tracking_uses_triton else []
     if tracking_uses_triton and _is_jetson_linux():
-        optional_tracking_keys = merge_required_keys(optional_tracking_keys, ["face_plan", "face_triton_config"])
-
-    if not anomaly_uses_triton and tracking_uses_triton:
-        ensure_default_face_tracking_model(model_dir)
-        return
+        required_tracking_keys = merge_required_keys(required_tracking_keys, _JETSON_FACE_TRACKING_REQUIRED_KEYS)
 
     pull_model_from_server(
         server_base_url=(os.getenv("NUVION_MODEL_SERVER_BASE_URL", os.getenv("NUVION_SERVER_BASE_URL", DEFAULT_MODEL_SERVER_BASE_URL)) or DEFAULT_MODEL_SERVER_BASE_URL).strip(),
@@ -155,11 +144,8 @@ def _pull_model(profile: str, model_dir: Path) -> None:
         access_token=(os.getenv("NUVION_MODEL_SERVER_ACCESS_TOKEN") or "").strip() or None,
         username=(os.getenv("NUVION_DEVICE_USERNAME") or "").strip() or None,
         password=(os.getenv("NUVION_DEVICE_PASSWORD") or "").strip() or None,
-        optional_keys=optional_tracking_keys,
+        extra_keys=required_tracking_keys if tracking_uses_triton else None,
     )
-
-    if tracking_uses_triton:
-        _ensure_optional_face_tracking_assets(model_dir)
 
 
 def ensure_model_ready(stage: str) -> Path:

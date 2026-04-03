@@ -138,6 +138,7 @@ class FaceDetector:
     def __init__(self) -> None:
         self.ready = False
         self.error = ""
+        self.max_batch_size = 1
         self._classifier = None
         if cv2 is None:
             self.error = f"opencv unavailable: {_CV2_IMPORT_ERROR}"
@@ -158,6 +159,9 @@ class FaceDetector:
         faces = [FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in results]
         return faces
 
+    def detect_many(self, frames_rgb) -> list[list[FaceBox]]:
+        return [self.detect(frame) for frame in frames_rgb]
+
 
 class TritonFaceDetector:
     def __init__(self) -> None:
@@ -165,13 +169,15 @@ class TritonFaceDetector:
         self.error = ""
         self._client = None
         self._client_thread_id: int | None = None
+        self.max_batch_size = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "4") or "4"), 1)
         if TritonFaceClient is None:
             self.error = f"triton face client unavailable: {_TRITON_FACE_IMPORT_ERROR}"
             return
         try:
             # Validate the Triton detector once up front, but create the long-lived
             # client lazily in the worker thread that will actually use it.
-            TritonFaceClient()
+            client = TritonFaceClient()
+            self.max_batch_size = client.max_batch_size
         except Exception as exc:
             self.error = str(exc)
             return
@@ -182,6 +188,7 @@ class TritonFaceDetector:
         if self._client is None or self._client_thread_id != current_thread_id:
             self._client = TritonFaceClient()
             self._client_thread_id = current_thread_id
+            self.max_batch_size = self._client.max_batch_size
         return self._client
 
     def detect(self, frame_rgb) -> list[FaceBox]:
@@ -189,6 +196,15 @@ class TritonFaceDetector:
             return []
         detections = self._get_or_create_client().predict(frame_rgb)
         return [FaceBox(x=item.x, y=item.y, width=item.width, height=item.height) for item in detections]
+
+    def detect_many(self, frames_rgb) -> list[list[FaceBox]]:
+        if not self.ready:
+            return [[] for _ in frames_rgb]
+        batched = self._get_or_create_client().predict_many(list(frames_rgb))
+        return [
+            [FaceBox(x=item.x, y=item.y, width=item.width, height=item.height) for item in detections]
+            for detections in batched
+        ]
 
 
 def build_face_detector() -> FaceDetector | TritonFaceDetector:
@@ -268,9 +284,8 @@ class FaceTrackingController:
         centered = pan_command is None and tilt_command is None
         return pan_command, tilt_command, centered
 
-    def process_frame(self, frame_rgb) -> TrackingDecision:
-        frame_height, frame_width = frame_rgb.shape[:2]
-        faces = self.detector.detect(frame_rgb)
+    def process_detections(self, frame_size: tuple[int, int], faces: list[FaceBox]) -> TrackingDecision:
+        frame_height, frame_width = frame_size
         deadzone = self._deadzone(frame_width, frame_height)
         now = time.time()
 
@@ -300,6 +315,10 @@ class FaceTrackingController:
 
         self._last_face = None
         return TrackingDecision(status_text="TRACK face idle", faces=(), deadzone=deadzone)
+
+    def process_frame(self, frame_rgb) -> TrackingDecision:
+        faces = self.detector.detect(frame_rgb)
+        return self.process_detections(frame_rgb.shape[:2], faces)
 
 
 def build_overlay_snapshot(

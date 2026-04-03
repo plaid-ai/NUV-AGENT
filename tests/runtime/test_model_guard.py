@@ -59,7 +59,7 @@ class ModelGuardTest(unittest.TestCase):
                 missing = model_guard._missing_required_files(Path(tmp), "runtime")
         self.assertEqual(missing, ["onnx/face_detector.onnx"])
 
-    def test_pull_model_face_tracking_only_uses_default_face_model_download(self) -> None:
+    def test_pull_model_face_tracking_only_uses_server_presign(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(
                 os.environ,
@@ -67,14 +67,17 @@ class ModelGuardTest(unittest.TestCase):
                     "NUVION_ZSAD_BACKEND": "none",
                     "NUVION_FACE_TRACKING_ENABLED": "true",
                     "NUVION_FACE_TRACKING_BACKEND": "triton",
+                    "NUVION_DEVICE_USERNAME": "device",
+                    "NUVION_DEVICE_PASSWORD": "secret",
                 },
                 clear=False,
             ):
-                with mock.patch.object(model_guard, "ensure_default_face_tracking_model") as ensure_face_model:
+                with mock.patch.object(model_guard, "_is_jetson_linux", return_value=False):
                     with mock.patch.object(model_guard, "pull_model_from_server") as pull_server:
                         model_guard._pull_model("runtime", Path(tmp))
-        ensure_face_model.assert_called_once()
-        pull_server.assert_not_called()
+
+        _, kwargs = pull_server.call_args
+        self.assertIn("face_onnx", kwargs["extra_keys"])
 
     def test_pull_model_requests_jetson_face_plan_as_optional_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,9 +97,27 @@ class ModelGuardTest(unittest.TestCase):
                         model_guard._pull_model("runtime", Path(tmp))
 
         _, kwargs = pull_server.call_args
-        self.assertIn("face_onnx", kwargs["optional_keys"])
-        self.assertIn("face_plan", kwargs["optional_keys"])
-        self.assertIn("face_triton_config", kwargs["optional_keys"])
+        self.assertIn("face_onnx", kwargs["extra_keys"])
+        self.assertIn("face_plan", kwargs["extra_keys"])
+        self.assertIn("face_triton_config", kwargs["extra_keys"])
+
+    def test_missing_required_files_face_tracking_jetson_requires_face_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NUVION_ZSAD_BACKEND": "none",
+                    "NUVION_FACE_TRACKING_ENABLED": "true",
+                    "NUVION_FACE_TRACKING_BACKEND": "triton",
+                },
+                clear=False,
+            ):
+                with mock.patch.object(model_guard, "_is_jetson_linux", return_value=True):
+                    missing = model_guard._missing_required_files(Path(tmp), "runtime")
+
+        self.assertIn("onnx/face_detector.onnx", missing)
+        self.assertIn("triton/model_repository/face_detector/1/model.plan", missing)
+        self.assertIn("triton/model_repository/face_detector/config.pbtxt", missing)
 
 
 if __name__ == "__main__":

@@ -86,10 +86,11 @@ class TritonFaceClientTest(unittest.TestCase):
         client.input_format = "NCHW"
         client.input_scale = 128.0
         client.input_mean = np.asarray([127.0, 127.0, 127.0], dtype=np.float32)
+        client.max_batch_size = 4
         client.boxes_output = "boxes"
         client.scores_output = "scores"
         client.num_output = ""
-        client._preprocess = lambda _frame: np.zeros((1, 3, 480, 640), dtype=np.float32)
+        client._preprocess = lambda _frame: np.zeros((3, 480, 640), dtype=np.float32)
         client.client = _FakeClient({"boxes": boxes, "scores": scores})
 
         with mock.patch.object(
@@ -110,6 +111,56 @@ class TritonFaceClientTest(unittest.TestCase):
         self.assertGreater(detections[0].score, 0.9)
         self.assertGreater(detections[0].width, 0)
         self.assertGreater(detections[0].height, 0)
+
+    def test_predict_many_returns_one_detection_list_per_frame(self) -> None:
+        frame_a = np.zeros((480, 640, 3), dtype=np.uint8)
+        frame_b = np.zeros((480, 640, 3), dtype=np.uint8)
+        priors = TritonFaceClient._ultraface_priors(640, 480)
+        count = len(priors)
+        boxes = np.zeros((2, count, 4), dtype=np.float32)
+        scores = np.zeros((2, count, 2), dtype=np.float32)
+        scores[0, 0, 1] = 0.95
+        scores[1, 1, 1] = 0.93
+
+        client = TritonFaceClient.__new__(TritonFaceClient)
+        client.model_name = "face_detector"
+        client.model_kind = "ultraface_rfb_640"
+        client.input_width = 640
+        client.input_height = 480
+        client.threshold = 0.7
+        client.max_detections = 8
+        client.max_batch_size = 4
+        client.nms_iou = 0.3
+        client.input_name = "input"
+        client.input_dtype = "FP32"
+        client.input_format = "NCHW"
+        client.input_scale = 128.0
+        client.input_mean = np.asarray([127.0, 127.0, 127.0], dtype=np.float32)
+        client.boxes_output = "boxes"
+        client.scores_output = "scores"
+        client.num_output = ""
+        client._preprocess = lambda _frame: np.zeros((3, 480, 640), dtype=np.float32)
+        client.client = _FakeClient({"boxes": boxes, "scores": scores})
+
+        with mock.patch.object(
+            face_client_module,
+            "httpclient",
+            type(
+                "FakeHttpClient",
+                (),
+                {
+                    "InferInput": _FakeInferInput,
+                    "InferRequestedOutput": _FakeRequestedOutput,
+                },
+            ),
+        ):
+            detections = client.predict_many([frame_a, frame_b])
+
+        self.assertEqual(len(detections), 2)
+        self.assertEqual(len(detections[0]), 1)
+        self.assertEqual(len(detections[1]), 1)
+        self.assertGreater(detections[0][0].score, 0.9)
+        self.assertGreater(detections[1][0].score, 0.9)
 
 
 if __name__ == "__main__":

@@ -14,11 +14,12 @@ class TritonManagerTest(unittest.TestCase):
 
     def test_default_face_tracking_config_matches_ultraface_io(self) -> None:
         config = triton_manager._default_face_tracking_config("onnxruntime_onnx")
+        self.assertIn('max_batch_size: 4', config)
         self.assertIn('name: "scores"', config)
         self.assertIn('name: "boxes"', config)
-        self.assertIn('dims: [ 1, 3, 480, 640 ]', config)
-        self.assertIn('dims: [ 1, 17640, 2 ]', config)
-        self.assertIn('dims: [ 1, 17640, 4 ]', config)
+        self.assertIn('dims: [ 3, 480, 640 ]', config)
+        self.assertIn('dims: [ 17640, 2 ]', config)
+        self.assertIn('dims: [ 17640, 4 ]', config)
         self.assertNotIn('name: "num_detections"', config)
         self.assertNotIn('format: FORMAT_NCHW', config)
 
@@ -92,9 +93,10 @@ class TritonManagerTest(unittest.TestCase):
             self.assertIn('name: "input"', config)
             self.assertIn('name: "scores"', config)
             self.assertIn('name: "boxes"', config)
-            self.assertIn('dims: [ 1, 3, 480, 640 ]', config)
-            self.assertIn('dims: [ 1, 17640, 2 ]', config)
-            self.assertIn('dims: [ 1, 17640, 4 ]', config)
+            self.assertIn('max_batch_size: 4', config)
+            self.assertIn('dims: [ 3, 480, 640 ]', config)
+            self.assertIn('dims: [ 17640, 2 ]', config)
+            self.assertIn('dims: [ 17640, 4 ]', config)
             self.assertNotIn('name: "num_detections"', config)
 
     def test_resolve_repository_jetson_face_detector_falls_back_to_onnx_when_plan_build_fails(self) -> None:
@@ -154,6 +156,35 @@ class TritonManagerTest(unittest.TestCase):
             self.assertTrue((resolved / "face_detector" / "1" / "model.plan").exists())
             config = (resolved / "face_detector" / "config.pbtxt").read_text()
             self.assertIn('platform: "tensorrt_plan"', config)
+
+    def test_prepare_face_detector_onnx_for_runtime_marks_batch_dimension_dynamic(self) -> None:
+        try:
+            import onnx
+            from onnx import TensorProto, helper
+        except Exception:
+            self.skipTest("onnx not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            src = model_dir / "face.onnx"
+            dst = model_dir / "face_runtime.onnx"
+            graph = helper.make_graph(
+                nodes=[],
+                name="face",
+                inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 480, 640])],
+                outputs=[
+                    helper.make_tensor_value_info("scores", TensorProto.FLOAT, [1, 17640, 2]),
+                    helper.make_tensor_value_info("boxes", TensorProto.FLOAT, [1, 17640, 4]),
+                ],
+            )
+            model = helper.make_model(graph)
+            onnx.save(model, src)
+
+            prepared = triton_manager._prepare_face_detector_onnx_for_runtime(src, dst)
+            prepared_model = onnx.load(prepared)
+
+            self.assertEqual(prepared_model.graph.input[0].type.tensor_type.shape.dim[0].dim_param, "batch")
+            self.assertEqual(prepared_model.graph.output[0].type.tensor_type.shape.dim[0].dim_param, "batch")
 
     def test_ensure_triton_ready_reloads_when_face_model_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
