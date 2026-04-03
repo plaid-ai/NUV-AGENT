@@ -232,13 +232,17 @@ class FaceTrackingController:
         *,
         detector: FaceDetector,
         deadzone_pct: float,
+        hysteresis_pct: float,
         lost_timeout_sec: float,
     ) -> None:
         self.detector = detector
         self.deadzone_pct = max(0.01, min(deadzone_pct, 0.45))
+        self.hysteresis_pct = max(0.0, min(hysteresis_pct, 0.2))
         self.lost_timeout_sec = max(0.1, lost_timeout_sec)
         self._last_face: FaceBox | None = None
         self._last_seen_at = 0.0
+        self._last_pan_command: MotorCommand | None = None
+        self._last_tilt_command: MotorCommand | None = None
 
     def _select_primary(self, faces: list[FaceBox], frame_width: int, frame_height: int) -> FaceBox | None:
         if not faces:
@@ -259,27 +263,63 @@ class FaceTrackingController:
         top = center_y - zone_height // 2
         return (left, top, zone_width, zone_height)
 
+    def _hysteresis_deadzone(self, frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+        expanded_pct = min(self.deadzone_pct + self.hysteresis_pct, 0.45)
+        zone_width = int(frame_width * expanded_pct)
+        zone_height = int(frame_height * expanded_pct)
+        center_x = frame_width // 2
+        center_y = frame_height // 2
+        left = center_x - zone_width // 2
+        top = center_y - zone_height // 2
+        return (left, top, zone_width, zone_height)
+
     def _commands_for_face(
         self,
         face: FaceBox,
         deadzone: tuple[int, int, int, int],
+        hysteresis_deadzone: tuple[int, int, int, int],
     ) -> tuple[MotorCommand | None, MotorCommand | None, bool]:
         left, top, zone_width, zone_height = deadzone
         right = left + zone_width
         bottom = top + zone_height
+        hysteresis_left, hysteresis_top, hysteresis_width, hysteresis_height = hysteresis_deadzone
+        hysteresis_right = hysteresis_left + hysteresis_width
+        hysteresis_bottom = hysteresis_top + hysteresis_height
 
         pan_command: MotorCommand | None = None
         tilt_command: MotorCommand | None = None
 
-        if face.center_x < left:
-            pan_command = MotorCommand.LEFT
-        elif face.center_x > right:
-            pan_command = MotorCommand.RIGHT
+        if self._last_pan_command == MotorCommand.LEFT:
+            if face.center_x > hysteresis_right:
+                pan_command = MotorCommand.RIGHT
+            elif face.center_x < left:
+                pan_command = MotorCommand.LEFT
+        elif self._last_pan_command == MotorCommand.RIGHT:
+            if face.center_x < hysteresis_left:
+                pan_command = MotorCommand.LEFT
+            elif face.center_x > right:
+                pan_command = MotorCommand.RIGHT
+        else:
+            if face.center_x < hysteresis_left:
+                pan_command = MotorCommand.LEFT
+            elif face.center_x > hysteresis_right:
+                pan_command = MotorCommand.RIGHT
 
-        if face.center_y < top:
-            tilt_command = MotorCommand.UP
-        elif face.center_y > bottom:
-            tilt_command = MotorCommand.DOWN
+        if self._last_tilt_command == MotorCommand.UP:
+            if face.center_y > hysteresis_bottom:
+                tilt_command = MotorCommand.DOWN
+            elif face.center_y < top:
+                tilt_command = MotorCommand.UP
+        elif self._last_tilt_command == MotorCommand.DOWN:
+            if face.center_y < hysteresis_top:
+                tilt_command = MotorCommand.UP
+            elif face.center_y > bottom:
+                tilt_command = MotorCommand.DOWN
+        else:
+            if face.center_y < hysteresis_top:
+                tilt_command = MotorCommand.UP
+            elif face.center_y > hysteresis_bottom:
+                tilt_command = MotorCommand.DOWN
 
         centered = pan_command is None and tilt_command is None
         return pan_command, tilt_command, centered
@@ -287,13 +327,16 @@ class FaceTrackingController:
     def process_detections(self, frame_size: tuple[int, int], faces: list[FaceBox]) -> TrackingDecision:
         frame_height, frame_width = frame_size
         deadzone = self._deadzone(frame_width, frame_height)
+        hysteresis_deadzone = self._hysteresis_deadzone(frame_width, frame_height)
         now = time.time()
 
         primary_face = self._select_primary(faces, frame_width, frame_height)
         if primary_face is not None:
             self._last_face = primary_face
             self._last_seen_at = now
-            pan_command, tilt_command, centered = self._commands_for_face(primary_face, deadzone)
+            pan_command, tilt_command, centered = self._commands_for_face(primary_face, deadzone, hysteresis_deadzone)
+            self._last_pan_command = pan_command
+            self._last_tilt_command = tilt_command
             status = "TRACK face centered" if centered else "TRACK face active"
             return TrackingDecision(
                 status_text=status,
@@ -314,6 +357,8 @@ class FaceTrackingController:
             )
 
         self._last_face = None
+        self._last_pan_command = None
+        self._last_tilt_command = None
         return TrackingDecision(status_text="TRACK face idle", faces=(), deadzone=deadzone)
 
     def process_frame(self, frame_rgb) -> TrackingDecision:

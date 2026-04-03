@@ -181,6 +181,7 @@ FACE_TRACKING_SHOW_BBOX = is_truthy(os.getenv("NUVION_FACE_TRACKING_SHOW_BBOX", 
 TRACKING_SAMPLE_SEC = parse_float(os.getenv("NUVION_TRACKING_SAMPLE_SEC"), 0.05)
 TRACKING_BATCH_SIZE = max(int(os.getenv("NUVION_FACE_TRACKING_BATCH_SIZE", "2") or "2"), 1)
 TRACKING_DEADZONE_PCT = parse_float(os.getenv("NUVION_TRACKING_DEADZONE_PCT"), 0.08)
+TRACKING_HYSTERESIS_PCT = parse_float(os.getenv("NUVION_TRACKING_HYSTERESIS_PCT"), 0.05)
 TRACKING_LOST_TIMEOUT_SEC = parse_float(os.getenv("NUVION_TRACKING_LOST_TIMEOUT_SEC"), 1.0)
 
 LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
@@ -975,6 +976,7 @@ class NuvionEventState:
                 self.tracking_controller = FaceTrackingController(
                     detector=self.face_detector,
                     deadzone_pct=TRACKING_DEADZONE_PCT,
+                    hysteresis_pct=TRACKING_HYSTERESIS_PCT,
                     lost_timeout_sec=TRACKING_LOST_TIMEOUT_SEC,
                 )
                 self.tracking_status_text = "TRACK idle"

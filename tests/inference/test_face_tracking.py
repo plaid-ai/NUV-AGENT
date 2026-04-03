@@ -11,6 +11,7 @@ from nuvion_app.inference.face_tracking import TrackingOverlayState
 from nuvion_app.inference.face_tracking import TritonFaceDetector
 from nuvion_app.inference.face_tracking import build_overlay_snapshot
 from nuvion_app.inference.face_tracking import draw_tracking_overlay
+from nuvion_app.inference.motor import MotorCommand
 
 
 class FakeDetector:
@@ -64,6 +65,7 @@ class FaceTrackingTest(unittest.TestCase):
                 ]
             ),
             deadzone_pct=0.12,
+            hysteresis_pct=0.05,
             lost_timeout_sec=1.0,
         )
 
@@ -75,6 +77,7 @@ class FaceTrackingTest(unittest.TestCase):
         controller = FaceTrackingController(
             detector=FakeDetector([FaceBox(290, 210, 60, 60)]),
             deadzone_pct=0.2,
+            hysteresis_pct=0.05,
             lost_timeout_sec=1.0,
         )
 
@@ -88,6 +91,7 @@ class FaceTrackingTest(unittest.TestCase):
         controller = FaceTrackingController(
             detector=FakeDetector([FaceBox(20, 20, 60, 60)]),
             deadzone_pct=0.1,
+            hysteresis_pct=0.05,
             lost_timeout_sec=1.0,
         )
 
@@ -100,6 +104,7 @@ class FaceTrackingTest(unittest.TestCase):
         controller = FaceTrackingController(
             detector=FakeDetector([FaceBox(300, 200, 80, 80)]),
             deadzone_pct=0.12,
+            hysteresis_pct=0.05,
             lost_timeout_sec=1.0,
         )
 
@@ -113,6 +118,26 @@ class FaceTrackingTest(unittest.TestCase):
         self.assertEqual(decision_lost.status_text, "TRACK face lost")
         self.assertIsNone(decision_idle.stale_face)
         self.assertEqual(decision_idle.status_text, "TRACK face idle")
+
+    def test_hysteresis_prevents_twitch_near_deadzone_boundary(self) -> None:
+        controller = FaceTrackingController(
+            detector=FakeDetector([]),
+            deadzone_pct=0.1,
+            hysteresis_pct=0.05,
+            lost_timeout_sec=1.0,
+        )
+
+        # Right deadzone edge is 352, hysteresis edge is 368 for 640px width.
+        near_boundary = controller.process_detections(self.frame.shape[:2], [FaceBox(330, 210, 60, 60)])
+        far_outside = controller.process_detections(self.frame.shape[:2], [FaceBox(350, 210, 60, 60)])
+        settle_back = controller.process_detections(self.frame.shape[:2], [FaceBox(330, 210, 60, 60)])
+
+        self.assertTrue(near_boundary.centered)
+        self.assertEqual(far_outside.pan_command, MotorCommand.RIGHT)
+        self.assertEqual(settle_back.pan_command, MotorCommand.RIGHT)
+
+        centered_again = controller.process_detections(self.frame.shape[:2], [FaceBox(320, 210, 60, 60)])
+        self.assertTrue(centered_again.centered)
 
     def test_draw_tracking_overlay_renders_faces_deadzone_and_center(self) -> None:
         snapshot = build_overlay_snapshot(
