@@ -39,6 +39,8 @@ from nuvion_app.inference.face_tracking import build_overlay_snapshot
 from nuvion_app.inference.face_tracking import draw_tracking_overlay
 from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
+from nuvion_app.inference.snapshot import LatestFrameBuffer
+from nuvion_app.inference.snapshot import capture_and_upload_snapshot
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -197,6 +199,8 @@ CLIP_MAX_SEGMENTS = int(os.getenv("NUVION_CLIP_MAX_SEGMENTS", "30"))
 CLIP_OUTPUT_DIR = os.getenv("NUVION_CLIP_OUTPUT_DIR", "/tmp/nuvion_clips")
 CLIP_COOLDOWN_SEC = parse_float(os.getenv("NUVION_CLIP_COOLDOWN_SEC"), 10.0)
 CLIP_CONTENT_TYPE = os.getenv("NUVION_CLIP_CONTENT_TYPE", "video/mp4")
+SNAPSHOT_ENABLED = is_truthy(os.getenv("NUVION_SNAPSHOT_ENABLED", "true"))
+SNAPSHOT_CONTENT_TYPE = os.getenv("NUVION_SNAPSHOT_CONTENT_TYPE", "image/jpeg")
 CLIP_WARMUP_SEC = parse_float(
     os.getenv("NUVION_CLIP_WARMUP_SEC"),
     CLIP_PRE_SEC + CLIP_SEGMENT_SEC + 1.0,
@@ -469,8 +473,8 @@ def api_request(
     return None
 
 
-def request_upload_url() -> dict | None:
-    payload = {"type": "CLIP", "contentType": CLIP_CONTENT_TYPE}
+def request_upload_url(media_type: str = "CLIP", content_type: str | None = None) -> dict | None:
+    payload = {"type": media_type, "contentType": content_type or CLIP_CONTENT_TYPE}
     response = api_request("POST", "/devices/media/upload-url", payload)
     if not response:
         return None
@@ -482,12 +486,10 @@ def update_clip_status(object_name: str, status: str) -> None:
     api_request("PATCH", "/devices/media/clip-status", payload)
 
 
-def upload_file_to_url(upload_url: str, file_path: str, content_type: str) -> bool:
+def upload_bytes_to_url(upload_url: str, data: bytes, content_type: str) -> bool:
     try:
         server_host = urlparse(SERVER_BASE_URL).netloc
         upload_host = urlparse(upload_url).netloc
-        with open(file_path, "rb") as f:
-            data = f.read()
         req = urllib.request.Request(upload_url, data=data, method="PUT")
         req.add_header("Content-Type", content_type)
         if server_host and upload_host == server_host:
@@ -501,6 +503,16 @@ def upload_file_to_url(upload_url: str, file_path: str, content_type: str) -> bo
     except Exception as exc:
         log.warning("[UPLOAD] Error: %s", exc)
     return False
+
+
+def upload_file_to_url(upload_url: str, file_path: str, content_type: str) -> bool:
+    try:
+        with open(file_path, "rb") as file_handle:
+            data = file_handle.read()
+    except Exception as exc:
+        log.warning("[UPLOAD] Error reading %s: %s", file_path, exc)
+        return False
+    return upload_bytes_to_url(upload_url, data, content_type)
 
 
 def build_send_frame(destination: str, payload: dict) -> str:
@@ -909,6 +921,7 @@ class NuvionEventState:
         self.last_status = None
         self.last_sent_status = None
         self.last_sent_at = 0.0
+        self.latest_frame = LatestFrameBuffer()
         self.clip_enabled = CLIP_ENABLED
         self.demo_mode = DEMO_MODE
         self.demo_tag = DEMO_TAG
@@ -1080,6 +1093,7 @@ class NuvionEventState:
         anomaly_type: str,
         message: str,
         severity: str,
+        snapshot_object: str | None = None,
         clip_object: str | None = None,
         clip_status: str | None = None,
     ):
@@ -1098,6 +1112,9 @@ class NuvionEventState:
         else:
             return
 
+        if status == "DEFECT" and status_changed and snapshot_object is None:
+            snapshot_object = self.capture_snapshot_upload()
+
         if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
             clip_object = self.start_clip_upload()
             if clip_object:
@@ -1111,7 +1128,7 @@ class NuvionEventState:
             "severity": severity,
             "lineId": LINE_ID,
             "processId": PROCESS_ID,
-            "snapshotObject": None,
+            "snapshotObject": snapshot_object,
             "clipObject": clip_object,
             "clipStatus": clip_status,
         }
@@ -1131,6 +1148,25 @@ class NuvionEventState:
         if message.lstrip().startswith(self.demo_tag):
             return message
         return f"{self.demo_tag} {message}"
+
+    def remember_latest_frame(self, frame_rgb: np.ndarray) -> None:
+        self.latest_frame.remember(frame_rgb)
+
+    def capture_snapshot_upload(self) -> str | None:
+        if not SNAPSHOT_ENABLED:
+            return None
+
+        frame = self.latest_frame.copy()
+        try:
+            return capture_and_upload_snapshot(
+                frame,
+                request_upload_url=request_upload_url,
+                upload_bytes_to_url=upload_bytes_to_url,
+                preferred_content_type=SNAPSHOT_CONTENT_TYPE,
+            )
+        except Exception as exc:
+            log.warning("[SNAPSHOT] Failed to upload snapshot: %s", exc)
+            return None
 
     def start_clip_upload(self) -> str | None:
         if not self.clip_enabled or not CLIP_ENABLED:
@@ -1492,6 +1528,7 @@ def on_new_sample(appsink, user_data: NuvionEventState):
 
     buffer.unmap(mapinfo)
     user_data.update_demo_ground_truth(int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None)
+    user_data.remember_latest_frame(frame)
     user_data.maybe_enqueue_frame(frame)
     return Gst.FlowReturn.OK
 
