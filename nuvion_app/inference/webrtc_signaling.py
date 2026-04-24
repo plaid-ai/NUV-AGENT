@@ -146,3 +146,34 @@ def build_uplink_payload(
     }
     payload.update(extra)
     return payload
+
+
+def parse_stomp_heartbeat_header(value: Any) -> tuple[int, int]:
+    if not isinstance(value, str):
+        return 0, 0
+
+    parts = [part.strip() for part in value.split(",", 1)]
+    if len(parts) != 2:
+        return 0, 0
+
+    try:
+        can_send = int(parts[0])
+        wants_receive = int(parts[1])
+    except ValueError:
+        return 0, 0
+
+    return max(0, can_send), max(0, wants_receive)
+
+
+def negotiate_stomp_send_interval_ms(
+    client_can_send_ms: int,
+    server_heartbeat_header: Any,
+) -> int | None:
+    if client_can_send_ms <= 0:
+        return None
+
+    _server_can_send_ms, server_wants_receive_ms = parse_stomp_heartbeat_header(server_heartbeat_header)
+    if server_wants_receive_ms <= 0:
+        return None
+
+    return max(client_can_send_ms, server_wants_receive_ms)
