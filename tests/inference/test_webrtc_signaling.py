@@ -4,7 +4,9 @@ import unittest
 
 from nuvion_app.inference.webrtc_signaling import (
     UPLINK_MODE_WEBRTC,
+    negotiate_stomp_send_interval_ms,
     normalize_uplink_mode,
+    parse_stomp_heartbeat_header,
     parse_ice_servers,
     to_gst_ice_server_config,
 )
@@ -42,6 +44,17 @@ class WebRTCSignalingTest(unittest.TestCase):
                 "turn://1700000000%3Adevice-1:c2VjcmV0Og%3D%3D@stunner.example.com:3478?transport=udp",
             ],
         )
+
+    def test_parse_stomp_heartbeat_header(self) -> None:
+        self.assertEqual(parse_stomp_heartbeat_header("10000,10000"), (10000, 10000))
+        self.assertEqual(parse_stomp_heartbeat_header("0,0"), (0, 0))
+        self.assertEqual(parse_stomp_heartbeat_header(None), (0, 0))
+        self.assertEqual(parse_stomp_heartbeat_header("bad"), (0, 0))
+
+    def test_negotiate_stomp_send_interval_ms(self) -> None:
+        self.assertEqual(negotiate_stomp_send_interval_ms(10000, "10000,10000"), 10000)
+        self.assertEqual(negotiate_stomp_send_interval_ms(10000, "0,15000"), 15000)
+        self.assertIsNone(negotiate_stomp_send_interval_ms(10000, "10000,0"))
 
 
 if __name__ == "__main__":

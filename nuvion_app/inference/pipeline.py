@@ -49,6 +49,7 @@ from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_START,
     WEBRTC_UPLINK_STATE,
     WEBRTC_UPLINK_STOP_DEST,
+    negotiate_stomp_send_interval_ms,
     parse_command_payload,
 )
 from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
@@ -616,6 +617,26 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
             log.warning("[STOMP] send failed: %s", exc)
 
 
+async def stomp_heartbeat_sender(
+    ws: websockets.WebSocketClientProtocol,
+    send_interval_ms: int | None,
+):
+    if not send_interval_ms or send_interval_ms <= 0:
+        log.info("[SIGNALING] STOMP heartbeat sender disabled.")
+        return
+
+    interval_sec = max(send_interval_ms / 1000.0, 1.0)
+    log.info("[SIGNALING] STOMP heartbeat sender enabled. interval_ms=%s", send_interval_ms)
+
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            await ws.send(json.dumps(["\n"]))
+        except Exception as exc:
+            log.warning("[SIGNALING] STOMP heartbeat send failed: %s", exc)
+            raise
+
+
 async def device_state_heartbeat_sender():
     interval = max(1.0, DEVICE_STATE_INTERVAL_SEC)
     while True:
@@ -852,12 +873,20 @@ async def signaling_client_main():
                 if "CONNECTED" not in raw:
                     raise ConnectionError("STOMP CONNECT failed")
 
+                connected_frame = stomper.unpack_frame(raw)
+                connected_headers = connected_frame.get("headers", {}) if isinstance(connected_frame, dict) else {}
+                send_interval_ms = negotiate_stomp_send_interval_ms(
+                    10_000,
+                    connected_headers.get("heart-beat"),
+                )
+
                 log.info("[SIGNALING] ✅ STOMP CONNECTED.")
 
                 await ws.send(json.dumps([stomper.subscribe(AGENT_COMMAND_QUEUE_DEST, "sub-command")]))
                 await ws.send(json.dumps([stomper.subscribe(AGENT_ERROR_QUEUE_DEST, "sub-agent-error")]))
 
                 sender_task = asyncio.create_task(outbound_sender(ws))
+                stomp_heartbeat_task = asyncio.create_task(stomp_heartbeat_sender(ws, send_interval_ms))
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
                 connectivity_task = None
                 if CONNECTIVITY_ENABLED:
@@ -880,6 +909,8 @@ async def signaling_client_main():
                         continue
                     frame_list = json.loads(message[1:])
                     for frame_str in frame_list:
+                        if isinstance(frame_str, str) and not frame_str.strip():
+                            continue
                         frame = stomper.unpack_frame(frame_str)
                         destination = frame["headers"].get("destination")
                         body = frame["body"]
@@ -895,6 +926,8 @@ async def signaling_client_main():
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
+            if "stomp_heartbeat_task" in locals():
+                stomp_heartbeat_task.cancel()
             if "heartbeat_task" in locals():
                 heartbeat_task.cancel()
             if "connectivity_task" in locals() and connectivity_task is not None:
