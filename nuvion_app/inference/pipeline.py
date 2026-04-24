@@ -232,7 +232,7 @@ AGENT_ERROR_MAX_RETRIES = int(os.getenv("NUVION_AGENT_ERROR_MAX_RETRIES", "3"))
 AGENT_ERROR_BACKOFF_BASE_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_BASE_SEC"), 1.0)
 AGENT_ERROR_BACKOFF_MAX_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_MAX_SEC"), 15.0)
 
-AGENT_ERROR_QUEUE_DEST = "/user/queue/agent/error"
+AGENT_ERROR_QUEUE_DEST = "/user/queue/agent.error"
 AGENT_COMMAND_QUEUE_DEST = "/user/queue/command"
 AGENT_RETRY_DESTINATIONS = {
     "/app/device/anomaly",
