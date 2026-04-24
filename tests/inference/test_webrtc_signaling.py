@@ -41,7 +41,7 @@ class WebRTCSignalingTest(unittest.TestCase):
         self.assertEqual(
             turn_servers,
             [
-                "turn://1700000000%3Adevice-1:c2VjcmV0Og%3D%3D@stunner.example.com:3478?transport=udp",
+                "turn://1700000000%3Adevice-1:c2VjcmV0Og%3D%3D@stunner.example.com:3478",
             ],
         )
 
