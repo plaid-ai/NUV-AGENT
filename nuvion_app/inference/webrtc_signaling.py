@@ -122,12 +122,14 @@ def to_gst_ice_server_config(ice_servers: list[dict[str, Any]]) -> tuple[str | N
             if not host:
                 continue
 
-            query = f"?{parsed.query}" if parsed.query else ""
             auth_prefix = ""
             if username and credential:
                 auth_prefix = f"{_quote_turn_username(username)}:{_quote_turn_password(credential)}@"
             turn_servers.append(
-                f"{_uri_scheme_prefix(parsed.scheme)}{auth_prefix}{host}:{port}{query}"
+                # webrtcbin expects turn(s)://username:password@host:port without browser-style
+                # query parameters such as ?transport=udp. Passing the query through prevents relay
+                # allocations on both macOS and Jetson runtimes.
+                f"{_uri_scheme_prefix(parsed.scheme)}{auth_prefix}{host}:{port}"
             )
 
     return stun_server, turn_servers
