@@ -274,7 +274,7 @@ For dev, `.env` in the repo is used automatically.
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
 
 ### Agent WebSocket error queue
-- Agent는 STOMP에서 `/user/queue/agent/error`를 구독합니다.
+- Agent는 STOMP에서 `/user/queue/agent.error`를 구독합니다.
 - `retryable=true` 에러는 마지막 uplink payload(`/app/device/*`, `/app/broadcast/start`)를 백오프로 재전송합니다.
 - `401/403` 같은 non-retryable 권한 오류는 uplink를 차단하고 로그에 원인(`code`, `path`, `detail`)을 남깁니다.
 
