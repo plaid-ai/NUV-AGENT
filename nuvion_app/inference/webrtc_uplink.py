@@ -41,7 +41,7 @@ class WebRTCUplinkController:
         self,
         *,
         send_message: Callable[[str, dict[str, Any], bool], bool],
-        default_force_relay: bool = True,
+        default_force_relay: bool = False,
     ) -> None:
         self._send_message = send_message
         self._default_force_relay = default_force_relay

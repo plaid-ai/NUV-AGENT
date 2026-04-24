@@ -157,7 +157,7 @@ DEMO_MODE = is_truthy(os.getenv("NUVION_DEMO_MODE", "false"))
 DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
-WEBRTC_FORCE_RELAY = is_truthy(os.getenv("NUVION_WEBRTC_FORCE_RELAY", "true"))
+WEBRTC_FORCE_RELAY = is_truthy(os.getenv("NUVION_WEBRTC_FORCE_RELAY", "false"))
 RTP_SSRC_ENV = os.getenv("NUVION_RTP_SSRC", None)
 H264_PROFILE_LEVEL_ID_ENV = os.getenv("NUVION_H264_PROFILE_LEVEL_ID", "42e01f")
 H264_PROFILE_ENV = os.getenv("NUVION_H264_PROFILE", "constrained-baseline")
