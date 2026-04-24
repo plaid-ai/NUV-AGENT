@@ -84,6 +84,26 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         self.assertEqual(len(_FakeGLib.calls), 1)
 
+    def test_on_ice_candidate_skips_empty_candidate(self) -> None:
+        sent_messages: list[tuple[str, dict[str, object], bool]] = []
+
+        def send_message(destination: str, payload: dict[str, object], remember: bool) -> bool:
+            sent_messages.append((destination, payload, remember))
+            return True
+
+        controller = self.module.WebRTCUplinkController(send_message=send_message)
+        controller._session = self.module.WebRTCUplinkSession(
+            broadcast_id="device-1",
+            session_id="session-1",
+            force_relay=False,
+            ice_servers=[],
+        )
+
+        controller._on_ice_candidate(None, 0, "")
+        controller._on_ice_candidate(None, 0, "   ")
+
+        self.assertEqual(sent_messages, [])
+
 
 if __name__ == "__main__":
     unittest.main()

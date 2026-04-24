@@ -222,11 +222,19 @@ class WebRTCUplinkController:
     def _on_ice_candidate(self, _element: Gst.Element, mline_index: int, candidate: str) -> None:
         if not self._session:
             return
+        candidate_text = str(candidate or "").strip()
+        if not candidate_text:
+            log.debug(
+                "[WEBRTC-UPLINK] skip empty local ICE candidate. sessionId=%s mline=%s",
+                self._session.session_id,
+                mline_index,
+            )
+            return
         payload = build_uplink_payload(
             WEBRTC_UPLINK_ICE_CANDIDATE,
             self._session.broadcast_id,
             self._session.session_id,
-            candidate=candidate,
+            candidate=candidate_text,
             sdpMLineIndex=int(mline_index),
             sdpMid="video",
         )
