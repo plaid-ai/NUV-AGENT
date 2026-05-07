@@ -19,12 +19,12 @@ class DockerManagerTest(unittest.TestCase):
 
     def test_local_host(self) -> None:
         self.assertTrue(docker_manager.is_local_host("localhost"))
-        self.assertFalse(docker_manager.is_local_host("api.nuvion-dev.plaidai.io"))
+        self.assertFalse(docker_manager.is_local_host("api.nuvion-dev.plaidlabs.ai"))
 
     def test_skip_remote_host(self) -> None:
         with mock.patch.object(docker_manager, "_ensure_docker_cli_mac") as mac_cli:
             with mock.patch.object(docker_manager, "_ensure_docker_cli_linux") as linux_cli:
-                docker_manager.ensure_docker_ready("https://api.nuvion-dev.plaidai.io:8000")
+                docker_manager.ensure_docker_ready("https://api.nuvion-dev.plaidlabs.ai:8000")
                 mac_cli.assert_not_called()
                 linux_cli.assert_not_called()
 

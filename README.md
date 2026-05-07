@@ -55,7 +55,7 @@ Python requirement: 3.10+
 # runtime: text_features + Triton model_repository (권장)
 nuv-agent pull-model \
   --source server \
-  --server-base-url https://api.nuvion-dev.plaidai.io \
+  --server-base-url https://api.nuvion-dev.plaidlabs.ai \
   --pointer anomalyclip/prod \
   --local-dir ~/.cache/nuvion/models/anomalyclip-current \
   --profile runtime
@@ -79,7 +79,7 @@ Profiles:
 기본값:
 - `NUVION_MODEL_POINTER=anomalyclip/prod`
 - `NUVION_MODEL_PRESIGN_TTL_SECONDS=300`
-- `NUVION_MODEL_SERVER_BASE_URL=https://api.nuvion-dev.plaidai.io`
+- `NUVION_MODEL_SERVER_BASE_URL=https://api.nuvion-dev.plaidlabs.ai`
 - `NUVION_MODEL_PROFILE=runtime`
 - `NUVION_MODEL_LOCAL_DIR=~/.cache/nuvion/models/anomalyclip-current`
 

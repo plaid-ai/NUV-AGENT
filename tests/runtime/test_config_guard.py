@@ -36,6 +36,32 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertEqual(report.values["NUVION_CONFIG_SCHEMA_VERSION"], CURRENT_CONFIG_SCHEMA_VERSION)
             self.assertGreater(len(report.changed), 0)
 
+    def test_guard_migrates_legacy_nuvion_hostnames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_CONFIG_SCHEMA_VERSION=8",
+                        "NUVION_SERVER_BASE_URL=https://api.nuvion-dev.plaidai.io",
+                        "NUVION_MODEL_SERVER_BASE_URL=https://api.nuvion-dev.plaidai.io",
+                        "NUVION_CONNECTIVITY_TARGET_HOST=api.nuvion-dev.plaidai.io",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_CONFIG_SCHEMA_VERSION"], CURRENT_CONFIG_SCHEMA_VERSION)
+            self.assertEqual(report.values["NUVION_SERVER_BASE_URL"], "https://api.nuvion-dev.plaidlabs.ai")
+            self.assertEqual(report.values["NUVION_MODEL_SERVER_BASE_URL"], "https://api.nuvion-dev.plaidlabs.ai")
+            self.assertEqual(report.values["NUVION_CONNECTIVITY_TARGET_HOST"], "api.nuvion-dev.plaidlabs.ai")
+
     def test_guard_detects_required_value_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
