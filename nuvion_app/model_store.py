@@ -16,7 +16,7 @@ DEFAULT_MODEL_SOURCE = "server"
 DEFAULT_MODEL_PROFILE = "runtime"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PRESIGN_TTL_SECONDS = 300
-DEFAULT_MODEL_SERVER_BASE_URL = "https://api.nuvion-dev.plaidai.io"
+DEFAULT_MODEL_SERVER_BASE_URL = "https://api.nuvion-dev.plaidlabs.ai"
 DEFAULT_MODEL_PRESIGN_REFRESH_RETRIES = 2
 DEFAULT_FACE_TRACKING_MODEL_URL = (
     "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/ultraface/models/version-RFB-640.onnx"

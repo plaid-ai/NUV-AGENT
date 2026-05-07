@@ -78,7 +78,7 @@ class ModelStoreSelfHealTest(unittest.TestCase):
                 with mock.patch.object(model_store, "_download_http_file", side_effect=fake_download) as dl_mock:
                     with mock.patch.object(model_store, "_validate_download_integrity", return_value=None):
                         target_dir, data = model_store.pull_model_from_server(
-                            server_base_url="https://api.nuvion-dev.plaidai.io",
+                            server_base_url="https://api.nuvion-dev.plaidlabs.ai",
                             pointer="anomalyclip/prod",
                             profile="light",
                             local_dir=tmp,

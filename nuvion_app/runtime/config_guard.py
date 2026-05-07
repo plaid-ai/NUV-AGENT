@@ -15,7 +15,16 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "8"
+CURRENT_CONFIG_SCHEMA_VERSION = "9"
+_LEGACY_HOST_REPLACEMENTS = {
+    "api.nuvion-dev.plaidai.io": "api.nuvion-dev.plaidlabs.ai",
+    "webrtc.nuvion-dev.plaidai.io": "webrtc.nuvion-dev.plaidlabs.ai",
+}
+_LEGACY_HOST_CONFIG_KEYS = (
+    "NUVION_SERVER_BASE_URL",
+    "NUVION_MODEL_SERVER_BASE_URL",
+    "NUVION_CONNECTIVITY_TARGET_HOST",
+)
 _VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
@@ -137,6 +146,14 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
 
     if values.get("NUVION_CONFIG_SCHEMA_VERSION", "").strip() != CURRENT_CONFIG_SCHEMA_VERSION:
         update("NUVION_CONFIG_SCHEMA_VERSION", CURRENT_CONFIG_SCHEMA_VERSION, "schema version update")
+
+    for key in _LEGACY_HOST_CONFIG_KEYS:
+        old_value = values.get(key, "")
+        new_value = old_value
+        for legacy_host, current_host in _LEGACY_HOST_REPLACEMENTS.items():
+            new_value = new_value.replace(legacy_host, current_host)
+        if new_value != old_value:
+            update(key, new_value, "replace legacy Nuvion hostname")
 
     if previous_schema != CURRENT_CONFIG_SCHEMA_VERSION:
         legacy_responsiveness_defaults = {
