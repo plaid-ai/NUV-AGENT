@@ -12,7 +12,7 @@ on:
 
 jobs:
   release:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release_meta.outputs.tag }}
       release_version: ${{ steps.release_meta.outputs.version }}
