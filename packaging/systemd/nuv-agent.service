@@ -11,6 +11,9 @@ Environment=NUV_AGENT_CONFIG=/etc/nuv-agent/agent.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONNOUSERSITE=1
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NUVION_EVENT_OUTBOX_PATH=/var/lib/nuv-agent/events.sqlite3
+StateDirectory=nuv-agent
+StateDirectoryMode=0750
 PermissionsStartOnly=true
 ExecStartPre=/bin/mkdir -p /tmp/nuvion_clips/segments /tmp/nuvion_clips/clips
 ExecStartPre=/bin/chmod 1777 /tmp/nuvion_clips

@@ -6,10 +6,90 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION, guard_config
+from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION, ensure_runtime_config, guard_config
 
 
 class ConfigGuardTest(unittest.TestCase):
+    def test_guard_normalizes_invalid_outbox_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_EVENT_OUTBOX_MAX_ROWS=0",
+                        "NUVION_EVENT_OUTBOX_MAX_BYTES=invalid",
+                        "NUVION_EVENT_DLQ_MAX_ROWS=-1",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_ROWS"], "10000")
+            self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_BYTES"], "67108864")
+            self.assertEqual(report.values["NUVION_EVENT_DLQ_MAX_ROWS"], "10000")
+
+    def test_runtime_migration_replaces_dotenv_origin_values_in_current_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            original_values = {
+                "NUVION_CONFIG_SCHEMA_VERSION": "8",
+                "NUVION_SERVER_BASE_URL": "https://api.nuvion-dev.plaidai.io",
+                "NUVION_MODEL_SERVER_BASE_URL": "https://api.nuvion-dev.plaidai.io",
+                "NUVION_DEVICE_USERNAME": "device-1",
+                "NUVION_DEVICE_PASSWORD": "secret",
+                "NUVION_ZSAD_BACKEND": "none",
+            }
+            config_path.write_text(
+                "\n".join(f"{key}={value}" for key, value in original_values.items()) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, original_values, clear=True):
+                report = ensure_runtime_config(config_path, stage="test", apply_fixes=True)
+
+                self.assertEqual(os.environ["NUVION_CONFIG_SCHEMA_VERSION"], CURRENT_CONFIG_SCHEMA_VERSION)
+                self.assertEqual(os.environ["NUVION_SERVER_BASE_URL"], "https://api.nuvion-dev.plaidlabs.ai")
+                self.assertNotIn("NUVION_CONFIG_SCHEMA_VERSION", report.env_overrides)
+                self.assertNotIn("NUVION_SERVER_BASE_URL", report.env_overrides)
+
+    def test_runtime_migration_preserves_explicit_external_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_CONFIG_SCHEMA_VERSION=8",
+                        "NUVION_SERVER_BASE_URL=https://api.nuvion-dev.plaidai.io",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            environment = {
+                "NUVION_CONFIG_SCHEMA_VERSION": "8",
+                "NUVION_SERVER_BASE_URL": "https://edge.override.example.com",
+                "NUVION_DEVICE_USERNAME": "device-1",
+                "NUVION_DEVICE_PASSWORD": "secret",
+                "NUVION_ZSAD_BACKEND": "none",
+            }
+
+            with mock.patch.dict(os.environ, environment, clear=True):
+                report = ensure_runtime_config(config_path, stage="test", apply_fixes=True)
+
+                self.assertEqual(os.environ["NUVION_CONFIG_SCHEMA_VERSION"], CURRENT_CONFIG_SCHEMA_VERSION)
+                self.assertEqual(os.environ["NUVION_SERVER_BASE_URL"], "https://edge.override.example.com")
+                self.assertIn("NUVION_SERVER_BASE_URL", report.env_overrides)
+
     def test_guard_applies_legacy_migrations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
