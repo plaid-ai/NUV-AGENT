@@ -15,7 +15,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "9"
+CURRENT_CONFIG_SCHEMA_VERSION = "10"
 _LEGACY_HOST_REPLACEMENTS = {
     "api.nuvion-dev.plaidai.io": "api.nuvion-dev.plaidlabs.ai",
     "webrtc.nuvion-dev.plaidai.io": "webrtc.nuvion-dev.plaidlabs.ai",
@@ -197,6 +197,15 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if str(height) != str(values.get("NUVION_TRITON_INPUT_HEIGHT", "")):
         update("NUVION_TRITON_INPUT_HEIGHT", str(height), "normalize triton input height")
 
+    for key, default in (
+        ("NUVION_EVENT_OUTBOX_MAX_ROWS", 10_000),
+        ("NUVION_EVENT_OUTBOX_MAX_BYTES", 64 * 1024 * 1024),
+        ("NUVION_EVENT_DLQ_MAX_ROWS", 10_000),
+    ):
+        normalized = _normalize_int(values.get(key, ""), default)
+        if str(normalized) != str(values.get(key, "")):
+            update(key, str(normalized), f"normalize {key.lower()}")
+
     base_url = (values.get("NUVION_MODEL_SERVER_BASE_URL", "") or "").strip()
     if not base_url:
         fallback_base = (values.get("NUVION_SERVER_BASE_URL", "") or "").strip()
@@ -299,15 +308,28 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     return changed
 
 
-def _collect_effective_values(fields: List[Dict[str, str]], file_values: Dict[str, str]) -> tuple[Dict[str, str], Dict[str, Tuple[str, str]]]:
+def _collect_effective_values(
+    fields: List[Dict[str, str]],
+    file_values: Dict[str, str],
+    original_file_values: Dict[str, str] | None = None,
+) -> tuple[Dict[str, str], Dict[str, Tuple[str, str]]]:
     effective = dict(file_values)
     overrides: Dict[str, Tuple[str, str]] = {}
+    original = original_file_values or {}
     for field in fields:
         key = field["key"]
         env_value = os.getenv(key)
         if env_value is None:
             continue
         file_value = file_values.get(key, "")
+        original_value = original.get(key)
+        if original_value is not None and env_value == original_value:
+            # load_env() populates os.environ from the pre-migration file.
+            # When that exact value was migrated, it is dotenv-origin state,
+            # not an operator-provided override. Use the migrated value so
+            # ensure_runtime_config can synchronize the current process.
+            effective[key] = file_value
+            continue
         if env_value != file_value:
             overrides[key] = (file_value, env_value)
         effective[key] = env_value
@@ -366,6 +388,9 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
         "NUVION_TRACKING_HYSTERESIS_PCT",
         "NUVION_TRACKING_LOST_TIMEOUT_SEC",
         "NUVION_MOTOR_COMMAND_INTERVAL_SEC",
+        "NUVION_EVENT_OUTBOX_MAX_ROWS",
+        "NUVION_EVENT_OUTBOX_MAX_BYTES",
+        "NUVION_EVENT_DLQ_MAX_ROWS",
     ):
         try:
             parsed = float(str(values.get(key, "")).strip())
@@ -484,7 +509,7 @@ def guard_config(config_path: Path, apply_fixes: bool = True) -> ConfigGuardResu
         if changed:
             write_env(config_path, lines, merged)
 
-    effective_values, overrides = _collect_effective_values(fields, merged)
+    effective_values, overrides = _collect_effective_values(fields, merged, existing)
     warnings, errors = _validate_values(effective_values)
 
     return ConfigGuardResult(

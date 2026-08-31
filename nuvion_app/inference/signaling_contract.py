@@ -1,0 +1,9 @@
+AGENT_COMMAND_QUEUE_DEST = "/user/queue/command"
+AGENT_ERROR_QUEUE_DEST = "/user/queue/agent.error"
+EVENT_ACK_QUEUE_DEST = "/user/queue/event.ack"
+
+REQUIRED_AGENT_SUBSCRIPTIONS = (
+    AGENT_COMMAND_QUEUE_DEST,
+    AGENT_ERROR_QUEUE_DEST,
+    EVENT_ACK_QUEUE_DEST,
+)

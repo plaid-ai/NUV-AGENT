@@ -232,6 +232,11 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
 - `NUVION_DEVICE_STATE_INTERVAL_SEC`: `/app/device/state` heartbeat 주기(초, 기본 `30`)
+- `NUVION_EVENT_OUTBOX_PATH`: anomaly/production SQLite outbox 경로 (systemd 기본 `/var/lib/nuv-agent/events.sqlite3`)
+- `NUVION_EVENT_REPLAY_INTERVAL_SEC`: ACK 미수신 event 재전송 주기(초, 기본 `5`)
+- `NUVION_EVENT_OUTBOX_MAX_ROWS`: replay 대기 event 최대 행 수(기본 `10000`)
+- `NUVION_EVENT_OUTBOX_MAX_BYTES`: replay 대기 payload 논리 크기 한도(기본 `67108864`, 64 MiB)
+- `NUVION_EVENT_DLQ_MAX_ROWS`: DLQ 보존 행 수(기본 `10000`, 초과 시 가장 오래된 DLQ 행 제거)
 - `NUVION_CONNECTIVITY_ENABLED`: `/app/device/connectivity` 보고 활성화 (`true|false`)
 - `NUVION_CONNECTIVITY_INTERVAL_SEC`: 연결 품질 샘플링 주기(초, 기본 `10`)
 - `NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC`: 전이 이벤트 최소 전송 간격(초, 기본 `30`)
@@ -270,13 +275,23 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_AGENT_ERROR_MAX_RETRIES`: 서버 agent error(`retryable=true`) 수신 시 자동 재시도 최대 횟수 (기본 `3`)
 - `NUVION_AGENT_ERROR_BACKOFF_BASE_SEC`: 첫 재시도 대기 시간(초), 이후 지수 백오프 (기본 `1.0`)
 - `NUVION_AGENT_ERROR_BACKOFF_MAX_SEC`: 재시도 최대 대기 시간(초) (기본 `15.0`)
+- `NUVION_CLIP_EVENT_ACK_WAIT_SEC`: anomaly 저장 ACK 후 clip finalize를 시도하기 위한 최대 대기(초, 기본 `60`)
+- `NUVION_CLIP_STATUS_MAX_RETRIES`: clip finalize API 최대 시도 횟수(기본 `5`)
 
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
 
 ### Agent WebSocket error queue
 - Agent는 STOMP에서 `/user/queue/agent.error`를 구독합니다.
-- `retryable=true` 에러는 마지막 uplink payload(`/app/device/*`, `/app/broadcast/start`)를 백오프로 재전송합니다.
+- `retryable=true` 에러는 일반 uplink payload를 백오프로 재전송합니다.
 - `401/403` 같은 non-retryable 권한 오류는 uplink를 차단하고 로그에 원인(`code`, `path`, `detail`)을 남깁니다.
+
+### Critical event delivery
+- anomaly/production은 `eventId`와 `occurredAt`을 붙여 SQLite에 먼저 저장한 뒤 전송합니다.
+- Agent는 `/user/queue/event.ack`의 `ACCEPTED|DUPLICATE` ACK를 받은 경우에만 outbox row를 삭제합니다.
+- `REJECTED` + `retryable=false` ACK 또는 eventId가 포함된 영구 400/422 error는 원본 payload와 시도 횟수를 DLQ로 이동합니다.
+- 재연결 또는 ACK timeout 시 동일한 `eventId`로 replay하므로 서버는 `eventId` 기준 idempotency를 제공해야 합니다.
+- Pending quota 초과 시 기존 event를 밀어내지 않고 신규 event를 DLQ로 격리하는 reject-new 정책을 사용합니다.
+- state heartbeat에는 legacy `status`와 함께 `runtimeStatus`, `inspectionStatus`, `connectivityStatus`, `agentVersion`, `componentSha`, `configSchema`, `modelPointer`, `modelVersion`이 포함됩니다.
 
 Connectivity 보고 정책:
 - macOS는 `airport -I`, Linux(Jetson)는 `iw dev <iface> link`에서 RSSI를 수집합니다.

@@ -13,6 +13,10 @@ on:
 jobs:
   release:
     runs-on: [self-hosted, linux, x64]
+    outputs:
+      release_tag: ${{ steps.release_meta.outputs.tag }}
+      release_version: ${{ steps.release_meta.outputs.version }}
+      component_sha: ${{ steps.release_meta.outputs.component_sha }}
     permissions:
       contents: write
     env:
@@ -21,11 +25,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Resolve and verify release identity
+        id: release_meta
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${REQUESTED_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          COMPONENT_SHA=$(git rev-parse HEAD)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "component_sha=$COMPONENT_SHA" >> $GITHUB_OUTPUT
+          python packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
+
+      - name: Test source in clean environment
+        env:
+          NUV_AGENT_CONFIG: ${{ runner.temp }}/nuv-agent-release-test-${{ github.run_id }}-${{ github.run_attempt }}.env
+        run: |
+          python -m venv .release-test-venv
+          .release-test-venv/bin/python -m pip install --upgrade pip
+          .release-test-venv/bin/python -m pip install .
+          .release-test-venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 
       - name: Build sdist
         run: |
@@ -33,25 +68,26 @@ jobs:
           python -m build --sdist --outdir dist
           ls -la dist
 
+      - name: Install and smoke-test built sdist
+        env:
+          NUV_AGENT_CONFIG: ${{ runner.temp }}/nuv-agent-release-test-${{ github.run_id }}-${{ github.run_attempt }}.env
+        run: |
+          TARBALL="dist/nuv_agent-${{ steps.release_meta.outputs.version }}.tar.gz"
+          python -m venv .release-smoke-venv
+          .release-smoke-venv/bin/python -m pip install --upgrade pip
+          .release-smoke-venv/bin/python -m pip install --no-cache-dir "$TARBALL"
+          .release-smoke-venv/bin/python -c "from nuvion_app import build_info; assert build_info.AGENT_VERSION == '${{ steps.release_meta.outputs.version }}'; assert build_info.COMPONENT_SHA == '${{ steps.release_meta.outputs.component_sha }}'"
+          .release-smoke-venv/bin/nuv-agent --help >/dev/null
+
       - name: Compute SHA256
         id: sha
         run: |
-          TARBALL=$(ls dist/nuv_agent-*.tar.gz | head -1)
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          VERSION="${TAG#v}"
-          EXPECTED_TARBALL="dist/nuv_agent-${VERSION}.tar.gz"
-          if [ "$TARBALL" != "$EXPECTED_TARBALL" ]; then
-            echo "Version mismatch: built $TARBALL but tag expects $EXPECTED_TARBALL" >&2
-            exit 1
-          fi
-          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
+          TARBALL="dist/nuv_agent-${{ steps.release_meta.outputs.version }}.tar.gz"
           SHA=$(python -c "import hashlib, pathlib; p=pathlib.Path('$TARBALL'); print(hashlib.sha256(p.read_bytes()).hexdigest())")
+          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
           echo "sha256=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${{ steps.release_meta.outputs.tag }}" >> $GITHUB_OUTPUT
+          echo "version=${{ steps.release_meta.outputs.version }}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -96,17 +132,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.release_tag }}
 
       - name: Resolve version
         id: version
+        env:
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
         run: |
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Stamp build identity
+        env:
+          COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
+          VERSION: ${{ needs.release.outputs.release_version }}
+        run: python3 packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
 
       - name: Install build deps
         run: |

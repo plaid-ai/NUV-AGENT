@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.error
+import uuid
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -29,8 +30,30 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
+from nuvion_app.inference.clip_segments import list_stable_segments
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
+from nuvion_app.inference.device_state import (
+    CONNECTIVITY_QUALITY_GOOD,
+    INSPECTION_STATUS_DEFECT,
+    INSPECTION_STATUS_NORMAL,
+    RUNTIME_STATUS_ERROR,
+    RUNTIME_STATUS_RUNNING,
+    DeviceStateCoordinator,
+)
+from nuvion_app.inference.durable_events import (
+    DEFAULT_DLQ_MAX_ROWS,
+    DEFAULT_OUTBOX_MAX_BYTES,
+    DEFAULT_OUTBOX_MAX_ROWS,
+    EVENT_TYPE_ANOMALY,
+    EVENT_TYPE_PRODUCTION,
+    DurableEvent,
+    DurableEventDelivery,
+    DurableEventOutbox,
+    parse_permanent_event_rejection,
+    resolve_default_outbox_path,
+    utc_now_iso,
+)
 from nuvion_app.inference.face_tracking import FaceTrackingController
 from nuvion_app.inference.face_tracking import TrackingOverlaySnapshot
 from nuvion_app.inference.face_tracking import TrackingOverlayState
@@ -41,6 +64,12 @@ from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.snapshot import LatestFrameBuffer
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot
+from nuvion_app.inference.signaling_contract import (
+    AGENT_COMMAND_QUEUE_DEST,
+    AGENT_ERROR_QUEUE_DEST,
+    EVENT_ACK_QUEUE_DEST,
+    REQUIRED_AGENT_SUBSCRIPTIONS,
+)
 from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_ANSWER,
     WEBRTC_UPLINK_ICE_CANDIDATE,
@@ -77,6 +106,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_backend,
     normalize_siglip_device,
 )
+from nuvion_app.runtime.telemetry import build_runtime_telemetry
 
 try:
     from nuvion_app.agent.triton_client import TritonAnomalyClient
@@ -229,15 +259,27 @@ CONNECTIVITY_TARGET_HOST = (os.getenv("NUVION_CONNECTIVITY_TARGET_HOST", "") or 
 CONNECTIVITY_WIFI_INTERFACE = (os.getenv("NUVION_WIFI_INTERFACE", "") or "").strip()
 
 OUTBOUND_QUEUE_MAX = int(os.getenv("NUVION_STOMP_QUEUE_MAX", "200"))
+EVENT_REPLAY_INTERVAL_SEC = parse_float(os.getenv("NUVION_EVENT_REPLAY_INTERVAL_SEC"), 5.0)
+EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
+    os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
+    DEFAULT_OUTBOX_MAX_ROWS,
+)
+EVENT_OUTBOX_MAX_BYTES = parse_int_with_default(
+    os.getenv("NUVION_EVENT_OUTBOX_MAX_BYTES"),
+    DEFAULT_OUTBOX_MAX_BYTES,
+)
+EVENT_DLQ_MAX_ROWS = parse_int_with_default(
+    os.getenv("NUVION_EVENT_DLQ_MAX_ROWS"),
+    DEFAULT_DLQ_MAX_ROWS,
+)
+CLIP_EVENT_ACK_WAIT_SEC = parse_float(os.getenv("NUVION_CLIP_EVENT_ACK_WAIT_SEC"), 60.0)
+CLIP_STATUS_MAX_RETRIES = parse_int_with_default(os.getenv("NUVION_CLIP_STATUS_MAX_RETRIES"), 5)
+CLIP_STATUS_RETRY_BASE_SEC = parse_float(os.getenv("NUVION_CLIP_STATUS_RETRY_BASE_SEC"), 1.0)
 AGENT_ERROR_MAX_RETRIES = int(os.getenv("NUVION_AGENT_ERROR_MAX_RETRIES", "3"))
 AGENT_ERROR_BACKOFF_BASE_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_BASE_SEC"), 1.0)
 AGENT_ERROR_BACKOFF_MAX_SEC = parse_float(os.getenv("NUVION_AGENT_ERROR_BACKOFF_MAX_SEC"), 15.0)
 
-AGENT_ERROR_QUEUE_DEST = "/user/queue/agent.error"
-AGENT_COMMAND_QUEUE_DEST = "/user/queue/command"
 AGENT_RETRY_DESTINATIONS = {
-    "/app/device/anomaly",
-    "/app/device/production",
     "/app/device/log",
     "/app/device/state",
     "/app/device/connectivity",
@@ -259,6 +301,11 @@ agent_retry_attempts: dict[str, int] = {}
 agent_retry_lock = threading.Lock()
 last_sent_payloads: dict[str, dict] = {}
 last_sent_payloads_lock = threading.Lock()
+critical_event_delivery: DurableEventDelivery | None = None
+critical_event_outbox_init_attempted = False
+critical_event_outbox_lock = threading.Lock()
+device_state_coordinator: DeviceStateCoordinator | None = None
+device_state_coordinator_lock = threading.Lock()
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
 
@@ -482,9 +529,29 @@ def request_upload_url(media_type: str = "CLIP", content_type: str | None = None
     return response.get("data")
 
 
-def update_clip_status(object_name: str, status: str) -> None:
+def update_clip_status(object_name: str, status: str) -> bool:
     payload = {"objectName": object_name, "status": status}
-    api_request("PATCH", "/devices/media/clip-status", payload)
+    return api_request("PATCH", "/devices/media/clip-status", payload) is not None
+
+
+def update_clip_status_with_retry(object_name: str, status: str) -> bool:
+    attempts = max(1, CLIP_STATUS_MAX_RETRIES)
+    for attempt in range(1, attempts + 1):
+        if update_clip_status(object_name, status):
+            return True
+        if attempt < attempts:
+            delay = max(0.1, CLIP_STATUS_RETRY_BASE_SEC) * (2 ** (attempt - 1))
+            log.warning(
+                "[CLIP] finalize retry object=%s status=%s attempt=%d/%d delay=%.1fs",
+                object_name,
+                status,
+                attempt,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    log.error("[CLIP] finalize failed object=%s status=%s", object_name, status)
+    return False
 
 
 def upload_bytes_to_url(upload_url: str, data: bytes, content_type: str) -> bool:
@@ -582,39 +649,185 @@ def _reset_agent_ws_state() -> None:
     _set_agent_uplink_blocked(False, "")
     with agent_retry_lock:
         agent_retry_attempts.clear()
+    if critical_event_delivery is not None:
+        critical_event_delivery.reset_for_reconnect()
     if g_app and getattr(g_app, "webrtc_uplink", None):
         g_app.webrtc_uplink.on_signaling_reset()
 
 
-def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
+def initialize_durable_event_outbox() -> DurableEventDelivery | None:
+    global critical_event_delivery, critical_event_outbox_init_attempted
+    with critical_event_outbox_lock:
+        if critical_event_outbox_init_attempted:
+            return critical_event_delivery
+        critical_event_outbox_init_attempted = True
+        try:
+            outbox = DurableEventOutbox(
+                resolve_default_outbox_path(),
+                max_rows=EVENT_OUTBOX_MAX_ROWS,
+                max_bytes=EVENT_OUTBOX_MAX_BYTES,
+                max_dead_letters=EVENT_DLQ_MAX_ROWS,
+            )
+            critical_event_delivery = DurableEventDelivery(outbox)
+            log.info(
+                "[OUTBOX] ready path=%s pending=%d",
+                outbox.path,
+                outbox.count(),
+            )
+        except Exception as exc:
+            critical_event_delivery = None
+            log.error("[OUTBOX] unavailable; critical events fail closed: %s", exc)
+        return critical_event_delivery
+
+
+def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None = None) -> bool:
     if outbound_queue is None or signaling_loop is None:
-        log.warning("[STOMP] outbound not ready, dropping message to %s", destination)
         return False
+    completed = threading.Event()
+    cancelled = threading.Event()
+    enqueued: list[bool] = []
+
+    def _enqueue() -> None:
+        try:
+            if cancelled.is_set():
+                return
+            outbound_queue.put_nowait((destination, _clone_payload(payload), event_id))
+            enqueued.append(True)
+        except asyncio.QueueFull:
+            enqueued.append(False)
+        finally:
+            completed.set()
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if current_loop is signaling_loop:
+        _enqueue()
+    else:
+        try:
+            signaling_loop.call_soon_threadsafe(_enqueue)
+        except RuntimeError:
+            return False
+        if not completed.wait(timeout=0.5):
+            cancelled.set()
+            return False
+    return bool(enqueued and enqueued[0])
+
+
+def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
     if _is_agent_uplink_blocked(destination):
+        return False
+    if not _try_enqueue_outbound(destination, payload):
+        log.warning("[STOMP] outbound unavailable or full for %s", destination)
         return False
     if remember:
         _remember_last_payload(destination, payload)
-
-    def _enqueue():
-        try:
-            outbound_queue.put_nowait((destination, payload))
-        except asyncio.QueueFull:
-            log.warning("[STOMP] outbound queue full, dropping message to %s", destination)
-
-    signaling_loop.call_soon_threadsafe(_enqueue)
     return True
+
+
+def _send_durable_event(event: DurableEvent) -> bool:
+    return _try_enqueue_outbound(event.destination, event.payload, event.event_id)
+
+
+def persist_critical_event(
+    event_type: str,
+    destination: str,
+    payload: dict,
+    event_id: str,
+    occurred_at: str,
+) -> DurableEvent | None:
+    delivery = initialize_durable_event_outbox()
+    if delivery is None:
+        return None
+    try:
+        event = delivery.publish(
+            event_type=event_type,
+            destination=destination,
+            payload=payload,
+            event_id=event_id,
+            occurred_at=occurred_at,
+            sender=_send_durable_event,
+        )
+        if event.dead_lettered:
+            log.error("[OUTBOX] event routed to DLQ type=%s eventId=%s", event_type, event_id)
+        return event
+    except Exception as exc:
+        log.error("[OUTBOX] persist failed type=%s eventId=%s: %s", event_type, event_id, exc)
+        return None
+
+
+def get_device_state_coordinator() -> DeviceStateCoordinator:
+    global device_state_coordinator
+    with device_state_coordinator_lock:
+        if device_state_coordinator is None:
+            device_state_coordinator = DeviceStateCoordinator(
+                send_message=lambda payload: enqueue_stomp_message("/app/device/state", payload),
+                line_id=LINE_ID,
+                process_id=PROCESS_ID,
+                telemetry=build_runtime_telemetry(),
+            )
+        return device_state_coordinator
 
 
 async def outbound_sender(ws: websockets.WebSocketClientProtocol):
     if outbound_queue is None:
         return
     while True:
-        destination, payload = await outbound_queue.get()
+        destination, payload, event_id = await outbound_queue.get()
+        if (
+            event_id
+            and critical_event_delivery is not None
+            and not critical_event_delivery.outbox.is_pending(event_id)
+        ):
+            critical_event_delivery.release(event_id)
+            outbound_queue.task_done()
+            continue
         frame_str = build_send_frame(destination, payload)
         try:
             await ws.send(json.dumps([frame_str]))
+            if event_id and critical_event_delivery is not None:
+                critical_event_delivery.mark_sent(event_id)
         except Exception as exc:
+            if event_id and critical_event_delivery is not None:
+                critical_event_delivery.release(event_id)
             log.warning("[STOMP] send failed: %s", exc)
+            await ws.close()
+            raise
+        finally:
+            outbound_queue.task_done()
+
+
+async def durable_event_replay_sender() -> None:
+    interval = max(1.0, EVENT_REPLAY_INTERVAL_SEC)
+    while True:
+        if critical_event_delivery is not None:
+            critical_event_delivery.replay(
+                _send_durable_event,
+                limit=OUTBOUND_QUEUE_MAX,
+                retry_after_seconds=interval,
+            )
+        await asyncio.sleep(interval)
+
+
+async def handle_event_ack(body: str) -> None:
+    if critical_event_delivery is None:
+        return
+    ack, removed = critical_event_delivery.acknowledge_body(body)
+    if ack is None:
+        log.warning("[OUTBOX] invalid ACK: %s", body)
+        return
+    if removed:
+        if ack.successful:
+            log.info("[OUTBOX] ACK eventId=%s type=%s status=%s", ack.event_id, ack.event_type, ack.status)
+        else:
+            log.error(
+                "[OUTBOX] permanent rejection moved to DLQ eventId=%s type=%s code=%s reason=%s",
+                ack.event_id,
+                ack.event_type,
+                ack.code,
+                ack.reason,
+            )
 
 
 async def stomp_heartbeat_sender(
@@ -639,21 +852,19 @@ async def stomp_heartbeat_sender(
 
 async def device_state_heartbeat_sender():
     interval = max(1.0, DEVICE_STATE_INTERVAL_SEC)
+    coordinator = get_device_state_coordinator()
     while True:
-        payload = {
-            "status": "RUNNING",
-            "message": "heartbeat",
-            "lineId": LINE_ID,
-            "processId": PROCESS_ID,
-        }
-        enqueue_stomp_message("/app/device/state", payload)
+        coordinator.emit_heartbeat()
         await asyncio.sleep(interval)
 
 
 async def device_connectivity_sender(reporter: ConnectivityReporter):
     interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
+    coordinator = get_device_state_coordinator()
     while True:
         payload = reporter.build_transition_payload()
+        if payload:
+            coordinator.set_connectivity_status(str(payload.get("quality") or CONNECTIVITY_QUALITY_GOOD))
         if payload and enqueue_stomp_message("/app/device/connectivity", payload):
             log.info(
                 "[CONNECTIVITY] sent quality=%s reason=%s rssi=%s loss=%s rtt=%s",
@@ -705,6 +916,24 @@ async def handle_agent_error(body: str) -> None:
         status_int = status
     elif isinstance(status, str) and status.isdigit():
         status_int = int(status)
+
+    rejection = parse_permanent_event_rejection(payload)
+    if rejection is not None and critical_event_delivery is not None:
+        quarantined = critical_event_delivery.reject_event(
+            rejection.event_id,
+            rejection.event_type,
+            reason=rejection.reason,
+            rejection_code=rejection.rejection_code,
+            source="agent.error",
+        )
+        if quarantined:
+            log.error(
+                "[OUTBOX] agent error moved event to DLQ eventId=%s type=%s code=%s",
+                rejection.event_id,
+                rejection.event_type,
+                rejection.rejection_code,
+            )
+        return
 
     if retryable:
         if path not in AGENT_RETRY_DESTINATIONS:
@@ -833,6 +1062,7 @@ async def signaling_client_main():
         signaling_loop = asyncio.get_running_loop()
     if outbound_queue is None:
         outbound_queue = asyncio.Queue(maxsize=OUTBOUND_QUEUE_MAX)
+    initialize_durable_event_outbox()
 
     while True:
         token = await login()
@@ -882,10 +1112,11 @@ async def signaling_client_main():
 
                 log.info("[SIGNALING] ✅ STOMP CONNECTED.")
 
-                await ws.send(json.dumps([stomper.subscribe(AGENT_COMMAND_QUEUE_DEST, "sub-command")]))
-                await ws.send(json.dumps([stomper.subscribe(AGENT_ERROR_QUEUE_DEST, "sub-agent-error")]))
+                for index, destination in enumerate(REQUIRED_AGENT_SUBSCRIPTIONS):
+                    await ws.send(json.dumps([stomper.subscribe(destination, f"sub-agent-{index}")]))
 
                 sender_task = asyncio.create_task(outbound_sender(ws))
+                event_replay_task = asyncio.create_task(durable_event_replay_sender())
                 stomp_heartbeat_task = asyncio.create_task(stomp_heartbeat_sender(ws, send_interval_ms))
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
                 connectivity_task = None
@@ -919,6 +1150,8 @@ async def signaling_client_main():
                             await handle_command_message(body)
                         elif destination and AGENT_ERROR_QUEUE_DEST in destination:
                             await handle_agent_error(body)
+                        elif destination and EVENT_ACK_QUEUE_DEST in destination:
+                            await handle_event_ack(body)
 
         except Exception as exc:
             log.error("[SIGNALING] WebSocket error: %s", exc)
@@ -926,6 +1159,8 @@ async def signaling_client_main():
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
+            if "event_replay_task" in locals():
+                event_replay_task.cancel()
             if "stomp_heartbeat_task" in locals():
                 stomp_heartbeat_task.cancel()
             if "heartbeat_task" in locals():
@@ -1131,6 +1366,8 @@ class NuvionEventState:
         clip_status: str | None = None,
     ):
         now = time.time()
+        inspection_status = INSPECTION_STATUS_DEFECT if status == "DEFECT" else INSPECTION_STATUS_NORMAL
+        get_device_state_coordinator().set_inspection_status(inspection_status)
         prev_sent_status = self.last_sent_status
         status_changed = (prev_sent_status is None) or (status != prev_sent_status)
         self.last_status = status
@@ -1145,11 +1382,16 @@ class NuvionEventState:
         else:
             return
 
+        event_id = str(uuid.uuid4())
+        occurred_at = utc_now_iso()
+        if initialize_durable_event_outbox() is None:
+            return
+
         if status == "DEFECT" and status_changed and snapshot_object is None:
             snapshot_object = self.capture_snapshot_upload()
 
         if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
-            clip_object = self.start_clip_upload()
+            clip_object = self.start_clip_upload(event_id=event_id)
             if clip_object:
                 clip_status = "UPLOADING"
 
@@ -1165,11 +1407,20 @@ class NuvionEventState:
             "clipObject": clip_object,
             "clipStatus": clip_status,
         }
-        enqueued = enqueue_stomp_message("/app/device/anomaly", payload)
-        if not enqueued:
+        event = persist_critical_event(
+            EVENT_TYPE_ANOMALY,
+            "/app/device/anomaly",
+            payload,
+            event_id,
+            occurred_at,
+        )
+        if event is None:
             return
         self.last_sent_status = status
         self.last_sent_at = now
+        if event.dead_lettered:
+            log.error("[ZSAD] Event quarantined before send eventId=%s status=%s", event.event_id, status)
+            return
         if status_changed:
             log.info("[ZSAD] Sent %s status (change): %s", status, tagged_message)
         else:
@@ -1201,7 +1452,7 @@ class NuvionEventState:
             log.warning("[SNAPSHOT] Failed to upload snapshot: %s", exc)
             return None
 
-    def start_clip_upload(self) -> str | None:
+    def start_clip_upload(self, event_id: str | None = None) -> str | None:
         if not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
@@ -1234,21 +1485,27 @@ class NuvionEventState:
 
         threading.Thread(
             target=self._capture_and_upload_clip,
-            args=(object_name, upload_url, now),
+            args=(object_name, upload_url, now, event_id),
             daemon=True,
         ).start()
         return object_name
 
-    def _capture_and_upload_clip(self, object_name: str, upload_url: str, detected_at: float):
+    def _capture_and_upload_clip(
+        self,
+        object_name: str,
+        upload_url: str,
+        detected_at: float,
+        event_id: str | None,
+    ):
         clip_path = None
+        final_status = "FAILED"
         try:
             clip_path = self._build_clip_from_segments(detected_at)
-            if not clip_path:
-                update_clip_status(object_name, "FAILED")
-                return
-
-            ok = upload_file_to_url(upload_url, clip_path, CLIP_CONTENT_TYPE)
-            update_clip_status(object_name, "READY" if ok else "FAILED")
+            if clip_path:
+                ok = upload_file_to_url(upload_url, clip_path, CLIP_CONTENT_TYPE)
+                final_status = "READY" if ok else "FAILED"
+        except Exception as exc:
+            log.warning("[CLIP] capture/upload failed object=%s: %s", object_name, exc)
         finally:
             if clip_path:
                 try:
@@ -1257,15 +1514,28 @@ class NuvionEventState:
                     pass
             with self.clip_lock:
                 self.clip_in_progress = False
+        self._finalize_clip_status(object_name, final_status, event_id)
+
+    @staticmethod
+    def _finalize_clip_status(object_name: str, status: str, event_id: str | None) -> None:
+        if event_id and critical_event_delivery is not None:
+            acknowledged = critical_event_delivery.wait_for_ack(event_id, CLIP_EVENT_ACK_WAIT_SEC)
+            if not acknowledged:
+                log.warning(
+                    "[CLIP] event ACK timeout before finalize eventId=%s object=%s",
+                    event_id,
+                    object_name,
+                )
+        update_clip_status_with_retry(object_name, status)
 
     def _list_segments(self) -> list[str]:
-        pattern = os.path.join(CLIP_SEGMENTS_DIR, "segment_*.mp4")
-        segments = glob.glob(pattern)
-        segments.sort(key=os.path.getmtime)
-        if len(segments) > 1:
-            segments = segments[:-1]
         now = time.time()
-        return [segment for segment in segments if self._is_stable_segment(segment, now)]
+        return list_stable_segments(
+            CLIP_SEGMENTS_DIR,
+            settle_sec=CLIP_SEGMENT_MIN_AGE_SEC,
+            probe_func=lambda segment: self._is_stable_segment(segment, now),
+            now_ts=now,
+        )
 
     def _is_stable_segment(self, path: str, now: float | None = None) -> bool:
         current = now if now is not None else time.time()
@@ -1372,13 +1642,21 @@ class NuvionEventState:
 
         return output_path
 
-    def report_production(self, count: int):
+    def report_production(self, count: int) -> bool:
+        event_id = str(uuid.uuid4())
+        occurred_at = utc_now_iso()
         payload = {
             "count": int(count),
             "lineId": LINE_ID,
             "processId": PROCESS_ID,
         }
-        enqueue_stomp_message("/app/device/production", payload)
+        return persist_critical_event(
+            EVENT_TYPE_PRODUCTION,
+            "/app/device/production",
+            payload,
+            event_id,
+            occurred_at,
+        ) is not None
 
     def _emit_overlay(self, text: str):
         if self.overlay_callback:
@@ -1438,8 +1716,8 @@ class NuvionEventState:
                     if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                         now = time.time()
                         if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
-                            self.last_production_at = now
-                            self.report_production(1)
+                            if self.report_production(1):
+                                self.last_production_at = now
 
             elif self.backend == "triton":
                 try:
@@ -1470,10 +1748,10 @@ class NuvionEventState:
                     self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO")
 
                 if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
-                        now = time.time()
-                        if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
+                    now = time.time()
+                    if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
+                        if self.report_production(1):
                             self.last_production_at = now
-                            self.report_production(1)
 
     @staticmethod
     def _drain_queue_batch(work_queue: queue.Queue, first_item, max_items: int) -> list:
@@ -1825,6 +2103,7 @@ class GStreamerInferenceApp:
             self.shutdown()
         elif msg_type == Gst.MessageType.ERROR:
             err, dbg = message.parse_error()
+            get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
             err_text = str(err).lower()
             dbg_text = (dbg or "").lower()
             if self.demo_mode and self.demo_loop and (
@@ -1904,6 +2183,7 @@ class GStreamerInferenceApp:
     def run(self):
         def _start():
             log.info("Starting signaling thread...")
+            get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
             signaling_thread = threading.Thread(target=lambda: asyncio.run(signaling_client_main()), daemon=True)
             signaling_thread.start()
 
