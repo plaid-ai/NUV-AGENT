@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from nuvion_app.config import _check_camera_source, _parse_gst_device_monitor_output, _render_form, _run_preflight, discover_video_source_options
+from nuvion_app.config import _check_camera_probe, _check_camera_source, _parse_gst_device_monitor_output, _render_form, _run_preflight, discover_video_source_options
 
 
 class ConfigVideoSourceTest(unittest.TestCase):
@@ -52,10 +52,99 @@ Device found:
         self.assertEqual(options[0]["value"], "jetson")
         self.assertEqual(options[0]["detail"], "Uses nvarguscamerasrc.")
 
+    def test_discover_video_source_options_linux_includes_oak_device(self) -> None:
+        with (
+            mock.patch("nuvion_app.config.Path.glob", return_value=[]),
+            mock.patch("nuvion_app.config._depthai_usb_nodes", return_value=[(mock.Mock(), "03e72485")]),
+            mock.patch("nuvion_app.config._is_jetson_platform", return_value=False),
+        ):
+            options = discover_video_source_options(platform_name="linux")
+
+        self.assertEqual(options[0]["value"], "oak")
+        self.assertIn("DepthAI", options[0]["detail"])
+
     def test_check_camera_source_accepts_auto(self) -> None:
         check = _check_camera_source({"NUVION_VIDEO_SOURCE": "auto", "NUVION_CAMERA_PREFERENCE": "usb"})
         self.assertEqual(check["status"], "pass")
         self.assertIn("preference=usb", check["detail"])
+
+    def test_check_camera_source_accepts_depthai_alias(self) -> None:
+        check = _check_camera_source({"NUVION_VIDEO_SOURCE": "oak-d-lite"})
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("DepthAI", check["detail"])
+
+    def test_depthai_probe_requires_runtime_device_and_rw_access(self) -> None:
+        node = mock.Mock()
+        node.exists.return_value = True
+        device = mock.Mock()
+        device.getMxId.return_value = "mxid-1"
+        depthai = mock.Mock()
+        depthai.Device.getAllAvailableDevices.return_value = [device]
+        with (
+            mock.patch("nuvion_app.config.importlib.util.find_spec", return_value=object()),
+            mock.patch("nuvion_app.config._depthai_usb_nodes", return_value=[(node, "03e72485")]),
+            mock.patch("nuvion_app.config.os.access", return_value=True),
+            mock.patch("nuvion_app.config.importlib.import_module", return_value=depthai),
+        ):
+            check = _check_camera_probe({"NUVION_VIDEO_SOURCE": "oak"})
+
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("1 device", check["detail"])
+
+    def test_depthai_probe_fails_closed_without_udev_access(self) -> None:
+        node = mock.Mock()
+        node.exists.return_value = True
+        with (
+            mock.patch("nuvion_app.config.importlib.util.find_spec", return_value=object()),
+            mock.patch("nuvion_app.config._depthai_usb_nodes", return_value=[(node, "03e72485")]),
+            mock.patch("nuvion_app.config.os.access", return_value=False),
+        ):
+            check = _check_camera_probe({"NUVION_VIDEO_SOURCE": "depthai"})
+
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("udev", check["detail"])
+
+    def test_depthai_probe_rejects_unattached_configured_mxid(self) -> None:
+        node = mock.Mock()
+        node.exists.return_value = True
+        device = mock.Mock()
+        device.getMxId.return_value = "attached-mxid"
+        depthai = mock.Mock()
+        depthai.Device.getAllAvailableDevices.return_value = [device]
+        with (
+            mock.patch("nuvion_app.config.importlib.util.find_spec", return_value=object()),
+            mock.patch("nuvion_app.config._depthai_usb_nodes", return_value=[(node, "03e72485")]),
+            mock.patch("nuvion_app.config.os.access", return_value=True),
+            mock.patch("nuvion_app.config.importlib.import_module", return_value=depthai),
+        ):
+            check = _check_camera_probe(
+                {
+                    "NUVION_VIDEO_SOURCE": "oak:missing-mxid",
+                    "NUVION_DEPTHAI_DEVICE_ID": "missing-mxid",
+                }
+            )
+
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("not attached", check["detail"])
+
+    def test_depthai_source_with_gst_override_uses_generic_probe(self) -> None:
+        values = {
+            "NUVION_VIDEO_SOURCE": "oak",
+            "NUVION_GST_SOURCE": "videotestsrc pattern=smpte",
+        }
+        with (
+            mock.patch("nuvion_app.config.shutil.which", return_value="/usr/bin/gst-launch-1.0"),
+            mock.patch(
+                "nuvion_app.inference.video_source.build_video_source_pipeline",
+                return_value="videotestsrc pattern=smpte",
+            ),
+            mock.patch("nuvion_app.config.subprocess.run") as run_mock,
+        ):
+            run_mock.return_value = mock.Mock(returncode=0, stderr="", stdout="")
+            check = _check_camera_probe(values)
+
+        self.assertEqual(check["status"], "pass")
+        run_mock.assert_called_once()
 
     def test_preflight_runs_live_camera_probe(self) -> None:
         values = {

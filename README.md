@@ -1,7 +1,7 @@
 # Nuvion Agent (Device Software)
 
 NUV-agent는 온디바이스 AI 장치에 설치하는 소프트웨어입니다. 도커 기반으로 제작되어 이식이 쉽고,
-USB 기반 웹캠 카메라 스트림을 Nuvion-be 스프링 서버를 통해 송출할 수 있습니다. 동시에 제로샷 AI 모델로
+USB UVC 웹캠과 Luxonis OAK/DepthAI 카메라 스트림을 Nuvion-be 스프링 서버를 통해 송출할 수 있습니다. 동시에 제로샷 AI 모델로
 이상 감지를 수행하여 공장에서 이상 감지와 생산량 추적을 할 수 있도록 해주는 프로그램입니다. 감지 결과는
 영상 위에 실시간으로 오버레이 됩니다.
 
@@ -220,7 +220,9 @@ For dev, `.env` in the repo is used automatically.
 - macOS: use Homebrew service definition in `packaging/homebrew/nuv-agent.rb`.
 
 ## Device configuration
-- `NUVION_VIDEO_SOURCE`: camera source. Linux는 `/dev/video0`, macOS는 `avf` 또는 `avf:<index>`, Raspberry Pi는 `rpi`
+- `NUVION_VIDEO_SOURCE`: camera source. Luxonis OAK는 `oak`/`oak:<MXID>`, Linux UVC는 `/dev/video0`, macOS는 `avf` 또는 `avf:<index>`, Raspberry Pi는 `rpi`
+- `NUVION_DEPTHAI_DEVICE_ID`: 여러 OAK 장치가 있을 때 선택할 MXID. 하나면 비워둔다.
+- `NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC`, `NUVION_DEPTHAI_READ_TIMEOUT_SEC`, `NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS`: OAK startup/read fail-closed 경계
 - `NUVION_DEMO_MODE`: 데모 모드 활성화 (`true|false`)
 - `NUVION_DEMO_MVTEC_BASE_URL`: MVTec archive base URL
 - `NUVION_DEMO_MVTEC_CATEGORIES`: 랜덤 선택 후보 category CSV
@@ -260,7 +262,7 @@ CRITICAL event는 server application ACK(`ACCEPTED`/`DUPLICATE`)까지 outbox에
 - `NUVION_MODEL_SERVER_ACCESS_TOKEN`: 사전 발급 토큰(선택). 미지정 시 setup에서 저장된 device credential로 로그인 후 다운로드
 - `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
 - `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
-- `NUVION_CONFIG_SCHEMA_VERSION`: config schema 버전 (현재 `11`, `doctor --fix`로 자동 보정)
+- `NUVION_CONFIG_SCHEMA_VERSION`: config schema 버전 (현재 `12`, `doctor --fix`로 자동 보정)
 - `NUVION_RUNTIME_BOOTSTRAP_ENABLED`: setup/run bootstrap 전체 on/off
 - `NUVION_HOMEBREW_AUTOINSTALL`: macOS Homebrew 자동 설치 허용
 - `NUVION_DOCKER_AUTOINSTALL`: Docker/Colima(또는 docker.io) 자동 설치 허용
@@ -382,8 +384,11 @@ curl -s http://127.0.0.1:8000/v2/models/image_encoder/config
 ```
 
 ## Target platforms
-- Jetson Nano / ARM 기반 장치 + Triton 서빙
-- Apple Silicon Mac (MPS) 로컬 테스트
+- Nuvion: Raspberry Pi 5 + DEEPX DX-M1
+- Nuvion Pro: Ventuno Q
+- Nuvion Ultra: Jetson Orin NX
+- IQ-9075 EVK 개발보드 + Luxonis OAK-D Lite
+- Apple Silicon Mac (MPS) 개발/디버그
 
 ## Notes
-- `nuvion_app/docker-compose.yml` is configured for Linux device runtime (USB camera).
+- `nuvion_app/docker-compose.yml` is configured for the Linux device runtime.

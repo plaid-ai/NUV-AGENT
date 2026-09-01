@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nuv-agent"
-version = "0.1.114"
+version = "0.1.115"
 description = "Nuvion on-device agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,9 @@ zsad = [
 triton = [
   "tritonclient[http]",
   "opencv-python",
+]
+depthai = [
+  "depthai==2.32.0.0",
 ]
 
 [project.scripts]

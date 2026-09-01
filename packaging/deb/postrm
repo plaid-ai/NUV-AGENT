@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  remove|purge)
+    if command -v udevadm >/dev/null 2>&1; then
+      # dpkg has removed the packaged rule before postrm runs. Reload the
+      # remaining rules, then reset any currently attached OAK device node.
+      udevadm control --reload-rules || true
+      udevadm trigger \
+        --action=add \
+        --subsystem-match=usb \
+        --attr-match=idVendor=03e7 || true
+      udevadm settle --timeout=10 || true
+    fi
+    ;;
+esac

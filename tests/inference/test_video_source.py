@@ -6,9 +6,62 @@ from unittest import mock
 
 from nuvion_app.inference.video_source import LinuxVideoDeviceInfo
 from nuvion_app.inference.video_source import build_video_source_pipeline
+from nuvion_app.inference.video_source import depthai_device_id_from_source
+from nuvion_app.inference.video_source import is_depthai_video_source
+from nuvion_app.inference.video_source import resolve_depthai_device_id
+from nuvion_app.inference.video_source import should_use_depthai_source
 
 
 class VideoSourceTest(unittest.TestCase):
+    def test_build_depthai_source_uses_bounded_live_appsrc(self) -> None:
+        pipeline = build_video_source_pipeline(
+            "oak-d-lite:1844301001CD5F0E00",
+            640,
+            480,
+            30,
+            platform_name="linux",
+        )
+
+        self.assertIn("appsrc name=oak_depthai_source", pipeline)
+        self.assertIn("is-live=true", pipeline)
+        self.assertIn("max-buffers=2", pipeline)
+        self.assertIn("max-bytes=0", pipeline)
+        self.assertIn("max-time=0", pipeline)
+        self.assertIn("emit-signals=false", pipeline)
+        self.assertIn("leaky-type=downstream", pipeline)
+        self.assertIn("video/x-raw,format=RGB,width=640,height=480,framerate=30/1", pipeline)
+        self.assertNotIn("autovideosrc", pipeline)
+        self.assertNotIn("v4l2src", pipeline)
+
+    def test_depthai_source_alias_and_optional_device_id_contract(self) -> None:
+        for source in ("oak", "oak-d", "oak-d-lite", "depthai", "OAK:device-1"):
+            with self.subTest(source=source):
+                self.assertTrue(is_depthai_video_source(source))
+        self.assertFalse(is_depthai_video_source("auto"))
+        self.assertEqual(depthai_device_id_from_source("oak:device-1"), "device-1")
+        self.assertIsNone(depthai_device_id_from_source("oak"))
+        self.assertIsNone(depthai_device_id_from_source("auto:device-1"))
+
+    def test_effective_depthai_source_respects_pipeline_replacements(self) -> None:
+        self.assertTrue(should_use_depthai_source("oak"))
+        self.assertFalse(
+            should_use_depthai_source(
+                "oak",
+                gst_source_override="videotestsrc pattern=smpte",
+            )
+        )
+        self.assertFalse(should_use_depthai_source("oak", demo_mode=True))
+
+    def test_depthai_device_id_resolution_rejects_conflicting_sources(self) -> None:
+        self.assertEqual(resolve_depthai_device_id("oak:inline", None), "inline")
+        self.assertEqual(resolve_depthai_device_id("oak", "configured"), "configured")
+        self.assertEqual(
+            resolve_depthai_device_id("oak:same", "same"),
+            "same",
+        )
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            resolve_depthai_device_id("oak:inline", "configured")
+
     def test_build_camera_source_linux(self) -> None:
         pipeline = build_video_source_pipeline(
             "/dev/video0",

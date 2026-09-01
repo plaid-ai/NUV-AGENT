@@ -1,0 +1,11 @@
+# OAK-D Lite runtime for Ubuntu arm64.
+#
+# Keep this file hash-pinned and binary-only (see postinst). depthai 2.32.0.0 has
+# no transitive Python dependencies. The hashes below are the official PyPI
+# manylinux_2_28_aarch64 wheels for CPython 3.10 through 3.14.
+depthai==2.32.0.0 \
+    --hash=sha256:efa3328bb05870f901bde991aa88ea4f9e137effdaa4499ec98f3fda3f08a395 \
+    --hash=sha256:0dbcedfb0a18187b2f16d2894773642943aa165a85dd6a03134f888f6d7afb1f \
+    --hash=sha256:b3192ffff904482254def4cd2b9aac0c4d082a0787303bdc980768da4368331c \
+    --hash=sha256:13b1fc97cbbdd89557a99461287618df388a27d521b7cfb8d0b81636b8b3c437 \
+    --hash=sha256:d797cd0d544ecc10d270c4f3cf0123aa49de5f11e6dc07bf6f804af8aef142c6

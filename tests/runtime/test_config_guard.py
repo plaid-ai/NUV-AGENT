@@ -14,16 +14,16 @@ from nuvion_app.runtime.config_guard import (
 
 
 class ConfigGuardTest(unittest.TestCase):
-    def test_current_schema_is_version_11_for_durable_outbox_contract(self) -> None:
-        self.assertEqual(CURRENT_CONFIG_SCHEMA_VERSION, "11")
+    def test_current_schema_is_version_12_for_depthai_camera_contract(self) -> None:
+        self.assertEqual(CURRENT_CONFIG_SCHEMA_VERSION, "12")
         template = (
             Path(__file__).parents[2] / "nuvion_app" / "config_template.env"
         ).read_text(encoding="utf-8")
-        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=11", template)
+        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=12", template)
         example = (Path(__file__).parents[2] / ".env.example").read_text(
             encoding="utf-8"
         )
-        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=11", example)
+        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=12", example)
 
     def test_guard_normalizes_invalid_outbox_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,6 +58,91 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS"], "2592000")
             self.assertEqual(report.values["NUVION_EVENT_DLQ_MAX_ROWS"], "10000")
             self.assertEqual(report.values["NUVION_EVENT_DLQ_MAX_BYTES"], "67108864")
+
+    def test_guard_normalizes_non_finite_depthai_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC=nan",
+                        "NUVION_DEPTHAI_READ_TIMEOUT_SEC=inf",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC"], "15.0")
+            self.assertEqual(report.values["NUVION_DEPTHAI_READ_TIMEOUT_SEC"], "2.0")
+
+    def test_guard_rejects_fractional_depthai_timeout_threshold_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS=3",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS": "1.5"},
+                clear=False,
+            ):
+                report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(
+                    issue.key == "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS"
+                    for issue in report.errors
+                )
+            )
+
+    def test_guard_rejects_conflicting_depthai_device_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_VIDEO_SOURCE=oak:inline-mxid",
+                        "NUVION_DEPTHAI_DEVICE_ID=configured-mxid",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(
+                    issue.key == "NUVION_DEPTHAI_DEVICE_ID"
+                    and "conflict" in issue.message
+                    for issue in report.errors
+                )
+            )
 
     def test_runtime_migration_replaces_dotenv_origin_values_in_current_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

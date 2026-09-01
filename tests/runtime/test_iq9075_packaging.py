@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,11 +18,65 @@ class Iq9075PackagingTest(unittest.TestCase):
             encoding="utf-8"
         )
         for package in (
+            "libusb-1.0-0",
+            "udev",
             "v4l-utils",
             "gstreamer1.0-nice",
             "gir1.2-gst-plugins-bad-1.0",
         ):
             self.assertIn(package, build_script)
+
+    def test_depthai_runtime_is_binary_only_version_and_hash_pinned(self) -> None:
+        requirements = (
+            ROOT / "packaging/deb/requirements-depthai-arm64.txt"
+        ).read_text(encoding="utf-8")
+        build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
+            encoding="utf-8"
+        )
+        postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+
+        self.assertEqual(requirements.count("depthai==2.32.0.0"), 1)
+        self.assertIn(
+            "b3192ffff904482254def4cd2b9aac0c4d082a0787303bdc980768da4368331c",
+            requirements,
+        )
+        self.assertIn("requirements-depthai-arm64.txt", build_script)
+        for evidence in (
+            'DEPTHAI_VERSION="2.32.0.0"',
+            'dpkg --print-architecture)" != "arm64"',
+            "--only-binary=:all:",
+            "--require-hashes",
+            "--no-deps",
+            'version("depthai")',
+            "import depthai",
+            'getattr(depthai, "__version__"',
+        ):
+            self.assertIn(evidence, postinst)
+
+    def test_oak_udev_rule_is_packaged_and_least_privilege(self) -> None:
+        rule_path = ROOT / "packaging/udev/80-movidius.rules"
+        rule = rule_path.read_text(encoding="utf-8")
+        active_rule = "\n".join(
+            line for line in rule.splitlines() if not line.lstrip().startswith("#")
+        )
+        build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
+            encoding="utf-8"
+        )
+        postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+        postrm = (ROOT / "packaging/deb/postrm").read_text(encoding="utf-8")
+
+        self.assertIn('ENV{DEVTYPE}=="usb_device"', active_rule)
+        self.assertIn('ATTR{idVendor}=="03e7"', active_rule)
+        self.assertIn('MODE="0660"', active_rule)
+        self.assertIn('GROUP="nuvion"', active_rule)
+        self.assertNotIn('MODE="0666"', active_rule)
+        self.assertIn("/usr/lib/udev/rules.d/80-movidius.rules", build_script)
+        self.assertIn("udevadm control --reload-rules", postinst)
+        self.assertIn("--attr-match=idVendor=03e7", postinst)
+        self.assertIn("packaging/deb/postrm", build_script)
+        self.assertIn("remove|purge", postrm)
+        self.assertIn("udevadm control --reload-rules", postrm)
+        self.assertIn("--attr-match=idVendor=03e7", postrm)
 
     def test_postinst_has_fail_closed_bounded_install_modes(self) -> None:
         postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
@@ -34,6 +93,9 @@ class Iq9075PackagingTest(unittest.TestCase):
         for evidence in ("qcs9075", "iq-9075", "dpkg --print-architecture"):
             self.assertIn(evidence, installer)
         for safe_value in (
+            '"NUVION_VIDEO_SOURCE": "oak" if camera_mode == "oak" else "auto"',
+            '"NUVION_GST_SOURCE": ""',
+            '"NUVION_DEMO_MODE": "false"',
             '"NUVION_ZSAD_BACKEND": "none"',
             '"NUVION_RUNTIME_BOOTSTRAP_ENABLED": "false"',
             '"NUVION_FLEET_COMMAND_ENABLED": "false"',
@@ -44,14 +106,124 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("--no-install-recommends", installer)
         self.assertIn("--reinstall", installer)
         self.assertIn("apt-get clean", installer)
+        self.assertIn('camera_mode="oak"', installer)
+        self.assertIn("--camera must be oak or uvc", installer)
+        self.assertIn("preserve_if_present", installer)
 
-    def test_hardware_e2e_is_local_bounded_and_requires_stable_uvc_path(self) -> None:
+    def test_iq9075_camera_config_update_is_idempotent(self) -> None:
+        installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
+            encoding="utf-8"
+        )
+        marker = 'sudo python3 - "$CONFIG_PATH" "$camera_mode" <<\'PY\'\n'
+        updater = installer.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        updater = updater.replace(
+            "os.chown(temporary, 0, path.stat().st_gid)",
+            "os.chown(temporary, os.getuid(), path.stat().st_gid)",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "agent.env"
+            config_path.write_text(
+                "NUVION_CONFIG_SCHEMA_VERSION=12\n"
+                "NUVION_VIDEO_SOURCE=auto\n"
+                "NUVION_GST_SOURCE=videotestsrc pattern=smpte\n"
+                "NUVION_DEMO_MODE=true\n"
+                "NUVION_DEPTHAI_DEVICE_ID=existing-mxid\n"
+                "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC=19\n",
+                encoding="utf-8",
+            )
+            for _ in range(2):
+                subprocess.run(
+                    [sys.executable, "-", str(config_path), "oak"],
+                    input=updater,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            oak_lines = config_path.read_text(encoding="utf-8").splitlines()
+            for key in (
+                "NUVION_VIDEO_SOURCE",
+                "NUVION_GST_SOURCE",
+                "NUVION_DEMO_MODE",
+                "NUVION_DEPTHAI_DEVICE_ID",
+                "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC",
+                "NUVION_DEPTHAI_READ_TIMEOUT_SEC",
+                "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS",
+            ):
+                self.assertEqual(
+                    sum(line.startswith(f"{key}=") for line in oak_lines),
+                    1,
+                )
+            self.assertIn("NUVION_VIDEO_SOURCE=oak", oak_lines)
+            self.assertIn("NUVION_GST_SOURCE=", oak_lines)
+            self.assertIn("NUVION_DEMO_MODE=false", oak_lines)
+            self.assertIn("NUVION_DEPTHAI_DEVICE_ID=existing-mxid", oak_lines)
+            self.assertIn("NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC=19", oak_lines)
+
+            subprocess.run(
+                [sys.executable, "-", str(config_path), "uvc"],
+                input=updater,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            uvc_lines = config_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("NUVION_VIDEO_SOURCE=auto", uvc_lines)
+            self.assertIn("NUVION_CAMERA_PREFERENCE=usb", uvc_lines)
+            self.assertIn("NUVION_DEPTHAI_DEVICE_ID=existing-mxid", uvc_lines)
+
+    def test_depthai_config_defaults_are_documented_without_replacing_uvc(self) -> None:
+        template = (ROOT / "nuvion_app/config_template.env").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=12", template)
+        self.assertIn("NUVION_VIDEO_SOURCE=auto", template)
+        self.assertIn("NUVION_CAMERA_PREFERENCE=auto", template)
+        for setting in (
+            "NUVION_DEPTHAI_DEVICE_ID=",
+            "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC=15",
+            "NUVION_DEPTHAI_READ_TIMEOUT_SEC=2",
+            "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS=3",
+        ):
+            self.assertIn(setting, template)
+
+    def test_hardware_e2e_covers_bounded_non_root_oak_and_stable_uvc(self) -> None:
         e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        self.assertIn('camera_mode="oak"', e2e)
+        self.assertIn("runuser -u nuvion", e2e)
+        self.assertIn('expected_version = "2.32.0.0"', e2e)
+        self.assertIn("timeout 45s", e2e)
+        self.assertIn("DepthAIFrameSource", e2e)
+        self.assertIn("DepthAIGStreamerBridge", e2e)
+        self.assertIn("range(30)", e2e)
+        self.assertIn('structure.get_name() != "application/x-rtp"', e2e)
+        self.assertIn('structure.get_string("encoding-name") != "H264"', e2e)
+        self.assertIn("buffer.pts == Gst.CLOCK_TIME_NONE", e2e)
+        self.assertIn("Gst.MessageType.ERROR", e2e)
+        self.assertIn('oak_status" -eq 3', e2e)
+        self.assertIn('NUVION_GST_SOURCE must be empty', e2e)
+        self.assertIn('NUVION_DEMO_MODE must be false', e2e)
+        self.assertIn('Path("/sys/bus/usb/devices").glob("*/idVendor")', e2e)
+        self.assertIn("OAK USB device is present but DepthAI could not enumerate it", e2e)
+        self.assertIn("no OAK-D device detected", e2e)
         self.assertIn("/dev/v4l/by-id", e2e)
         self.assertIn('driver" = "uvcvideo"', e2e)
         self.assertIn("timeout 20s gst-launch-1.0", e2e)
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)
         self.assertNotIn("curl ", e2e)
+
+    def test_packaging_shell_scripts_parse(self) -> None:
+        scripts = sorted((ROOT / "packaging").rglob("*.sh"))
+        self.assertTrue(scripts)
+        for script in scripts:
+            with self.subTest(script=script.relative_to(ROOT)):
+                subprocess.run(
+                    ["bash", "-n", str(script)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
 
     def test_provisioner_validates_scope_and_never_prints_credentials(self) -> None:
         provisioner = (
@@ -60,9 +232,66 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("deviceUsername does not match spaceId", provisioner)
         self.assertIn("credential input must not be accessible", provisioner)
         self.assertIn('"NUVION_FLEET_COMMAND_ENABLED": "false"', provisioner)
+        self.assertIn('"NUVION_GST_SOURCE": ""', provisioner)
+        self.assertIn('"NUVION_DEMO_MODE": "false"', provisioner)
         self.assertIn("--synthetic-camera", provisioner)
         self.assertIn("--consume", provisioner)
         self.assertNotIn('echo "$password"', provisioner)
+
+    def test_provisioner_clears_stale_synthetic_source_in_physical_mode(self) -> None:
+        provisioner = (
+            ROOT / "packaging/dev/provision-iq9075.sh"
+        ).read_text(encoding="utf-8")
+        marker = 'python3 - "$credentials_path" "$CONFIG_PATH" "$synthetic_camera" <<\'PY\'\n'
+        updater = provisioner.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        updater = updater.replace(
+            "os.chown(temporary, 0, config_path.stat().st_gid)",
+            "os.chown(temporary, os.getuid(), config_path.stat().st_gid)",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials_path = root / "credentials.json"
+            config_path = root / "agent.env"
+            credentials_path.write_text(
+                json.dumps(
+                    {
+                        "spaceId": 33,
+                        "deviceUsername": "sp-33-nuvion-test",
+                        "devicePassword": "long-test-password",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(credentials_path, 0o600)
+            config_path.write_text(
+                "NUVION_GST_SOURCE=videotestsrc pattern=smpte\n"
+                "NUVION_DEMO_MODE=true\n",
+                encoding="utf-8",
+            )
+
+            for synthetic in ("true", "false"):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-",
+                        str(credentials_path),
+                        str(config_path),
+                        synthetic,
+                    ],
+                    input=updater,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            values = dict(
+                line.split("=", 1)
+                for line in config_path.read_text(encoding="utf-8").splitlines()
+                if "=" in line
+            )
+            self.assertEqual(values["NUVION_GST_SOURCE"], "")
+            self.assertEqual(values["NUVION_DEMO_MODE"], "false")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,14 @@ This script:
 - Installs the systemd unit.
 - Creates `/etc/nuv-agent/agent.env` if missing.
 - Installs optional extras for runtime bootstrap (`zsad,triton`).
+- On arm64, installs `depthai==2.32.0.0` into the Agent venv from a
+  hash-pinned, binary-only requirements file. CPython 3.10-3.14
+  `manylinux_2_28_aarch64` wheels are allowlisted; an unexpected wheel or sdist
+  fails installation instead of running unverified code. Ubuntu 24.04 uses the
+  pinned CPython 3.12 wheel.
+- Installs the OAK/Movidius USB rule at
+  `/usr/lib/udev/rules.d/80-movidius.rules`, reloads udev, and triggers only USB
+  devices with vendor ID `03e7`.
 - Persists the event outbox and Fleet command inbox under systemd-managed
   `/var/lib/nuv-agent/`; the service account intentionally has no home directory.
 - Demo mode uses the public MVTec dataset bucket and local cache at runtime.
@@ -51,14 +59,66 @@ The maintainer script supports bounded install modes:
 - `NUVION_INSTALL_AUTOSTART=false` installs the package but leaves the service
   stopped and disabled until identity, camera, and credentials have been checked.
 
-For a Qualcomm IQ-9075 EVK, use `packaging/dev/install-iq9075.sh <deb>` and then
-`packaging/dev/test-iq9075.sh`. The installer accepts only Ubuntu arm64 on an
-IQ-9075/QCS9075 device tree, provisions a root-owned development identity, applies
-safe no-model/no-Fleet defaults, and deliberately does not start the Agent.
+### IQ-9075 with OAK-D Lite
+
+Build and install on the Ubuntu arm64 board:
+
+```bash
+ARCH=arm64 packaging/deb/build-deb.sh
+packaging/dev/install-iq9075.sh dist/nuv-agent_<version>_arm64.deb
+sudo packaging/dev/test-iq9075.sh --camera oak
+```
+
+The IQ-9075 installer accepts only Ubuntu arm64 on an IQ-9075/QCS9075 device
+tree, provisions a root-owned development identity, applies safe
+no-model/no-Fleet defaults, selects `NUVION_VIDEO_SOURCE=oak`, and deliberately
+leaves the Agent stopped and disabled. Both installer and test default to
+`--camera oak`; the option is shown above to make the intended hardware explicit.
+
+The upstream Luxonis rule grants every local process read/write access with
+`MODE=0666`. The packaged rule keeps its official `03e7` vendor match but limits
+the match to a USB device node and applies `MODE=0660,GROUP=nuvion`. The systemd
+service already runs as the `nuvion` user/group, so it can open and re-enumerate
+the camera without root while unrelated local users cannot. `postinst` reloads
+the rule and issues a filtered udev trigger; reconnect the camera once if host
+firmware prevents the live node from being updated. The hardware test opens the
+camera as the non-root `nuvion` service user and captures a bounded RGB frame.
+On package removal, `postrm` reloads the remaining udev rules and retriggers the
+same filtered devices so the package-specific group permission does not linger.
+
+The default OAK stream is RGB `640x480@30`. An empty
+`NUVION_DEPTHAI_DEVICE_ID` selects the first available OAK device. Set it to the
+camera MXID when multiple devices are attached. Startup/read failure bounds are
+controlled by:
+
+```dotenv
+NUVION_VIDEO_SOURCE=oak
+NUVION_DEPTHAI_DEVICE_ID=
+NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC=15
+NUVION_DEPTHAI_READ_TIMEOUT_SEC=2
+NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS=3
+```
+
+Existing UVC deployments remain supported. Select the old auto-discovered V4L2
+path explicitly and use the matching release test:
+
+```bash
+packaging/dev/install-iq9075.sh dist/nuv-agent_<version>_arm64.deb --camera uvc
+sudo packaging/dev/test-iq9075.sh --camera uvc
+```
+
+The UVC mode writes `NUVION_VIDEO_SOURCE=auto` and
+`NUVION_CAMERA_PREFERENCE=usb`; OAK-specific values remain present but inactive.
+Re-running the installer with the same camera option is idempotent: it rebuilds
+the venv from the pinned inputs, does not duplicate config keys, and preserves an
+existing MXID and tuned DepthAI timeout values.
+
 Use `sudo packaging/dev/provision-iq9075.sh <credentials.json> --consume` to
 atomically install Dev device credentials without printing them. Add
-`--synthetic-camera` only for an isolated control-plane test when no UVC camera is
-attached; remove `NUVION_GST_SOURCE` before the physical-camera release gate.
+`--synthetic-camera` only for an isolated control-plane test when neither a UVC
+nor OAK camera is attached; remove `NUVION_GST_SOURCE` before the physical-camera
+release gate. Once credentials and the selected camera test pass, enable the
+service with `sudo systemctl enable --now nuv-agent.service`.
 
 Runtime bootstrap:
 - `nuv-agent setup` / `nuv-agent run` now try to bootstrap Docker/Triton/model bundle automatically.

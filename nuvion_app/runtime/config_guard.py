@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +16,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "11"
+CURRENT_CONFIG_SCHEMA_VERSION = "12"
 _LEGACY_HOST_REPLACEMENTS = {
     "api.nuvion-dev.plaidai.io": "api.nuvion-dev.plaidlabs.ai",
     "webrtc.nuvion-dev.plaidai.io": "webrtc.nuvion-dev.plaidlabs.ai",
@@ -116,7 +117,7 @@ def _normalize_float(value: str, default: float) -> float:
         parsed = float(str(value).strip())
     except Exception:
         return default
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         return default
     return parsed
 
@@ -125,6 +126,8 @@ def _normalize_float_in_range(value: str, default: float, *, lower: float, upper
     try:
         parsed = float(str(value).strip())
     except Exception:
+        return default
+    if not math.isfinite(parsed):
         return default
     if parsed < lower:
         return lower
@@ -246,6 +249,27 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if camera_wb_mode not in _VALID_CAMERA_WB_MODES:
         update("NUVION_CAMERA_WB_MODE", "auto", "normalize camera white balance mode")
 
+    for key, default in (
+        ("NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC", 15.0),
+        ("NUVION_DEPTHAI_READ_TIMEOUT_SEC", 2.0),
+    ):
+        normalized = _normalize_float(values.get(key, ""), default)
+        if str(normalized) != str(values.get(key, "")):
+            update(key, str(normalized), f"normalize {key.lower()}")
+
+    depthai_max_timeouts = _normalize_int(
+        values.get("NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS", ""),
+        3,
+    )
+    if str(depthai_max_timeouts) != str(
+        values.get("NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS", "")
+    ):
+        update(
+            "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS",
+            str(depthai_max_timeouts),
+            "normalize depthai timeout threshold",
+        )
+
     motor_backend = (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower()
     if motor_backend not in _VALID_MOTOR_BACKENDS:
         update("NUVION_MOTOR_BACKEND", "auto", "normalize motor backend")
@@ -283,7 +307,7 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
         tracking_threshold = float(values.get("NUVION_FACE_TRACKING_THRESHOLD", "0.45") or "0.45")
     except Exception:
         tracking_threshold = 0.45
-    if tracking_threshold <= 0 or tracking_threshold > 1:
+    if not math.isfinite(tracking_threshold) or tracking_threshold <= 0 or tracking_threshold > 1:
         update("NUVION_FACE_TRACKING_THRESHOLD", "0.45", "normalize face tracking threshold")
 
     deadzone = _normalize_float(values.get("NUVION_TRACKING_DEADZONE_PCT", ""), 0.08)
@@ -381,6 +405,28 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     if (values.get("NUVION_CAMERA_WB_MODE", "auto") or "auto").strip().lower() not in _VALID_CAMERA_WB_MODES:
         errors.append(ConfigIssue(key="NUVION_CAMERA_WB_MODE", message="camera wb mode 값이 지원되지 않습니다."))
 
+    from nuvion_app.inference.video_source import resolve_depthai_device_id
+    from nuvion_app.inference.video_source import should_use_depthai_source
+
+    video_source = values.get("NUVION_VIDEO_SOURCE", "auto")
+    if should_use_depthai_source(
+        video_source,
+        gst_source_override=values.get("NUVION_GST_SOURCE"),
+        demo_mode=_is_truthy(values.get("NUVION_DEMO_MODE", "false")),
+    ):
+        try:
+            resolve_depthai_device_id(
+                video_source,
+                values.get("NUVION_DEPTHAI_DEVICE_ID"),
+            )
+        except ValueError as exc:
+            errors.append(
+                ConfigIssue(
+                    key="NUVION_DEPTHAI_DEVICE_ID",
+                    message=str(exc),
+                )
+            )
+
     if (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower() not in _VALID_MOTOR_BACKENDS:
         errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, uart, pwm, none 중 하나여야 합니다."))
 
@@ -406,31 +452,47 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
         "NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS",
         "NUVION_EVENT_DLQ_MAX_ROWS",
         "NUVION_EVENT_DLQ_MAX_BYTES",
+        "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC",
+        "NUVION_DEPTHAI_READ_TIMEOUT_SEC",
     ):
         try:
             parsed = float(str(values.get(key, "")).strip())
-            if parsed <= 0:
+            if not math.isfinite(parsed) or parsed <= 0:
                 raise ValueError
         except Exception:
             errors.append(ConfigIssue(key=key, message="양수 값이어야 합니다."))
 
     try:
+        depthai_max_timeouts = int(
+            str(values.get("NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS", "")).strip()
+        )
+        if depthai_max_timeouts <= 0:
+            raise ValueError
+    except Exception:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS",
+                message="양수 정수이어야 합니다.",
+            )
+        )
+
+    try:
         deadzone = float(str(values.get("NUVION_TRACKING_DEADZONE_PCT", "")).strip())
-        if deadzone <= 0 or deadzone > 0.45:
+        if not math.isfinite(deadzone) or deadzone <= 0 or deadzone > 0.45:
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_TRACKING_DEADZONE_PCT", message="0보다 크고 0.45 이하이어야 합니다."))
 
     try:
         hysteresis = float(str(values.get("NUVION_TRACKING_HYSTERESIS_PCT", "")).strip())
-        if hysteresis < 0 or hysteresis > 0.2:
+        if not math.isfinite(hysteresis) or hysteresis < 0 or hysteresis > 0.2:
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_TRACKING_HYSTERESIS_PCT", message="0 이상 0.2 이하이어야 합니다."))
 
     try:
         threshold = float(str(values.get("NUVION_FACE_TRACKING_THRESHOLD", "")).strip())
-        if threshold <= 0 or threshold > 1:
+        if not math.isfinite(threshold) or threshold <= 0 or threshold > 1:
             raise ValueError
     except Exception:
         errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_THRESHOLD", message="0보다 크고 1 이하이어야 합니다."))
@@ -443,7 +505,7 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
     ):
         try:
             parsed = float(str(values.get(key, "")).strip())
-            if parsed < lower or parsed > upper:
+            if not math.isfinite(parsed) or parsed < lower or parsed > upper:
                 raise ValueError
         except Exception:
             errors.append(ConfigIssue(key=key, message=f"{lower} 이상 {upper} 이하 값이어야 합니다."))

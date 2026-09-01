@@ -59,7 +59,7 @@ PROFILE_CAPABILITIES = {
     PROFILE_JETSON_ORIN_NX: _COMMON_COMMAND_CAPABILITIES
     | {"accelerator.cuda", "accelerator.tensorrt"},
     PROFILE_IQ9075_DEV: _COMMON_COMMAND_CAPABILITIES
-    | {"dev.hardware", "camera.usb"},
+    | {"dev.hardware", "camera.usb", "camera.depthai"},
     PROFILE_MACOS_DEV: _COMMON_COMMAND_CAPABILITIES
     | {"accelerator.mps", "dev.simulation"},
 }

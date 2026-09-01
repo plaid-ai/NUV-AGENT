@@ -1,6 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly NUVION_VENV="/opt/nuv-agent/venv"
+readonly DEPTHAI_REQUIREMENTS="/opt/nuv-agent/share/requirements-depthai-arm64.txt"
+readonly DEPTHAI_VERSION="2.32.0.0"
+
+install_depthai_arm64() {
+  local installed_version
+
+  if [ "$(dpkg --print-architecture)" != "arm64" ]; then
+    echo "Skipping DepthAI: the pinned OAK runtime is packaged for Ubuntu arm64 only"
+    return 0
+  fi
+  if [ ! -f "$DEPTHAI_REQUIREMENTS" ]; then
+    echo "Missing DepthAI requirements: $DEPTHAI_REQUIREMENTS" >&2
+    return 1
+  fi
+
+  "$NUVION_VENV/bin/pip" install \
+    --disable-pip-version-check \
+    --no-cache-dir \
+    --no-deps \
+    --only-binary=:all: \
+    --require-hashes \
+    --requirement "$DEPTHAI_REQUIREMENTS" >/dev/null
+
+  installed_version="$("$NUVION_VENV/bin/python" - <<'PY'
+from importlib.metadata import version
+
+import depthai
+
+distribution_version = version("depthai")
+module_version = str(getattr(depthai, "__version__", "")).strip()
+if module_version != distribution_version:
+    raise SystemExit(
+        "DepthAI native import version mismatch: "
+        f"distribution={distribution_version}, module={module_version or '<missing>'}"
+    )
+print(distribution_version)
+PY
+)"
+  if [ "$installed_version" != "$DEPTHAI_VERSION" ]; then
+    echo "DepthAI version verification failed: expected $DEPTHAI_VERSION, found $installed_version" >&2
+    return 1
+  fi
+}
+
+reload_oak_udev_rules() {
+  if ! command -v udevadm >/dev/null 2>&1; then
+    echo "udevadm is unavailable; OAK permissions will apply after the next boot" >&2
+    return 0
+  fi
+
+  udevadm control --reload-rules || true
+  udevadm trigger \
+    --action=add \
+    --subsystem-match=usb \
+    --attr-match=idVendor=03e7 || true
+  udevadm settle --timeout=10 || true
+}
+
 install_profile="${NUVION_INSTALL_PROFILE:-full}"
 case "$install_profile" in
   full)
@@ -82,13 +141,17 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   fi
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  python3 -m venv --clear --system-site-packages /opt/nuv-agent/venv
-  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade pip >/dev/null
-  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "$package_spec" >/dev/null
-  /opt/nuv-agent/venv/bin/python -m nuvion_app.cli doctor --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required to configure nuv-agent" >&2
+  exit 1
 fi
+python3 -m venv --clear --system-site-packages "$NUVION_VENV"
+"$NUVION_VENV/bin/pip" install --no-cache-dir --upgrade pip >/dev/null
+"$NUVION_VENV/bin/pip" install --no-cache-dir --upgrade "$package_spec" >/dev/null
+install_depthai_arm64
+"$NUVION_VENV/bin/python" -m nuvion_app.cli doctor --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
 
+reload_oak_udev_rules
 systemctl daemon-reload || true
 if [ "$install_autostart" = true ]; then
   systemctl enable --now nuv-agent.service || true

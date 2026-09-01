@@ -132,6 +132,7 @@ class PlatformIdentityTest(unittest.TestCase):
                 self.assertIn(expected_capability, identity.capabilities)
                 if product == IQ9075_DEV:
                     self.assertIn("camera.usb", identity.capabilities)
+                    self.assertIn("camera.depthai", identity.capabilities)
                     self.assertFalse(
                         any(
                             capability.startswith("accelerator.qnn")

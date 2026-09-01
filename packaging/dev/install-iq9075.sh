@@ -6,7 +6,7 @@ readonly IDENTITY_PATH="/etc/nuv-agent/device-identity.json"
 readonly CONFIG_PATH="/etc/nuv-agent/agent.env"
 
 usage() {
-  echo "Usage: $0 /absolute/or/relative/path/to/nuv-agent_<version>_arm64.deb" >&2
+  echo "Usage: $0 /path/to/nuv-agent_<version>_arm64.deb [--camera oak|uvc]" >&2
 }
 
 die() {
@@ -23,17 +23,42 @@ read_device_tree() {
   done
 }
 
-if [ "$#" -ne 1 ]; then
+if [ "$#" -lt 1 ]; then
   usage
   exit 2
 fi
+
+deb_argument="$1"
+shift
+camera_mode="oak"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --camera)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      camera_mode="$2"
+      shift 2
+      ;;
+    --camera=*)
+      camera_mode="${1#*=}"
+      shift
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+case "$camera_mode" in
+  oak|uvc) ;;
+  *) die "--camera must be oak or uvc" ;;
+esac
 
 command -v dpkg-deb >/dev/null 2>&1 || die "dpkg-deb is required"
 command -v apt-get >/dev/null 2>&1 || die "apt-get is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v sudo >/dev/null 2>&1 || die "sudo is required"
 
-deb_path="$(realpath "$1")"
+deb_path="$(realpath "$deb_argument")"
 [ -f "$deb_path" ] || die "package not found: $deb_path"
 [ "$(dpkg --print-architecture)" = "arm64" ] || die "only Ubuntu arm64 is supported"
 
@@ -106,16 +131,23 @@ if ! sudo test -e "$IDENTITY_PATH"; then
   trap cleanup_mask EXIT
 fi
 
-sudo python3 - "$CONFIG_PATH" <<'PY'
+sudo python3 - "$CONFIG_PATH" "$camera_mode" <<'PY'
 import os
 import pathlib
 import tempfile
 import sys
 
 path = pathlib.Path(sys.argv[1])
+camera_mode = sys.argv[2]
 updates = {
-    "NUVION_VIDEO_SOURCE": "auto",
+    "NUVION_VIDEO_SOURCE": "oak" if camera_mode == "oak" else "auto",
+    "NUVION_GST_SOURCE": "",
+    "NUVION_DEMO_MODE": "false",
     "NUVION_CAMERA_PREFERENCE": "usb",
+    "NUVION_DEPTHAI_DEVICE_ID": "",
+    "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC": "15",
+    "NUVION_DEPTHAI_READ_TIMEOUT_SEC": "2",
+    "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS": "3",
     "NUVION_ZERO_SHOT_ENABLED": "false",
     "NUVION_ZSAD_BACKEND": "none",
     "NUVION_RUNTIME_BOOTSTRAP_ENABLED": "false",
@@ -129,6 +161,12 @@ updates = {
     "NUVION_FACE_TRACKING_ENABLED": "false",
     "NUVION_MOTOR_ENABLED": "false",
 }
+preserve_if_present = {
+    "NUVION_DEPTHAI_DEVICE_ID",
+    "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC",
+    "NUVION_DEPTHAI_READ_TIMEOUT_SEC",
+    "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS",
+}
 
 lines = path.read_text(encoding="utf-8").splitlines()
 seen = set()
@@ -139,7 +177,9 @@ for line in lines:
         key = stripped.split("=", 1)[0].strip()
         if key in updates:
             if key not in seen:
-                rendered.append(f"{key}={updates[key]}")
+                rendered.append(
+                    line if key in preserve_if_present else f"{key}={updates[key]}"
+                )
                 seen.add(key)
             continue
     rendered.append(line)
@@ -171,5 +211,6 @@ trap - EXIT
 sudo apt-get clean
 
 echo "[iq9075-install] complete"
+echo "[iq9075-install] camera mode: $camera_mode"
 echo "[iq9075-install] service is disabled and inactive"
 echo "[iq9075-install] run packaging/dev/test-iq9075.sh before adding device credentials or enabling the service"

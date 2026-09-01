@@ -10,6 +10,7 @@ from nuvion_app.config import (
     load_template,
     read_env,
     resolve_config_path,
+    run_camera_health_checks,
     setup_config,
     write_env,
 )
@@ -141,6 +142,11 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help="Validate/migrate agent config")
     doctor_parser.add_argument("--config", help="Path to config env file")
     doctor_parser.add_argument("--fix", action="store_true", help="Apply automatic migration fixes")
+    doctor_parser.add_argument(
+        "--hardware",
+        action="store_true",
+        help="Also probe the configured camera runtime, USB access, and device selection",
+    )
 
     return parser
 
@@ -291,7 +297,18 @@ def main() -> None:
         config_path = resolve_config_path(args.config)
         report = guard_config(config_path=config_path, apply_fixes=args.fix)
         print_report(report)
-        if report.ok:
+        hardware_ok = True
+        if args.hardware and report.ok:
+            hardware_checks = run_camera_health_checks(report.values)
+            for check in hardware_checks:
+                sys.stdout.write(
+                    f"[DOCTOR] hardware {check['name']}: "
+                    f"{check['status'].upper()} - {check['detail']}\n"
+                )
+            hardware_ok = not any(
+                check["status"] == "fail" for check in hardware_checks
+            )
+        if report.ok and hardware_ok:
             sys.stdout.write("[DOCTOR] result: OK\n")
             return
         sys.stderr.write("[DOCTOR] result: FAILED\n")

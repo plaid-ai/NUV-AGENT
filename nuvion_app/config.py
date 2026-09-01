@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import importlib.util
 import json
 import os
 import platform
@@ -117,6 +118,29 @@ def _is_jetson_platform() -> bool:
     return Path("/etc/nv_tegra_release").exists()
 
 
+def _depthai_usb_nodes() -> List[Tuple[Path, str]]:
+    devices_root = Path("/sys/bus/usb/devices")
+    if not devices_root.is_dir():
+        return []
+    devices: List[Tuple[Path, str]] = []
+    try:
+        entries = list(devices_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            if (entry / "idVendor").read_text(encoding="utf-8").strip().lower() != "03e7":
+                continue
+            busnum = int((entry / "busnum").read_text(encoding="utf-8").strip())
+            devnum = int((entry / "devnum").read_text(encoding="utf-8").strip())
+            serial_path = entry / "serial"
+            serial = serial_path.read_text(encoding="utf-8").strip() if serial_path.is_file() else ""
+        except (OSError, ValueError):
+            continue
+        devices.append((Path(f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"), serial))
+    return devices
+
+
 def _camera_choice_values(key: str) -> tuple[str, ...]:
     if key == "NUVION_CAMERA_PREFERENCE":
         return _CAMERA_PREFERENCE_CHOICES
@@ -186,6 +210,15 @@ def discover_video_source_options(platform_name: Optional[str] = None) -> List[D
         )
 
     if current_platform.startswith("linux"):
+        if _depthai_usb_nodes():
+            options.insert(
+                0,
+                {
+                    "value": "oak",
+                    "label": "Luxonis OAK camera",
+                    "detail": "Uses DepthAI/XLink instead of V4L2.",
+                },
+            )
         if _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
             options.insert(
                 0,
@@ -287,6 +320,8 @@ def _field_section(key: str) -> str:
         return "detection"
     if key.startswith("NUVION_H264_") or key.startswith("NUVION_WEBRTC_") or key.startswith("NUVION_VIDEO_"):
         return "streaming"
+    if key.startswith("NUVION_DEPTHAI_"):
+        return "streaming"
     if key.startswith("NUVION_CAMERA_"):
         return "streaming"
     if key in {"NUVION_LINE_ID", "NUVION_PROCESS_ID"}:
@@ -299,8 +334,12 @@ def _field_note(key: str) -> str:
         "NUVION_DEVICE_USERNAME": "Usually auto-filled by Auto Provision. You rarely need to type this manually.",
         "NUVION_DEVICE_PASSWORD": "Usually auto-filled by Auto Provision. Leave blank on save to keep the current secret.",
         "NUVION_DEMO_MODE": "Turn this on only when testing without a real camera.",
-        "NUVION_VIDEO_SOURCE": "Use auto-detect unless you need to force a specific USB/CSI source.",
+        "NUVION_VIDEO_SOURCE": "Use oak for Luxonis OAK/DepthAI, or auto for V4L2/CSI detection.",
         "NUVION_CAMERA_PREFERENCE": "When NUVION_VIDEO_SOURCE=auto, choose whether CSI or USB should win first.",
+        "NUVION_DEPTHAI_DEVICE_ID": "Optional OAK MXID. Leave empty when exactly one OAK camera is attached.",
+        "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC": "Maximum seconds to wait for the first OAK RGB frame.",
+        "NUVION_DEPTHAI_READ_TIMEOUT_SEC": "Maximum seconds to wait for each OAK RGB frame.",
+        "NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS": "Consecutive frame timeouts before the Agent fails closed and restarts.",
         "NUVION_VIDEO_ROTATION": "Allowed values: 0, 90, 180, 270.",
         "NUVION_VIDEO_FLIP_HORIZONTAL": "Mirror the image left-to-right after source capture.",
         "NUVION_VIDEO_FLIP_VERTICAL": "Flip the image upside-down after source capture.",
@@ -1009,6 +1048,14 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
             "status": "pass",
             "detail": f"Automatic camera detection is enabled (preference={preference}).",
         }
+    from nuvion_app.inference.video_source import is_depthai_video_source
+
+    if is_depthai_video_source(source):
+        return {
+            "name": "Camera source",
+            "status": "pass",
+            "detail": f"Luxonis DepthAI source configured: {source}",
+        }
     if sys.platform == "darwin":
         if source.startswith("avf"):
             return {
@@ -1059,6 +1106,84 @@ def _check_camera_source(values: Dict[str, str]) -> Dict[str, str]:
 
 
 def _check_camera_probe(values: Dict[str, str]) -> Dict[str, str]:
+    source = (values.get("NUVION_VIDEO_SOURCE") or "auto").strip() or "auto"
+    gst_source_override = (values.get("NUVION_GST_SOURCE") or "").strip()
+    from nuvion_app.inference.video_source import should_use_depthai_source
+
+    if should_use_depthai_source(
+        source,
+        gst_source_override=gst_source_override,
+        demo_mode=False,
+    ):
+        if importlib.util.find_spec("depthai") is None:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "DepthAI Python runtime is not installed.",
+            }
+        usb_nodes = _depthai_usb_nodes()
+        if not usb_nodes:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "No Luxonis USB device (vendor 03e7) was detected.",
+            }
+        accessible = [
+            node
+            for node, _serial in usb_nodes
+            if node.exists() and os.access(node, os.R_OK | os.W_OK)
+        ]
+        if not accessible:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "Luxonis USB device is present but not readable/writable; check the 80-movidius udev rule.",
+            }
+        try:
+            depthai = importlib.import_module("depthai")
+            available_devices = depthai.Device.getAllAvailableDevices()
+            available_ids = {
+                str(device.getMxId()).strip()
+                for device in available_devices
+                if str(device.getMxId()).strip()
+            }
+        except Exception:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "DepthAI device enumeration failed; check the native runtime and USB permissions.",
+            }
+        if not available_ids:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "DepthAI did not enumerate an available OAK device.",
+            }
+        from nuvion_app.inference.video_source import resolve_depthai_device_id
+
+        try:
+            configured_device_id = resolve_depthai_device_id(
+                source,
+                values.get("NUVION_DEPTHAI_DEVICE_ID"),
+            )
+        except ValueError as exc:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": str(exc),
+            }
+        if configured_device_id is not None and configured_device_id not in available_ids:
+            return {
+                "name": "Camera probe",
+                "status": "fail",
+                "detail": "The configured OAK MXID is not attached.",
+            }
+        return {
+            "name": "Camera probe",
+            "status": "pass",
+            "detail": f"DepthAI runtime, Luxonis USB access, and MXID selection are ready ({len(available_ids)} device(s)).",
+        }
+
     gst_launch = shutil.which("gst-launch-1.0")
     if not gst_launch:
         return {
@@ -1124,7 +1249,6 @@ def _check_camera_probe(values: Dict[str, str]) -> Dict[str, str]:
         }
 
     if result.returncode == 0:
-        source = (values.get("NUVION_VIDEO_SOURCE") or "auto").strip() or "auto"
         return {
             "name": "Camera probe",
             "status": "pass",
@@ -1187,14 +1311,17 @@ def _check_motor_backend(values: Dict[str, str]) -> Dict[str, str]:
         controller.close()
 
 
-def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
+def run_camera_health_checks(values: Dict[str, str]) -> List[Dict[str, str]]:
     demo_mode = _is_truthy(values.get("NUVION_DEMO_MODE", "false"))
     source_check = _check_demo_video_source(values) if demo_mode else _check_camera_source(values)
+    return [source_check, *([] if demo_mode else [_check_camera_probe(values)])]
+
+
+def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:
     checks = [
         _check_server_login(values),
         _check_triton_health(values),
-        source_check,
-        *([] if demo_mode else [_check_camera_probe(values)]),
+        *run_camera_health_checks(values),
         _check_tracking_overlay(values),
         _check_motor_backend(values),
     ]

@@ -12,6 +12,62 @@ from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
 
+DEPTHAI_SOURCE_ALIASES = frozenset({"depthai", "oak", "oak-d", "oak-d-lite"})
+DEPTHAI_APPSRC_NAME = "oak_depthai_source"
+
+
+def is_depthai_video_source(raw: str | None) -> bool:
+    source = (raw or "").strip().lower()
+    prefix = source.split(":", 1)[0]
+    return prefix in DEPTHAI_SOURCE_ALIASES
+
+
+def should_use_depthai_source(
+    video_source: str | None,
+    *,
+    gst_source_override: str | None = None,
+    demo_mode: bool = False,
+) -> bool:
+    """Return whether the effective pipeline needs the DepthAI frame bridge.
+
+    A custom GStreamer source and demo mode both replace the configured camera
+    source. Centralizing that precedence keeps construction, bridge setup, and
+    doctor probes consistent.
+    """
+    if gst_source_override and gst_source_override.strip():
+        return False
+    if demo_mode:
+        return False
+    return is_depthai_video_source(video_source)
+
+
+def depthai_device_id_from_source(raw: str | None) -> str | None:
+    source = (raw or "").strip()
+    prefix, separator, value = source.partition(":")
+    if prefix.lower() not in DEPTHAI_SOURCE_ALIASES or not separator:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def resolve_depthai_device_id(
+    video_source: str | None,
+    configured_device_id: str | None,
+) -> str | None:
+    inline_device_id = depthai_device_id_from_source(video_source)
+    explicit_device_id = (configured_device_id or "").strip() or None
+    if (
+        inline_device_id is not None
+        and explicit_device_id is not None
+        and inline_device_id != explicit_device_id
+    ):
+        raise ValueError(
+            "DepthAI device ID conflict between NUVION_VIDEO_SOURCE and "
+            "NUVION_DEPTHAI_DEVICE_ID"
+        )
+    return explicit_device_id or inline_device_id
+
+
 def is_truthy(value: str | None) -> bool:
     if value is None:
         return False
@@ -253,6 +309,16 @@ def _finalize_camera_pipeline(base_pipeline: str) -> str:
     return _append_video_transforms(pipeline)
 
 
+def _build_depthai_appsrc_pipeline(width: int, height: int, fps: int) -> str:
+    appsrc = (
+        f"appsrc name={DEPTHAI_APPSRC_NAME} "
+        "is-live=true format=time do-timestamp=true block=false emit-signals=false "
+        "max-buffers=2 max-bytes=0 max-time=0 leaky-type=downstream "
+        f"caps=video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1"
+    )
+    return _finalize_camera_pipeline(f"{appsrc} ! videoconvert")
+
+
 def _build_jetson_camera_source_prefix() -> str:
     sensor_id = _env_int("NUVION_JETSON_SENSOR_ID", 0)
     properties = [f"sensor-id={sensor_id}"]
@@ -389,6 +455,13 @@ def build_video_source_pipeline(
             "video/x-raw,format=RGB"
         )
         return _append_video_transforms(pipeline)
+
+    if should_use_depthai_source(
+        video_source,
+        gst_source_override=gst_source_override,
+        demo_mode=demo_mode,
+    ):
+        return _build_depthai_appsrc_pipeline(width, height, fps)
 
     resolved_source = video_source
     if not resolved_source or resolved_source == "auto":

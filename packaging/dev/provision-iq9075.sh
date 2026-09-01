@@ -77,6 +77,8 @@ updates = {
     "NUVION_SPACE_ID": str(space_id),
     "NUVION_DEVICE_ID": username,
     "NUVION_FLEET_COMMAND_ENABLED": "false",
+    "NUVION_GST_SOURCE": "",
+    "NUVION_DEMO_MODE": "false",
 }
 if synthetic_camera:
     updates["NUVION_GST_SOURCE"] = (

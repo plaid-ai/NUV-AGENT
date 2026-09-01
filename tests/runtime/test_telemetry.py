@@ -9,14 +9,18 @@ from nuvion_app.runtime.platform_identity import (
     PlatformProbe,
     resolve_platform_identity,
 )
+from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION
 from nuvion_app.runtime.release_bom import (
     build_release_bom_payload,
     canonical_release_bom_json,
 )
-from nuvion_app.runtime.telemetry import build_runtime_telemetry
+from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA, build_runtime_telemetry
 
 
 class RuntimeTelemetryTest(unittest.TestCase):
+    def test_default_telemetry_schema_matches_runtime_config_guard(self) -> None:
+        self.assertEqual(DEFAULT_CONFIG_SCHEMA, CURRENT_CONFIG_SCHEMA_VERSION)
+
     def test_reports_build_config_and_resolved_model_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)

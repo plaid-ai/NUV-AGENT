@@ -19,7 +19,7 @@ from nuvion_app.runtime.release_bom import (
     load_release_bom,
 )
 
-DEFAULT_CONFIG_SCHEMA = "11"
+DEFAULT_CONFIG_SCHEMA = "12"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PROFILE = "runtime"
 

@@ -39,6 +39,9 @@ from nuvion_app.inference.command_runtime import (
 )
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
+from nuvion_app.inference.depthai_gst import DepthAIGStreamerBridge
+from nuvion_app.inference.depthai_source import DepthAIConfig
+from nuvion_app.inference.depthai_source import DepthAIFrameSource
 from nuvion_app.inference.device_state import (
     CONNECTIVITY_QUALITY_GOOD,
     INSPECTION_STATUS_DEFECT,
@@ -122,6 +125,9 @@ from gi.repository import Gst, GLib
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.inference.video_source import build_video_source_pipeline
+from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
+from nuvion_app.inference.video_source import resolve_depthai_device_id
+from nuvion_app.inference.video_source import should_use_depthai_source
 from nuvion_app.inference.video_source import is_truthy
 from nuvion_app.runtime.inference_mode import (
     apply_inference_runtime_defaults,
@@ -205,6 +211,19 @@ DEVICE_PASSWORD = os.getenv("NUVION_DEVICE_PASSWORD", "password")
 
 VIDEO_SOURCE_ENV = os.getenv("NUVION_VIDEO_SOURCE", "auto")
 GST_SOURCE_OVERRIDE = os.getenv("NUVION_GST_SOURCE")
+DEPTHAI_DEVICE_ID = (os.getenv("NUVION_DEPTHAI_DEVICE_ID", "") or "").strip() or None
+DEPTHAI_STARTUP_TIMEOUT_SEC = parse_float(
+    os.getenv("NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC"),
+    15.0,
+)
+DEPTHAI_READ_TIMEOUT_SEC = parse_float(
+    os.getenv("NUVION_DEPTHAI_READ_TIMEOUT_SEC"),
+    2.0,
+)
+DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS = max(
+    parse_int_with_default(os.getenv("NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS"), 3),
+    1,
+)
 DEMO_MODE = is_truthy(os.getenv("NUVION_DEMO_MODE", "false"))
 DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
@@ -2237,6 +2256,7 @@ class GStreamerInferenceApp:
 
         self.pipeline = None
         self.loop = None
+        self.depthai_bridge: DepthAIGStreamerBridge | None = None
         self._demo_restarting = False
         self._demo_last_restart_at = 0.0
 
@@ -2403,6 +2423,41 @@ class GStreamerInferenceApp:
         self.pipeline = Gst.parse_launch(pipeline_string)
         self.loop = GLib.MainLoop()
 
+        if should_use_depthai_source(
+            self.video_source,
+            gst_source_override=GST_SOURCE_OVERRIDE,
+            demo_mode=self.demo_mode,
+        ):
+            depthai_appsrc = self.pipeline.get_by_name(DEPTHAI_APPSRC_NAME)
+            if depthai_appsrc is None:
+                raise RuntimeError("DepthAI GStreamer appsrc is missing")
+            configured_device_id = resolve_depthai_device_id(
+                self.video_source,
+                DEPTHAI_DEVICE_ID,
+            )
+            depthai_source = DepthAIFrameSource(
+                DepthAIConfig(
+                    width=self.video_width,
+                    height=self.video_height,
+                    fps=self.frame_rate,
+                    device_id=configured_device_id,
+                    queue_size=1,
+                    startup_timeout=DEPTHAI_STARTUP_TIMEOUT_SEC,
+                    read_timeout=DEPTHAI_READ_TIMEOUT_SEC,
+                )
+            )
+            self.depthai_bridge = DepthAIGStreamerBridge(
+                frame_source=depthai_source,
+                appsrc=depthai_appsrc,
+                gst=Gst,
+                width=self.video_width,
+                height=self.video_height,
+                read_timeout=DEPTHAI_READ_TIMEOUT_SEC,
+                max_consecutive_timeouts=DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS,
+                on_failure=self._on_depthai_failure,
+                logger=log,
+            )
+
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self.bus_call, self.loop)
@@ -2458,6 +2513,26 @@ class GStreamerInferenceApp:
             return True
         finally:
             self._demo_restarting = False
+
+    def _on_depthai_failure(self, exc: BaseException) -> None:
+        log.error(
+            "[DEPTHAI] capture failed type=%s detail=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+
+        def _stop_failed_pipeline() -> bool:
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+            if self.loop and self.loop.is_running():
+                self.loop.quit()
+            return False
+
+        try:
+            GLib.idle_add(_stop_failed_pipeline)
+        except Exception:  # noqa: BLE001 - fallback during GLib teardown.
+            _stop_failed_pipeline()
 
     def bus_call(self, bus, message, loop):
         msg_type = message.type
@@ -2549,17 +2624,28 @@ class GStreamerInferenceApp:
 
     def run(self):
         def _start():
-            log.info("Starting signaling thread...")
-            get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
-            signaling_thread = threading.Thread(target=lambda: asyncio.run(signaling_client_main()), daemon=True)
-            signaling_thread.start()
-
             log.info("Starting GStreamer main loop...")
-            self.pipeline.set_state(Gst.State.PLAYING)
             try:
+                state_result = self.pipeline.set_state(Gst.State.PLAYING)
+                if state_result == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("GStreamer pipeline failed to enter PLAYING")
+                if self.depthai_bridge is not None:
+                    self.depthai_bridge.start()
+                    log.info("[DEPTHAI] RGB source started")
+
+                get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
+                log.info("Starting signaling thread...")
+                signaling_thread = threading.Thread(
+                    target=lambda: asyncio.run(signaling_client_main()),
+                    daemon=True,
+                )
+                signaling_thread.start()
                 self.loop.run()
             except KeyboardInterrupt:
                 log.info("KeyboardInterrupt received.")
+            except Exception:
+                get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+                raise
             finally:
                 self.shutdown()
 
@@ -2575,6 +2661,8 @@ class GStreamerInferenceApp:
     def shutdown(self):
         self.user_data.running = False
         self.user_data.motor_controller.close()
+        if self.depthai_bridge is not None:
+            self.depthai_bridge.close()
         if self.webrtc_uplink:
             self.webrtc_uplink.stop(send_signal=True)
         if self.pipeline:
