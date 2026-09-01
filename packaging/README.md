@@ -50,6 +50,8 @@ Runtime bootstrap:
 - `packaging/release/build-sdist.sh`: build source tarball and print SHA256.
 - `packaging/release/generate-release-bom.py`: actual artifact digest, component SHA,
   config schema, compatible platform profiles로 immutable sidecar BOM을 생성합니다.
+- `packaging/release/normalize-sdist.py`: commit timestamp를 기준으로 tar/gzip metadata를
+  정규화해 같은 release commit에서 byte-identical sdist를 재생성합니다.
 - `packaging/release/update-homebrew-formula.sh`: inject URL/SHA/version into formula.
 - `packaging/release/bootstrap-homebrew-tap.sh`: create and seed the tap repo.
 - `packaging/release/promote-model-pointer.sh`: promote model channel pointer (`canary.json`/`prod.json`) in GCS.

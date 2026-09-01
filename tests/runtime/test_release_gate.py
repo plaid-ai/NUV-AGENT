@@ -40,6 +40,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("APT checkout does not match the release component SHA", workflow)
         self.assertIn("overwrite_files: false", workflow)
         self.assertIn("verify-github-release-assets.py", workflow)
+        self.assertIn("normalize-sdist.py", workflow)
         self.assertIn('SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")', workflow)
         self.assertEqual(workflow.count('--built-at "$BUILT_AT"'), 2)
         self.assertGreaterEqual(workflow.count("stamp-build-info.py"), 2)
