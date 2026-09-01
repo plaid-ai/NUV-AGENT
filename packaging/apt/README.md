@@ -22,12 +22,12 @@ artifact 인자에 같은 `agent-bundle`을 전달합니다. APT `.deb` build/pu
 RELEASE_KEYRING_PATH=/secure/release-keyring.json \
 RELEASE_TRUST_DOMAIN=iq9075-dev \
 SKIP_APT_PUBLISH=true \
-VERSION=0.1.118 \
+VERSION=0.1.119 \
 ./publish-gcs.sh \
-  /path/to/nuv-agent_0.1.118_iq9075-aarch64.agent-bundle.tar.gz \
+  /path/to/nuv-agent_0.1.119_iq9075-aarch64.agent-bundle.tar.gz \
   /path/to/release-bom.json \
   /path/to/release-bom.json.sig \
-  /path/to/nuv-agent_0.1.118_iq9075-aarch64.agent-bundle.tar.gz
+  /path/to/nuv-agent_0.1.119_iq9075-aarch64.agent-bundle.tar.gz
 ```
 
 세 release 파일은 동일한

@@ -24,6 +24,11 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertLess(build, smoke)
         self.assertLess(smoke, publish)
         self.assertIn("packaging/release/run-isolated-tests.py", workflow)
+        self.assertIn("RELEASE_TEST_VENV: ${{ runner.temp }}/", workflow)
+        self.assertIn(
+            '"$RELEASE_TEST_VENV/bin/python" packaging/release/generate-release-bom.py',
+            workflow,
+        )
         self.assertIn('pip install --no-cache-dir "$TARBALL"', workflow)
         self.assertIn(
             'stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"', workflow

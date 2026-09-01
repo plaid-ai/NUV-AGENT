@@ -35,6 +35,7 @@ jobs:
     env:
       TAP_REPO: plaid-ai/homebrew-NUV-agent-homebrew
       FORMULA_PATH: Formula/nuv-agent.rb
+      RELEASE_TEST_VENV: ${{ runner.temp }}/nuv-agent-source-test-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -93,7 +94,6 @@ jobs:
         env:
           NUV_AGENT_CONFIG: ${{ runner.temp }}/nuv-agent-release-test-${{ github.run_id }}-${{ github.run_attempt }}.env
         run: |
-          RELEASE_TEST_VENV="${RUNNER_TEMP}/nuv-agent-source-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           python -m venv "$RELEASE_TEST_VENV"
           "$RELEASE_TEST_VENV/bin/python" -m pip install --upgrade pip
           "$RELEASE_TEST_VENV/bin/python" -m pip install .
@@ -151,11 +151,11 @@ jobs:
           COMPONENT_SHA: ${{ steps.release_meta.outputs.component_sha }}
           TARBALL: ${{ steps.sha.outputs.tarball }}
         run: |
-          CONFIG_SCHEMA=$(python -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
-          UPDATER_VERSION=$(python -c "from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)")
+          CONFIG_SCHEMA=$("$RELEASE_TEST_VENV/bin/python" -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
+          UPDATER_VERSION=$("$RELEASE_TEST_VENV/bin/python" -c "from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)")
           BUILT_AT=$(git show -s --format=%cI "$COMPONENT_SHA")
           BOM_PATH="dist/nuv_agent-${VERSION}-sdist.release-bom.json"
-          python packaging/release/generate-release-bom.py \
+          "$RELEASE_TEST_VENV/bin/python" packaging/release/generate-release-bom.py \
             --bom-id "nuv-agent-${VERSION}-sdist" \
             --version "$VERSION" \
             --component-sha "$COMPONENT_SHA" \
