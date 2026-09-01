@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly NUVION_VENV="/opt/nuv-agent/venv"
+readonly NUVION_CURRENT="/opt/nuv-agent/current"
 readonly DEPTHAI_REQUIREMENTS="/opt/nuv-agent/share/requirements-depthai-arm64.txt"
 readonly DEPTHAI_VERSION="2.32.0.0"
 
@@ -150,6 +151,12 @@ python3 -m venv --clear --system-site-packages "$NUVION_VENV"
 "$NUVION_VENV/bin/pip" install --no-cache-dir --upgrade "$package_spec" >/dev/null
 install_depthai_arm64
 "$NUVION_VENV/bin/python" -m nuvion_app.cli doctor --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
+
+# Legacy single-slot packages expose the same stable path used by staged OTA.
+# Never replace an OTA-managed current symlink that already exists.
+if [ ! -e "$NUVION_CURRENT" ] && [ ! -L "$NUVION_CURRENT" ]; then
+  ln -s /opt/nuv-agent "$NUVION_CURRENT"
+fi
 
 reload_oak_udev_rules
 systemctl daemon-reload || true

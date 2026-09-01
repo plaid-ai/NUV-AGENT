@@ -594,7 +594,14 @@ def pull_model_from_server(
 
     metadata_dir = (target_dir / "metadata").resolve()
     metadata_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(metadata_dir / "server_presign_response.json", data)
+    # Persist the authenticated resolver binding used for this download.  The
+    # CONFIG_APPLY restart gate consumes this sidecar together with freshly
+    # hashed artifacts; an environment variable is never accepted as proof of
+    # the active model identity.
+    persisted_resolution = dict(data)
+    persisted_resolution["pointer"] = normalized_pointer
+    persisted_resolution["profile"] = profile
+    _write_json(metadata_dir / "server_presign_response.json", persisted_resolution)
     _write_json(metadata_dir / "downloaded_from_server.json", downloaded)
 
     return target_dir, data

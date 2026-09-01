@@ -110,6 +110,22 @@ class ConnectivityParserTest(unittest.TestCase):
 
 
 class ConnectivityReporterTest(unittest.TestCase):
+    def test_collect_sample_exposes_steady_state_for_closed_loop(self) -> None:
+        reporter = ConnectivityReporter(
+            target_host="api.example.com",
+            rssi_collector=lambda: -60,
+            ping_collector=lambda: (0.5, 35),
+            bitrate_collector=lambda: (2400, 8000),
+            measured_at_factory=lambda: "2026-09-01T00:00:00Z",
+        )
+
+        sample = reporter.collect_sample_payload()
+
+        self.assertEqual(sample["quality"], "GOOD")
+        self.assertEqual(sample["uplinkKbps"], 2400)
+        self.assertEqual(sample["packetLossPct"], 0.5)
+        self.assertIsNone(reporter.build_transition_payload(sample))
+
     def test_reporter_sends_only_transitions(self) -> None:
         samples = [
             {"rssi": -60, "loss": 0.0, "rtt": 40},

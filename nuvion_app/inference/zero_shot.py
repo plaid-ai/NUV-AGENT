@@ -1,5 +1,6 @@
 import logging
-from typing import List, Optional
+import stat
+from pathlib import Path
 
 from nuvion_app.runtime.inference_mode import normalize_siglip_device
 
@@ -18,7 +19,7 @@ class ZeroShotAnomalyDetector:
         if AutoProcessor is not None:
             try:
                 return AutoProcessor.from_pretrained(self.model_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - backend compatibility chain.
                 attempts.append(f"AutoProcessor.from_pretrained failed ({self._format_exc(exc)})")
 
         for class_name in ("Siglip2Processor", "SiglipProcessor"):
@@ -27,7 +28,7 @@ class ZeroShotAnomalyDetector:
                 continue
             try:
                 return processor_cls.from_pretrained(self.model_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - backend compatibility chain.
                 attempts.append(f"{class_name}.from_pretrained failed ({self._format_exc(exc)})")
 
         image_processor = None
@@ -41,7 +42,7 @@ class ZeroShotAnomalyDetector:
             try:
                 image_processor = image_processor_cls.from_pretrained(self.model_name)
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - backend compatibility chain.
                 attempts.append(f"{class_name}.from_pretrained failed ({self._format_exc(exc)})")
 
         for class_name in ("GemmaTokenizerFast", "GemmaTokenizer", "AutoTokenizer"):
@@ -51,13 +52,13 @@ class ZeroShotAnomalyDetector:
             try:
                 tokenizer = tokenizer_cls.from_pretrained(self.model_name)
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - backend compatibility chain.
                 attempts.append(f"{class_name}.from_pretrained failed ({self._format_exc(exc)})")
 
         if processor_cls is not None and image_processor is not None and tokenizer is not None:
             try:
                 return processor_cls(image_processor=image_processor, tokenizer=tokenizer)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - backend compatibility chain.
                 attempts.append(f"{processor_cls.__name__}(image_processor, tokenizer) failed ({self._format_exc(exc)})")
 
         details = "; ".join(attempts) if attempts else "processor class not found"
@@ -67,8 +68,8 @@ class ZeroShotAnomalyDetector:
         self,
         enabled: bool,
         model_name: str,
-        labels: List[str],
-        anomaly_labels: List[str],
+        labels: list[str],
+        anomaly_labels: list[str],
         threshold: float,
         device_preference: str = "auto",
     ):
@@ -82,6 +83,7 @@ class ZeroShotAnomalyDetector:
         self._model = None
         self._processor = None
         self._device = None
+        self._loaded_model_source: str | None = None
 
         if not self.enabled:
             return
@@ -94,7 +96,7 @@ class ZeroShotAnomalyDetector:
             import torch
             import transformers
             from PIL import Image
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - optional dependencies vary.
             log.warning("Zero-shot dependencies not available: %s", exc)
             self.enabled = False
             return
@@ -113,6 +115,17 @@ class ZeroShotAnomalyDetector:
             self._torch = torch
             self._Image = Image
             self._device = device
+            candidate = Path(self.model_name).expanduser()
+            try:
+                metadata = candidate.lstat()
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(
+                    metadata.st_mode
+                ):
+                    self._loaded_model_source = str(candidate.resolve(strict=True))
+            except OSError:
+                # A remote Hugging Face identifier has no authenticated local
+                # resolver identity and is intentionally not CONFIG evidence.
+                self._loaded_model_source = None
             self.ready = True
             log.info(
                 "Zero-shot model loaded: %s (device=%s, preference=%s)",
@@ -120,9 +133,16 @@ class ZeroShotAnomalyDetector:
                 device,
                 self.device_preference,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - model loader is third-party.
             log.warning("Failed to load zero-shot model '%s': %s", self.model_name, exc)
             self.enabled = False
+
+    def loaded_model_source(self) -> str | None:
+        """Exact local directory handed to the successful model loader, if any."""
+
+        if not self.enabled or not self.ready:
+            return None
+        return self._loaded_model_source
 
     @staticmethod
     def _resolve_device(torch_module, preference: str) -> str:
@@ -153,7 +173,7 @@ class ZeroShotAnomalyDetector:
 
         return "cpu"
 
-    def classify(self, frame_rgb) -> Optional[dict]:
+    def classify(self, frame_rgb) -> dict | None:
         if not self.enabled or not self.ready:
             return None
 
@@ -181,7 +201,7 @@ class ZeroShotAnomalyDetector:
                 logits = image_features @ text_features.T
 
             probs = self._torch.sigmoid(logits).squeeze(0).tolist()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - inference backend is third-party.
             log.warning("Zero-shot inference failed: %s", exc)
             return None
 

@@ -3,6 +3,7 @@
 # USB/Webcam -> GStreamer -> H.264(RTP) -> mediasoup plain transport
 # Zero-shot anomaly detection (SigLIP) or Triton backend (optional)
 
+import base64
 import os
 import sys
 import json
@@ -22,11 +23,13 @@ import subprocess
 import urllib.request
 import urllib.error
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
-from nuvion_app.config import load_env
+from nuvion_app.config import load_env, resolve_config_path
 import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
@@ -37,6 +40,8 @@ from nuvion_app.inference.command_runtime import (
     FleetCommandRuntimeError,
     build_fleet_command_runtime_from_env,
 )
+from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
+from nuvion_app.inference.fleet_command import COMMAND_CAPABILITY_BY_TYPE
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.depthai_gst import DepthAIGStreamerBridge
@@ -88,9 +93,20 @@ from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.snapshot import LatestFrameBuffer
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot
+from nuvion_app.inference.stream_policy import (
+    GlibMainContextDispatcher,
+    StreamPolicyReconciler,
+    X264EncoderAdapter,
+)
+from nuvion_app.inference.settings_reconciler import (
+    AtomicSettingsStore,
+    SettingsReconciler,
+    UnsupportedSettingsEffect,
+)
 from nuvion_app.inference.signaling_contract import (
     AGENT_COMMAND_QUEUE_DEST,
     AGENT_ERROR_QUEUE_DEST,
+    COMMAND_OBSERVED_ACK_QUEUE_DEST,
     EVENT_ACK_QUEUE_DEST,
     FLEET_COMMAND_QUEUE_DEST,
     REQUIRED_AGENT_SUBSCRIPTIONS,
@@ -134,7 +150,14 @@ from nuvion_app.runtime.inference_mode import (
     normalize_backend,
     normalize_siglip_device,
 )
-from nuvion_app.runtime.telemetry import build_runtime_telemetry
+from nuvion_app.model_store import DEFAULT_MODEL_POINTER
+from nuvion_app.runtime.model_guard import resolve_effective_profile, resolve_model_dir
+from nuvion_app.runtime.telemetry import (
+    build_runtime_telemetry,
+    merge_runtime_public_state,
+    verify_model_artifact_identity,
+)
+from nuvion_app.runtime.settings_overlay import resolve_settings_state_dir
 
 try:
     from nuvion_app.agent.triton_client import TritonAnomalyClient
@@ -179,6 +202,38 @@ def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_label_array(encoded_value: str | None, csv_value: str) -> list[str]:
+    encoded = str(encoded_value or "").strip()
+    if not encoded:
+        return parse_csv(csv_value)
+    try:
+        padding = "=" * ((4 - len(encoded) % 4) % 4)
+        decoded = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        log.error("[CONFIG-APPLY] invalid encoded label array; using legacy CSV")
+        return parse_csv(csv_value)
+    if (
+        not isinstance(payload, list)
+        or not 1 <= len(payload) <= 100
+        or any(
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or len(item) > 100
+            for item in payload
+        )
+        or len({item.lower() for item in payload}) != len(payload)
+    ):
+        log.error("[CONFIG-APPLY] invalid label array payload; using legacy CSV")
+        return parse_csv(csv_value)
+    return list(payload)
+
+
 def parse_int(value: str | None) -> int | None:
     if not value:
         return None
@@ -200,6 +255,14 @@ def parse_float(value: str | None, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def systemd_restart_enabled(environ) -> bool:
+    return (
+        sys.platform.startswith("linux")
+        and is_truthy(environ.get("NUVION_SUPERVISOR_RESTART_ENABLED", "false"))
+        and bool(str(environ.get("INVOCATION_ID") or "").strip())
+    )
 
 
 load_env()
@@ -246,8 +309,17 @@ PRODUCTION_DEDUP_SEC = parse_float(os.getenv("NUVION_PRODUCTION_DEDUP_SEC"), 3.0
 ZERO_SHOT_ENABLED = is_truthy(os.getenv("NUVION_ZERO_SHOT_ENABLED", "true"))
 ZERO_SHOT_MODEL = os.getenv("NUVION_ZERO_SHOT_MODEL", "google/siglip2-base-patch16-224")
 ZERO_SHOT_DEVICE = normalize_siglip_device(os.getenv("NUVION_ZERO_SHOT_DEVICE", "auto"), default="auto")
-ZERO_SHOT_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect"))
-ZERO_SHOT_ANOMALY_LABELS = parse_csv(os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS", "defect,broken,crack,scratch"))
+ZERO_SHOT_LABELS = parse_label_array(
+    os.getenv("NUVION_ZERO_SHOT_LABELS_B64"),
+    os.getenv("NUVION_ZERO_SHOT_LABELS", "normal,defect"),
+)
+ZERO_SHOT_ANOMALY_LABELS = parse_label_array(
+    os.getenv("NUVION_ZERO_SHOT_ANOMALY_LABELS_B64"),
+    os.getenv(
+        "NUVION_ZERO_SHOT_ANOMALY_LABELS",
+        "defect,broken,crack,scratch",
+    ),
+)
 ZERO_SHOT_THRESHOLD = parse_float(os.getenv("NUVION_ZERO_SHOT_THRESHOLD"), 0.7)
 ZERO_SHOT_SAMPLE_SEC = parse_float(os.getenv("NUVION_ZERO_SHOT_SAMPLE_SEC"), 2.0)
 FACE_TRACKING_ENABLED = is_truthy(os.getenv("NUVION_FACE_TRACKING_ENABLED", "false"))
@@ -285,6 +357,16 @@ CLIP_SEGMENT_MIN_SIZE_BYTES = parse_int_with_default(
     os.getenv("NUVION_CLIP_SEGMENT_MIN_SIZE_BYTES"),
     64 * 1024,
 )
+VIDEO_WIDTH = parse_int_with_default(os.getenv("NUVION_VIDEO_WIDTH"), 640)
+VIDEO_HEIGHT = parse_int_with_default(os.getenv("NUVION_VIDEO_HEIGHT"), 480)
+VIDEO_FPS = parse_int_with_default(os.getenv("NUVION_VIDEO_FPS"), 30)
+VIDEO_BITRATE_KBPS = parse_int_with_default(
+    os.getenv("NUVION_VIDEO_BITRATE_KBPS"),
+    1000,
+)
+MODEL_POINTER = (
+    os.getenv("NUVION_MODEL_POINTER", DEFAULT_MODEL_POINTER) or DEFAULT_MODEL_POINTER
+).strip()
 
 LINE_ID = parse_int(os.getenv("NUVION_LINE_ID"))
 PROCESS_ID = parse_int(os.getenv("NUVION_PROCESS_ID"))
@@ -304,6 +386,18 @@ EVENT_REPLAY_INTERVAL_SEC = parse_float(os.getenv("NUVION_EVENT_REPLAY_INTERVAL_
 FLEET_COMMAND_POLL_INTERVAL_SEC = parse_float(
     os.getenv("NUVION_FLEET_COMMAND_POLL_INTERVAL_SEC"),
     30.0,
+)
+FLEET_EFFECT_RECONCILE_INTERVAL_SEC = parse_float(
+    os.getenv("NUVION_FLEET_EFFECT_RECONCILE_INTERVAL_SEC"),
+    1.0,
+)
+FLEET_OBSERVATION_REPLAY_INTERVAL_SEC = parse_float(
+    os.getenv("NUVION_FLEET_OBSERVATION_REPLAY_INTERVAL_SEC"),
+    2.0,
+)
+WEBRTC_STATS_INTERVAL_SEC = parse_float(
+    os.getenv("NUVION_WEBRTC_STATS_INTERVAL_SEC"),
+    2.0,
 )
 EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
@@ -367,6 +461,10 @@ device_state_coordinator_lock = threading.Lock()
 fleet_command_runtime: FleetCommandRuntime | None = None
 fleet_command_runtime_init_attempted = False
 fleet_command_runtime_lock = threading.Lock()
+fleet_effect_registry = ReconcilerRegistry()
+updater_public_state_provider: Callable[[], Mapping[str, object]] | None = None
+updater_public_state_lock = threading.Lock()
+FLEET_PROCESS_INSTANCE_ID = str(uuid.uuid4())
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
 
@@ -506,6 +604,71 @@ def get_rtp_ssrc() -> int:
         except ValueError:
             log.warning("[RTP] Invalid NUVION_RTP_SSRC='%s', using random ssrc.", RTP_SSRC_ENV)
     return random.randint(100000, 4294967295)
+
+
+def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) -> str:
+    normalized_name = str(element_name or "").strip()
+    if not normalized_name.replace("_", "").isalnum():
+        raise ValueError("GStreamer encoder element name must be alphanumeric/underscore")
+    target = int(bitrate_kbps)
+    if target < 100 or target > 20_000:
+        raise ValueError("encoder bitrate must be in [100, 20000] Kbps")
+    return (
+        "videoconvert ! "
+        "video/x-raw,format=I420 ! "
+        f"x264enc name={normalized_name} "
+        "tune=zerolatency "
+        "speed-preset=faster "
+        f"bitrate={target} "
+        "vbv-buf-capacity=10000 "
+        "key-int-max=30 "
+        "bframes=0 "
+        "threads=4 "
+        "sliced-threads=true "
+        "pass=cbr "
+        "! "
+        f"video/x-h264,profile={H264_PROFILE_ENV} ! "
+    )
+
+
+def build_uplink_pipeline(
+    *,
+    rtp_ssrc: int,
+    clip_enabled: bool,
+    clip_segment_sec: float,
+    clip_max_segments: int,
+    clip_segments_dir: str,
+    video_bitrate_kbps: int = 1000,
+) -> str:
+    encoder_pipeline = build_x264_encoder_pipeline(
+        "video_encoder",
+        bitrate_kbps=video_bitrate_kbps,
+    )
+    if not clip_enabled:
+        return (
+            f"{encoder_pipeline}"
+            f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
+            "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
+            "webrtc_uplink."
+        )
+
+    segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
+    segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
+    clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
+    return (
+        "tee name=stream_split "
+        "stream_split. ! queue ! "
+        f"{encoder_pipeline}"
+        "h264parse config-interval=1 ! "
+        f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
+        "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
+        "webrtc_uplink. "
+        "stream_split. ! queue ! "
+        f"{clip_encoder_pipeline}"
+        "h264parse config-interval=1 ! "
+        f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
+        f"max-files={int(clip_max_segments)} location=\"{segment_location}\""
+    )
 
 
 async def login() -> str | None:
@@ -818,6 +981,13 @@ def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
                     payload,
                     remember=False,
                 ),
+                reconciler_registry=fleet_effect_registry,
+                process_instance_id=FLEET_PROCESS_INSTANCE_ID,
+                restart_requester=(
+                    (lambda: bool(g_app and g_app.request_supervisor_restart()))
+                    if systemd_restart_enabled(os.environ)
+                    else None
+                ),
             )
         except (FleetCommandRuntimeError, OSError, sqlite3.Error, ValueError) as exc:
             log.error("[FLEET-COMMAND] disabled by invalid fail-closed configuration: %s", exc)
@@ -1023,6 +1193,87 @@ def build_event_outbox_runtime_health() -> dict:
     return health
 
 
+def register_updater_public_state_provider(
+    provider: Callable[[], Mapping[str, object]] | None,
+) -> None:
+    """Integration hook for the authenticated root updater public state."""
+
+    if provider is not None and not callable(provider):
+        raise TypeError("updater public state provider must be callable")
+    global updater_public_state_provider
+    with updater_public_state_lock:
+        updater_public_state_provider = provider
+
+
+def build_command_observation_runtime_health() -> dict:
+    runtime = fleet_command_runtime
+    if runtime is None or runtime.observation_outbox is None:
+        return {
+            "pendingRows": 0,
+            "pendingBytes": 0,
+            "reservedRows": 0,
+            "reservedBytes": 0,
+            "dlqRows": 0,
+            "dlqBytes": 0,
+            "dlqBlockedRows": 0,
+            "retentionPressure": False,
+            "capacityState": (
+                "UNAVAILABLE"
+                if fleet_command_runtime_init_attempted
+                else "INITIALIZING"
+            ),
+        }
+    try:
+        return runtime.observation_outbox.health_snapshot().to_telemetry()
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        return {
+            "pendingRows": 0,
+            "pendingBytes": 0,
+            "reservedRows": 0,
+            "reservedBytes": 0,
+            "dlqRows": 0,
+            "dlqBytes": 0,
+            "dlqBlockedRows": 0,
+            "retentionPressure": True,
+            "capacityState": "UNAVAILABLE",
+            "healthError": str(exc)[:500],
+        }
+
+
+def build_dynamic_runtime_telemetry(
+    base_capabilities: set[str] | frozenset[str] = frozenset(),
+) -> dict:
+    functional_health = (
+        "FUNCTIONAL_HEALTHY"
+        if g_app is not None
+        and getattr(g_app, "pipeline", None) is not None
+        and bool(getattr(getattr(g_app, "user_data", None), "running", False))
+        else "FUNCTIONAL_UNHEALTHY"
+    )
+    public_state: dict[str, object] = {"functionalHealth": functional_health}
+    with updater_public_state_lock:
+        provider = updater_public_state_provider
+    if provider is not None:
+        try:
+            public_state.update(dict(provider()))
+        except Exception as exc:  # noqa: BLE001 - telemetry must stay available.
+            log.error("[UPDATER] public state unavailable: %s", exc)
+            public_state = {"functionalHealth": "FUNCTIONAL_UNHEALTHY"}
+    if functional_health == "FUNCTIONAL_UNHEALTHY":
+        public_state["functionalHealth"] = functional_health
+    try:
+        merged = merge_runtime_public_state({}, public_state)
+    except (TypeError, ValueError) as exc:
+        log.error("[UPDATER] invalid public state rejected: %s", exc)
+        merged = {"functionalHealth": "FUNCTIONAL_UNHEALTHY"}
+    merged["eventOutbox"] = build_event_outbox_runtime_health()
+    merged["commandObservationOutbox"] = build_command_observation_runtime_health()
+    merged["capabilities"] = sorted(
+        set(base_capabilities) | set(fleet_effect_registry.capabilities)
+    )
+    return merged
+
+
 def persist_state_event(payload: dict) -> bool:
     event = persist_durable_event(
         EVENT_TYPE_DEVICE_STATE,
@@ -1053,14 +1304,20 @@ def get_device_state_coordinator() -> DeviceStateCoordinator:
     global device_state_coordinator
     with device_state_coordinator_lock:
         if device_state_coordinator is None:
+            telemetry = build_runtime_telemetry(
+                effect_capabilities=fleet_effect_registry.capabilities,
+            )
+            base_capabilities = frozenset(telemetry.get("capabilities", ())) - set(
+                COMMAND_CAPABILITY_BY_TYPE.values()
+            )
             device_state_coordinator = DeviceStateCoordinator(
                 send_message=persist_state_event,
                 line_id=LINE_ID,
                 process_id=PROCESS_ID,
-                telemetry=build_runtime_telemetry(),
-                runtime_telemetry_provider=lambda: {
-                    "eventOutbox": build_event_outbox_runtime_health()
-                },
+                telemetry=telemetry,
+                runtime_telemetry_provider=lambda: build_dynamic_runtime_telemetry(
+                    base_capabilities
+                ),
             )
         return device_state_coordinator
 
@@ -1166,7 +1423,18 @@ async def device_connectivity_sender(reporter: ConnectivityReporter):
     interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
     coordinator = get_device_state_coordinator()
     while True:
-        payload = reporter.build_transition_payload()
+        sample = reporter.collect_sample_payload()
+        runtime = fleet_command_runtime
+        if sample and runtime is not None:
+            try:
+                await runtime.observe_connectivity(sample)
+            except Exception as exc:  # noqa: BLE001 - next sample keeps the loop alive.
+                log.error(
+                    "[STREAM-POLICY] connectivity observation failed type=%s detail=%s",
+                    type(exc).__name__,
+                    str(exc)[:500],
+                )
+        payload = reporter.build_transition_payload(sample)
         if payload:
             coordinator.set_connectivity_status(str(payload.get("quality") or CONNECTIVITY_QUALITY_GOOD))
         if payload and persist_connectivity_event(payload):
@@ -1404,6 +1672,84 @@ async def fleet_command_poll_sender(runtime: FleetCommandRuntime) -> None:
             )
 
 
+async def fleet_effect_reconcile_sender(runtime: FleetCommandRuntime) -> None:
+    interval = max(0.25, FLEET_EFFECT_RECONCILE_INTERVAL_SEC)
+    while True:
+        try:
+            processed = await runtime.reconcile_effects()
+            if processed:
+                log.info(
+                    "[FLEET-EFFECT] reconciled durable jobs count=%d",
+                    processed,
+                )
+        except Exception as exc:  # noqa: BLE001 - durable leases permit retry.
+            log.error(
+                "[FLEET-EFFECT] reconciliation failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+        await asyncio.sleep(interval)
+
+
+async def fleet_observation_sender(runtime: FleetCommandRuntime) -> None:
+    interval = max(0.5, FLEET_OBSERVATION_REPLAY_INTERVAL_SEC)
+    while True:
+        try:
+            sent = await asyncio.to_thread(runtime.replay_observations)
+            if sent:
+                log.debug("[FLEET-OBSERVED] replayed count=%d", sent)
+        except Exception as exc:  # noqa: BLE001 - durable outbox retries next interval.
+            log.error(
+                "[FLEET-OBSERVED] replay failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+        await asyncio.sleep(interval)
+
+
+async def handle_command_observation_ack(body: str) -> None:
+    runtime = initialize_fleet_command_runtime()
+    if runtime is None:
+        return
+    try:
+        ack, removed = await asyncio.to_thread(
+            runtime.acknowledge_observation,
+            body,
+        )
+        log.debug(
+            "[FLEET-OBSERVED] ACK observationId=%s revision=%d status=%s removed=%s",
+            ack.observation_id,
+            ack.revision,
+            ack.status,
+            removed,
+        )
+    except Exception as exc:  # noqa: BLE001 - malformed ACK cannot delete durable row.
+        log.error(
+            "[FLEET-OBSERVED] invalid ACK type=%s detail=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
+
+
+async def webrtc_stats_sender(runtime: FleetCommandRuntime) -> None:
+    interval = max(0.5, WEBRTC_STATS_INTERVAL_SEC)
+    while True:
+        controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+        if controller is not None:
+            sample = controller.take_latest_outbound_stats()
+            if sample:
+                try:
+                    await runtime.observe_stream_metrics(sample)
+                except Exception as exc:  # noqa: BLE001 - next stats sample retries.
+                    log.error(
+                        "[STREAM-POLICY] WebRTC stats observation failed type=%s detail=%s",
+                        type(exc).__name__,
+                        str(exc)[:500],
+                    )
+            controller.request_outbound_stats()
+        await asyncio.sleep(interval)
+
+
 async def signaling_client_main():
     global websocket, signaling_loop, outbound_queue
 
@@ -1413,6 +1759,17 @@ async def signaling_client_main():
         outbound_queue = asyncio.Queue(maxsize=OUTBOUND_QUEUE_MAX)
     initialize_durable_event_outbox()
     command_runtime = initialize_fleet_command_runtime()
+    if command_runtime is not None:
+        try:
+            # Boot verification/rollback is local and must not wait for login or
+            # WebSocket availability. Lifecycle ACK/observations remain durable.
+            await command_runtime.reconcile_effects()
+        except Exception as exc:  # noqa: BLE001 - durable lease retries on connect.
+            log.error(
+                "[FLEET-EFFECT] startup reconciliation failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:500],
+            )
 
     while True:
         token = await login()
@@ -1471,6 +1828,9 @@ async def signaling_client_main():
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
                 connectivity_task = None
                 fleet_command_poll_task = None
+                fleet_effect_task = None
+                webrtc_stats_task = None
+                fleet_observation_task = None
                 if CONNECTIVITY_ENABLED:
                     connectivity_target_host = CONNECTIVITY_TARGET_HOST or extract_host_from_server_url(SERVER_BASE_URL)
                     connectivity_thresholds = ConnectivityThresholds(
@@ -1502,6 +1862,15 @@ async def signaling_client_main():
                     fleet_command_poll_task = asyncio.create_task(
                         fleet_command_poll_sender(command_runtime)
                     )
+                    fleet_effect_task = asyncio.create_task(
+                        fleet_effect_reconcile_sender(command_runtime)
+                    )
+                    webrtc_stats_task = asyncio.create_task(
+                        webrtc_stats_sender(command_runtime)
+                    )
+                    fleet_observation_task = asyncio.create_task(
+                        fleet_observation_sender(command_runtime)
+                    )
 
                 async for message in ws:
                     if not message.startswith("a["):
@@ -1514,7 +1883,9 @@ async def signaling_client_main():
                         destination = frame["headers"].get("destination")
                         body = frame["body"]
 
-                        if destination and FLEET_COMMAND_QUEUE_DEST in destination:
+                        if destination and COMMAND_OBSERVED_ACK_QUEUE_DEST in destination:
+                            await handle_command_observation_ack(body)
+                        elif destination and FLEET_COMMAND_QUEUE_DEST in destination:
                             await handle_fleet_command_wakeup(body)
                         elif destination and AGENT_COMMAND_QUEUE_DEST in destination:
                             await handle_command_message(body)
@@ -1539,6 +1910,12 @@ async def signaling_client_main():
                 connectivity_task.cancel()
             if "fleet_command_poll_task" in locals() and fleet_command_poll_task is not None:
                 fleet_command_poll_task.cancel()
+            if "fleet_effect_task" in locals() and fleet_effect_task is not None:
+                fleet_effect_task.cancel()
+            if "webrtc_stats_task" in locals() and webrtc_stats_task is not None:
+                webrtc_stats_task.cancel()
+            if "fleet_observation_task" in locals() and fleet_observation_task is not None:
+                fleet_observation_task.cancel()
 
         log.info("[SIGNALING] Reconnecting in 10s...")
         await asyncio.sleep(10)
@@ -2230,11 +2607,164 @@ def on_new_sample(appsink, user_data: NuvionEventState):
     return Gst.FlowReturn.OK
 
 
+class PipelineSettingsRuntimeAdapter:
+    """Read back only settings that the running pipeline can prove and restore."""
+
+    def __init__(
+        self,
+        *,
+        app,
+        encoder: X264EncoderAdapter,
+        model_pointer: str,
+        model_dir,
+    ) -> None:
+        self.app = app
+        self.encoder = encoder
+        self.model_pointer = str(model_pointer)
+        self.model_dir = model_dir
+
+    def set_effect_fence(self, fence_check: Callable[[], None]) -> None:
+        self.encoder.set_effect_fence(fence_check)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "labels": {
+                "inspection": list(ZERO_SHOT_LABELS),
+                "anomaly": list(ZERO_SHOT_ANOMALY_LABELS),
+            },
+            "clip": {
+                "enabled": bool(self.app.user_data.clip_enabled),
+                "preSeconds": int(CLIP_PRE_SEC),
+                "postSeconds": int(CLIP_POST_SEC),
+            },
+            "video": {
+                "width": int(self.app.video_width),
+                "height": int(self.app.video_height),
+                "fps": int(self.app.frame_rate),
+                "bitrateKbps": self.encoder.read_bitrate_kbps(),
+            },
+        }
+
+    def apply_immediate(self, desired) -> dict[str, object]:
+        global CLIP_PRE_SEC, CLIP_POST_SEC
+
+        if "model" in desired:
+            raise UnsupportedSettingsEffect(
+                "model changes require activation=RESTART"
+            )
+        if "labels" in desired:
+            current_labels = self.snapshot()["labels"]
+            if any(
+                current_labels.get(key) != value
+                for key, value in desired["labels"].items()
+            ):
+                raise UnsupportedSettingsEffect(
+                    "label changes require activation=RESTART"
+                )
+            self.verify_labels(desired["labels"])
+        clip = desired.get("clip")
+        if isinstance(clip, dict):
+            if bool(clip["enabled"]) != bool(self.app.user_data.clip_enabled):
+                raise UnsupportedSettingsEffect(
+                    "clip topology changes require activation=RESTART"
+                )
+            CLIP_PRE_SEC = float(clip["preSeconds"])
+            CLIP_POST_SEC = float(clip["postSeconds"])
+        video = desired.get("video")
+        if isinstance(video, dict):
+            if (
+                int(video["width"]) != int(self.app.video_width)
+                or int(video["height"]) != int(self.app.video_height)
+                or int(video["fps"]) != int(self.app.frame_rate)
+            ):
+                raise UnsupportedSettingsEffect(
+                    "video geometry changes require activation=RESTART"
+                )
+            self.encoder.set_bitrate_kbps(int(video["bitrateKbps"]))
+        return self.snapshot()
+
+    def restore(self, snapshot) -> None:
+        global CLIP_PRE_SEC, CLIP_POST_SEC
+
+        clip = snapshot.get("clip")
+        if isinstance(clip, dict):
+            CLIP_PRE_SEC = float(clip["preSeconds"])
+            CLIP_POST_SEC = float(clip["postSeconds"])
+        video = snapshot.get("video")
+        if isinstance(video, dict):
+            self.encoder.set_bitrate_kbps(int(video["bitrateKbps"]))
+
+    def functional_health(self) -> bool:
+        if self.app.pipeline is None or not self.app.user_data.running:
+            return False
+        try:
+            state_result, current_state, _pending_state = self.app.pipeline.get_state(0)
+            if state_result == Gst.StateChangeReturn.FAILURE:
+                return False
+            if current_state != Gst.State.PLAYING:
+                return False
+            return 100 <= self.encoder.read_bitrate_kbps() <= 20_000
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def verify_model(self, desired) -> dict[str, str]:
+        detector = getattr(self.app.user_data, "zero_shot", None)
+        source_provider = getattr(detector, "loaded_model_source", None)
+        if (
+            self.app.user_data.backend != "siglip"
+            or detector is None
+            or not detector.enabled
+            or not detector.ready
+            or not callable(source_provider)
+        ):
+            raise UnsupportedSettingsEffect(
+                "active inference backend cannot prove exact loaded model identity"
+            )
+        loaded_source = source_provider()
+        if not loaded_source:
+            raise UnsupportedSettingsEffect(
+                "SigLIP was not loaded from the authenticated local model store"
+            )
+        try:
+            expected_source = Path(self.model_dir).expanduser().resolve(strict=True)
+            actual_source = Path(loaded_source).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("loaded model source is no longer resolvable") from exc
+        if actual_source != expected_source:
+            raise RuntimeError("active runtime loaded an old or different model source")
+        if str(desired.get("pointer") or "") != self.model_pointer:
+            raise RuntimeError("active configured model pointer mismatch")
+        verified = verify_model_artifact_identity(
+            actual_source,
+            expected_pointer=str(desired.get("pointer") or ""),
+            expected_digest=str(desired.get("digest") or ""),
+        )
+        if verified is None:
+            raise RuntimeError("loaded model manifest/digest identity mismatch")
+        return verified
+
+    def verify_labels(self, desired) -> dict[str, object]:
+        detector = getattr(self.app.user_data, "zero_shot", None)
+        if self.app.user_data.backend != "siglip" or detector is None or not detector.enabled:
+            raise UnsupportedSettingsEffect(
+                "labels are not active in the selected inference backend"
+            )
+        inspection = list(desired.get("inspection") or [])
+        anomaly = list(desired.get("anomaly") or [])
+        if "inspection" in desired and list(detector.labels) != inspection:
+            raise RuntimeError("active inspection labels mismatch")
+        if "anomaly" in desired and {
+            value.lower() for value in anomaly
+        } != set(detector.anomaly_labels):
+            raise RuntimeError("active anomaly labels mismatch")
+        return dict(desired)
+
+
 class GStreamerInferenceApp:
     def __init__(self, video_source: str):
-        self.video_width = 640
-        self.video_height = 480
-        self.frame_rate = 30
+        self.video_width = VIDEO_WIDTH
+        self.video_height = VIDEO_HEIGHT
+        self.frame_rate = VIDEO_FPS
         self.video_source = video_source
         self.demo_mode = DEMO_MODE
         self.demo_loop = DEMO_LOOP
@@ -2256,9 +2786,12 @@ class GStreamerInferenceApp:
 
         self.pipeline = None
         self.loop = None
+        self.encoder_adapter: X264EncoderAdapter | None = None
         self.depthai_bridge: DepthAIGStreamerBridge | None = None
         self._demo_restarting = False
         self._demo_last_restart_at = 0.0
+        self._supervisor_restart_lock = threading.Lock()
+        self._supervisor_restart_requested = False
 
         self.create_pipeline()
 
@@ -2354,44 +2887,14 @@ class GStreamerInferenceApp:
                 "! "
             )
 
-        encoder_pipeline = (
-            "videoconvert ! "
-            "video/x-raw,format=I420 ! "
-            "x264enc "
-            "tune=zerolatency "
-            "speed-preset=faster "
-            "bitrate=1000 "
-            "vbv-buf-capacity=10000 "
-            "key-int-max=30 "
-            "bframes=0 "
-            "threads=4 "
-            "sliced-threads=true "
-            "pass=cbr "
-            "! "
-            f"video/x-h264,profile={H264_PROFILE_ENV} ! "
+        uplink_pipeline = build_uplink_pipeline(
+            rtp_ssrc=self.rtp_ssrc,
+            clip_enabled=CLIP_ENABLED,
+            clip_segment_sec=CLIP_SEGMENT_SEC,
+            clip_max_segments=CLIP_MAX_SEGMENTS,
+            clip_segments_dir=CLIP_SEGMENTS_DIR,
+            video_bitrate_kbps=VIDEO_BITRATE_KBPS,
         )
-
-        if CLIP_ENABLED:
-            segment_ns = int(CLIP_SEGMENT_SEC * 1_000_000_000)
-            segment_location = os.path.join(CLIP_SEGMENTS_DIR, "segment_%05d.mp4")
-            uplink_pipeline = (
-                f"{encoder_pipeline}"
-                "tee name=enc_t "
-                "enc_t. ! queue ! h264parse config-interval=1 ! "
-                f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
-                "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-                "webrtc_uplink. "
-                "enc_t. ! queue ! h264parse config-interval=1 ! "
-                f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
-                f"max-files={CLIP_MAX_SEGMENTS} location=\"{segment_location}\""
-            )
-        else:
-            uplink_pipeline = (
-                f"{encoder_pipeline}"
-                f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={self.rtp_ssrc} ! "
-                "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-                "webrtc_uplink."
-            )
 
         if LOCAL_DISPLAY:
             pipeline_string = (
@@ -2485,6 +2988,48 @@ class GStreamerInferenceApp:
         self.score_overlay = self.pipeline.get_by_name("zsad_score_overlay")
         self.gt_overlay = self.pipeline.get_by_name("zsad_gt_overlay")
 
+        video_encoder = self.pipeline.get_by_name("video_encoder")
+        if video_encoder is None:
+            fleet_effect_registry.unregister("STREAM_POLICY")
+            log.error(
+                "[STREAM-POLICY] named video_encoder missing; capability disabled"
+            )
+        else:
+            self.encoder_adapter = X264EncoderAdapter(
+                video_encoder,
+                dispatch=GlibMainContextDispatcher(GLib.idle_add),
+            )
+            fleet_effect_registry.register(
+                StreamPolicyReconciler(self.encoder_adapter)
+            )
+            log.info("[STREAM-POLICY] x264 reconciler registered")
+
+            try:
+                settings_state_dir = resolve_settings_state_dir(os.environ)
+                settings_runtime = PipelineSettingsRuntimeAdapter(
+                    app=self,
+                    encoder=self.encoder_adapter,
+                    model_pointer=MODEL_POINTER,
+                    model_dir=resolve_model_dir(resolve_effective_profile()),
+                )
+                fleet_effect_registry.register(
+                    SettingsReconciler(
+                        store=AtomicSettingsStore(
+                            resolve_config_path(),
+                            settings_state_dir,
+                        ),
+                        runtime=settings_runtime,
+                        process_instance_id=FLEET_PROCESS_INSTANCE_ID,
+                    )
+                )
+                log.info("[CONFIG-APPLY] transactional reconciler registered")
+            except (OSError, RuntimeError, ValueError) as exc:
+                fleet_effect_registry.unregister("CONFIG_APPLY")
+                log.error(
+                    "[CONFIG-APPLY] capability disabled: %s",
+                    exc,
+                )
+
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None
 
@@ -2513,6 +3058,29 @@ class GStreamerInferenceApp:
             return True
         finally:
             self._demo_restarting = False
+
+    def request_supervisor_restart(self) -> bool:
+        """Gracefully end the process; systemd Restart=always owns relaunch."""
+
+        with self._supervisor_restart_lock:
+            if self._supervisor_restart_requested:
+                return True
+
+            def _graceful_stop() -> bool:
+                self.shutdown()
+                return False
+
+            try:
+                source_id = GLib.idle_add(_graceful_stop)
+            except Exception:  # noqa: BLE001 - caller will retry the request.
+                return False
+            if not source_id:
+                return False
+            self._supervisor_restart_requested = True
+            log.warning(
+                "[CONFIG-APPLY] graceful shutdown requested for supervisor restart"
+            )
+            return True
 
     def _on_depthai_failure(self, exc: BaseException) -> None:
         log.error(

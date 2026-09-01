@@ -208,6 +208,19 @@ class DurableCommandInbox:
         finally:
             connection.close()
 
+    @contextmanager
+    def transaction(self, *, immediate: bool = False):
+        """Open a serialized transaction for command-adjacent durable state.
+
+        Reconciler stores share the inbox database so a desired-state checkpoint
+        and its command lifecycle transition can commit atomically.  Callers must
+        keep this transaction limited to SQLite work; device, filesystem, network,
+        and process effects belong outside it.
+        """
+
+        with self._lock, self._transaction(immediate=immediate) as connection:
+            yield connection
+
     def _initialize(self) -> None:
         parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -672,6 +685,33 @@ class DurableCommandInbox:
                 message=normalized_message,
                 reported_state=normalized_state,
             )
+
+    def transition_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        command_id: str,
+        status: str,
+        *,
+        code: str | None = None,
+        message: str | None = None,
+        reported_state: Mapping[str, Any] | None = None,
+    ) -> CommandAck:
+        """Persist a lifecycle transition on an already-open inbox transaction."""
+
+        normalized_status = str(status or "").strip().upper()
+        if normalized_status not in COMMAND_STATUSES:
+            raise ValueError(f"unsupported command status: {status}")
+        normalized_code, normalized_message, normalized_state = (
+            self._normalize_transition_fields(code, message, reported_state)
+        )
+        return self._transition_locked(
+            connection,
+            command_id,
+            normalized_status,
+            code=normalized_code,
+            message=normalized_message,
+            reported_state=normalized_state,
+        )
 
     def run_transactional_effect(
         self,

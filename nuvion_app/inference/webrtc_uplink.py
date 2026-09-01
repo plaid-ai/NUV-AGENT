@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import gi
 
@@ -28,6 +31,148 @@ from nuvion_app.inference.webrtc_signaling import (
 log = logging.getLogger(__name__)
 
 
+def _structure_to_mapping(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _structure_to_mapping(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_structure_to_mapping(item) for item in value]
+    n_fields = getattr(value, "n_fields", None)
+    nth_field_name = getattr(value, "nth_field_name", None)
+    get_value = getattr(value, "get_value", None)
+    if callable(n_fields) and callable(nth_field_name) and callable(get_value):
+        mapped: dict[str, Any] = {}
+        for index in range(int(n_fields())):
+            name = str(nth_field_name(index))
+            mapped[name] = _structure_to_mapping(get_value(name))
+        return mapped
+    return value
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _flatten_stats(value: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        result.append(value)
+        for nested in value.values():
+            result.extend(_flatten_stats(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            result.extend(_flatten_stats(nested))
+    return result
+
+
+class WebRTCStatsAccumulator:
+    """Normalize cumulative webrtcbin stats into one interval feedback sample."""
+
+    def __init__(self) -> None:
+        self._previous: dict[str, float] | None = None
+
+    def reset(self) -> None:
+        self._previous = None
+
+    def observe(self, raw_stats: Any) -> dict[str, Any] | None:
+        mapped = _structure_to_mapping(raw_stats)
+        structures = _flatten_stats(mapped)
+        outbound: dict[str, Any] = {}
+        remote: dict[str, Any] = {}
+        for item in structures:
+            stats_type = str(item.get("type") or item.get("statsType") or "").lower()
+            if "remote-inbound-rtp" in stats_type:
+                remote.update(item)
+            elif "outbound-rtp" in stats_type:
+                outbound.update(item)
+        if not outbound and isinstance(mapped, dict):
+            outbound = mapped
+
+        def number(*names: str, source: dict[str, Any] | None = None) -> float | None:
+            values = outbound if source is None else source
+            for name in names:
+                candidate = _finite_number(values.get(name))
+                if candidate is not None:
+                    return candidate
+            return None
+
+        current = {
+            "timestamp": number("timestamp", "timestampUs", "timestamp-us"),
+            "packetsSent": number("packetsSent", "packets-sent"),
+            "packetsLost": number(
+                "packetsLost", "packets-lost", source=remote or outbound
+            ),
+            "bytesSent": number("bytesSent", "bytes-sent"),
+            "nackCount": number("nackCount", "nack-count"),
+            "pliCount": number("pliCount", "pli-count"),
+        }
+        rtt = number(
+            "roundTripTime",
+            "round-trip-time",
+            source=remote or outbound,
+        )
+        fraction_lost = number(
+            "fractionLost",
+            "fraction-lost",
+            source=remote or outbound,
+        )
+        queue_pressure = number("queuePressurePct", "queue-pressure-pct")
+
+        previous = self._previous
+        self._previous = {
+            key: value for key, value in current.items() if value is not None
+        }
+        sample: dict[str, Any] = {"source": "WEBRTC_OUTBOUND"}
+        if rtt is not None:
+            sample["outboundRttMs"] = rtt * 1000.0 if rtt < 10.0 else rtt
+        if queue_pressure is not None:
+            sample["queuePressurePct"] = queue_pressure
+        if previous is not None:
+            sent_delta = max(
+                0.0,
+                (current["packetsSent"] or 0.0) - previous.get("packetsSent", 0.0),
+            )
+            lost_delta = max(
+                0.0,
+                (current["packetsLost"] or 0.0) - previous.get("packetsLost", 0.0),
+            )
+            total_delta = sent_delta + lost_delta
+            if total_delta > 0:
+                sample["outboundPacketLossPct"] = 100.0 * lost_delta / total_delta
+            elif fraction_lost is not None:
+                sample["outboundPacketLossPct"] = (
+                    fraction_lost * 100.0 if fraction_lost <= 1.0 else fraction_lost
+                )
+            for source_key, output_key in (
+                ("nackCount", "nackDelta"),
+                ("pliCount", "pliDelta"),
+            ):
+                value = current[source_key]
+                if value is not None:
+                    sample[output_key] = max(
+                        0.0,
+                        value - previous.get(source_key, value),
+                    )
+            timestamp = current["timestamp"]
+            bytes_sent = current["bytesSent"]
+            if timestamp is not None and bytes_sent is not None:
+                elapsed = timestamp - previous.get("timestamp", timestamp)
+                byte_delta = max(0.0, bytes_sent - previous.get("bytesSent", bytes_sent))
+                # WebRTC/GStreamer timestamps are normally microseconds; accept
+                # millisecond test fixtures as well.
+                elapsed_seconds = elapsed / (1_000_000.0 if elapsed > 10_000 else 1000.0)
+                if elapsed_seconds > 0:
+                    sample["sendBitrateKbps"] = byte_delta * 8.0 / elapsed_seconds / 1000.0
+        elif fraction_lost is not None:
+            sample["outboundPacketLossPct"] = (
+                fraction_lost * 100.0 if fraction_lost <= 1.0 else fraction_lost
+            )
+
+        return sample if len(sample) > 1 else None
+
+
 @dataclass
 class WebRTCUplinkSession:
     broadcast_id: str
@@ -49,6 +194,10 @@ class WebRTCUplinkController:
         self._webrtcbin: Gst.Element | None = None
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
+        self._stats_accumulator = WebRTCStatsAccumulator()
+        self._stats_lock = threading.Lock()
+        self._latest_outbound_stats: dict[str, Any] | None = None
+        self._stats_generation = 0
 
     def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
         self._pipeline = pipeline
@@ -85,7 +234,83 @@ class WebRTCUplinkController:
             ice_servers=ice_servers,
         )
         self._stop_sent = False
+        with self._stats_lock:
+            self._stats_generation += 1
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
         GLib.idle_add(self._start_on_main_loop)
+
+    def request_outbound_stats(self) -> bool:
+        if not self._webrtcbin or not self._session:
+            return False
+        with self._stats_lock:
+            generation = self._stats_generation
+            session_id = self._session.session_id
+        return bool(
+            GLib.idle_add(
+                self._request_stats_on_main_loop,
+                generation,
+                session_id,
+            )
+        )
+
+    def take_latest_outbound_stats(self) -> dict[str, Any] | None:
+        with self._stats_lock:
+            sample = self._latest_outbound_stats
+            self._latest_outbound_stats = None
+        return dict(sample) if sample is not None else None
+
+    def _request_stats_on_main_loop(
+        self,
+        generation: int,
+        session_id: str,
+    ) -> bool:
+        with self._stats_lock:
+            current = self._session
+            if (
+                generation != self._stats_generation
+                or current is None
+                or current.session_id != session_id
+            ):
+                return False
+        if not self._webrtcbin:
+            return False
+        try:
+            promise = Gst.Promise.new_with_change_func(
+                self._on_stats_created,
+                (generation, session_id),
+                None,
+            )
+            self._webrtcbin.emit("get-stats", None, promise)
+        except Exception as exc:  # noqa: BLE001 - unsupported stats must not stop RTC.
+            log.debug("[WEBRTC-UPLINK] get-stats unavailable: %s", exc)
+        return False
+
+    def _on_stats_created(
+        self,
+        promise: Gst.Promise,
+        token: object = None,
+        *_args: object,
+    ) -> None:
+        try:
+            reply = promise.get_reply()
+            if reply is None:
+                return
+            with self._stats_lock:
+                if (
+                    not isinstance(token, tuple)
+                    or len(token) != 2
+                    or token[0] != self._stats_generation
+                    or self._session is None
+                    or token[1] != self._session.session_id
+                ):
+                    return
+                sample = self._stats_accumulator.observe(reply)
+                if sample is None:
+                    return
+                self._latest_outbound_stats = sample
+        except Exception as exc:  # noqa: BLE001 - malformed stats are one missed sample.
+            log.debug("[WEBRTC-UPLINK] failed to normalize outbound stats: %s", exc)
 
     def apply_answer(self, payload: dict[str, Any]) -> None:
         if not self._session or not self._matches_session(payload):
@@ -130,7 +355,13 @@ class WebRTCUplinkController:
     def stop(self, *, send_signal: bool = True) -> None:
         if send_signal and self._session and not self._stop_sent:
             self._send_stop_message()
-        GLib.idle_add(self._stop_on_main_loop)
+        with self._stats_lock:
+            session_id = self._session.session_id if self._session else None
+            self._stats_generation += 1
+            generation = self._stats_generation
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
+        GLib.idle_add(self._stop_on_main_loop, generation, session_id)
 
     def on_signaling_reset(self) -> None:
         self._stop_sent = False
@@ -159,14 +390,29 @@ class WebRTCUplinkController:
         )
         return False
 
-    def _stop_on_main_loop(self) -> bool:
+    def _stop_on_main_loop(
+        self,
+        generation: int,
+        session_id: str | None,
+    ) -> bool:
+        with self._stats_lock:
+            if generation != self._stats_generation:
+                return False
+            if (
+                session_id is not None
+                and self._session is not None
+                and self._session.session_id != session_id
+            ):
+                return False
+            self._session = None
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
         if self._pipeline:
             try:
                 self._pipeline.send_event(Gst.Event.new_flush_start())
                 self._pipeline.send_event(Gst.Event.new_flush_stop(False))
-            except Exception:
-                pass
-        self._session = None
+            except Exception as exc:  # noqa: BLE001 - teardown is best effort.
+                log.debug("[WEBRTC-UPLINK] pipeline flush failed: %s", exc)
         return False
 
     def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:
@@ -281,5 +527,5 @@ def _build_session_description(
 def describe_payload(payload: dict[str, Any]) -> str:
     try:
         return json.dumps(payload, ensure_ascii=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 - diagnostic fallback accepts any object.
         return str(payload)

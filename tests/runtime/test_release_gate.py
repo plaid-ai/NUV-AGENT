@@ -139,6 +139,33 @@ class ReleaseGateTest(unittest.TestCase):
             "Environment=NUVION_COMMAND_INBOX_PATH=/var/lib/nuv-agent/commands.sqlite3",
             unit,
         )
+        self.assertIn(
+            "Environment=NUVION_SETTINGS_STATE_DIR=/var/lib/nuv-agent/settings",
+            unit,
+        )
+        self.assertIn("Environment=NUVION_SUPERVISOR_RESTART_ENABLED=true", unit)
+        self.assertIn("-m nuvion_app.runtime.settings_boot_guard", unit)
+        self.assertEqual(unit.count("/opt/nuv-agent/current/venv/bin/python"), 2)
+        self.assertNotIn("ExecStartPre=/opt/nuv-agent/venv/bin/python", unit)
+        self.assertIn(
+            "ExecStartPre=/usr/sbin/runuser -u nuvion -- "
+            "/opt/nuv-agent/current/venv/bin/python -s "
+            "-m nuvion_app.runtime.settings_boot_guard",
+            unit,
+        )
+        self.assertLess(
+            unit.index("-m nuvion_app.runtime.settings_boot_guard"),
+            unit.index("from nuvion_app.runtime.bootstrap import ensure_ready"),
+        )
+        self.assertIn("Restart=always", unit)
+        self.assertIn("StartLimitIntervalSec=300", unit)
+        self.assertIn("StartLimitBurst=3", unit)
+
+        postinst = (ROOT / "packaging" / "deb" / "postinst").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('readonly NUVION_CURRENT="/opt/nuv-agent/current"', postinst)
+        self.assertIn('ln -s /opt/nuv-agent "$NUVION_CURRENT"', postinst)
 
 
 if __name__ == "__main__":

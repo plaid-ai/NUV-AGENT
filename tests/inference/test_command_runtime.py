@@ -34,6 +34,7 @@ from nuvion_app.inference.command_transport import (
     PulledCommand,
     PulledCommandPage,
 )
+from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
 from nuvion_app.inference.fleet_command import (
     CommandValidationError,
     Ed25519Keyring,
@@ -77,7 +78,15 @@ def _signed_delivery(
     signing_key: Ed25519PrivateKey | None = None,
 ) -> PulledCommand:
     payload = json.dumps(
-        {"configVersion": sequence},
+        {
+            "configVersion": sequence,
+            "activation": "IMMEDIATE",
+            "clip": {
+                "enabled": True,
+                "preSeconds": 5,
+                "postSeconds": 5,
+            },
+        },
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -165,6 +174,14 @@ class ExpiredVerifier:
         if compact_jws != self.command.compact_jws:
             raise AssertionError("unexpected compact JWS")
         return self.command
+
+
+class NoopStreamReconciler:
+    command_type = "STREAM_POLICY"
+    capability = "command.stream.policy"
+
+    def reconcile(self, _command: VerifiedFleetCommand) -> CommandEffectOutcome:
+        return CommandEffectOutcome.succeeded()
 
 
 class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
@@ -781,6 +798,50 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 inbox_path=self.root / "unknown.sqlite3",
                 platform_identity=identity,
             )
+
+    def test_runtime_capabilities_and_handlers_come_only_from_registry(self) -> None:
+        identity = SimpleNamespace(
+            identity_status="DEV",
+            platform_profile="macos_dev",
+            capabilities=frozenset(
+                {
+                    "fleet.command.v1",
+                    "video.gstreamer",
+                    # Stale/static declarations must not bypass the registry.
+                    "command.config.apply",
+                    "command.agent.update",
+                }
+            ),
+        )
+        registry = ReconcilerRegistry()
+        registry.register(NoopStreamReconciler())
+        with mock.patch(
+            "nuvion_app.inference.command_runtime.load_fleet_command_keyring",
+            return_value=object(),
+        ):
+            runtime = build_fleet_command_runtime(
+                base_url="https://api.example.test",
+                access_token_provider=lambda: "token",
+                ack_sender=lambda _destination, _payload: True,
+                device_id="sp-3-nuvion-test",
+                space_id=3,
+                keyring_path=self.root / "unused-keyring.json",
+                inbox_path=self.root / "registry.sqlite3",
+                platform_identity=identity,
+                reconciler_registry=registry,
+            )
+
+        self.assertEqual(runtime.effect_capabilities, {"command.stream.policy"})
+        self.assertEqual(set(runtime.processor.handlers), {"STREAM_POLICY"})
+        self.assertIn(
+            "command.stream.policy", runtime.processor.verifier.capabilities
+        )
+        self.assertNotIn(
+            "command.config.apply", runtime.processor.verifier.capabilities
+        )
+        self.assertNotIn(
+            "command.agent.update", runtime.processor.verifier.capabilities
+        )
 
 
 if __name__ == "__main__":

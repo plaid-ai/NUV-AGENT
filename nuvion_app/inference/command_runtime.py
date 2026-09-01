@@ -16,6 +16,12 @@ from nuvion_app.inference.command_inbox import (
     DurableCommandInbox,
     resolve_default_command_inbox_path,
 )
+from nuvion_app.inference.command_observation import (
+    COMMAND_OBSERVED_DESTINATION,
+    CommandObservationAck,
+    DurableCommandObservationOutbox,
+    build_command_observation_payload,
+)
 from nuvion_app.inference.command_processor import (
     DurableCommandProcessor,
     ProcessResult,
@@ -30,14 +36,20 @@ from nuvion_app.inference.command_transport import (
     build_lifecycle_ack_payloads,
     parse_command_wakeup,
 )
+from nuvion_app.inference.effect_reconciler import (
+    FleetEffectCoordinator,
+    ReconcilerRegistry,
+)
 from nuvion_app.inference.fleet_command import (
     AUTHENTICATED_REJECTION_CODES,
+    COMMAND_CAPABILITY_BY_TYPE,
     CommandValidationError,
     Ed25519Keyring,
     FleetCommandEvaluation,
     FleetCommandVerifier,
     VerifiedFleetCommand,
 )
+from nuvion_app.inference.reconcile_store import DurableReconcileStore
 from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
@@ -232,8 +244,9 @@ def desired_state_handler(
     connection.execute(
         """
         INSERT INTO fleet_desired_state (
-            command_type, command_id, sequence, payload_hash, payload_json
-        ) VALUES (?, ?, ?, ?, ?)
+            command_type, command_id, sequence, payload_hash, payload_json,
+            accepted_at
+        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(command_type) DO UPDATE SET
             command_id = excluded.command_id,
             sequence = excluded.sequence,
@@ -261,6 +274,9 @@ class FleetCommandRuntime:
         processor: DurableCommandProcessor,
         http_client: FleetCommandHttpClient,
         ack_sender: AckSender,
+        reconcile_store: DurableReconcileStore | None = None,
+        effect_coordinator: FleetEffectCoordinator | None = None,
+        observation_outbox: DurableCommandObservationOutbox | None = None,
         ack_replay_limit: int = DEFAULT_ACK_REPLAY_LIMIT,
         max_pull_batches: int = DEFAULT_MAX_PULL_BATCHES,
         pull_page_size: int = DEFAULT_COMMAND_PULL_LIMIT,
@@ -271,6 +287,9 @@ class FleetCommandRuntime:
         self.processor = processor
         self.http_client = http_client
         self.ack_sender = ack_sender
+        self.reconcile_store = reconcile_store
+        self.effect_coordinator = effect_coordinator
+        self.observation_outbox = observation_outbox
         self.ack_replay_limit = max(1, min(int(ack_replay_limit), 10_000))
         self.max_pull_batches = max(1, min(int(max_pull_batches), 1_000))
         self.pull_page_size = max(
@@ -283,6 +302,59 @@ class FleetCommandRuntime:
         self._pending_resume_cursor = 0
         self._pending_resume_through: int | None = None
         self._sync_lock = asyncio.Lock()
+
+    @property
+    def effect_capabilities(self) -> frozenset[str]:
+        if self.effect_coordinator is None:
+            return frozenset()
+        return self.effect_coordinator.registry.capabilities
+
+    async def reconcile_effects(self) -> int:
+        """Run one bounded external-effect batch and publish terminal ACKs."""
+
+        if self.effect_coordinator is None:
+            return 0
+        result = await asyncio.to_thread(self.effect_coordinator.run_once)
+        self._send_payloads(
+            [build_command_ack_payload(ack) for ack in result.terminal_acks]
+        )
+        return result.processed
+
+    async def observe_connectivity(self, sample: Mapping[str, Any]) -> int:
+        if self.effect_coordinator is None:
+            return 0
+        return await asyncio.to_thread(
+            self.effect_coordinator.observe_connectivity,
+            sample,
+        )
+
+    async def observe_stream_metrics(self, sample: Mapping[str, Any]) -> int:
+        if self.effect_coordinator is None:
+            return 0
+        return await asyncio.to_thread(
+            self.effect_coordinator.observe_stream_metrics,
+            sample,
+        )
+
+    def replay_observations(self, *, limit: int = 100) -> int:
+        if self.observation_outbox is None:
+            return 0
+        sent = 0
+        for observation in self.observation_outbox.pending(limit=limit):
+            payload = build_command_observation_payload(observation)
+            accepted = self.ack_sender(COMMAND_OBSERVED_DESTINATION, payload)
+            self.observation_outbox.mark_attempt(
+                observation.observation_id,
+                error=None if accepted else "outbound queue unavailable",
+            )
+            if accepted:
+                sent += 1
+        return sent
+
+    def acknowledge_observation(self, body: str) -> tuple[CommandObservationAck, bool]:
+        if self.observation_outbox is None:
+            raise FleetCommandRuntimeError("command observation outbox is unavailable")
+        return self.observation_outbox.acknowledge_body(body)
 
     def _send_payloads(self, payloads: list[dict[str, Any]]) -> int:
         sent = 0
@@ -481,6 +553,9 @@ def build_fleet_command_runtime(
     keyring_path: str | Path,
     inbox_path: str | Path,
     platform_identity: PlatformIdentity,
+    reconciler_registry: ReconcilerRegistry | None = None,
+    process_instance_id: str | None = None,
+    restart_requester: Callable[[], bool] | None = None,
 ) -> FleetCommandRuntime:
     if platform_identity.identity_status not in {
         IDENTITY_STATUS_VERIFIED,
@@ -520,20 +595,36 @@ def build_fleet_command_runtime(
         raise FleetCommandRuntimeError(
             f"Fleet command inbox identity binding failed ({exc.code}): {exc}"
         ) from exc
+    registry = reconciler_registry or ReconcilerRegistry()
+    effective_capabilities = (
+        set(platform_identity.capabilities)
+        - set(COMMAND_CAPABILITY_BY_TYPE.values())
+    ) | set(registry.capabilities)
     verifier = FleetCommandVerifier(
         keyring=keyring,
         expected_device_id=device_id,
         expected_space_id=space_id,
-        capabilities=platform_identity.capabilities,
+        capabilities=effective_capabilities,
+    )
+    observation_outbox = DurableCommandObservationOutbox(inbox)
+    reconcile_store = DurableReconcileStore(
+        inbox,
+        observation_outbox=observation_outbox,
     )
     processor = DurableCommandProcessor(
         inbox=inbox,
         verifier=verifier,
         handlers={
-            "CONFIG_APPLY": desired_state_handler,
-            "STREAM_POLICY": desired_state_handler,
-            "AGENT_UPDATE": desired_state_handler,
+            command_type: reconcile_store.stage_verified
+            for command_type in registry.command_types
         },
+    )
+    effect_coordinator = FleetEffectCoordinator(
+        inbox=inbox,
+        store=reconcile_store,
+        registry=registry,
+        process_instance_id=process_instance_id,
+        restart_requester=restart_requester,
     )
     return FleetCommandRuntime(
         inbox=inbox,
@@ -543,6 +634,9 @@ def build_fleet_command_runtime(
             access_token_provider=access_token_provider,
         ),
         ack_sender=ack_sender,
+        reconcile_store=reconcile_store,
+        effect_coordinator=effect_coordinator,
+        observation_outbox=observation_outbox,
     )
 
 
@@ -552,6 +646,9 @@ def build_fleet_command_runtime_from_env(
     access_token_provider: Callable[[], str],
     ack_sender: AckSender,
     environ: Mapping[str, str] | None = None,
+    reconciler_registry: ReconcilerRegistry | None = None,
+    process_instance_id: str | None = None,
+    restart_requester: Callable[[], bool] | None = None,
 ) -> FleetCommandRuntime | None:
     values = os.environ if environ is None else environ
     enabled = str(values.get("NUVION_FLEET_COMMAND_ENABLED") or "false").strip().lower()
@@ -585,4 +682,7 @@ def build_fleet_command_runtime_from_env(
         keyring_path=keyring_path,
         inbox_path=resolve_default_command_inbox_path(values),
         platform_identity=identity,
+        reconciler_registry=reconciler_registry,
+        process_instance_id=process_instance_id,
+        restart_requester=restart_requester,
     )

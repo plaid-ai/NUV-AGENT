@@ -302,12 +302,56 @@ macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to s
 - Fleet command를 사용할 때는 `NUVION_FLEET_COMMAND_ENABLED=true`, `NUVION_SPACE_ID`,
   `NUVION_FLEET_COMMAND_KEYRING_PATH`를 provision합니다. Agent는
   `/user/queue/fleet.command` wake-up 후 BE journal을 pull하고, device/space-bound Ed25519 JWS를
-  검증한 뒤 SQLite inbox와 desired-state checkpoint를 먼저 기록합니다. 공통 runtime은
-  `IN_PROGRESS`까지만 ACK하며 NUV-436/437/439 reconciler가 실제 effect와 health check 후
-  terminal ACK를 기록해야 합니다. macOS 개발 keyring(`macos-dev`)과 생산 keyring
-  (`production`)은 서로 호환되지 않습니다.
+  검증한 뒤 SQLite inbox와 command별 reconcile job/history/lease/checkpoint를 먼저 기록합니다.
+  실제 named encoder와 transactional settings store가 준비된 경우에만 `STREAM_POLICY`와
+  `CONFIG_APPLY` effect/capability를 등록하며, `AGENT_UPDATE`는 구현 전까지 광고하지 않습니다.
+  새 desired state는 적용 전의 이전 command(`WAITING_RESTART` 포함)를
+  `FAILED/SUPERSEDED`로 terminal 처리하고, bounded coordinator가 transaction 밖에서 named
+  `x264enc`를 변경한 뒤 readback과 reported state를 포함해 `SUCCEEDED`를 기록합니다. macOS
+  개발 keyring(`macos-dev`)과 생산 keyring(`production`)은 서로 호환되지 않습니다.
+
+Command observed state는 lifecycle ACK와 별개입니다. Agent는 SQLite outbox에 먼저 저장한 뒤
+`/app/device/command.observed`로 정확히 `observationId`, `commandId`, `revision`, `observedAt`,
+`reportedState`만 전송합니다. `/user/queue/fleet.command.observed.ack`의
+`ACCEPTED|DUPLICATE`에서 완료하고, retryable reject/network failure는 동일 observationId로
+지수 backoff 재전송하며 permanent reject는 DLQ에 보존합니다. STREAM ADAPTIVE bitrate/health
+변경은 command별 monotonic revision과 signed desired superset으로 관측됩니다.
+
+`CONFIG_APPLY`는 strict signed payload의 `model|labels|clip|video` 중 하나 이상을 요구합니다.
+labels는 `inspection`/`anomaly`별 1..100개의 trim된 unique string 배열입니다. IMMEDIATE는
+runtime이 실제 변경/readback 가능한 효과만 성공시키며, RESTART는 atomic config와 LKG를
+stage한 뒤 새 process에서 실제 runtime readback 및 functional health를 검증합니다. Model은
+env digest를 증거로 사용하지 않고 authenticated resolver pointer와 실제 다운로드 artifact
+bytes에서 계산한 manifest/aggregate digest가 signed digest와 일치할 때만 성공합니다. 실패 시
+active SigLIP backend가 그 authenticated local directory에서 실제 load되었다는 source identity까지
+일치해야 성공합니다. Triton/remote backend가 exact loaded identity를 증명하지 못하거나 실패하면
+LKG rollback/restart를 완료하기 전에는 `FUNCTIONAL_HEALTHY`를 보고하지 않습니다.
+
+Canonical adaptive payload는 다음 field만 허용합니다. Tuning field가 없으면 Agent의 versioned
+default를 적용하며, `min <= initial <= max`, bitrate `100..20000`을 검증합니다.
+
+```json
+{
+  "policyVersion": 7,
+  "mode": "ADAPTIVE",
+  "minBitrateKbps": 300,
+  "maxBitrateKbps": 3000,
+  "initialBitrateKbps": 1200,
+  "decreaseFactor": 0.75,
+  "increaseStepKbps": 100,
+  "congestionSamples": 3,
+  "recoverySamples": 8,
+  "cooldownSeconds": 5
+}
+```
+
+`FIXED`는 `targetBitrateKbps`, `DISABLED`는 공통 `policyVersion`/`mode` 외 field를 허용하지
+않습니다. Clip이 켜진 경우 WebRTC와 clip은 raw tee 뒤 독립 encoder를 사용하므로 adaptive
+bitrate 변경이 forensic clip encoder에 전파되지 않습니다.
 
 Connectivity 보고 정책:
+- Adaptive controller는 `webrtcbin get-stats`의 outbound RTP loss/RTT/NACK/PLI를 우선 사용하고,
+  해당 primary signal이 없을 때만 아래 OS connectivity 지표를 보조 신호로 사용합니다.
 - macOS는 `airport -I`, Linux(Jetson)는 `iw dev <iface> link`에서 RSSI를 수집합니다.
 - 공통으로 `ping` 평균 RTT/패킷손실을 수집합니다.
 - `uplinkKbps/downlinkKbps`는 OS별 무선 링크 bitrate를 기반으로 채웁니다.

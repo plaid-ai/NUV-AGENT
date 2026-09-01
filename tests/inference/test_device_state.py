@@ -150,7 +150,11 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
             line_id=1,
             process_id=2,
             telemetry={"runtimeTelemetry": {"agentVersion": "0.1.113"}},
-            runtime_telemetry_provider=lambda: {"eventOutbox": dict(health)},
+            runtime_telemetry_provider=lambda: {
+                "eventOutbox": dict(health),
+                "functionalHealth": "FUNCTIONAL_HEALTHY",
+                "capabilities": ["command.stream.policy"],
+            },
         )
 
         coordinator.emit_heartbeat()
@@ -163,6 +167,14 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
         self.assertEqual(second["eventOutbox"]["pendingRows"], 2)
         self.assertEqual(second["eventOutbox"]["capacityState"], "OPERATOR_STOP")
         self.assertEqual(second["agentVersion"], "0.1.113")
+        self.assertEqual(
+            self.sent_payloads[1]["functionalHealth"],
+            "FUNCTIONAL_HEALTHY",
+        )
+        self.assertEqual(
+            self.sent_payloads[1]["capabilities"],
+            ["command.stream.policy"],
+        )
 
 
 if __name__ == "__main__":

@@ -658,6 +658,9 @@ def load_env(path: Optional[str] = None) -> Path:
     override = _LOADED and _LOADED_PATH is not None and _LOADED_PATH != config_path
     os.environ["NUV_AGENT_CONFIG"] = str(config_path)
     load_dotenv(config_path, override=override)
+    from nuvion_app.runtime.settings_overlay import apply_settings_overlay
+
+    apply_settings_overlay(os.environ)
 
     _LOADED = True
     _LOADED_PATH = config_path

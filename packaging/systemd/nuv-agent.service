@@ -1,5 +1,7 @@
 [Unit]
 Description=Nuvion Agent
+StartLimitIntervalSec=300
+StartLimitBurst=3
 After=network-online.target
 Wants=network-online.target
 After=docker.service
@@ -13,6 +15,8 @@ Environment=PYTHONNOUSERSITE=1
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NUVION_EVENT_OUTBOX_PATH=/var/lib/nuv-agent/events.sqlite3
 Environment=NUVION_COMMAND_INBOX_PATH=/var/lib/nuv-agent/commands.sqlite3
+Environment=NUVION_SETTINGS_STATE_DIR=/var/lib/nuv-agent/settings
+Environment=NUVION_SUPERVISOR_RESTART_ENABLED=true
 StateDirectory=nuv-agent
 StateDirectoryMode=0750
 PermissionsStartOnly=true
@@ -20,7 +24,8 @@ ExecStartPre=/bin/mkdir -p /tmp/nuvion_clips/segments /tmp/nuvion_clips/clips
 ExecStartPre=/bin/chmod 1777 /tmp/nuvion_clips
 ExecStartPre=/bin/chmod 0777 /tmp/nuvion_clips/segments /tmp/nuvion_clips/clips
 ExecStartPre=/bin/sh -c 'rm -f /tmp/nuvion_clips/segments/segment_*.mp4 /tmp/nuvion_clips/clips/clip_*.mp4 || true'
-ExecStartPre=/opt/nuv-agent/venv/bin/python -s -c 'from nuvion_app.config import load_env; load_env(); from nuvion_app.runtime.bootstrap import ensure_ready; ensure_ready(stage=\"run\")'
+ExecStartPre=/usr/sbin/runuser -u nuvion -- /opt/nuv-agent/current/venv/bin/python -s -m nuvion_app.runtime.settings_boot_guard
+ExecStartPre=/opt/nuv-agent/current/venv/bin/python -s -c 'from nuvion_app.config import load_env; load_env(); from nuvion_app.runtime.bootstrap import ensure_ready; ensure_ready(stage=\"run\")'
 ExecStart=/usr/bin/nuv-agent run
 Restart=always
 RestartSec=3

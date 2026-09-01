@@ -127,8 +127,10 @@ class PlatformIdentityTest(unittest.TestCase):
                     if product in {MACOS_DEV, IQ9075_DEV}
                     else IDENTITY_STATUS_VERIFIED,
                 )
-                self.assertIn("command.config.apply", identity.capabilities)
-                self.assertIn("command.agent.update", identity.capabilities)
+                self.assertIn("fleet.command.v1", identity.capabilities)
+                self.assertNotIn("command.config.apply", identity.capabilities)
+                self.assertNotIn("command.agent.update", identity.capabilities)
+                self.assertNotIn("command.stream.policy", identity.capabilities)
                 self.assertIn(expected_capability, identity.capabilities)
                 if product == IQ9075_DEV:
                     self.assertIn("camera.usb", identity.capabilities)

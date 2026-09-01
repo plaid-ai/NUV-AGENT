@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION
 from nuvion_app.runtime.platform_identity import (
     PlatformProbe,
     resolve_platform_identity,
 )
-from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION
 from nuvion_app.runtime.release_bom import (
     build_release_bom_payload,
     canonical_release_bom_json,
 )
-from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA, build_runtime_telemetry
+from nuvion_app.runtime.telemetry import (
+    DEFAULT_CONFIG_SCHEMA,
+    build_runtime_telemetry,
+    merge_runtime_public_state,
+)
 
 
 class RuntimeTelemetryTest(unittest.TestCase):
@@ -26,13 +31,28 @@ class RuntimeTelemetryTest(unittest.TestCase):
             model_dir = Path(tmp)
             metadata_dir = model_dir / "metadata"
             metadata_dir.mkdir()
+            manifest = metadata_dir / "gcs_manifest.json"
+            manifest.write_bytes(b'{"model":"v0007"}\n')
+            manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
             (metadata_dir / "server_presign_response.json").write_text(
                 json.dumps(
                     {
                         "pointer": "anomalyclip/prod",
                         "resolvedVersion": "v0007",
-                        "modelDigest": "sha256:model-bundle-7",
+                        "modelDigest": f"sha256:{manifest_digest}",
                     }
+                ),
+                encoding="utf-8",
+            )
+            (metadata_dir / "downloaded_from_server.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "key": "manifest",
+                            "dst": str(manifest),
+                            "sha256": manifest_digest,
+                        }
+                    ]
                 ),
                 encoding="utf-8",
             )
@@ -63,6 +83,7 @@ class RuntimeTelemetryTest(unittest.TestCase):
                 agent_version="0.1.113",
                 component_sha="0123456789abcdef",
                 platform_identity=identity,
+                effect_capabilities={"command.stream.policy"},
             )
 
         self.assertEqual(telemetry["agentVersion"], "0.1.113")
@@ -70,7 +91,7 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["configSchema"], "11")
         self.assertEqual(telemetry["modelPointer"], "anomalyclip/prod")
         self.assertEqual(telemetry["modelVersion"], "v0007")
-        self.assertEqual(telemetry["modelDigest"], "sha256:model-bundle-7")
+        self.assertEqual(telemetry["modelDigest"], f"sha256:{manifest_digest}")
         self.assertEqual(telemetry["updaterVersion"], "0.4.2")
         self.assertEqual(telemetry["bomId"], "nuv-agent-0.1.113-macos-arm64")
         self.assertEqual(telemetry["bomDigest"], "sha256:bom-113")
@@ -78,7 +99,12 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["productModel"], "MACOS_DEV")
         self.assertEqual(telemetry["platformProfile"], "macos_dev")
         self.assertEqual(telemetry["identityStatus"], "DEV")
-        self.assertEqual(telemetry["capabilities"], sorted(identity.capabilities))
+        self.assertEqual(
+            telemetry["capabilities"],
+            sorted(set(identity.capabilities) | {"command.stream.policy"}),
+        )
+        self.assertNotIn("command.config.apply", telemetry["capabilities"])
+        self.assertNotIn("command.agent.update", telemetry["capabilities"])
         self.assertEqual(telemetry["bomVerificationStatus"], "UNCONFIGURED")
         self.assertNotIn("runtimeTelemetry", telemetry["runtimeTelemetry"])
         self.assertEqual(telemetry["runtimeTelemetry"]["agentVersion"], "0.1.113")
@@ -107,11 +133,25 @@ class RuntimeTelemetryTest(unittest.TestCase):
             model_dir = Path(tmp)
             metadata_dir = model_dir / "metadata"
             metadata_dir.mkdir()
+            model = model_dir / "model.onnx"
+            labels = model_dir / "labels.json"
+            model.write_bytes(b"model-bytes")
+            labels.write_bytes(b"labels-bytes")
+            model_digest = hashlib.sha256(model.read_bytes()).hexdigest()
+            labels_digest = hashlib.sha256(labels.read_bytes()).hexdigest()
             (metadata_dir / "downloaded_from_server.json").write_text(
                 json.dumps(
                     [
-                        {"key": "model.onnx", "sha256": "a" * 64},
-                        {"key": "labels.json", "sha256": "b" * 64},
+                        {
+                            "key": "model.onnx",
+                            "dst": str(model),
+                            "sha256": model_digest,
+                        },
+                        {
+                            "key": "labels.json",
+                            "dst": str(labels),
+                            "sha256": labels_digest,
+                        },
                     ]
                 ),
                 encoding="utf-8",
@@ -137,8 +177,41 @@ class RuntimeTelemetryTest(unittest.TestCase):
             )
 
         digest = telemetry["modelDigest"]
-        self.assertEqual(len(digest), 64)
-        self.assertTrue(all(character in "0123456789abcdef" for character in digest))
+        self.assertTrue(digest.startswith("sha256:"))
+        self.assertEqual(len(digest), 71)
+        self.assertTrue(
+            all(character in "0123456789abcdef" for character in digest[7:])
+        )
+
+    def test_expected_model_digest_cannot_override_observed_artifact_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            metadata_dir = model_dir / "metadata"
+            metadata_dir.mkdir()
+            manifest = metadata_dir / "gcs_manifest.json"
+            manifest.write_bytes(b"actual-manifest")
+            actual = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            (metadata_dir / "downloaded_from_server.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "key": "manifest",
+                            "dst": str(manifest),
+                            "sha256": actual,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            telemetry = build_runtime_telemetry(
+                environ={"NUVION_MODEL_DIGEST": "sha256:" + "f" * 64},
+                model_dir=model_dir,
+            )
+
+        self.assertEqual(telemetry["modelDigest"], "sha256:" + actual)
+        self.assertEqual(telemetry["modelExpectedDigest"], "sha256:" + "f" * 64)
+        self.assertIs(telemetry["modelDigestMatchesExpected"], False)
 
     def test_verified_bom_sidecar_is_authoritative_and_runtime_bound(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +281,42 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["bomVerificationStatus"], "INVALID")
         self.assertEqual(telemetry["bomId"], "unknown")
         self.assertIn("bomVerificationError", telemetry)
+
+    def test_updater_public_state_hook_requires_canonical_rollback_evidence(self) -> None:
+        public_state = {
+            "functionalHealth": "FUNCTIONAL_HEALTHY",
+            "updatePhase": "ROLLED_BACK",
+            "targetVersion": "0.1.120",
+            "updateEvidence": {
+                "rolledBackToVersion": "0.1.119",
+                "reason": "health gate failed",
+            },
+        }
+
+        merged = merge_runtime_public_state({}, public_state)
+
+        self.assertEqual(merged, public_state)
+        with self.assertRaises(ValueError):
+            merge_runtime_public_state(
+                {},
+                {
+                    "functionalHealth": "FUNCTIONAL_HEALTHY",
+                    "updatePhase": "ROLLED_BACK",
+                },
+            )
+        with self.assertRaises(ValueError):
+            merge_runtime_public_state(
+                {},
+                {"functionalHealth": "HEALTHY"},
+            )
+
+    def test_command_agent_update_is_not_advertised_without_registered_effect(self) -> None:
+        telemetry = build_runtime_telemetry(
+            environ={},
+            effect_capabilities=frozenset(),
+        )
+
+        self.assertNotIn("command.agent.update", telemetry["capabilities"])
 
 
 if __name__ == "__main__":

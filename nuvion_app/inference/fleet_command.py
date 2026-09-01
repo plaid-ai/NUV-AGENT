@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -16,6 +17,10 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from nuvion_app.runtime.settings_overlay import (
+    SettingsOverlayError,
+    validate_model_pointer,
+)
 
 JWS_ALGORITHM = "EdDSA"
 JWS_TYPE = "nuvion-command+jws"
@@ -248,11 +253,176 @@ def _positive_payload_int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
+def _bounded_payload_int(
+    payload: Mapping[str, Any], key: str, *, minimum: int, maximum: int
+) -> int:
+    value = payload.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        raise CommandValidationError(
+            "INVALID_PAYLOAD_SCHEMA",
+            f"{key} must be an integer in [{minimum}, {maximum}]",
+        )
+    return value
+
+
+def _bounded_payload_number(
+    payload: Mapping[str, Any], key: str, *, minimum: float, maximum: float
+) -> float:
+    value = payload.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < minimum
+        or float(value) > maximum
+    ):
+        raise CommandValidationError(
+            "INVALID_PAYLOAD_SCHEMA",
+            f"{key} must be a finite number in [{minimum}, {maximum}]",
+        )
+    return float(value)
+
+
+def _require_exact_payload_keys(
+    payload: Mapping[str, Any], *, required: set[str], optional: set[str] | None = None
+) -> None:
+    optional_keys = optional or set()
+    actual = set(payload)
+    missing = sorted(required - actual)
+    unknown = sorted(actual - required - optional_keys)
+    if missing or unknown:
+        detail: list[str] = []
+        if missing:
+            detail.append(f"missing={','.join(missing)}")
+        if unknown:
+            detail.append(f"unknown={','.join(unknown)}")
+        raise CommandValidationError(
+            "INVALID_PAYLOAD_SCHEMA",
+            "command payload keys are invalid (" + "; ".join(detail) + ")",
+        )
+
+
+def _payload_object(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise CommandValidationError(
+            "INVALID_PAYLOAD_SCHEMA", f"{key} must be an object"
+        )
+    return value
+
+
 def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> None:
     """Validate stable v1 discriminator fields before an effect is journaled."""
 
     if command_type == "CONFIG_APPLY":
-        _positive_payload_int(payload, "configVersion")
+        _require_exact_payload_keys(
+            payload,
+            required={"configVersion", "activation"},
+            optional={"model", "labels", "clip", "video"},
+        )
+        _bounded_payload_int(
+            payload,
+            "configVersion",
+            minimum=1,
+            maximum=2**63 - 1,
+        )
+        if payload.get("activation") not in {"IMMEDIATE", "RESTART"}:
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "CONFIG_APPLY activation must be IMMEDIATE or RESTART",
+            )
+        if not any(key in payload for key in ("model", "labels", "clip", "video")):
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "CONFIG_APPLY requires at least one model/labels/clip/video section",
+            )
+        if "model" in payload:
+            model = _payload_object(payload, "model")
+            _require_exact_payload_keys(
+                model,
+                required={"pointer", "digest"},
+            )
+            try:
+                validate_model_pointer(model.get("pointer"))
+            except SettingsOverlayError as exc:
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    f"model.pointer is invalid: {exc}",
+                ) from exc
+            digest = model.get("digest")
+            if not isinstance(digest, str) or not _DIGEST_PATTERN.fullmatch(digest):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "model.digest must be sha256:<64 lowercase hex>",
+                )
+        if "labels" in payload:
+            labels = _payload_object(payload, "labels")
+            _require_exact_payload_keys(
+                labels,
+                required=set(),
+                optional={"inspection", "anomaly"},
+            )
+            if not labels:
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "labels requires inspection or anomaly",
+                )
+            for key in labels:
+                values = labels.get(key)
+                if not isinstance(values, list) or not 1 <= len(values) <= 100:
+                    raise CommandValidationError(
+                        "INVALID_PAYLOAD_SCHEMA",
+                        f"labels.{key} must be an array of 1..100 labels",
+                    )
+                canonical: set[str] = set()
+                for value in values:
+                    if (
+                        not isinstance(value, str)
+                        or not value
+                        or value != value.strip()
+                        or len(value) > 100
+                    ):
+                        raise CommandValidationError(
+                            "INVALID_PAYLOAD_SCHEMA",
+                            f"labels.{key} entries must be trimmed non-empty strings "
+                            "up to 100 characters",
+                        )
+                    duplicate_key = value.lower()
+                    if duplicate_key in canonical:
+                        raise CommandValidationError(
+                            "INVALID_PAYLOAD_SCHEMA",
+                            f"labels.{key} entries must be unique",
+                        )
+                    canonical.add(duplicate_key)
+        if "clip" in payload:
+            clip = _payload_object(payload, "clip")
+            _require_exact_payload_keys(
+                clip,
+                required={"enabled", "preSeconds", "postSeconds"},
+            )
+            if not isinstance(clip.get("enabled"), bool):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA", "clip.enabled must be boolean"
+                )
+            _bounded_payload_int(clip, "preSeconds", minimum=0, maximum=60)
+            _bounded_payload_int(clip, "postSeconds", minimum=0, maximum=300)
+        if "video" in payload:
+            video = _payload_object(payload, "video")
+            _require_exact_payload_keys(
+                video,
+                required={"width", "height", "fps", "bitrateKbps"},
+            )
+            _bounded_payload_int(video, "width", minimum=160, maximum=7680)
+            _bounded_payload_int(video, "height", minimum=120, maximum=4320)
+            _bounded_payload_int(video, "fps", minimum=1, maximum=120)
+            _bounded_payload_int(
+                video, "bitrateKbps", minimum=100, maximum=20_000
+            )
         return
 
     if command_type == "STREAM_POLICY":
@@ -262,6 +432,70 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
             raise CommandValidationError(
                 "INVALID_PAYLOAD_SCHEMA",
                 "STREAM_POLICY mode must be ADAPTIVE, FIXED or DISABLED",
+            )
+        common = {"policyVersion", "mode"}
+        if mode == "DISABLED":
+            _require_exact_payload_keys(payload, required=common)
+            return
+        if mode == "FIXED":
+            _require_exact_payload_keys(
+                payload,
+                required=common | {"targetBitrateKbps"},
+            )
+            _bounded_payload_int(
+                payload,
+                "targetBitrateKbps",
+                minimum=100,
+                maximum=20_000,
+            )
+            return
+
+        required = common | {
+            "minBitrateKbps",
+            "maxBitrateKbps",
+            "initialBitrateKbps",
+        }
+        optional = {
+            "increaseStepKbps",
+            "decreaseFactor",
+            "congestionSamples",
+            "recoverySamples",
+            "cooldownSeconds",
+        }
+        _require_exact_payload_keys(payload, required=required, optional=optional)
+        minimum = _bounded_payload_int(
+            payload, "minBitrateKbps", minimum=100, maximum=20_000
+        )
+        initial = _bounded_payload_int(
+            payload, "initialBitrateKbps", minimum=100, maximum=20_000
+        )
+        maximum = _bounded_payload_int(
+            payload, "maxBitrateKbps", minimum=100, maximum=20_000
+        )
+        if not minimum <= initial <= maximum:
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "STREAM_POLICY bitrate bounds must satisfy min <= initial <= max",
+            )
+        if "increaseStepKbps" in payload:
+            _bounded_payload_int(
+                payload, "increaseStepKbps", minimum=1, maximum=10_000
+            )
+        if "decreaseFactor" in payload:
+            _bounded_payload_number(
+                payload, "decreaseFactor", minimum=0.5, maximum=0.95
+            )
+        if "congestionSamples" in payload:
+            _bounded_payload_int(
+                payload, "congestionSamples", minimum=1, maximum=20
+            )
+        if "recoverySamples" in payload:
+            _bounded_payload_int(
+                payload, "recoverySamples", minimum=1, maximum=20
+            )
+        if "cooldownSeconds" in payload:
+            _bounded_payload_int(
+                payload, "cooldownSeconds", minimum=1, maximum=300
             )
         return
 

@@ -1,0 +1,68 @@
+{
+  "contract": "fleet-effect-v2",
+  "commandType": "STREAM_POLICY",
+  "validPayloads": [
+    {
+      "policyVersion": 7,
+      "mode": "FIXED",
+      "targetBitrateKbps": 1500
+    },
+    {
+      "policyVersion": 8,
+      "mode": "ADAPTIVE",
+      "minBitrateKbps": 300,
+      "maxBitrateKbps": 3000,
+      "initialBitrateKbps": 1200,
+      "decreaseFactor": 0.75,
+      "increaseStepKbps": 100,
+      "congestionSamples": 3,
+      "recoverySamples": 8,
+      "cooldownSeconds": 5
+    },
+    {
+      "policyVersion": 9,
+      "mode": "ADAPTIVE",
+      "minBitrateKbps": 300,
+      "maxBitrateKbps": 3000,
+      "initialBitrateKbps": 1200
+    },
+    {
+      "policyVersion": 10,
+      "mode": "DISABLED"
+    }
+  ],
+  "adaptiveDefaults": {
+    "decreaseFactor": 0.75,
+    "increaseStepKbps": 100,
+    "congestionSamples": 3,
+    "recoverySamples": 8,
+    "cooldownSeconds": 5
+  },
+  "adaptiveReportedStateKeys": [
+    "policyVersion",
+    "mode",
+    "encoder",
+    "requestedBitrateKbps",
+    "appliedBitrateKbps",
+    "minBitrateKbps",
+    "maxBitrateKbps",
+    "initialBitrateKbps",
+    "decreaseFactor",
+    "increaseStepKbps",
+    "congestionSamples",
+    "recoverySamples",
+    "cooldownSeconds",
+    "lastAdjustmentReason",
+    "health"
+  ],
+  "fixedReportedStateKeys": [
+    "policyVersion",
+    "mode",
+    "encoder",
+    "requestedBitrateKbps",
+    "appliedBitrateKbps",
+    "targetBitrateKbps",
+    "lastAdjustmentReason",
+    "health"
+  ]
+}

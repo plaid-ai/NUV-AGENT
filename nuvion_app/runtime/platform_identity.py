@@ -45,9 +45,6 @@ PRODUCT_PROFILE = {
 _COMMON_COMMAND_CAPABILITIES = frozenset(
     {
         "fleet.command.v1",
-        "command.config.apply",
-        "command.stream.policy",
-        "command.agent.update",
         "telemetry.runtime.v1",
         "video.gstreamer",
     }

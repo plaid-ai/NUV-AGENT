@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,69 @@ from nuvion_app.runtime.release_bom import (
 DEFAULT_CONFIG_SCHEMA = "12"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PROFILE = "runtime"
+FUNCTIONAL_HEALTH_VALUES = frozenset(
+    {"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"}
+)
+UPDATE_PHASE_VALUES = frozenset(
+    {
+        "IDLE",
+        "STAGED",
+        "INSTALLING",
+        "VERIFYING",
+        "SUCCEEDED",
+        "ROLLED_BACK",
+        "FAILED",
+    }
+)
+_RUNTIME_PUBLIC_STATE_KEYS = frozenset(
+    {
+        "functionalHealth",
+        "updatePhase",
+        "updateEvidence",
+        "targetVersion",
+        "agentVersion",
+        "bomDigest",
+        "artifactDigest",
+        "componentSha",
+        "configSchema",
+        "releaseSequence",
+        "bomVerificationStatus",
+    }
+)
+
+
+def merge_runtime_public_state(
+    telemetry: Mapping[str, Any],
+    public_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge a fail-closed updater/health adapter into runtime telemetry."""
+
+    merged = dict(telemetry)
+    if public_state is None:
+        return merged
+    state = dict(public_state)
+    unknown = set(state) - _RUNTIME_PUBLIC_STATE_KEYS
+    if unknown:
+        raise ValueError(
+            "runtime public state contains unsupported fields: "
+            + ",".join(sorted(unknown))
+        )
+    functional_health = state.get("functionalHealth")
+    if (
+        functional_health is not None
+        and functional_health not in FUNCTIONAL_HEALTH_VALUES
+    ):
+        raise ValueError("functionalHealth is not canonical")
+    update_phase = state.get("updatePhase")
+    if update_phase is not None and update_phase not in UPDATE_PHASE_VALUES:
+        raise ValueError("updatePhase is not canonical")
+    evidence = state.get("updateEvidence")
+    if evidence is not None and not isinstance(evidence, Mapping):
+        raise ValueError("updateEvidence must be an object")
+    if update_phase == "ROLLED_BACK" and (not isinstance(evidence, Mapping) or not evidence):
+        raise ValueError("ROLLED_BACK requires persistent updateEvidence")
+    merged.update(state)
+    return merged
 
 
 def _package_version() -> str:
@@ -49,16 +114,19 @@ def _default_model_dir(environ: Mapping[str, str], pointer: str) -> Path:
     return (root / identifier).resolve()
 
 
-def _read_server_model_identity(model_dir: Path) -> tuple[str | None, str | None]:
+def _read_server_model_identity(
+    model_dir: Path,
+) -> tuple[str | None, str | None, str | None]:
     metadata_path = model_dir / "metadata" / "server_presign_response.json"
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return None, None
+        return None, None, None
     if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
         payload = payload["data"]
     if not isinstance(payload, dict):
-        return None, None
+        return None, None, None
+    pointer = str(payload.get("pointer") or "").strip() or None
     version = str(payload.get("resolvedVersion") or "").strip() or None
     digest = (
         str(
@@ -69,36 +137,102 @@ def _read_server_model_identity(model_dir: Path) -> tuple[str | None, str | None
         ).strip()
         or None
     )
-    return version, digest
+    return pointer, version, digest
 
 
-def _artifact_manifest_digest(model_dir: Path) -> str | None:
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _verified_artifact_digests(model_dir: Path) -> tuple[str | None, str | None]:
+    """Return (manifest-file digest, aggregate digest) after hashing every artifact."""
+
     metadata_path = model_dir / "metadata" / "downloaded_from_server.json"
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return None
+        return None, None
     if not isinstance(payload, list):
-        return None
+        return None, None
     entries: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    manifest_digest: str | None = None
+    root = model_dir.resolve()
     for item in payload:
         if not isinstance(item, dict):
-            return None
+            return None, None
         key = str(item.get("key") or "").strip()
         digest = str(item.get("sha256") or "").strip().lower()
+        raw_destination = str(item.get("dst") or "").strip()
         if (
             not key
+            or not raw_destination
             or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
         ):
-            return None
+            return None, None
+        if key in seen_keys:
+            return None, None
+        seen_keys.add(key)
+        destination = Path(raw_destination).expanduser()
+        try:
+            if stat.S_ISLNK(destination.lstat().st_mode):
+                return None, None
+            resolved_destination = destination.resolve(strict=True)
+            resolved_destination.relative_to(root)
+            actual_digest = _sha256_file(resolved_destination)
+        except (OSError, ValueError):
+            return None, None
+        if actual_digest != digest:
+            return None, None
         entries.append((key, digest))
+        if key == "manifest":
+            manifest_digest = "sha256:" + actual_digest
     if not entries:
-        return None
+        return None, None
     canonical = "".join(f"{key}:{digest}\n" for key, digest in sorted(entries)).encode(
         "utf-8"
     )
-    return hashlib.sha256(canonical).hexdigest()
+    return manifest_digest, "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _artifact_manifest_digest(model_dir: Path) -> str | None:
+    """Compatibility helper returning only verified, content-derived evidence."""
+
+    manifest_digest, aggregate_digest = _verified_artifact_digests(model_dir)
+    return manifest_digest or aggregate_digest
+
+
+def verify_model_artifact_identity(
+    model_dir: str | Path,
+    *,
+    expected_pointer: str,
+    expected_digest: str,
+) -> dict[str, str] | None:
+    """Verify a resolver pointer and signed digest against actual local bytes.
+
+    The expected environment value is deliberately not consulted.  A successful
+    result requires persisted resolver metadata plus a digest derived by hashing
+    every downloaded artifact.  The signed digest may name either the downloaded
+    manifest file or the canonical aggregate manifest.
+    """
+
+    root = Path(model_dir).expanduser().resolve()
+    observed_pointer, _version, _declared_digest = _read_server_model_identity(root)
+    manifest_digest, aggregate_digest = _verified_artifact_digests(root)
+    normalized_pointer = str(expected_pointer or "").strip()
+    normalized_digest = str(expected_digest or "").strip().lower()
+    candidates = {value for value in (manifest_digest, aggregate_digest) if value}
+    if observed_pointer != normalized_pointer or normalized_digest not in candidates:
+        return None
+    return {"pointer": observed_pointer, "digest": normalized_digest}
 
 
 def _build_info_value(name: str) -> str:
@@ -128,6 +262,8 @@ def build_runtime_telemetry(
     agent_version: str | None = None,
     component_sha: str | None = None,
     platform_identity: PlatformIdentity | None = None,
+    effect_capabilities: AbstractSet[str] = frozenset(),
+    public_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     values = os.environ if environ is None else environ
     pointer = str(values.get("NUVION_MODEL_POINTER") or DEFAULT_MODEL_POINTER).strip()
@@ -136,19 +272,18 @@ def build_runtime_telemetry(
         if model_dir
         else _default_model_dir(values, pointer)
     )
-    metadata_model_version, metadata_model_digest = _read_server_model_identity(
+    metadata_model_pointer, metadata_model_version, metadata_model_digest = _read_server_model_identity(
         resolved_model_dir
     )
     model_version = str(values.get("NUVION_MODEL_VERSION") or "").strip()
     if not model_version:
         model_version = metadata_model_version or "unknown"
-    model_digest = str(values.get("NUVION_MODEL_DIGEST") or "").strip()
-    if not model_digest:
-        model_digest = (
-            metadata_model_digest
-            or _artifact_manifest_digest(resolved_model_dir)
-            or "unknown"
-        )
+    expected_model_digest = str(values.get("NUVION_MODEL_DIGEST") or "").strip()
+    observed_artifact_digest = _artifact_manifest_digest(resolved_model_dir)
+    # Expected config is not actual evidence.  Only byte-verified artifact
+    # metadata is published as modelDigest.  The resolver-declared value remains
+    # useful context but cannot override the observed digest.
+    model_digest = observed_artifact_digest or "unknown"
 
     resolved_agent_version = (
         str(
@@ -191,6 +326,9 @@ def build_runtime_telemetry(
             values.get("NUVION_CONFIG_SCHEMA_VERSION") or DEFAULT_CONFIG_SCHEMA
         ).strip(),
         "modelPointer": pointer,
+        "modelObservedPointer": (
+            metadata_model_pointer if observed_artifact_digest else "unknown"
+        ),
         "modelVersion": model_version,
         "modelDigest": model_digest,
         "updaterVersion": str(
@@ -219,9 +357,20 @@ def build_runtime_telemetry(
         ).strip(),
         "bomVerificationStatus": bom_status,
     }
+    if expected_model_digest:
+        result["modelExpectedDigest"] = expected_model_digest
+        result["modelDigestMatchesExpected"] = model_digest == expected_model_digest
+    if metadata_model_digest:
+        result["modelResolverDigest"] = metadata_model_digest
+    if metadata_model_pointer:
+        result["modelResolverPointer"] = metadata_model_pointer
     if bom_error:
         result["bomVerificationError"] = bom_error
     result.update(identity.to_telemetry())
+    result["capabilities"] = sorted(
+        set(identity.capabilities) | {str(value) for value in effect_capabilities}
+    )
+    result = merge_runtime_public_state(result, public_state)
     # Keep the established flat fields during rollout while giving BE/FE one
     # evolvable object for platform, component and BOM details.
     result["runtimeTelemetry"] = dict(result)

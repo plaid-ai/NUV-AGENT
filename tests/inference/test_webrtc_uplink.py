@@ -31,6 +31,14 @@ class _FakeSessionDescription:
         return object()
 
 
+class _ReplyPromise:
+    def __init__(self, reply: dict[str, object]) -> None:
+        self.reply = reply
+
+    def get_reply(self) -> dict[str, object]:
+        return self.reply
+
+
 def _install_fake_gi() -> None:
     gi = types.ModuleType("gi")
     gi.require_version = lambda *_args, **_kwargs: None
@@ -103,6 +111,97 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller._on_ice_candidate(None, 0, "   ")
 
         self.assertEqual(sent_messages, [])
+
+    def test_stats_accumulator_emits_interval_loss_rtt_and_feedback_deltas(self) -> None:
+        accumulator = self.module.WebRTCStatsAccumulator()
+        first = {
+            "outbound": {
+                "type": "outbound-rtp",
+                "timestamp": 1_000_000,
+                "packets-sent": 100,
+                "bytes-sent": 100_000,
+                "nack-count": 2,
+                "pli-count": 1,
+            },
+            "remote": {
+                "type": "remote-inbound-rtp",
+                "packets-lost": 4,
+                "round-trip-time": 0.08,
+            },
+        }
+        second = {
+            "outbound": {
+                "type": "outbound-rtp",
+                "timestamp": 2_000_000,
+                "packets-sent": 200,
+                "bytes-sent": 225_000,
+                "nack-count": 4,
+                "pli-count": 2,
+            },
+            "remote": {
+                "type": "remote-inbound-rtp",
+                "packets-lost": 9,
+                "round-trip-time": 0.12,
+            },
+        }
+
+        initial = accumulator.observe(first)
+        sample = accumulator.observe(second)
+
+        self.assertEqual(initial["outboundRttMs"], 80.0)
+        self.assertAlmostEqual(sample["outboundRttMs"], 120.0)
+        self.assertAlmostEqual(sample["outboundPacketLossPct"], 100 * 5 / 105)
+        self.assertEqual(sample["nackDelta"], 2.0)
+        self.assertEqual(sample["pliDelta"], 1.0)
+        self.assertAlmostEqual(sample["sendBitrateKbps"], 1000.0)
+
+    def test_late_stats_callback_from_replaced_session_is_ignored(self) -> None:
+        controller = self.module.WebRTCUplinkController(
+            send_message=lambda *_args: True
+        )
+        controller.start(
+            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
+        )
+        old_token = (controller._stats_generation, "session-1")
+        controller.start(
+            {"broadcastId": "device-1", "sessionId": "session-2", "iceServers": []}
+        )
+        new_token = (controller._stats_generation, "session-2")
+        stats = {
+            "type": "remote-inbound-rtp",
+            "round-trip-time": 0.05,
+        }
+
+        controller._on_stats_created(_ReplyPromise(stats), old_token)
+        self.assertIsNone(controller.take_latest_outbound_stats())
+        controller._on_stats_created(_ReplyPromise(stats), new_token)
+
+        self.assertEqual(
+            controller.take_latest_outbound_stats()["outboundRttMs"],
+            50.0,
+        )
+
+    def test_stop_invalidates_inflight_stats_before_glib_callback(self) -> None:
+        controller = self.module.WebRTCUplinkController(
+            send_message=lambda *_args: True
+        )
+        controller.start(
+            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
+        )
+        token = (controller._stats_generation, "session-1")
+
+        controller.stop(send_signal=False)
+        controller._on_stats_created(
+            _ReplyPromise(
+                {
+                    "type": "remote-inbound-rtp",
+                    "round-trip-time": 0.05,
+                }
+            ),
+            token,
+        )
+
+        self.assertIsNone(controller.take_latest_outbound_stats())
 
 
 if __name__ == "__main__":

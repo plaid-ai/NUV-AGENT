@@ -1,0 +1,41 @@
+{
+  "contract": "fleet-effect-v2",
+  "commandType": "CONFIG_APPLY",
+  "validPayloads": [
+    {
+      "configVersion": 21,
+      "activation": "IMMEDIATE",
+      "video": {
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "bitrateKbps": 1500
+      }
+    },
+    {
+      "configVersion": 22,
+      "activation": "RESTART",
+      "model": {
+        "pointer": "anomalyclip/prod-v2",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "labels": {
+        "inspection": ["normal", "defect"],
+        "anomaly": ["defect"]
+      },
+      "clip": {
+        "enabled": true,
+        "preSeconds": 5,
+        "postSeconds": 10
+      }
+    }
+  ],
+  "reportedStateRequiredKeys": [
+    "configVersion",
+    "activation",
+    "configSchema",
+    "settingsDigest",
+    "health"
+  ],
+  "labelsContract": "inspection/anomaly are arrays of 1..100 trimmed non-empty strings up to 100 chars; duplicates use lowercase(Locale.ROOT)-equivalent normalization"
+}

@@ -5,6 +5,7 @@ import unittest
 from nuvion_app.inference.signaling_contract import (
     AGENT_COMMAND_QUEUE_DEST,
     AGENT_ERROR_QUEUE_DEST,
+    COMMAND_OBSERVED_ACK_QUEUE_DEST,
     EVENT_ACK_QUEUE_DEST,
     FLEET_COMMAND_QUEUE_DEST,
     REQUIRED_AGENT_SUBSCRIPTIONS,
@@ -18,12 +19,17 @@ class SignalingContractTest(unittest.TestCase):
         self.assertEqual(EVENT_ACK_QUEUE_DEST, "/user/queue/event.ack")
         self.assertEqual(FLEET_COMMAND_QUEUE_DEST, "/user/queue/fleet.command")
         self.assertEqual(
+            COMMAND_OBSERVED_ACK_QUEUE_DEST,
+            "/user/queue/fleet.command.observed.ack",
+        )
+        self.assertEqual(
             REQUIRED_AGENT_SUBSCRIPTIONS,
             (
                 AGENT_COMMAND_QUEUE_DEST,
                 AGENT_ERROR_QUEUE_DEST,
                 EVENT_ACK_QUEUE_DEST,
                 FLEET_COMMAND_QUEUE_DEST,
+                COMMAND_OBSERVED_ACK_QUEUE_DEST,
             ),
         )
 

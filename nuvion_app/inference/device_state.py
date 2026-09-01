@@ -139,6 +139,14 @@ class DeviceStateCoordinator:
                 payload["runtimeTelemetry"] = merged_runtime_telemetry
             else:
                 payload["runtimeTelemetry"] = dynamic_telemetry
+            for public_key in (
+                "capabilities",
+                "functionalHealth",
+                "updatePhase",
+                "updateEvidence",
+            ):
+                if public_key in dynamic_telemetry:
+                    payload[public_key] = dynamic_telemetry[public_key]
         return payload
 
     def _message_locked(self, status: str) -> str:

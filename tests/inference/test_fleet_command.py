@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import unittest
@@ -60,7 +61,17 @@ class FleetCommandVerifierTest(unittest.TestCase):
         )
 
     def _claims(self, **overrides: object) -> dict[str, object]:
-        payload = _json_bytes({"configVersion": 11})
+        payload = _json_bytes(
+            {
+                "configVersion": 11,
+                "activation": "IMMEDIATE",
+                "clip": {
+                    "enabled": True,
+                    "preSeconds": 5,
+                    "postSeconds": 5,
+                },
+            }
+        )
         claims: dict[str, object] = {
             "commandId": str(uuid.uuid4()),
             "deviceId": DEVICE_ID,
@@ -118,7 +129,18 @@ class FleetCommandVerifierTest(unittest.TestCase):
         self.assertEqual(command.device_id, DEVICE_ID)
         self.assertEqual(command.space_id, SPACE_ID)
         self.assertEqual(command.command_type, "CONFIG_APPLY")
-        self.assertEqual(command.payload, {"configVersion": 11})
+        self.assertEqual(
+            command.payload,
+            {
+                "configVersion": 11,
+                "activation": "IMMEDIATE",
+                "clip": {
+                    "enabled": True,
+                    "preSeconds": 5,
+                    "postSeconds": 5,
+                },
+            },
+        )
         self.assertEqual(command.required_capability, "command.config.apply")
         self.assertEqual(command.key_id, KID)
 
@@ -177,10 +199,16 @@ class FleetCommandVerifierTest(unittest.TestCase):
                     clock=lambda: NOW,
                     allowed_clock_skew=timedelta(seconds=30),
                 )
-                verified = verifier.verify(compact_jws)
-                self.assertEqual(verified.command_id, expected_claims["commandId"])
-                self.assertEqual(verified.payload, {"configVersion": 11})
-                self.assertEqual(verified.payload_hash, fixture["payloadHash"])
+                rejection = verifier.verify_for_rejection(compact_jws)
+                self.assertEqual(
+                    rejection.command.command_id,
+                    expected_claims["commandId"],
+                )
+                self.assertEqual(rejection.code, "INVALID_PAYLOAD_SCHEMA")
+                self.assertEqual(
+                    rejection.command.payload_hash,
+                    fixture["payloadHash"],
+                )
 
     def test_rejects_algorithm_type_and_unknown_key_id(self) -> None:
         cases = (
@@ -514,9 +542,56 @@ class FleetCommandVerifierTest(unittest.TestCase):
         cases = (
             ({}, {}, "INVALID_PAYLOAD_SCHEMA"),
             (
-                {"policyVersion": 1, "mode": "ADAPTIVE"},
+                {
+                    "policyVersion": 1,
+                    "mode": "ADAPTIVE",
+                    "minBitrateKbps": 256,
+                    "maxBitrateKbps": 4000,
+                    "initialBitrateKbps": 1000,
+                    "congestionSamples": 3,
+                    "recoverySamples": 5,
+                    "cooldownSeconds": 5,
+                },
                 {"type": "STREAM_POLICY"},
                 None,
+            ),
+            (
+                {
+                    "policyVersion": 1,
+                    "mode": "FIXED",
+                    "targetBitrateKbps": 1200,
+                },
+                {"type": "STREAM_POLICY"},
+                None,
+            ),
+            (
+                {"policyVersion": 1, "mode": "DISABLED"},
+                {"type": "STREAM_POLICY"},
+                None,
+            ),
+            (
+                {
+                    "policyVersion": 1,
+                    "mode": "FIXED",
+                    "targetBitrateKbps": 1200,
+                    "unexpected": True,
+                },
+                {"type": "STREAM_POLICY"},
+                "INVALID_PAYLOAD_SCHEMA",
+            ),
+            (
+                {
+                    "policyVersion": 1,
+                    "mode": "ADAPTIVE",
+                    "minBitrateKbps": 2000,
+                    "maxBitrateKbps": 4000,
+                    "initialBitrateKbps": 1000,
+                    "congestionSamples": 3,
+                    "recoverySamples": 5,
+                    "cooldownSeconds": 5,
+                },
+                {"type": "STREAM_POLICY"},
+                "INVALID_PAYLOAD_SCHEMA",
             ),
             (
                 {"policyVersion": 1, "mode": "AUTO"},
@@ -554,6 +629,151 @@ class FleetCommandVerifierTest(unittest.TestCase):
                     with self.assertRaises(CommandValidationError) as raised:
                         verifier.verify(compact)
                     self.assertEqual(raised.exception.code, expected_code)
+
+    def test_config_apply_strict_schema_boundaries_and_label_arrays(self) -> None:
+        canonical = {
+            "configVersion": 1,
+            "activation": "RESTART",
+            "model": {
+                "pointer": "anomalyclip/prod-v2",
+                "digest": "sha256:" + "a" * 64,
+            },
+            "labels": {
+                "inspection": [
+                    "normal",
+                    "defect",
+                    "x" * 100,
+                    "Straße",
+                    "STRASSE",
+                ],
+                "anomaly": ["defect"],
+            },
+            "clip": {
+                "enabled": True,
+                "preSeconds": 0,
+                "postSeconds": 300,
+            },
+            "video": {
+                "width": 160,
+                "height": 120,
+                "fps": 120,
+                "bitrateKbps": 20_000,
+            },
+        }
+        self.assertEqual(
+            self.verifier.verify(
+                self._sign(self._claims_with_payload(canonical))
+            ).payload,
+            canonical,
+        )
+
+        invalid_payloads = []
+        for mutate in (
+            lambda value: value.update(unexpected=True),
+            lambda value: value.update(configVersion=True),
+            lambda value: value.update(activation="LATER"),
+            lambda value: value["model"].update(pointer=" untrimmed"),
+            lambda value: value["model"].update(pointer="line\nbreak"),
+            lambda value: value["model"].update(pointer="/absolute/model"),
+            lambda value: value["model"].update(pointer="model//artifact"),
+            lambda value: value["model"].update(pointer="model/./artifact"),
+            lambda value: value["model"].update(pointer="model/../artifact"),
+            lambda value: value["model"].update(pointer="model$PASSWORD"),
+            lambda value: value["model"].update(pointer="model${PASSWORD}"),
+            lambda value: value["model"].update(pointer="model=value"),
+            lambda value: value["model"].update(pointer="x" * 256),
+            lambda value: value["model"].update(digest="sha256:" + "A" * 64),
+            lambda value: value["clip"].update(preSeconds=61),
+            lambda value: value["clip"].update(postSeconds=301),
+            lambda value: value["video"].update(width=159),
+            lambda value: value["video"].update(height=4321),
+            lambda value: value["video"].update(fps=0),
+            lambda value: value["video"].update(bitrateKbps=20_001),
+            lambda value: value["labels"].update(inspection=[]),
+            lambda value: value["labels"].update(inspection=["normal"] * 101),
+            lambda value: value["labels"].update(inspection=[" normal"]),
+            lambda value: value["labels"].update(inspection=["x" * 101]),
+            lambda value: value["labels"].update(inspection=["normal", "NORMAL"]),
+            lambda value: value["labels"].update(anomaly="defect"),
+        ):
+            candidate = copy.deepcopy(canonical)
+            mutate(candidate)
+            invalid_payloads.append(candidate)
+        invalid_payloads.extend(
+            [
+                {"configVersion": 1, "activation": "IMMEDIATE"},
+                {
+                    "configVersion": 1,
+                    "activation": "RESTART",
+                    "labels": {},
+                },
+            ]
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(CommandValidationError) as raised:
+                    self.verifier.verify(
+                        self._sign(self._claims_with_payload(payload))
+                    )
+                self.assertEqual(raised.exception.code, "INVALID_PAYLOAD_SCHEMA")
+
+    def test_fleet_effect_v2_stream_policy_cross_contract_fixture(self) -> None:
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "fleet-effect-v2-stream-policy.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.assertEqual(fixture["contract"], "fleet-effect-v2")
+        verifier = self._verifier(
+            Ed25519Keyring({KID: self.raw_public_key}),
+            capabilities={"command.stream.policy"},
+        )
+
+        for payload in fixture["validPayloads"]:
+            with self.subTest(mode=payload["mode"]):
+                compact = self._sign(
+                    self._claims_with_payload(payload, type="STREAM_POLICY")
+                )
+                self.assertEqual(verifier.verify(compact).payload, payload)
+
+        legacy_adaptive = {
+            "policyVersion": 11,
+            "mode": "ADAPTIVE",
+            "targetBitrateKbps": 1200,
+            "minBitrateKbps": 300,
+            "maxBitrateKbps": 3000,
+            "hysteresisSamples": 3,
+            "cooldownMs": 5000,
+        }
+        with self.assertRaises(CommandValidationError) as raised:
+            verifier.verify(
+                self._sign(
+                    self._claims_with_payload(
+                        legacy_adaptive,
+                        type="STREAM_POLICY",
+                    )
+                )
+            )
+        self.assertEqual(raised.exception.code, "INVALID_PAYLOAD_SCHEMA")
+
+    def test_fleet_effect_v2_config_apply_cross_contract_fixture(self) -> None:
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "fleet-effect-v2-config-apply.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.assertEqual(fixture["contract"], "fleet-effect-v2")
+        self.assertEqual(fixture["commandType"], "CONFIG_APPLY")
+
+        for payload in fixture["validPayloads"]:
+            with self.subTest(config_version=payload["configVersion"]):
+                compact = self._sign(
+                    self._claims_with_payload(payload, type="CONFIG_APPLY")
+                )
+                self.assertEqual(self.verifier.verify(compact).payload, payload)
 
     def test_rejects_payload_larger_than_v1_limit(self) -> None:
         payload = {"configVersion": 11, "padding": "x" * (64 * 1024)}
