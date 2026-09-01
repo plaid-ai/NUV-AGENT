@@ -176,15 +176,10 @@ class FleetCommandVerifierTest(unittest.TestCase):
         self,
     ) -> None:
         repository_root = Path(__file__).resolve().parents[2]
-        workspace_root = (
-            repository_root.parent.parent
-            if repository_root.parent.name == ".worktrees"
-            else repository_root.parent
-        )
         fixture_path = (
-            workspace_root
-            / "architecture"
-            / "contracts"
+            repository_root
+            / "tests"
+            / "runtime"
             / "fixtures"
             / "fleet-command-v1-ed25519.json"
         )

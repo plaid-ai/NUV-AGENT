@@ -1,0 +1,21 @@
+{
+  "testOnly": true,
+  "keyId": "fleet-contract-test-1",
+  "publicKeyX509Base64": "MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "publicKeyRawBase64": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+  "payloadUtf8": "{\"configVersion\":11}",
+  "payloadHash": "456a9a484ff6bace6e971b84d73dd89b6c9b7333b655c1f70801936488b65c02",
+  "compactJws": "eyJhbGciOiJFZERTQSIsImtpZCI6ImZsZWV0LWNvbnRyYWN0LXRlc3QtMSIsInR5cCI6Im51dmlvbi1jb21tYW5kK2p3cyJ9.eyJjb21tYW5kSWQiOiJjNGM0ZWNmNS1kNjZmLTRkMTYtOGJkZi03ODhmMDlmMjZhNmEiLCJkZXZpY2VJZCI6InNwLTMtbnV2aW9uLTc0ZWQ0YWEyIiwic3BhY2VJZCI6MywidHlwZSI6IkNPTkZJR19BUFBMWSIsInNjaGVtYVZlcnNpb24iOjEsImlzc3VlZEF0IjoiMjAyNi0wOS0wMVQwMjowMDowMFoiLCJleHBpcmVzQXQiOiIyMDI2LTA5LTAxVDAyOjEwOjAwWiIsInNlcXVlbmNlIjo0MiwicGF5bG9hZEJhc2U2NCI6ImV5SmpiMjVtYVdkV1pYSnphVzl1SWpveE1YMCIsInBheWxvYWRIYXNoIjoiNDU2YTlhNDg0ZmY2YmFjZTZlOTcxYjg0ZDczZGQ4OWI2YzliNzMzM2I2NTVjMWY3MDgwMTkzNjQ4OGI2NWMwMiIsImFjdG9yIjoib3BlcmF0b3JAZXhhbXBsZS5jb20iLCJhdXRob3JpemF0aW9uQ29udGV4dCI6IlNQQUNFX0FETUlOIn0.p_r8XoadW_StDmUuapAHYaQ-cm_cHjhe-gv7zBMh9L8JLAo8EFmJ7BmMJdxAhQtjF7VC1Ge1DEKaZgLPaaIZAg",
+  "claims": {
+    "commandId": "c4c4ecf5-d66f-4d16-8bdf-788f09f26a6a",
+    "deviceId": "sp-3-nuvion-74ed4aa2",
+    "spaceId": 3,
+    "type": "CONFIG_APPLY",
+    "schemaVersion": 1,
+    "issuedAt": "2026-09-01T02:00:00Z",
+    "expiresAt": "2026-09-01T02:10:00Z",
+    "sequence": 42,
+    "actor": "operator@example.com",
+    "authorizationContext": "SPACE_ADMIN"
+  }
+}

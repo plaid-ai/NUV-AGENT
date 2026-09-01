@@ -28,8 +28,8 @@ builders execute in digest-pinned containers:
 export COMPONENT_SHA=<full-stamped-source-sha>
 export SOURCE_DATE_EPOCH=<source-commit-epoch>
 packaging/release/build-agent-bundle.sh \
-  0.1.116 dist/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz
-BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz \
+  0.1.117 dist/nuv-agent_0.1.117_iq9075-aarch64.agent-bundle.tar.gz
+BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.117_iq9075-aarch64.agent-bundle.tar.gz \
   packaging/deb/build-deb.sh
 ```
 
