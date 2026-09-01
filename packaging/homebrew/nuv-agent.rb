@@ -5,7 +5,7 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.119"
+  version "0.1.120"
   license "Proprietary"
 
   depends_on :macos
