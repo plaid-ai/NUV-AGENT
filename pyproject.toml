@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nuv-agent"
-version = "0.1.115"
+version = "0.1.116"
 description = "Nuvion on-device agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ depthai = [
 
 [project.scripts]
 nuv-agent = "nuvion_app.cli:main"
+nuvion-updater = "nuvion_updater.daemon:main"
 
 [tool.setuptools]
 packages = [
@@ -44,6 +45,7 @@ packages = [
   "nuvion_app.inference",
   "nuvion_app.agent",
   "nuvion_app.runtime",
+  "nuvion_updater",
 ]
 include-package-data = true
 

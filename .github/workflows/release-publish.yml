@@ -9,6 +9,19 @@ on:
       tag:
         description: "Tag to release (e.g. v0.1.0)"
         required: true
+      publish_iq9075_ota:
+        description: "Publish signed IQ9075_DEV OTA agent-bundle"
+        required: false
+        type: boolean
+        default: false
+      release_sequence:
+        description: "Positive monotonic OTA release sequence"
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -24,13 +37,14 @@ jobs:
       FORMULA_PATH: Formula/nuv-agent.rb
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
 
@@ -63,9 +77,11 @@ jobs:
             git status --short >&2
             exit 1
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "component_sha=$COMPONENT_SHA" >> $GITHUB_OUTPUT
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "component_sha=$COMPONENT_SHA"
+          } >> "$GITHUB_OUTPUT"
           python packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
           if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
             echo "Release stamp modified unexpected files" >&2
@@ -121,10 +137,12 @@ jobs:
         run: |
           TARBALL="dist/nuv_agent-${{ steps.release_meta.outputs.version }}.tar.gz"
           SHA=$(python -c "import hashlib, pathlib; p=pathlib.Path('$TARBALL'); print(hashlib.sha256(p.read_bytes()).hexdigest())")
-          echo "tarball=$TARBALL" >> $GITHUB_OUTPUT
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=${{ steps.release_meta.outputs.tag }}" >> $GITHUB_OUTPUT
-          echo "version=${{ steps.release_meta.outputs.version }}" >> $GITHUB_OUTPUT
+          {
+            echo "tarball=$TARBALL"
+            echo "sha256=$SHA"
+            echo "tag=${{ steps.release_meta.outputs.tag }}"
+            echo "version=${{ steps.release_meta.outputs.version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate immutable sdist BOM
         id: sdist_bom
@@ -134,6 +152,7 @@ jobs:
           TARBALL: ${{ steps.sha.outputs.tarball }}
         run: |
           CONFIG_SCHEMA=$(python -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
+          UPDATER_VERSION=$(python -c "from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)")
           BUILT_AT=$(git show -s --format=%cI "$COMPONENT_SHA")
           BOM_PATH="dist/nuv_agent-${VERSION}-sdist.release-bom.json"
           python packaging/release/generate-release-bom.py \
@@ -141,13 +160,13 @@ jobs:
             --version "$VERSION" \
             --component-sha "$COMPONENT_SHA" \
             --config-schema "$CONFIG_SCHEMA" \
-            --updater-version "$VERSION" \
+            --updater-version "$UPDATER_VERSION" \
             --platform-profile macos_dev \
             --artifact "$TARBALL" \
             --artifact-kind python-sdist \
             --built-at "$BUILT_AT" \
             --output "$BOM_PATH"
-          echo "path=$BOM_PATH" >> $GITHUB_OUTPUT
+          echo "path=$BOM_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Verify existing GitHub release asset digests
         env:
@@ -163,7 +182,7 @@ jobs:
             --asset "$BOM_PATH"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.sha.outputs.tag }}
           fail_on_unmatched_files: true
@@ -184,22 +203,26 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN is not set" >&2
             exit 1
           fi
-          git clone https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git tap
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
           cp packaging/homebrew/nuv-agent.rb "tap/$FORMULA_PATH"
-          FORMULA_PATH=tap/$FORMULA_PATH URL=$URL SHA256=$SHA256 VERSION=$VERSION \
+          FORMULA_PATH="tap/$FORMULA_PATH" URL="$URL" SHA256="$SHA256" VERSION="$VERSION" \
             ./packaging/release/update-homebrew-formula.sh
           cd tap
-          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git"
           git config user.email "release-bot@plaidai.io"
           git config user.name "release-bot"
           git add "$FORMULA_PATH"
-          git commit -m "Update nuv-agent ${VERSION#v}"
-          git push origin HEAD
+          if git diff --cached --quiet; then
+            echo "Homebrew formula already matches ${VERSION}; rerun is idempotent."
+          else
+            git commit -m "Update nuv-agent ${VERSION#v}"
+            git push origin HEAD
+          fi
 
   apt-publish:
     name: Publish APT repo
-    runs-on: ubuntu-24.04-arm
-    needs: release
+    runs-on: ubuntu-latest
+    needs: [release, iq9075-ota-build]
     permissions:
       contents: read
     env:
@@ -208,23 +231,14 @@ jobs:
       BUCKET: apt.plaidai.io
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release.outputs.release_tag }}
+          persist-credentials: false
 
-      - name: Resolve version
-        id: version
-        env:
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
-        run: |
-          echo "tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-          echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Stamp build identity
+      - name: Verify clean publisher checkout
         env:
           COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
-          VERSION: ${{ needs.release.outputs.release_version }}
         run: |
           ACTUAL_SHA=$(git rev-parse HEAD)
           if [ "$ACTUAL_SHA" != "$COMPONENT_SHA" ]; then
@@ -232,27 +246,30 @@ jobs:
             exit 1
           fi
           if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-            echo "APT checkout must be clean before stamping" >&2
-            git status --short >&2
-            exit 1
-          fi
-          python3 packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
-          if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
-            echo "APT release stamp modified unexpected files" >&2
+            echo "APT publisher checkout must be clean" >&2
             git status --short >&2
             exit 1
           fi
 
-      - name: Install build deps
+      - name: Install publisher runtime before credentials
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev python3-venv python3-pip aptly gnupg
+          sudo apt-get install -y aptly gnupg
 
-      - name: Verify arm64 runner
+      - name: Download keyless release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-release-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Verify transferred deb identity
+        env:
+          DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
+          DEB_SHA256: ${{ needs.iq9075-ota-build.outputs.deb_sha256 }}
         run: |
-          ARCH=$(dpkg --print-architecture)
-          if [ "$ARCH" != "arm64" ]; then
-            echo "Runner architecture must be arm64, got $ARCH" >&2
+          ACTUAL_SHA256=$(sha256sum "dist/$DEB_NAME" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$DEB_SHA256" ]; then
+            echo "Transferred deb digest mismatch" >&2
             exit 1
           fi
 
@@ -278,52 +295,266 @@ jobs:
           echo "test" | gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --local-user "$GPG_KEY_ID" --sign >/dev/null
 
       - name: Auth GCP
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Build deb
+      - name: Publish deb to APT (GCS)
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          VERSION: ${{ needs.release.outputs.release_version }}
+          DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
+          DEB_SHA256: ${{ needs.iq9075-ota-build.outputs.deb_sha256 }}
+        run: |
+          DEB_PATH="dist/$DEB_NAME"
+          if [ "$(sha256sum "$DEB_PATH" | awk '{print $1}')" != "$DEB_SHA256" ]; then
+            echo "Deb changed before APT signing" >&2
+            exit 1
+          fi
+          packaging/apt/publish-gcs.sh "$DEB_PATH"
+
+
+  iq9075-ota-build:
+    name: Build keyless IQ9075 release artifacts
+    runs-on: ubuntu-24.04-arm
+    needs: release
+    outputs:
+      bundle_name: ${{ steps.bundle.outputs.name }}
+      bundle_sha256: ${{ steps.bundle.outputs.sha256 }}
+      deb_name: ${{ steps.bundle.outputs.deb_name }}
+      deb_sha256: ${{ steps.bundle.outputs.deb_sha256 }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.release_tag }}
+          persist-credentials: false
+
+      - name: Verify and stamp release identity
+        env:
+          COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
+          VERSION: ${{ needs.release.outputs.release_version }}
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [ "$ACTUAL_SHA" != "$COMPONENT_SHA" ]; then
+            echo "OTA checkout does not match the release component SHA" >&2
+            exit 1
+          fi
+          if [ "$(dpkg --print-architecture)" != "arm64" ]; then
+            echo "OTA runner architecture must be arm64" >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "OTA checkout must be clean before stamping" >&2
+            exit 1
+          fi
+          python3 packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
+          if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
+            echo "OTA release stamp modified unexpected files" >&2
+            git status --short >&2
+            exit 1
+          fi
+
+      - name: Build exact bundle and deb without release credentials
+        id: bundle
+        env:
+          VERSION: ${{ needs.release.outputs.release_version }}
           COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
         run: |
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")
           export SOURCE_DATE_EPOCH
-          cd packaging/deb
-          ./build-deb.sh
+          BUNDLE_NAME="nuv-agent_${VERSION}_iq9075-aarch64.agent-bundle.tar.gz"
+          BUNDLE_PATH="dist/$BUNDLE_NAME"
+          packaging/release/build-agent-bundle.sh "$VERSION" "$BUNDLE_PATH"
+          BUNDLE_SHA256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
+          DEB_NAME="nuv-agent_${VERSION}_arm64.deb"
+          DEB_PATH="dist/$DEB_NAME"
+          BOOTSTRAP_BUNDLE_PATH="$BUNDLE_PATH" \
+          OUTPUT_DEB="$DEB_PATH" \
+            packaging/deb/build-deb.sh
+          DEB_SHA256=$(sha256sum "$DEB_PATH" | awk '{print $1}')
+          {
+            echo "name=$BUNDLE_NAME"
+            echo "path=$BUNDLE_PATH"
+            echo "sha256=$BUNDLE_SHA256"
+            echo "deb_name=$DEB_NAME"
+            echo "deb_path=$DEB_PATH"
+            echo "deb_sha256=$DEB_SHA256"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Publish to APT (GCS)
+      - name: Transfer immutable unsigned artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iq9075-release-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.bundle.outputs.path }}
+            ${{ steps.bundle.outputs.deb_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  iq9075-ota-publish:
+    name: Sign and publish IQ9075 OTA bundle
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_iq9075_ota
+    runs-on: ubuntu-latest
+    needs: [release, iq9075-ota-build]
+    permissions:
+      contents: read
+    env:
+      BUCKET: apt.plaidai.io
+    steps:
+      - name: Checkout trusted signer and publisher
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.release_tag }}
+          persist-credentials: false
+
+      - name: Install signer runtime without project dependency resolution
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-cryptography
+
+      - name: Download keyless bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-release-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Verify transferred bundle identity
         env:
-          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
-          VERSION: ${{ steps.version.outputs.version }}
+          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.iq9075-ota-build.outputs.bundle_sha256 }}
           COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
         run: |
-          DEB_PATH="dist/nuv-agent_${VERSION}_arm64.deb"
-          if [ ! -f "$DEB_PATH" ]; then
-            echo "Deb not found at $DEB_PATH" >&2
-            ls -la dist || true
+          if [ "$(git rev-parse HEAD)" != "$COMPONENT_SHA" ]; then
+            echo "Signer checkout does not match the release component SHA" >&2
             exit 1
           fi
+          ACTUAL_SHA256=$(sha256sum "dist/$BUNDLE_NAME" | awk '{print $1}')
+          if [ "$ACTUAL_SHA256" != "$BUNDLE_SHA256" ]; then
+            echo "Transferred OTA bundle digest mismatch" >&2
+            exit 1
+          fi
+
+      - name: Sign exact bundle BOM
+        env:
+          VERSION: ${{ needs.release.outputs.release_version }}
+          COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
+          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.iq9075-ota-build.outputs.bundle_sha256 }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
+          RELEASE_SIGNING_KEY_ID: ${{ secrets.IQ9075_RELEASE_SIGNING_KEY_ID }}
+        run: |
+          if [[ ! "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]; then
+            echo "release_sequence must be a positive integer for IQ9075 OTA" >&2
+            exit 1
+          fi
+          if [ -z "$RELEASE_SIGNING_PRIVATE_KEY" ]; then
+            echo "IQ9075 release signing private key secret is required" >&2
+            exit 1
+          fi
+          if [ -z "$RELEASE_SIGNING_KEY_ID" ]; then
+            echo "IQ9075 release signing key id secret is required" >&2
+            exit 1
+          fi
+
           CONFIG_SCHEMA=$(python3 -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
+          MIN_UPDATER_VERSION=$(python3 -c "from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)")
           BUILT_AT=$(git show -s --format=%cI "$COMPONENT_SHA")
-          BOM_PATH="dist/nuv-agent_${VERSION}_arm64.release-bom.json"
-          python3 packaging/release/generate-release-bom.py \
-            --bom-id "nuv-agent-${VERSION}-arm64" \
+          BUNDLE_PATH="dist/$BUNDLE_NAME"
+          if [ "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" != "$BUNDLE_SHA256" ]; then
+            echo "Bundle changed before signing" >&2
+            exit 1
+          fi
+
+          BOM_PATH="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          SIGNATURE_PATH="$BOM_PATH.sig"
+          NUVION_IQ9075_RELEASE_SIGNING_KEY="$RELEASE_SIGNING_PRIVATE_KEY" \
+            python3 packaging/release/generate-release-bom.py \
+            --schema-version 2 \
+            --bom-id "nuv-agent-${VERSION}-iq9075-aarch64" \
             --version "$VERSION" \
             --component-sha "$COMPONENT_SHA" \
             --config-schema "$CONFIG_SCHEMA" \
-            --updater-version "$VERSION" \
-            --platform-profile rpi5_deepx_dx_m1 \
-            --platform-profile ventuno_q \
-            --platform-profile jetson_orin_nx \
-            --platform-profile iq9075_dev \
-            --artifact "$DEB_PATH" \
-            --artifact-kind deb \
+            --release-sequence "$RELEASE_SEQUENCE" \
+            --min-updater-version "$MIN_UPDATER_VERSION" \
+            --target "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64" \
+            --artifact "$BUNDLE_PATH" \
+            --artifact-kind agent-bundle \
             --built-at "$BUILT_AT" \
-            --output "$BOM_PATH"
-          packaging/apt/publish-gcs.sh "$DEB_PATH" "$BOM_PATH"
+            --output "$BOM_PATH" \
+            --signature-output "$SIGNATURE_PATH" \
+            --signing-key-id "$RELEASE_SIGNING_KEY_ID" \
+            --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+          unset RELEASE_SIGNING_PRIVATE_KEY
+
+      - name: Verify signed BOM with independent public keyring
+        env:
+          VERSION: ${{ needs.release.outputs.release_version }}
+          RELEASE_KEYRING_JSON: ${{ secrets.IQ9075_RELEASE_PUBLIC_KEYRING_JSON }}
+        run: |
+          if [ -z "$RELEASE_KEYRING_JSON" ]; then
+            echo "IQ9075 release public keyring secret is required" >&2
+            exit 1
+          fi
+          KEYRING_PATH="${RUNNER_TEMP}/iq9075-release-keyring-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          umask 077
+          printf '%s' "$RELEASE_KEYRING_JSON" > "$KEYRING_PATH"
+          PYTHONPATH=. python3 - \
+            "dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json" \
+            "dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json.sig" \
+            "$KEYRING_PATH" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from nuvion_app.runtime.release_bom import load_signed_release_bom
+          from nuvion_updater.trust import load_release_keyring
+
+          keyring = load_release_keyring(
+              Path(sys.argv[3]),
+              expected_trust_domain="iq9075-dev",
+              require_root_owner=False,
+          )
+          load_signed_release_bom(
+              Path(sys.argv[1]), Path(sys.argv[2]), release_keyring=keyring
+          )
+          PY
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Publish verified exact bundle without signing key
+        env:
+          VERSION: ${{ needs.release.outputs.release_version }}
+          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.iq9075-ota-build.outputs.bundle_sha256 }}
+        run: |
+          BUNDLE_PATH="dist/$BUNDLE_NAME"
+          if [ "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" != "$BUNDLE_SHA256" ]; then
+            echo "Bundle changed before publish" >&2
+            exit 1
+          fi
+          BOM_PATH="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          SIGNATURE_PATH="$BOM_PATH.sig"
+
+          KEYRING_PATH="${RUNNER_TEMP}/iq9075-release-keyring-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          RELEASE_KEYRING_PATH="$KEYRING_PATH" \
+          RELEASE_TRUST_DOMAIN=iq9075-dev \
+          SKIP_APT_PUBLISH=true \
+            packaging/apt/publish-gcs.sh \
+              "$BUNDLE_PATH" "$BOM_PATH" "$SIGNATURE_PATH" "$BUNDLE_PATH"

@@ -14,6 +14,7 @@ from nuvion_app.inference.command_inbox import (
 )
 from nuvion_app.inference.effect_reconciler import (
     FleetEffectCoordinator,
+    ReconcileDeferred,
     ReconcilerRegistry,
 )
 from nuvion_app.inference.fleet_command import VerifiedFleetCommand
@@ -22,6 +23,7 @@ from nuvion_app.inference.reconcile_store import (
     JOB_PHASE_CLAIMED,
     JOB_PHASE_PENDING,
     JOB_PHASE_SUPERSEDED,
+    JOB_PHASE_VERIFYING,
     DurableReconcileStore,
     EffectFenceStale,
 )
@@ -92,6 +94,30 @@ class _WritingReconciler:
         self.restore_calls.append(command.command_id)
         outcome = self.reconcile(command)
         return dict(outcome.reported_state or {})
+
+
+class _RetryingReconciler:
+    command_type = "STREAM_POLICY"
+    capability = "command.stream.policy"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def reconcile(
+        self, command: VerifiedFleetCommand
+    ) -> CommandEffectOutcome | ReconcileDeferred:
+        self.calls += 1
+        if self.calls == 1:
+            return ReconcileDeferred(
+                reported_state={**command.payload, "health": "HELPER_UNAVAILABLE"},
+                checkpoint={
+                    "nextAction": "RETRY_EFFECT",
+                    "restartRequired": False,
+                },
+            )
+        return CommandEffectOutcome.succeeded(
+            {**command.payload, "health": "STREAM_CONTINUOUS"}
+        )
 
 
 class _Encoder:
@@ -217,6 +243,46 @@ class DurableReconcileStoreTest(unittest.TestCase):
         self.assertEqual(reclaimed.phase, JOB_PHASE_CLAIMED)
         self.assertEqual(reclaimed.lease_owner, "worker-b")
         self.assertEqual(reclaimed.attempts, 2)
+
+    def test_effect_retry_uses_backoff_without_requesting_restart(self) -> None:
+        ticks = {"now": 10.0}
+        inbox = DurableCommandInbox(Path(self.tempdir.name) / "retry.sqlite3")
+        store = DurableReconcileStore(
+            inbox,
+            monotonic_clock=lambda: ticks["now"],
+        )
+        command = _stream_command(1)
+        inbox.accept(command)
+        inbox.transition(command.command_id, "IN_PROGRESS")
+        inbox.run_transactional_effect(
+            command.command_id,
+            lambda connection: store.stage_verified(command, connection),
+        )
+        reconciler = _RetryingReconciler()
+        registry = ReconcilerRegistry()
+        registry.register(reconciler)
+        restart_calls: list[bool] = []
+        coordinator = FleetEffectCoordinator(
+            inbox=inbox,
+            store=store,
+            registry=registry,
+            owner="retry-worker",
+            restart_requester=lambda: restart_calls.append(True) or True,
+        )
+
+        first = coordinator.run_once()
+
+        self.assertEqual(first.processed, 1)
+        self.assertEqual(first.terminal_acks, ())
+        self.assertEqual(store.get_job(command.command_id).phase, JOB_PHASE_VERIFYING)
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(coordinator.run_once().processed, 0)
+
+        ticks["now"] = 12.1
+        completed = coordinator.run_once()
+        self.assertEqual(completed.terminal_acks[0].status, "SUCCEEDED")
+        self.assertEqual(reconciler.calls, 2)
+        self.assertEqual(restart_calls, [])
 
     def test_expired_stale_fence_cannot_mutate_encoder(self) -> None:
         ticks = {"now": 10.0}

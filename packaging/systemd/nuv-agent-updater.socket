@@ -1,0 +1,13 @@
+[Unit]
+Description=NUVION Agent privileged updater socket
+
+[Socket]
+ListenStream=/run/nuvion-updater/control.sock
+SocketUser=root
+SocketGroup=nuvion
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

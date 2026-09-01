@@ -184,6 +184,33 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIn("updateEvidence", telemetry)
         self.assertIn("commandObservationOutbox", telemetry)
 
+    def test_stale_updater_cache_hides_capability_but_keeps_terminal_evidence(self) -> None:
+        trusted = {
+            "agentUpdate": {
+                "capabilityAvailable": True,
+                "authenticatedHelper": True,
+                "reason": "READY",
+            },
+            "updaterVersion": "0.1.0",
+            "updatePhase": "ROLLED_BACK",
+            "updateEvidence": {"commandId": "update-1", "phase": "ROLLED_BACK"},
+        }
+        with (
+            mock.patch.object(pipeline, "updater_telemetry_cache", trusted),
+            mock.patch.object(
+                pipeline,
+                "updater_telemetry_cache_updated_at",
+                pipeline.time.monotonic() - 100.0,
+            ),
+            mock.patch.object(pipeline, "UPDATER_TELEMETRY_TTL_SEC", 1.0),
+        ):
+            stale = pipeline.get_cached_updater_runtime_telemetry()
+
+        self.assertEqual(stale["updaterVersion"], "unknown")
+        self.assertFalse(stale["agentUpdate"]["capabilityAvailable"])
+        self.assertEqual(stale["updatePhase"], "ROLLED_BACK")
+        self.assertEqual(stale["updateEvidence"], trusted["updateEvidence"])
+
     def test_supervisor_restart_is_enabled_only_inside_systemd_linux_service(self) -> None:
         with mock.patch.object(pipeline.sys, "platform", "linux"):
             self.assertTrue(

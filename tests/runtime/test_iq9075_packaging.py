@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -34,6 +33,9 @@ class Iq9075PackagingTest(unittest.TestCase):
             encoding="utf-8"
         )
         postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+        bundle = (ROOT / "packaging/release/build-agent-bundle.sh").read_text(
+            encoding="utf-8"
+        )
 
         self.assertEqual(requirements.count("depthai==2.32.0.0"), 1)
         self.assertIn(
@@ -44,14 +46,13 @@ class Iq9075PackagingTest(unittest.TestCase):
         for evidence in (
             'DEPTHAI_VERSION="2.32.0.0"',
             'dpkg --print-architecture)" != "arm64"',
-            "--only-binary=:all:",
-            "--require-hashes",
-            "--no-deps",
             'version("depthai")',
             "import depthai",
             'getattr(depthai, "__version__"',
         ):
             self.assertIn(evidence, postinst)
+        for evidence in ("--only-binary=:all:", "--require-hashes", "--no-deps"):
+            self.assertIn(evidence, bundle)
 
     def test_oak_udev_rule_is_packaged_and_least_privilege(self) -> None:
         rule_path = ROOT / "packaging/udev/80-movidius.rules"
@@ -80,11 +81,15 @@ class Iq9075PackagingTest(unittest.TestCase):
 
     def test_postinst_has_fail_closed_bounded_install_modes(self) -> None:
         postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
-        self.assertIn('NUVION_INSTALL_PROFILE:-full', postinst)
+        self.assertIn('NUVION_INSTALL_PROFILE:-base', postinst)
         self.assertIn('NUVION_INSTALL_AUTOSTART:-true', postinst)
-        self.assertIn('package_spec="/opt/nuv-agent/src"', postinst)
+        self.assertIn('full|runtime)', postinst)
+        self.assertIn("requires its own hash-locked immutable bundle", postinst)
+        self.assertIn('BOOTSTRAP_ROOT="$INSTALL_ROOT/bootstrap"', postinst)
+        self.assertNotIn("venv --clear", postinst)
+        self.assertNotIn("pip install", postinst)
         self.assertIn("Unsupported NUVION_INSTALL_PROFILE", postinst)
-        self.assertIn("systemctl disable nuv-agent.service", postinst)
+        self.assertIn("systemctl disable --now nuv-agent.service", postinst)
 
     def test_iq9075_installer_is_board_bound_and_leaves_service_disabled(self) -> None:
         installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
@@ -92,6 +97,8 @@ class Iq9075PackagingTest(unittest.TestCase):
         )
         for evidence in ("qcs9075", "iq-9075", "dpkg --print-architecture"):
             self.assertIn(evidence, installer)
+        self.assertIn('VERSION_ID:-}" = "24.04"', installer)
+        self.assertIn('python_version" = "3.12"', installer)
         for safe_value in (
             '"NUVION_VIDEO_SOURCE": "oak" if camera_mode == "oak" else "auto"',
             '"NUVION_GST_SOURCE": ""',
@@ -192,6 +199,7 @@ class Iq9075PackagingTest(unittest.TestCase):
         e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
         self.assertIn('camera_mode="oak"', e2e)
         self.assertIn("runuser -u nuvion", e2e)
+        self.assertIn("/opt/nuv-agent/current/venv/bin/python", e2e)
         self.assertIn('expected_version = "2.32.0.0"', e2e)
         self.assertIn("timeout 45s", e2e)
         self.assertIn("DepthAIFrameSource", e2e)

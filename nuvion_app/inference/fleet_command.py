@@ -17,6 +17,7 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 from nuvion_app.runtime.settings_overlay import (
     SettingsOverlayError,
     validate_model_pointer,
@@ -500,6 +501,11 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
         return
 
     if command_type == "AGENT_UPDATE":
+        if set(payload) != {"targetVersion", "bomDigest"}:
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "AGENT_UPDATE payload must contain exactly targetVersion and bomDigest",
+            )
         target_version = payload.get("targetVersion")
         if not isinstance(target_version, str) or not _SEMVER_PATTERN.fullmatch(
             target_version
@@ -527,6 +533,7 @@ class FleetCommandVerifier:
         expected_device_id: str,
         expected_space_id: int,
         capabilities: AbstractSet[str],
+        capability_provider: Callable[[], AbstractSet[str]] | None = None,
         supported_schema_versions: AbstractSet[int] = frozenset({1}),
         allowed_authorization_contexts: AbstractSet[
             str
@@ -562,12 +569,24 @@ class FleetCommandVerifier:
         self.keyring = keyring
         self.expected_device_id = expected_device_id
         self.expected_space_id = expected_space_id
-        self.capabilities = frozenset(capabilities)
+        self._capabilities = frozenset(capabilities)
+        if capability_provider is not None and not callable(capability_provider):
+            raise TypeError("capability_provider must be callable")
+        self._capability_provider = capability_provider
         self.supported_schema_versions = frozenset(supported_schema_versions)
         self.allowed_authorization_contexts = normalized_contexts
         self.max_command_ttl = max_command_ttl
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.allowed_clock_skew = allowed_clock_skew
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        if self._capability_provider is None:
+            return self._capabilities
+        try:
+            return frozenset(self._capability_provider())
+        except Exception:  # noqa: BLE001 - command admission must fail closed.
+            return frozenset()
 
     def verify(self, compact_jws: str) -> VerifiedFleetCommand:
         evaluation = self.evaluate(compact_jws)

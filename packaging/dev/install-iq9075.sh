@@ -65,6 +65,9 @@ deb_path="$(realpath "$deb_argument")"
 # shellcheck disable=SC1091
 . /etc/os-release
 [ "${ID:-}" = "ubuntu" ] || die "only Ubuntu is supported (found ${ID:-unknown})"
+[ "${VERSION_ID:-}" = "24.04" ] || die "IQ9075 OTA requires Ubuntu 24.04"
+python_version="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+[ "$python_version" = "3.12" ] || die "IQ9075 OTA requires CPython 3.12"
 
 device_tree="$(read_device_tree | tr '[:upper:]' '[:lower:]')"
 case "$device_tree" in

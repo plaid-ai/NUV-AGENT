@@ -4,6 +4,8 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from nuvion_app.runtime.updater_client import authenticated_updater_version
+
 DEVICE_STATE_RUNNING = "RUNNING"
 DEVICE_STATE_ERROR = "ERROR"
 DEVICE_STATE_NETWORK_ISSUE = "NETWORK_ISSUE"
@@ -132,6 +134,13 @@ class DeviceStateCoordinator:
         payload.update(self._telemetry)
         if self._runtime_telemetry_provider is not None:
             dynamic_telemetry = dict(self._runtime_telemetry_provider())
+            if "agentUpdate" in dynamic_telemetry or "updaterVersion" in dynamic_telemetry:
+                # updaterVersion is rollout eligibility evidence. Never let a
+                # static/BOM/config value or unauthenticated dynamic adapter
+                # upgrade it from the fail-closed sentinel.
+                dynamic_telemetry["updaterVersion"] = authenticated_updater_version(
+                    dynamic_telemetry.get("agentUpdate")
+                )
             runtime_telemetry = payload.get("runtimeTelemetry")
             if isinstance(runtime_telemetry, Mapping):
                 merged_runtime_telemetry = dict(runtime_telemetry)
@@ -144,9 +153,22 @@ class DeviceStateCoordinator:
                 "functionalHealth",
                 "updatePhase",
                 "updateEvidence",
+                "updaterVersion",
             ):
                 if public_key in dynamic_telemetry:
                     payload[public_key] = dynamic_telemetry[public_key]
+        functional_health = (
+            "FUNCTIONAL_HEALTHY"
+            if self._runtime_status == RUNTIME_STATUS_RUNNING
+            else "FUNCTIONAL_UNHEALTHY"
+        )
+        payload["functionalHealth"] = functional_health
+        runtime_telemetry = payload.get("runtimeTelemetry")
+        if isinstance(runtime_telemetry, Mapping):
+            payload["runtimeTelemetry"] = {
+                **dict(runtime_telemetry),
+                "functionalHealth": functional_health,
+            }
         return payload
 
     def _message_locked(self, status: str) -> str:

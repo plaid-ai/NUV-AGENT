@@ -1,0 +1,38 @@
+[Unit]
+Description=NUVION Agent privileged release updater
+Requires=nuv-agent-updater.socket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/usr/lib/nuvion-updater
+EnvironmentFile=/etc/nuvion-updater/updater.env
+ExecStart=/usr/bin/python3 -s -m nuvion_updater.daemon --repository-base-url ${NUVION_RELEASE_BASE_URL}
+StateDirectory=nuvion-updater
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# IQ9075 release gating needs physical OAK access. The fixed probe drops camera
+# access to the nuvion service user; updater requests cannot provide commands.
+PrivateDevices=false
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/nuv-agent /var/lib/nuvion-updater /run/nuvion-updater
+ReadOnlyPaths=/etc/nuvion-updater /usr/lib/nuvion-updater
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

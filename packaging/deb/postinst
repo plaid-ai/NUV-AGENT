@@ -1,32 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly NUVION_VENV="/opt/nuv-agent/venv"
-readonly NUVION_CURRENT="/opt/nuv-agent/current"
-readonly DEPTHAI_REQUIREMENTS="/opt/nuv-agent/share/requirements-depthai-arm64.txt"
+readonly INSTALL_ROOT="/opt/nuv-agent"
+readonly BOOTSTRAP_ROOT="$INSTALL_ROOT/bootstrap"
+readonly BOOTSTRAP_BUNDLE="$INSTALL_ROOT/share/bootstrap-agent-bundle.tar.gz"
+readonly BOOTSTRAP_BUNDLE_DIGEST="$INSTALL_ROOT/share/bootstrap-agent-bundle.sha256"
 readonly DEPTHAI_VERSION="2.32.0.0"
 
-install_depthai_arm64() {
+package_version="$(dpkg-query -W -f='${Version}' nuv-agent 2>/dev/null || true)"
+package_version="${package_version#*:}"
+package_version="${package_version%%-*}"
+if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "Cannot resolve a safe installed nuv-agent version" >&2
+  exit 1
+fi
+readonly BOOTSTRAP_SLOT="$BOOTSTRAP_ROOT/$package_version"
+
+verify_depthai_arm64() {
+  local venv_path="$1"
   local installed_version
 
   if [ "$(dpkg --print-architecture)" != "arm64" ]; then
-    echo "Skipping DepthAI: the pinned OAK runtime is packaged for Ubuntu arm64 only"
-    return 0
-  fi
-  if [ ! -f "$DEPTHAI_REQUIREMENTS" ]; then
-    echo "Missing DepthAI requirements: $DEPTHAI_REQUIREMENTS" >&2
+    echo "Immutable bootstrap bundle is only supported on arm64" >&2
     return 1
   fi
-
-  "$NUVION_VENV/bin/pip" install \
-    --disable-pip-version-check \
-    --no-cache-dir \
-    --no-deps \
-    --only-binary=:all: \
-    --require-hashes \
-    --requirement "$DEPTHAI_REQUIREMENTS" >/dev/null
-
-  installed_version="$("$NUVION_VENV/bin/python" - <<'PY'
+  installed_version="$("$venv_path/bin/python" -s - <<'PY'
 from importlib.metadata import version
 
 import depthai
@@ -52,7 +50,6 @@ reload_oak_udev_rules() {
     echo "udevadm is unavailable; OAK permissions will apply after the next boot" >&2
     return 0
   fi
-
   udevadm control --reload-rules || true
   udevadm trigger \
     --action=add \
@@ -61,16 +58,12 @@ reload_oak_udev_rules() {
   udevadm settle --timeout=10 || true
 }
 
-install_profile="${NUVION_INSTALL_PROFILE:-full}"
+install_profile="${NUVION_INSTALL_PROFILE:-base}"
 case "$install_profile" in
-  full)
-    package_spec="/opt/nuv-agent/src[zsad,triton]"
-    ;;
-  runtime)
-    package_spec="/opt/nuv-agent/src[triton]"
-    ;;
-  base)
-    package_spec="/opt/nuv-agent/src"
+  base) ;;
+  full|runtime)
+    echo "Profile $install_profile requires its own hash-locked immutable bundle" >&2
+    exit 2
     ;;
   *)
     echo "Unsupported NUVION_INSTALL_PROFILE: $install_profile (expected full, runtime, or base)" >&2
@@ -81,12 +74,8 @@ esac
 install_autostart="${NUVION_INSTALL_AUTOSTART:-true}"
 install_autostart="${install_autostart,,}"
 case "$install_autostart" in
-  1|true|yes|on)
-    install_autostart=true
-    ;;
-  0|false|no|off)
-    install_autostart=false
-    ;;
+  1|true|yes|on) install_autostart=true ;;
+  0|false|no|off) install_autostart=false ;;
   *)
     echo "Unsupported NUVION_INSTALL_AUTOSTART: $install_autostart" >&2
     exit 2
@@ -102,26 +91,78 @@ print_nuv_agent_banner() {
 '|_| \_|\___/   \__/  /_/   \_\____|_____|_| \_| |_|'
 }
 
+atomic_slot_link() {
+  local name="$1"
+  local target="$2"
+  local temporary="$INSTALL_ROOT/.${name}.$$"
+  ln -s "$target" "$temporary"
+  mv -Tf "$temporary" "$INSTALL_ROOT/$name"
+}
+
 if ! id -u nuvion >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin nuvion
 fi
-
 if getent group video >/dev/null 2>&1; then
   usermod -a -G video nuvion || true
 fi
 if getent group dialout >/dev/null 2>&1; then
   usermod -a -G dialout nuvion || true
 fi
+# Load the package's new units before auditing/stopping legacy processes. This
+# also makes a first upgrade from a package without the updater units safe.
+systemctl daemon-reload
+# docker.sock is root-equivalent. The Agent must never retain this group.
 if getent group docker >/dev/null 2>&1; then
-  usermod -a -G docker nuvion || true
+  docker_gid="$(getent group docker | awk -F: 'NR == 1 {print $3}')"
+  if [[ ! "$docker_gid" =~ ^[0-9]+$ ]]; then
+    echo "Cannot resolve the docker group GID safely" >&2
+    exit 1
+  fi
+  if id -G nuvion | tr ' ' '\n' | grep -Fxq "$docker_gid"; then
+    # Stop first so the old process cannot retain the supplementary GID after
+    # NSS membership changes. Failure is not optional at this trust boundary.
+    if ! systemctl stop nuv-agent-updater.socket nuv-agent-updater.service; then
+      echo "Cannot stop the existing updater trust endpoint" >&2
+      exit 1
+    fi
+    if ! systemctl stop nuv-agent.service; then
+      echo "Cannot stop the docker-privileged nuvion process" >&2
+      exit 1
+    fi
+    if systemctl is-active --quiet nuv-agent.service; then
+      echo "docker-privileged nuvion process is still active" >&2
+      exit 1
+    fi
+    if ! gpasswd -d nuvion docker >/dev/null 2>&1; then
+      echo "Cannot remove root-equivalent docker group from nuvion" >&2
+      systemctl disable --now nuv-agent-updater.socket || true
+      exit 1
+    fi
+  fi
+  if id -G nuvion | tr ' ' '\n' | grep -Fxq "$docker_gid"; then
+    echo "nuvion still has the root-equivalent docker group" >&2
+    if ! systemctl stop nuv-agent.service; then
+      systemctl kill --kill-who=all --signal=SIGKILL nuv-agent.service || true
+    fi
+    if systemctl is-active --quiet nuv-agent.service; then
+      echo "Cannot safe-stop the docker-privileged nuvion process" >&2
+      exit 1
+    fi
+    if ! systemctl disable --now nuv-agent-updater.socket; then
+      echo "Cannot disable the updater endpoint after docker-group audit failure" >&2
+      exit 1
+    fi
+    exit 1
+  fi
 fi
 
 install -d -m 0770 -o root -g nuvion /etc/nuv-agent
+install -d -m 0700 -o root -g root /etc/nuvion-updater /var/lib/nuvion-updater
+chmod 0600 /etc/nuvion-updater/updater.env
 
 if [ ! -f /etc/nuv-agent/agent.env ]; then
-  cp /opt/nuv-agent/share/agent.env.example /etc/nuv-agent/agent.env
+  cp "$INSTALL_ROOT/share/agent.env.example" /etc/nuv-agent/agent.env
 fi
-
 chown root:nuvion /etc/nuv-agent/agent.env
 chmod 0660 /etc/nuv-agent/agent.env
 
@@ -133,9 +174,6 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   if getent group dialout >/dev/null 2>&1; then
     usermod -a -G dialout "$SUDO_USER" || true
   fi
-  if getent group docker >/dev/null 2>&1; then
-    usermod -a -G docker "$SUDO_USER" || true
-  fi
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "u:${SUDO_USER}:rwx" /etc/nuv-agent || true
     setfacl -m "u:${SUDO_USER}:rw" /etc/nuv-agent/agent.env || true
@@ -146,28 +184,131 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required to configure nuv-agent" >&2
   exit 1
 fi
-python3 -m venv --clear --system-site-packages "$NUVION_VENV"
-"$NUVION_VENV/bin/pip" install --no-cache-dir --upgrade pip >/dev/null
-"$NUVION_VENV/bin/pip" install --no-cache-dir --upgrade "$package_spec" >/dev/null
-install_depthai_arm64
-"$NUVION_VENV/bin/python" -m nuvion_app.cli doctor --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
 
-# Legacy single-slot packages expose the same stable path used by staged OTA.
-# Never replace an OTA-managed current symlink that already exists.
-if [ ! -e "$NUVION_CURRENT" ] && [ ! -L "$NUVION_CURRENT" ]; then
-  ln -s /opt/nuv-agent "$NUVION_CURRENT"
+install -d -m 0755 -o root -g root "$BOOTSTRAP_ROOT"
+if [ ! -d "$BOOTSTRAP_SLOT" ]; then
+  temporary_slot="$(mktemp -d "$BOOTSTRAP_ROOT/.${package_version}.XXXXXX")"
+  cleanup_slot() {
+    [ -n "${temporary_slot:-}" ] && rm -rf -- "$temporary_slot"
+  }
+  trap cleanup_slot EXIT
+  if [ -L "$BOOTSTRAP_BUNDLE" ] || [ ! -f "$BOOTSTRAP_BUNDLE" ]; then
+    echo "Missing regular immutable bootstrap bundle" >&2
+    exit 1
+  fi
+  if [ -L "$BOOTSTRAP_BUNDLE_DIGEST" ] || [ ! -f "$BOOTSTRAP_BUNDLE_DIGEST" ]; then
+    echo "Missing regular bootstrap bundle digest" >&2
+    exit 1
+  fi
+  (
+    cd "$INSTALL_ROOT/share"
+    sha256sum --check --strict --status "$(basename "$BOOTSTRAP_BUNDLE_DIGEST")"
+  )
+  python3 - "$BOOTSTRAP_BUNDLE" "$temporary_slot" <<'PY'
+import os
+import shutil
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+archive_path = Path(sys.argv[1])
+destination = Path(sys.argv[2]).resolve(strict=True)
+seen: set[str] = set()
+total_size = 0
+with tarfile.open(archive_path, mode="r:gz") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > 100_000:
+        raise SystemExit("bootstrap bundle has an unsafe member count")
+    for member in members:
+        path = PurePosixPath(member.name)
+        if (
+            not member.name
+            or member.name.startswith("/")
+            or "\\" in member.name
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or len(member.name) > 512
+            or member.name in seen
+        ):
+            raise SystemExit("bootstrap bundle contains an unsafe path")
+        if member.uid != 0 or member.gid != 0:
+            raise SystemExit("bootstrap bundle ownership is not normalized")
+        if not (member.isdir() or member.isreg()):
+            raise SystemExit("bootstrap bundle contains a non-regular member")
+        seen.add(member.name)
+        total_size += member.size
+        if total_size > 2 * 1024 * 1024 * 1024:
+            raise SystemExit("bootstrap bundle exceeds the extraction limit")
+
+    for member in members:
+        target = destination.joinpath(*PurePosixPath(member.name).parts)
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if member.isdir():
+            target.mkdir(mode=member.mode & 0o755, exist_ok=True)
+            os.chmod(target, member.mode & 0o755)
+            continue
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("bootstrap bundle member cannot be read")
+        with source, target.open("xb") as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        os.chmod(target, member.mode & 0o755)
+PY
+  verify_depthai_arm64 "$temporary_slot/venv"
+  test -x "$temporary_slot/bin/nuv-agent"
+  test -x "$temporary_slot/venv/bin/python"
+  chmod -R go-w "$temporary_slot"
+  chmod 0755 "$temporary_slot"
+  mv "$temporary_slot" "$BOOTSTRAP_SLOT"
+  temporary_slot=""
+  trap - EXIT
+fi
+
+runuser --user nuvion -- "$BOOTSTRAP_SLOT/bin/nuv-agent" doctor \
+  --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
+
+old_current=""
+if [ -L "$INSTALL_ROOT/current" ]; then
+  old_current="$(readlink "$INSTALL_ROOT/current")"
+  case "$old_current" in
+    bootstrap/*|releases/*) ;;
+    *)
+      echo "Refusing unsafe existing current slot target" >&2
+      exit 1
+      ;;
+  esac
+elif [ -e "$INSTALL_ROOT/current" ]; then
+  echo "Refusing non-symlink current slot" >&2
+  exit 1
+fi
+if [[ "$old_current" == releases/* ]]; then
+  echo "Preserving active OTA release slot: $old_current"
+elif [ "$old_current" != "bootstrap/$package_version" ]; then
+  if [ -n "$old_current" ]; then
+    atomic_slot_link previous "$old_current"
+  fi
+  atomic_slot_link current "bootstrap/$package_version"
 fi
 
 reload_oak_udev_rules
-systemctl daemon-reload || true
 if [ "$install_autostart" = true ]; then
-  systemctl enable --now nuv-agent.service || true
+  systemctl enable nuv-agent.service
+  # Always restart after the docker-group audit so the process obtains a fresh
+  # supplementary-group set even when the immutable slot pointer did not move.
+  systemctl restart nuv-agent.service
 else
-  systemctl stop nuv-agent.service || true
-  systemctl disable nuv-agent.service || true
+  systemctl disable --now nuv-agent.service || true
+fi
+
+if [ -f /etc/nuvion-updater/device-binding.json ] \
+  && [ -f /etc/nuvion-updater/command-keyring.json ] \
+  && [ -f /etc/nuvion-updater/release-keyring.json ]; then
+  systemctl enable --now nuv-agent-updater.socket
+  systemctl try-restart nuv-agent-updater.service || true
+else
+  systemctl disable --now nuv-agent-updater.socket || true
 fi
 
 echo
 print_nuv_agent_banner
 echo
-echo "nuv-agent installed (profile=$install_profile, autostart=$install_autostart). Run: nuv-agent setup"
+echo "nuv-agent installed in immutable bootstrap slot (profile=$install_profile, autostart=$install_autostart)."

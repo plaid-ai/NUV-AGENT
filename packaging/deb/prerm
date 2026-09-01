@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-systemctl stop nuv-agent.service || true
-systemctl disable nuv-agent.service || true
+case "${1:-}" in
+  remove|deconfigure)
+    systemctl disable --now nuv-agent.service || true
+    systemctl disable --now nuv-agent-updater.socket || true
+    ;;
+  upgrade|failed-upgrade)
+    # Keep the current immutable slot running until the new package has staged
+    # its bootstrap replacement. postinst owns the atomic switch/restart.
+    ;;
+esac
 systemctl daemon-reload || true

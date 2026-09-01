@@ -484,6 +484,12 @@ class SettingsReconciler:
                     )
                 if self.store.lkg_is_active() and self._functional_health():
                     self._ensure_fence()
+                    self.store.update_marker(
+                        {
+                            "phase": "ROLLED_BACK",
+                            "rollbackCompletedByProcessInstanceId": self.process_instance_id,
+                        }
+                    )
                     return CommandEffectOutcome(
                         status=COMMAND_STATUS_ROLLED_BACK,
                         code="FUNCTIONAL_HEALTH_ROLLBACK",

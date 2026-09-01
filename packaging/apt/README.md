@@ -14,6 +14,26 @@ This flow syncs the published repo to `gs://apt.plaidai.io` and serves it via `h
 ./publish-gcs.sh /path/to/nuv-agent_0.1.0_arm64.deb
 ```
 
+Publisher-authenticated OTA-only 배포는 첫 번째 호환 인자와 네 번째 exact
+artifact 인자에 같은 `agent-bundle`을 전달합니다. APT `.deb` build/publish는
+별도 keyless artifact job과 clean signer job에서 수행됩니다.
+
+```bash
+RELEASE_KEYRING_PATH=/secure/release-keyring.json \
+RELEASE_TRUST_DOMAIN=iq9075-dev \
+SKIP_APT_PUBLISH=true \
+VERSION=0.1.116 \
+./publish-gcs.sh \
+  /path/to/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz \
+  /path/to/release-bom.json \
+  /path/to/release-bom.json.sig \
+  /path/to/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz
+```
+
+세 release 파일은 동일한
+`releases/by-bom-sha256/<digest>/` 디렉터리에 저장되며, 기존 remote byte와
+다르면 publish를 거부합니다.
+
 Requirements:
 - `gcloud` + `gsutil`
 - A GCS bucket named `apt.plaidai.io`
@@ -40,6 +60,9 @@ Required GitHub secrets:
 - `APT_GPG_PASSPHRASE`: passphrase for the signing key
 - `GCP_SA_KEY`: GCP service account JSON with write access to the bucket
 - `GCP_PROJECT_ID`: GCP project ID
+- `IQ9075_RELEASE_SIGNING_PRIVATE_KEY`: Ed25519 publisher private key material
+- `IQ9075_RELEASE_SIGNING_KEY_ID`: key id present in the public keyring
+- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON`: separate `iq9075-dev` release keyring JSON
 
 Runner note:
 - Default is `ubuntu-24.04-arm`. If you don't have access, change the job to `self-hosted`

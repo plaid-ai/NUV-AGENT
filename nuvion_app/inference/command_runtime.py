@@ -596,15 +596,19 @@ def build_fleet_command_runtime(
             f"Fleet command inbox identity binding failed ({exc.code}): {exc}"
         ) from exc
     registry = reconciler_registry or ReconcilerRegistry()
-    effective_capabilities = (
-        set(platform_identity.capabilities)
-        - set(COMMAND_CAPABILITY_BY_TYPE.values())
-    ) | set(registry.capabilities)
+    base_capabilities = set(platform_identity.capabilities) - set(
+        COMMAND_CAPABILITY_BY_TYPE.values()
+    )
+
+    def effective_capabilities() -> frozenset[str]:
+        return frozenset(base_capabilities | set(registry.capabilities))
+
     verifier = FleetCommandVerifier(
         keyring=keyring,
         expected_device_id=device_id,
         expected_space_id=space_id,
-        capabilities=effective_capabilities,
+        capabilities=effective_capabilities(),
+        capability_provider=effective_capabilities,
     )
     observation_outbox = DurableCommandObservationOutbox(inbox)
     reconcile_store = DurableReconcileStore(
@@ -616,7 +620,7 @@ def build_fleet_command_runtime(
         verifier=verifier,
         handlers={
             command_type: reconcile_store.stage_verified
-            for command_type in registry.command_types
+            for command_type in COMMAND_CAPABILITY_BY_TYPE
         },
     )
     effect_coordinator = FleetEffectCoordinator(

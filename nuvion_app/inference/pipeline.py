@@ -40,6 +40,7 @@ from nuvion_app.inference.command_runtime import (
     FleetCommandRuntimeError,
     build_fleet_command_runtime_from_env,
 )
+from nuvion_app.inference.agent_update import AgentUpdateReconciler
 from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
 from nuvion_app.inference.fleet_command import COMMAND_CAPABILITY_BY_TYPE
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
@@ -158,6 +159,10 @@ from nuvion_app.runtime.telemetry import (
     verify_model_artifact_identity,
 )
 from nuvion_app.runtime.settings_overlay import resolve_settings_state_dir
+from nuvion_app.runtime.updater_client import (
+    UpdaterClient,
+    build_updater_capability_telemetry,
+)
 
 try:
     from nuvion_app.agent.triton_client import TritonAnomalyClient
@@ -399,6 +404,14 @@ WEBRTC_STATS_INTERVAL_SEC = parse_float(
     os.getenv("NUVION_WEBRTC_STATS_INTERVAL_SEC"),
     2.0,
 )
+UPDATER_TELEMETRY_REFRESH_SEC = parse_float(
+    os.getenv("NUVION_UPDATER_TELEMETRY_REFRESH_SEC"),
+    5.0,
+)
+UPDATER_TELEMETRY_TTL_SEC = parse_float(
+    os.getenv("NUVION_UPDATER_TELEMETRY_TTL_SEC"),
+    15.0,
+)
 EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
     DEFAULT_OUTBOX_MAX_ROWS,
@@ -462,6 +475,18 @@ fleet_command_runtime: FleetCommandRuntime | None = None
 fleet_command_runtime_init_attempted = False
 fleet_command_runtime_lock = threading.Lock()
 fleet_effect_registry = ReconcilerRegistry()
+fleet_updater_client = UpdaterClient()
+updater_telemetry_cache: dict[str, object] = {
+    "agentUpdate": {
+        "capabilityAvailable": False,
+        "authenticatedHelper": False,
+        "reason": "INITIALIZING",
+    },
+    "updaterVersion": "unknown",
+    "updatePhase": "IDLE",
+}
+updater_telemetry_cache_updated_at = 0.0
+updater_telemetry_cache_lock = threading.Lock()
 updater_public_state_provider: Callable[[], Mapping[str, object]] | None = None
 updater_public_state_lock = threading.Lock()
 FLEET_PROCESS_INSTANCE_ID = str(uuid.uuid4())
@@ -973,6 +998,13 @@ def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
             return fleet_command_runtime
         fleet_command_runtime_init_attempted = True
         try:
+            if fleet_effect_registry.get("AGENT_UPDATE") is None:
+                fleet_effect_registry.register(
+                    AgentUpdateReconciler(
+                        fleet_updater_client,
+                        readiness_provider=_cached_agent_update_status,
+                    )
+                )
             fleet_command_runtime = build_fleet_command_runtime_from_env(
                 base_url=SERVER_BASE_URL,
                 access_token_provider=lambda: get_auth_token() or "",
@@ -1205,6 +1237,66 @@ def register_updater_public_state_provider(
         updater_public_state_provider = provider
 
 
+def _stale_updater_telemetry(
+    trusted: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    stale: dict[str, object] = {
+        "agentUpdate": {
+            "capabilityAvailable": False,
+            "authenticatedHelper": False,
+            "reason": "STALE_UPDATER_STATUS" if trusted else "UPDATER_UNAVAILABLE",
+        },
+        "updaterVersion": "unknown",
+        "updatePhase": "IDLE",
+    }
+    if trusted is not None:
+        for key in ("updatePhase", "updateEvidence"):
+            if key in trusted:
+                stale[key] = trusted[key]
+    return stale
+
+
+def get_cached_updater_runtime_telemetry() -> dict[str, object]:
+    with updater_telemetry_cache_lock:
+        cached = dict(updater_telemetry_cache)
+        updated_at = updater_telemetry_cache_updated_at
+    ttl = max(1.0, min(UPDATER_TELEMETRY_TTL_SEC, 300.0))
+    if updated_at <= 0.0 or time.monotonic() - updated_at > ttl:
+        return _stale_updater_telemetry(cached if updated_at > 0.0 else None)
+    return cached
+
+
+def _cached_agent_update_status() -> Mapping[str, object]:
+    status = get_cached_updater_runtime_telemetry().get("agentUpdate")
+    return dict(status) if isinstance(status, Mapping) else {}
+
+
+async def refresh_updater_runtime_telemetry() -> dict[str, object]:
+    global updater_telemetry_cache_updated_at
+    try:
+        refreshed = await asyncio.to_thread(
+            build_updater_capability_telemetry,
+            fleet_updater_client,
+        )
+    except Exception as exc:  # noqa: BLE001 - cache remains fail closed.
+        log.warning("[UPDATER] status refresh failed: %s", str(exc)[:200])
+        refreshed = _stale_updater_telemetry(
+            get_cached_updater_runtime_telemetry()
+        )
+    with updater_telemetry_cache_lock:
+        updater_telemetry_cache.clear()
+        updater_telemetry_cache.update(refreshed)
+        updater_telemetry_cache_updated_at = time.monotonic()
+    return dict(refreshed)
+
+
+async def updater_telemetry_refresh_sender() -> None:
+    interval = max(1.0, min(UPDATER_TELEMETRY_REFRESH_SEC, 60.0))
+    while True:
+        await asyncio.sleep(interval)
+        await refresh_updater_runtime_telemetry()
+
+
 def build_command_observation_runtime_health() -> dict:
     runtime = fleet_command_runtime
     if runtime is None or runtime.observation_outbox is None:
@@ -1250,7 +1342,11 @@ def build_dynamic_runtime_telemetry(
         and bool(getattr(getattr(g_app, "user_data", None), "running", False))
         else "FUNCTIONAL_UNHEALTHY"
     )
+    updater_telemetry = get_cached_updater_runtime_telemetry()
     public_state: dict[str, object] = {"functionalHealth": functional_health}
+    for key in ("updatePhase", "updateEvidence"):
+        if key in updater_telemetry:
+            public_state[key] = updater_telemetry[key]
     with updater_public_state_lock:
         provider = updater_public_state_provider
     if provider is not None:
@@ -1258,7 +1354,7 @@ def build_dynamic_runtime_telemetry(
             public_state.update(dict(provider()))
         except Exception as exc:  # noqa: BLE001 - telemetry must stay available.
             log.error("[UPDATER] public state unavailable: %s", exc)
-            public_state = {"functionalHealth": "FUNCTIONAL_UNHEALTHY"}
+            public_state["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
     if functional_health == "FUNCTIONAL_UNHEALTHY":
         public_state["functionalHealth"] = functional_health
     try:
@@ -1268,6 +1364,8 @@ def build_dynamic_runtime_telemetry(
         merged = {"functionalHealth": "FUNCTIONAL_UNHEALTHY"}
     merged["eventOutbox"] = build_event_outbox_runtime_health()
     merged["commandObservationOutbox"] = build_command_observation_runtime_health()
+    merged["agentUpdate"] = updater_telemetry["agentUpdate"]
+    merged["updaterVersion"] = updater_telemetry["updaterVersion"]
     merged["capabilities"] = sorted(
         set(base_capabilities) | set(fleet_effect_registry.capabilities)
     )
@@ -1758,6 +1856,8 @@ async def signaling_client_main():
     if outbound_queue is None:
         outbound_queue = asyncio.Queue(maxsize=OUTBOUND_QUEUE_MAX)
     initialize_durable_event_outbox()
+    await refresh_updater_runtime_telemetry()
+    updater_refresh_task = asyncio.create_task(updater_telemetry_refresh_sender())
     command_runtime = initialize_fleet_command_runtime()
     if command_runtime is not None:
         try:

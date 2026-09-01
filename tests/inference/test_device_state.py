@@ -55,6 +55,7 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
                     "configSchema": "11",
                     "modelPointer": "anomalyclip/prod",
                     "modelVersion": "v0001",
+                    "functionalHealth": "FUNCTIONAL_HEALTHY",
                 }
             ],
         )
@@ -175,6 +176,52 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
             self.sent_payloads[1]["capabilities"],
             ["command.stream.policy"],
         )
+        self.assertEqual(second["functionalHealth"], "FUNCTIONAL_HEALTHY")
+
+        coordinator.set_runtime_status(RUNTIME_STATUS_ERROR)
+        unhealthy = self.sent_payloads[-1]
+        self.assertEqual(unhealthy["functionalHealth"], "FUNCTIONAL_UNHEALTHY")
+        self.assertEqual(
+            unhealthy["runtimeTelemetry"]["functionalHealth"],
+            "FUNCTIONAL_UNHEALTHY",
+        )
+
+    def test_updater_version_is_promoted_only_with_authenticated_live_status(self) -> None:
+        dynamic: dict[str, object] = {
+            "updaterVersion": "99.0.0",
+            "agentUpdate": {
+                "capabilityAvailable": False,
+                "authenticatedHelper": False,
+                "reason": "UPDATER_UNAVAILABLE",
+            },
+        }
+        coordinator = DeviceStateCoordinator(
+            send_message=self._capture,
+            line_id=1,
+            process_id=2,
+            telemetry={
+                "updaterVersion": "7.7.7",
+                "runtimeTelemetry": {"updaterVersion": "7.7.7"},
+            },
+            runtime_telemetry_provider=lambda: dict(dynamic),
+        )
+
+        unavailable = coordinator.current_payload()
+        self.assertEqual(unavailable["updaterVersion"], "unknown")
+        self.assertEqual(
+            unavailable["runtimeTelemetry"]["updaterVersion"], "unknown"
+        )
+
+        dynamic["updaterVersion"] = "0.1.0"
+        dynamic["agentUpdate"] = {
+            "capabilityAvailable": True,
+            "authenticatedHelper": True,
+            "reason": "READY",
+            "updaterVersion": "0.1.0",
+        }
+        live = coordinator.current_payload()
+        self.assertEqual(live["updaterVersion"], "0.1.0")
+        self.assertEqual(live["runtimeTelemetry"]["updaterVersion"], "0.1.0")
 
 
 if __name__ == "__main__":

@@ -303,12 +303,16 @@ macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to s
   `NUVION_FLEET_COMMAND_KEYRING_PATH`를 provision합니다. Agent는
   `/user/queue/fleet.command` wake-up 후 BE journal을 pull하고, device/space-bound Ed25519 JWS를
   검증한 뒤 SQLite inbox와 command별 reconcile job/history/lease/checkpoint를 먼저 기록합니다.
-  실제 named encoder와 transactional settings store가 준비된 경우에만 `STREAM_POLICY`와
-  `CONFIG_APPLY` effect/capability를 등록하며, `AGENT_UPDATE`는 구현 전까지 광고하지 않습니다.
-  새 desired state는 적용 전의 이전 command(`WAITING_RESTART` 포함)를
-  `FAILED/SUPERSEDED`로 terminal 처리하고, bounded coordinator가 transaction 밖에서 named
-  `x264enc`를 변경한 뒤 readback과 reported state를 포함해 `SUCCEEDED`를 기록합니다. macOS
-  개발 keyring(`macos-dev`)과 생산 keyring(`production`)은 서로 호환되지 않습니다.
+  공통 runtime은 `IN_PROGRESS`까지만 ACK하고, bounded coordinator가 transaction 밖에서 실제
+  effect와 health check를 수행한 뒤 terminal ACK를 기록합니다. 실제 named encoder와
+  transactional settings store가 준비된 경우에만 `STREAM_POLICY`와 `CONFIG_APPLY`
+  effect/capability를 등록합니다. `command.agent.update` capability는 platform identity에
+  정적으로 포함하지 않으며, root-owned updater socket, command/release keyring, exact device
+  binding 및 제품별 BOOT/FUNCTIONAL health adapter가 모두 준비된 경우에만 runtime이
+  동적으로 등록하고 광고합니다. 새 desired state는 적용 전의 이전 command
+  (`WAITING_RESTART` 포함)를 `FAILED/SUPERSEDED`로 terminal 처리하고, named `x264enc`를
+  변경한 뒤 readback과 reported state를 포함해 `SUCCEEDED`를 기록합니다. macOS 개발
+  keyring(`macos-dev`)과 생산 keyring(`production`)은 서로 호환되지 않습니다.
 
 Command observed state는 lifecycle ACK와 별개입니다. Agent는 SQLite outbox에 먼저 저장한 뒤
 `/app/device/command.observed`로 정확히 `observationId`, `commandId`, `revision`, `observedAt`,
@@ -348,6 +352,12 @@ default를 적용하며, `min <= initial <= max`, bitrate `100..20000`을 검증
 `FIXED`는 `targetBitrateKbps`, `DISABLED`는 공통 `policyVersion`/`mode` 외 field를 허용하지
 않습니다. Clip이 켜진 경우 WebRTC와 clip은 raw tee 뒤 독립 encoder를 사용하므로 adaptive
 bitrate 변경이 forensic clip encoder에 전파되지 않습니다.
+
+OTA helper는 raw command JWS와 publisher-signed release-bom-v2를 각각 재검증하고,
+content-addressed immutable release slot을 준비한 뒤 `/opt/nuv-agent/current`와
+`/opt/nuv-agent/previous`를 원자적으로 전환합니다. BOOT/FUNCTIONAL health gate를 통과하지
+못한 release는 이전 slot로 rollback하며, 현재 slot과 updater 상태를 telemetry evidence로
+보고합니다.
 
 Connectivity 보고 정책:
 - Adaptive controller는 `webrtcbin get-stats`의 outbound RTP loss/RTT/NACK/PLI를 우선 사용하고,

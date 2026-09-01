@@ -77,14 +77,14 @@ timeout 20s gst-launch-1.0 -q \
   h264parse ! rtph264pay pt=96 ! fakesink sync=false
 
 if [ "$camera_mode" = "oak" ]; then
-  if [ ! -x /opt/nuv-agent/venv/bin/python ]; then
-    die "nuv-agent venv is missing"
+  if [ ! -x /opt/nuv-agent/current/venv/bin/python ]; then
+    die "nuv-agent current slot venv is missing"
   fi
 
-  oak_python=(/opt/nuv-agent/venv/bin/python)
+  oak_python=(/opt/nuv-agent/current/venv/bin/python)
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
-    oak_python=(runuser -u nuvion -- /opt/nuv-agent/venv/bin/python)
+    oak_python=(runuser -u nuvion -- /opt/nuv-agent/current/venv/bin/python)
   elif [ "$(id -un)" != "nuvion" ]; then
     die "run the OAK test with sudo so capture can be verified as the nuvion service user"
   fi

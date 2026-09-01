@@ -137,9 +137,17 @@ class ReconcilerRegistry:
     @property
     def capabilities(self) -> frozenset[str]:
         with self._lock:
-            return frozenset(
-                reconciler.capability for reconciler in self._reconcilers.values()
-            )
+            reconcilers = tuple(self._reconcilers.values())
+        capabilities: set[str] = set()
+        for reconciler in reconcilers:
+            readiness = getattr(reconciler, "ready", True)
+            try:
+                ready = bool(readiness() if callable(readiness) else readiness)
+            except Exception:  # noqa: BLE001 - admission must fail closed.
+                ready = False
+            if ready:
+                capabilities.add(reconciler.capability)
+        return frozenset(capabilities)
 
     def observe_connectivity(
         self, sample: Mapping[str, Any]
@@ -337,24 +345,49 @@ class FleetEffectCoordinator:
                         **outcome.checkpoint,
                         "processInstanceId": self.process_instance_id,
                     }
-                    self.store.defer_for_restart(
-                        command,
-                        owner=self.owner,
-                        reported_state=outcome.reported_state,
-                        checkpoint=checkpoint,
+                    next_action = str(
+                        checkpoint.get("nextAction") or "RESTART_AGENT"
                     )
-                    processed += 1
-                    restart_accepted = False
-                    try:
-                        restart_accepted = bool(
-                            self.restart_requester
-                            and self.restart_requester()
+                    restart_required = checkpoint.get(
+                        "restartRequired", next_action == "RESTART_AGENT"
+                    )
+                    if next_action == "RETRY_EFFECT" and restart_required is False:
+                        retry_delay = min(60.0, float(2 ** min(job.attempts, 6)))
+                        self.store.defer_for_retry(
+                            command,
+                            owner=self.owner,
+                            reported_state=outcome.reported_state,
+                            checkpoint=checkpoint,
+                            retry_after_seconds=retry_delay,
                         )
-                    except Exception:  # noqa: BLE001 - requester is injectable.
+                        processed += 1
+                        # Do not reclaim the same deferred update in this run.
+                        break
+                    if next_action == "RESTART_AGENT" and restart_required is True:
+                        self.store.defer_for_restart(
+                            command,
+                            owner=self.owner,
+                            reported_state=outcome.reported_state,
+                            checkpoint=checkpoint,
+                        )
+                        processed += 1
                         restart_accepted = False
-                    if not restart_accepted:
-                        self.store.retry_restart_request(command.command_id)
-                    break
+                        try:
+                            restart_accepted = bool(
+                                self.restart_requester
+                                and self.restart_requester()
+                            )
+                        except Exception:  # noqa: BLE001 - requester is injectable.
+                            restart_accepted = False
+                        if not restart_accepted:
+                            self.store.retry_restart_request(command.command_id)
+                        break
+                    outcome = CommandEffectOutcome(
+                        status=COMMAND_STATUS_FAILED,
+                        code="INVALID_DEFERRED_ACTION",
+                        message="reconciler returned an inconsistent deferred action",
+                        reported_state=outcome.reported_state,
+                    )
 
                 ack = self.store.finish(
                     command,

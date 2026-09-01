@@ -1,0 +1,44 @@
+{
+  "bom": {
+    "agentVersion": "0.2.0",
+    "artifact": {
+      "kind": "agent-bundle",
+      "name": "nuv-agent_0.2.0_arm64.tar.gz",
+      "sha256": "2c5f18e817c9081567812dcde87cc8f0f9059f5850a739b98bf4edfd1fcb71b7",
+      "sizeBytes": 35
+    },
+    "bomDigest": "sha256:054b588d8d72cbb4019b406069d0caefe6f9b18e8cd5d9ca3a84d854c0b5eb95",
+    "bomId": "nuv-agent-0.2.0-arm64",
+    "builtAt": "2026-09-01T03:00:00Z",
+    "componentSha": "0123456789abcdef0123456789abcdef01234567",
+    "configSchema": "12",
+    "minUpdaterVersion": "1.4.0",
+    "releaseSequence": 42,
+    "schemaVersion": 2,
+    "targets": [
+      {
+        "architecture": "aarch64",
+        "hardwareRevision": "rpi5-dxm1-rev-a",
+        "platformProfile": "rpi5_deepx_dx_m1",
+        "productModel": "NUVION"
+      }
+    ]
+  },
+  "contract": "nuvion-release-bom-v2-ed25519",
+  "expected": {
+    "canonicalBomSha256": "55b26613444fcc4f9f2401fbd7350bda676848c9e964141270be8c99342e87aa",
+    "domainSeparationPrefixHex": "4e5556494f4e2d52454c454153452d424f4d2d563200",
+    "signingInputSha256": "1be97d42eac28a293783a2fb28b4a216f427ce725d7696406f5ed4a33d5b66f1"
+  },
+  "publicKey": {
+    "encoding": "raw-base64",
+    "keyId": "fixture-rfc8032-1",
+    "value": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+  },
+  "signatureEnvelope": {
+    "algorithm": "Ed25519",
+    "keyId": "fixture-rfc8032-1",
+    "schemaVersion": 1,
+    "signature": "/nl1sx88sP8rnaVmsm8nyc31IIVTJ1w960TAzRv8+rjpaGDxUbuC/J7+j/kR7kXikECMhSUUQkoaYhM2t2kwAw=="
+  }
+}

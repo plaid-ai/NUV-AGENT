@@ -12,7 +12,9 @@ from nuvion_app.runtime.platform_identity import (
     resolve_platform_identity,
 )
 from nuvion_app.runtime.release_bom import (
+    ReleaseTarget,
     build_release_bom_payload,
+    build_release_bom_v2_payload,
     canonical_release_bom_json,
 )
 from nuvion_app.runtime.telemetry import (
@@ -92,7 +94,7 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["modelPointer"], "anomalyclip/prod")
         self.assertEqual(telemetry["modelVersion"], "v0007")
         self.assertEqual(telemetry["modelDigest"], f"sha256:{manifest_digest}")
-        self.assertEqual(telemetry["updaterVersion"], "0.4.2")
+        self.assertEqual(telemetry["updaterVersion"], "unknown")
         self.assertEqual(telemetry["bomId"], "nuv-agent-0.1.113-macos-arm64")
         self.assertEqual(telemetry["bomDigest"], "sha256:bom-113")
         self.assertEqual(telemetry["artifactDigest"], "sha256:artifact-113")
@@ -106,6 +108,7 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertNotIn("command.config.apply", telemetry["capabilities"])
         self.assertNotIn("command.agent.update", telemetry["capabilities"])
         self.assertEqual(telemetry["bomVerificationStatus"], "UNCONFIGURED")
+        self.assertEqual(telemetry["functionalHealth"], "FUNCTIONAL_UNHEALTHY")
         self.assertNotIn("runtimeTelemetry", telemetry["runtimeTelemetry"])
         self.assertEqual(telemetry["runtimeTelemetry"]["agentVersion"], "0.1.113")
         self.assertEqual(telemetry["runtimeTelemetry"]["platformProfile"], "macos_dev")
@@ -258,9 +261,10 @@ class RuntimeTelemetryTest(unittest.TestCase):
             )
 
         self.assertEqual(telemetry["bomVerificationStatus"], "VERIFIED")
+        self.assertNotIn("releaseSequence", telemetry)
         self.assertEqual(telemetry["bomId"], "nuv-agent-0.1.113-arm64")
         self.assertEqual(telemetry["bomDigest"], payload["bomDigest"])
-        self.assertEqual(telemetry["updaterVersion"], "0.5.0")
+        self.assertEqual(telemetry["updaterVersion"], "unknown")
         self.assertEqual(
             telemetry["runtimeTelemetry"]["bomVerificationStatus"], "VERIFIED"
         )
@@ -317,6 +321,63 @@ class RuntimeTelemetryTest(unittest.TestCase):
         )
 
         self.assertNotIn("command.agent.update", telemetry["capabilities"])
+
+    def test_active_v2_slot_reports_integer_release_sequence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "agent-bundle.tar.gz"
+            artifact.write_bytes(b"bundle")
+            payload = build_release_bom_v2_payload(
+                bom_id="nuv-agent-0.1.116-iq9075-aarch64",
+                release_sequence=116,
+                agent_version="0.1.116",
+                component_sha="a" * 40,
+                config_schema="12",
+                min_updater_version="0.1.0",
+                targets=[
+                    ReleaseTarget(
+                        product_model="IQ9075_DEV",
+                        platform_profile="iq9075_dev",
+                        hardware_revision="QCS9075-EVK",
+                        architecture="aarch64",
+                    )
+                ],
+                artifact_path=artifact,
+                artifact_kind="agent-bundle",
+                built_at="2026-09-01T10:00:00Z",
+            )
+            bom_path = root / "release-bom.json"
+            bom_path.write_text(canonical_release_bom_json(payload), encoding="utf-8")
+            identity = resolve_platform_identity(
+                environ={},
+                identity_path=root / "device-identity.json",
+                probe=PlatformProbe(
+                    system="Linux",
+                    os_version="24.04",
+                    kernel_version="6.8.0",
+                    architecture="aarch64",
+                    hardware_text="QCS9075 IQ-9075",
+                    accelerator_runtime="unknown",
+                    gstreamer_version="1.24.2",
+                ),
+            )
+
+            telemetry = build_runtime_telemetry(
+                environ={
+                    "NUVION_RELEASE_BOM_PATH": str(bom_path),
+                    "NUVION_EXPECTED_BOM_DIGEST": str(payload["bomDigest"]),
+                    "NUVION_CONFIG_SCHEMA_VERSION": "12",
+                },
+                model_dir=root,
+                agent_version="0.1.116",
+                component_sha="a" * 40,
+                platform_identity=identity,
+            )
+
+        self.assertEqual(telemetry["releaseSequence"], 116)
+        self.assertIsInstance(telemetry["releaseSequence"], int)
+        self.assertEqual(telemetry["bomVerificationStatus"], "VERIFIED")
+        self.assertEqual(telemetry["runtimeTelemetry"]["releaseSequence"], 116)
 
 
 if __name__ == "__main__":

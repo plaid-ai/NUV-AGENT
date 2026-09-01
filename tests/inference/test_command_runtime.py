@@ -832,7 +832,12 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(runtime.effect_capabilities, {"command.stream.policy"})
-        self.assertEqual(set(runtime.processor.handlers), {"STREAM_POLICY"})
+        # Transaction handlers are inert staging adapters for every supported
+        # command; the live registry-backed verifier is the admission boundary.
+        self.assertEqual(
+            set(runtime.processor.handlers),
+            {"STREAM_POLICY", "CONFIG_APPLY", "AGENT_UPDATE"},
+        )
         self.assertIn(
             "command.stream.policy", runtime.processor.verifier.capabilities
         )

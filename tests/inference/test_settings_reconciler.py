@@ -323,6 +323,17 @@ class SettingsReconcilerTest(unittest.TestCase):
         recovered = self._reconciler(_Runtime(), "process-c").reconcile(command)
         self.assertEqual(recovered.status, "ROLLED_BACK")
         self.assertEqual(recovered.reported_state["health"], "LKG_RESTORED")
+        self.assertEqual(
+            AtomicSettingsStore(self.config_path, self.root / "state").marker()["phase"],
+            "ROLLED_BACK",
+        )
+        self.assertEqual(
+            run_settings_boot_guard(
+                {"NUVION_SETTINGS_STATE_DIR": str(self.root / "state")},
+                base_config_path=self.config_path,
+            ),
+            "ROLLED_BACK",
+        )
 
     def test_corrupt_restart_marker_recovers_through_lkg_restart(self) -> None:
         command = _command(11, activation="RESTART")

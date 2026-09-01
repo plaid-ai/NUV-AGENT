@@ -216,6 +216,23 @@ class ReleaseBomTest(unittest.TestCase):
             self.assertIn("refusing to overwrite", different.stderr)
             self.assertEqual(output.read_bytes(), original)
 
+            linked_artifact = root / "linked-agent.deb"
+            linked_artifact.symlink_to(artifact)
+            linked_output = root / "linked-release-bom.json"
+            linked_command = list(base_command)
+            linked_command[linked_command.index(str(artifact))] = str(linked_artifact)
+            linked_command[linked_command.index(str(output))] = str(linked_output)
+            linked = subprocess.run(
+                [*linked_command, "--built-at", "2026-09-01T03:00:00Z"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertIn("symbolic link", linked.stderr)
+            self.assertFalse(linked_output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

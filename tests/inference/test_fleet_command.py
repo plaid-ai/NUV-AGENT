@@ -175,8 +175,14 @@ class FleetCommandVerifierTest(unittest.TestCase):
     def test_shared_java_python_contract_vector_verifies_with_raw_and_x509_keys(
         self,
     ) -> None:
+        repository_root = Path(__file__).resolve().parents[2]
+        workspace_root = (
+            repository_root.parent.parent
+            if repository_root.parent.name == ".worktrees"
+            else repository_root.parent
+        )
         fixture_path = (
-            Path(__file__).resolve().parents[3]
+            workspace_root
             / "architecture"
             / "contracts"
             / "fixtures"

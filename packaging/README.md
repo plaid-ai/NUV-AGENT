@@ -22,40 +22,49 @@ Demo mode:
 - Public dataset base URL defaults to `https://storage.googleapis.com/mvtec-dataset/mvtec-ad`.
 
 ## Debian/Ubuntu (.deb)
-Build a package on the target architecture (e.g., Jetson ARM64):
+Build the IQ9075 base bundle and package on a native arm64 Docker host. Both
+builders execute in digest-pinned containers:
 ```bash
-cd NUV-agent/packaging/deb
-./build-deb.sh
+export COMPONENT_SHA=<full-stamped-source-sha>
+export SOURCE_DATE_EPOCH=<source-commit-epoch>
+packaging/release/build-agent-bundle.sh \
+  0.1.116 dist/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz
+BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.116_iq9075-aarch64.agent-bundle.tar.gz \
+  packaging/deb/build-deb.sh
 ```
 
 This script:
-- Copies only `pyproject.toml`, `README.md`, and `nuvion_app/` into the package;
-  workflow credentials, test environments, and repository metadata never enter the `.deb`.
-- Creates a venv under `/opt/nuv-agent/venv`.
-- Installs the Python package.
+- Embeds the exact hash-locked bundle and its SHA-256; `postinst` performs no
+  network access, package resolution, `pip`, or local source build as root.
+- Creates a versioned bootstrap slot under `/opt/nuv-agent/bootstrap/<version>`
+  and atomically points `/opt/nuv-agent/current` at it. Package upgrades never
+  clear the currently running venv in place.
+- Safely extracts only normalized regular files/directories from the verified
+  bundle into the versioned slot.
 - Installs the systemd unit.
 - Creates `/etc/nuv-agent/agent.env` if missing.
-- Installs optional extras for runtime bootstrap (`zsad,triton`).
-- On arm64, installs `depthai==2.32.0.0` into the Agent venv from a
-  hash-pinned, binary-only requirements file. CPython 3.10-3.14
-  `manylinux_2_28_aarch64` wheels are allowlisted; an unexpected wheel or sdist
-  fails installation instead of running unverified code. Ubuntu 24.04 uses the
-  pinned CPython 3.12 wheel.
+- Includes `depthai==2.32.0.0` from a hash-pinned binary-only wheel in the
+  keyless build job. Ubuntu 24.04 CPython 3.12 is the exact target runtime.
 - Installs the OAK/Movidius USB rule at
   `/usr/lib/udev/rules.d/80-movidius.rules`, reloads udev, and triggers only USB
   devices with vendor ID `03e7`.
 - Persists the event outbox and Fleet command inbox under systemd-managed
   `/var/lib/nuv-agent/`; the service account intentionally has no home directory.
+- Installs the root updater outside the swappable Agent slot under
+  `/usr/lib/nuvion-updater`, with a `root:nuvion` `0660` systemd Unix socket.
+  The `nuvion` account is explicitly removed from the root-equivalent Docker
+  group. Docker/Triton profiles remain OTA fail-closed until their separate
+  privileged runtime helper and product health adapter are installed.
 - Demo mode uses the public MVTec dataset bucket and local cache at runtime.
 
-Python requirement: 3.10+
+Python requirement: Ubuntu 24.04 system CPython 3.12.
 
 The maintainer script supports bounded install modes:
 
-- `NUVION_INSTALL_PROFILE=full` installs `zsad,triton` extras (default).
-- `NUVION_INSTALL_PROFILE=runtime` installs only the Triton client extra.
-- `NUVION_INSTALL_PROFILE=base` installs the control-plane and media runtime without
-  model backends. This is the initial IQ-9075 development-board profile.
+- `NUVION_INSTALL_PROFILE=base` (default) installs the exact IQ9075
+  control-plane/media bundle without model backends.
+- `full` and `runtime` fail closed until they receive separate hash locks,
+  immutable bundles, and the root-owned Docker/Triton lifecycle helper.
 - `NUVION_INSTALL_AUTOSTART=false` installs the package but leaves the service
   stopped and disabled until identity, camera, and credentials have been checked.
 
@@ -64,7 +73,8 @@ The maintainer script supports bounded install modes:
 Build and install on the Ubuntu arm64 board:
 
 ```bash
-ARCH=arm64 packaging/deb/build-deb.sh
+BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_<version>_iq9075-aarch64.agent-bundle.tar.gz \
+  ARCH=arm64 packaging/deb/build-deb.sh
 packaging/dev/install-iq9075.sh dist/nuv-agent_<version>_arm64.deb
 sudo packaging/dev/test-iq9075.sh --camera oak
 ```
@@ -109,8 +119,8 @@ sudo packaging/dev/test-iq9075.sh --camera uvc
 
 The UVC mode writes `NUVION_VIDEO_SOURCE=auto` and
 `NUVION_CAMERA_PREFERENCE=usb`; OAK-specific values remain present but inactive.
-Re-running the installer with the same camera option is idempotent: it rebuilds
-the venv from the pinned inputs, does not duplicate config keys, and preserves an
+Re-running the installer with the same camera option is idempotent: it reuses
+the immutable versioned bootstrap slot, does not duplicate config keys, and preserves an
 existing MXID and tuned DepthAI timeout values.
 
 Use `sudo packaging/dev/provision-iq9075.sh <credentials.json> --consume` to
@@ -120,14 +130,24 @@ nor OAK camera is attached; remove `NUVION_GST_SOURCE` before the physical-camer
 release gate. Once credentials and the selected camera test pass, enable the
 service with `sudo systemctl enable --now nuv-agent.service`.
 
-Runtime bootstrap:
-- `nuv-agent setup` / `nuv-agent run` now try to bootstrap Docker/Triton/model bundle automatically.
-- systemd unit includes docker dependency and bootstrap preflight.
+Runtime privilege boundary:
+- The Agent service runs without `docker.sock` access and without a Docker
+  systemd dependency.
+- Docker/Triton lifecycle must move to a separately audited fixed-operation
+  helper; arbitrary image, volume, path, or shell parameters are not accepted by
+  the Agent updater.
 
 ## Release helpers
 - `packaging/release/build-sdist.sh`: build source tarball and print SHA256.
-- `packaging/release/generate-release-bom.py`: actual artifact digest, component SHA,
-  config schema, compatible platform profiles로 immutable sidecar BOM을 생성합니다.
+- `packaging/release/build-agent-bundle.sh`: IQ9075 OTA용 self-contained immutable
+  slot bundle을 만들며, symlink 없는 tar.gz, CPython 3.12/Linux aarch64
+  hash-lock, pinned DepthAI wheel, stamped component SHA를 강제합니다. 직접 실행할
+  때는 `SOURCE_DATE_EPOCH=<commit epoch> COMPONENT_SHA=<full commit SHA>
+  packaging/release/build-agent-bundle.sh <version> <output>`을 사용합니다.
+- `packaging/release/generate-release-bom.py`: v1 telemetry BOM 또는 exact product
+  target, release sequence, minimum updater version, detached Ed25519 signature를
+  가진 release-bom-v2를 생성합니다.
+- `packaging/release/release-bom-v2.md`: BE/Agent 공통 canonical byte/signature contract.
 - `packaging/release/normalize-sdist.py`: commit timestamp를 기준으로 tar/gzip metadata를
   정규화해 같은 release commit에서 byte-identical sdist를 재생성합니다.
 - `packaging/release/update-homebrew-formula.sh`: inject URL/SHA/version into formula.
@@ -138,15 +158,27 @@ Runtime bootstrap:
 ## GitHub Actions release
 Workflow: `.github/workflows/release-publish.yml`
 
-Release workflow는 sdist와 arm64 `.deb` 각각에 대해 `*.release-bom.json`을 생성합니다.
+Release workflow는 sdist/GitHub Release와 arm64 `.deb`/APT 배포를 유지하되,
+OTA는 manual opt-in 시 별도의 IQ9075 전용 `agent-bundle`로 생성합니다. Dependency
+build는 signing/GCP credential이 없는 keyless ARM job에서 수행되고, SHA256으로 묶인
+artifact만 별도의 clean signing/publish job으로 전달됩니다. 현재 검증된
+OTA tuple은 `IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64` 하나뿐이며 production
+SKU/revision은 추정하거나 wildcard로 발행하지 않습니다. 이 dev tuple의 runtime
+contract는 Ubuntu 24.04 + CPython 3.12입니다.
 Artifact digest는 자기참조를 피하기 위해 artifact 내부가 아니라 sidecar에 보관하며,
-Agent updater는 signed `AGENT_UPDATE` command의 expected BOM digest와 대조해야 합니다.
-APT publish는 sidecar를 `releases/<version>/`과
-`releases/by-bom-sha256/<bom digest>/`에 모두 저장하고 업로드 후 byte-compare합니다.
+OTA activation은 publisher-signed release-bom-v2만 허용하며 signed
+`AGENT_UPDATE` command의 expected BOM digest와 별도로 publisher signature를 검증합니다.
+독립 OTA publisher는 sidecar를 `releases/<version>/`과
+`releases/by-bom-sha256/<bom digest>/`에 exact artifact 및 detached signature와
+함께 create-only로 저장하고 업로드 전후 byte-compare합니다. APT job은 OTA signing
+key를 받지 않으며 OTA build/signing job은 APT GPG key를 받지 않습니다.
 GitHub release asset은 기존 동일 이름을 덮어쓰지 않도록 설정되어 있으므로, 이미 발행된
 version을 변경해야 할 때는 새 patch version을 발행해야 합니다.
 
 Required secrets:
 - `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)
+- `IQ9075_RELEASE_SIGNING_PRIVATE_KEY` (Ed25519 private publisher key)
+- `IQ9075_RELEASE_SIGNING_KEY_ID`
+- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON` (`trustDomain=iq9075-dev`)
 
 To host an APT repo, use a tool like `aptly` or `reprepro`, then publish the generated `.deb`.

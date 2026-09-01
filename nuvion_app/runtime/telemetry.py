@@ -319,6 +319,15 @@ def build_runtime_telemetry(
             bom_status = "PLATFORM_MISMATCH"
 
     bom_telemetry = release_bom.to_telemetry() if release_bom is not None else {}
+    raw_functional_health = str(
+        values.get("NUVION_FUNCTIONAL_HEALTH") or "FUNCTIONAL_UNHEALTHY"
+    ).strip().upper()
+    functional_health = (
+        raw_functional_health
+        if raw_functional_health
+        in {"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"}
+        else "FUNCTIONAL_UNHEALTHY"
+    )
     result: dict[str, Any] = {
         "agentVersion": resolved_agent_version,
         "componentSha": resolved_component_sha,
@@ -331,12 +340,11 @@ def build_runtime_telemetry(
         ),
         "modelVersion": model_version,
         "modelDigest": model_digest,
-        "updaterVersion": str(
-            bom_telemetry.get("updaterVersion")
-            or values.get("NUVION_UPDATER_VERSION")
-            or _build_info_value("UPDATER_VERSION")
-            or "unknown"
-        ).strip(),
+        # An environment value, build constant, or BOM requirement proves
+        # neither that the privileged updater is installed nor that it is
+        # alive. Fresh peer-authenticated STATUS telemetry is merged by the
+        # heartbeat provider; the static snapshot must fail closed.
+        "updaterVersion": "unknown",
         "bomId": str(
             bom_telemetry.get("bomId")
             or values.get("NUVION_BOM_ID")
@@ -356,6 +364,7 @@ def build_runtime_telemetry(
             or "unknown"
         ).strip(),
         "bomVerificationStatus": bom_status,
+        "functionalHealth": functional_health,
     }
     if expected_model_digest:
         result["modelExpectedDigest"] = expected_model_digest
@@ -364,6 +373,9 @@ def build_runtime_telemetry(
         result["modelResolverDigest"] = metadata_model_digest
     if metadata_model_pointer:
         result["modelResolverPointer"] = metadata_model_pointer
+    release_sequence = bom_telemetry.get("releaseSequence")
+    if isinstance(release_sequence, int) and not isinstance(release_sequence, bool):
+        result["releaseSequence"] = release_sequence
     if bom_error:
         result["bomVerificationError"] = bom_error
     result.update(identity.to_telemetry())

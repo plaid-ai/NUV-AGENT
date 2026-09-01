@@ -40,6 +40,10 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("APT checkout does not match the release component SHA", workflow)
         self.assertIn("overwrite_files: false", workflow)
         self.assertIn("verify-github-release-assets.py", workflow)
+        self.assertIn("if git diff --cached --quiet; then", workflow)
+        self.assertIn("rerun is idempotent", workflow)
+        self.assertIn("group: release-${{ inputs.tag || github.ref_name }}", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("normalize-sdist.py", workflow)
         self.assertIn('SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")', workflow)
         self.assertEqual(workflow.count('--built-at "$BUILT_AT"'), 2)
@@ -63,24 +67,97 @@ class ReleaseGateTest(unittest.TestCase):
 
         self.assertEqual(workflow.count("generate-release-bom.py"), 2)
         self.assertIn("${{ steps.sdist_bom.outputs.path }}", workflow)
-        for profile in (
+        self.assertIn(
+            '--target "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64"',
+            workflow,
+        )
+        for unsupported_target in (
             "rpi5_deepx_dx_m1",
             "ventuno_q",
             "jetson_orin_nx",
-            "iq9075_dev",
-            "macos_dev",
         ):
-            self.assertIn(f"--platform-profile {profile}", workflow)
+            self.assertNotIn(unsupported_target, workflow)
+        self.assertIn("--platform-profile macos_dev", workflow)
         self.assertIn('--component-sha "$COMPONENT_SHA"', workflow)
-        self.assertIn("--artifact-kind deb", workflow)
-        self.assertIn('packaging/apt/publish-gcs.sh "$DEB_PATH" "$BOM_PATH"', workflow)
+        self.assertIn("--artifact-kind agent-bundle", workflow)
+        self.assertIn('packaging/apt/publish-gcs.sh "$DEB_PATH"', workflow)
+        self.assertIn(
+            '"$BUNDLE_PATH" "$BOM_PATH" "$SIGNATURE_PATH" "$BUNDLE_PATH"',
+            workflow,
+        )
+        self.assertIn("RELEASE_TRUST_DOMAIN=iq9075-dev", workflow)
+        self.assertIn("SKIP_APT_PUBLISH=true", workflow)
+        self.assertIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", workflow)
+        self.assertIn("IQ9075_RELEASE_PUBLIC_KEYRING_JSON", workflow)
+        self.assertIn("--signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY", workflow)
+        self.assertIn("build-agent-bundle.sh", workflow)
+        apt_and_release, ota_jobs = workflow.split(
+            "  iq9075-ota-build:", maxsplit=1
+        )
+        ota_build, ota_publish = ota_jobs.split(
+            "  iq9075-ota-publish:", maxsplit=1
+        )
+        self.assertIn("APT_GPG_PRIVATE_KEY", apt_and_release)
+        self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", apt_and_release)
+        self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", ota_build)
+        self.assertNotIn("GCP_SA_KEY", ota_build)
+        self.assertRegex(ota_build, r"actions/upload-artifact@[0-9a-f]{40} # v4")
+        self.assertIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", ota_publish)
+        self.assertNotIn("APT_GPG_PRIVATE_KEY", ota_publish)
+        self.assertNotIn("build-agent-bundle.sh", ota_publish)
+        self.assertNotIn("aptly", ota_publish)
+        self.assertIn("python3-cryptography", ota_publish)
+        self.assertRegex(ota_publish, r"actions/download-artifact@[0-9a-f]{40} # v4")
+        private_sign_step, publish_step = ota_publish.split(
+            "      - name: Publish verified exact bundle without signing key",
+            maxsplit=1,
+        )
+        self.assertIn("RELEASE_SIGNING_PRIVATE_KEY", private_sign_step)
+        self.assertNotIn("RELEASE_SIGNING_PRIVATE_KEY", publish_step)
+        self.assertIn("BOOTSTRAP_BUNDLE_PATH=\"$BUNDLE_PATH\"", ota_build)
+        self.assertIn("deb_sha256", ota_build)
 
         apt_publish = (ROOT / "packaging" / "apt" / "publish-gcs.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn("releases/by-bom-sha256/$BOM_DIGEST", apt_publish)
-        self.assertIn("Refusing to overwrite an existing remote BOM", apt_publish)
+        self.assertIn(
+            "Refusing to overwrite existing immutable release bytes", apt_publish
+        )
+        self.assertIn("release-bom.json.sig", apt_publish)
+        self.assertIn('$(basename "$BOM_ARTIFACT_PATH")', apt_publish)
         self.assertIn('gsutil cat "gs://$BUCKET/$relative_path" | cmp -s', apt_publish)
+        self.assertIn('cp -n "$published_release" "$remote_path"', apt_publish)
+        self.assertIn("-x '^(releases/|pool/)'", apt_publish)
+        self.assertNotIn("setmeta", apt_publish)
+        self.assertIn("RELEASE_TRUST_DOMAIN is required", apt_publish)
+
+        bundle = (
+            ROOT / "packaging" / "release" / "build-agent-bundle.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("python@sha256:", bundle)
+        self.assertIn('--target "$site_packages"', bundle)
+        self.assertIn('NUVION_SYSTEM_PYTHON:-/usr/bin/python3', bundle)
+        self.assertIn("requirements-agent-bundle-arm64.txt", bundle)
+        self.assertIn("--no-build-isolation", bundle)
+        self.assertGreaterEqual(bundle.count("--require-hashes"), 2)
+        self.assertIn("EXPECTED_COMPONENT_SHA", bundle)
+        self.assertIn("build_info.COMPONENT_SHA != expected_sha", bundle)
+        self.assertIn("package_path.is_relative_to(slot / \"venv\")", bundle)
+        self.assertIn("requirements-depthai-arm64.txt", bundle)
+        self.assertIn("agent-bundle must not contain symbolic links", bundle)
+
+        lock = (
+            ROOT
+            / "packaging"
+            / "release"
+            / "requirements-agent-bundle-arm64.txt"
+        ).read_text(encoding="utf-8")
+        requirements = [
+            line for line in lock.splitlines() if line and not line.startswith("#")
+        ]
+        self.assertGreaterEqual(len(requirements), 20)
+        self.assertTrue(all("==" in line and "--hash=sha256:" in line for line in requirements))
 
     def test_release_candidate_version_is_consistent(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -113,13 +190,14 @@ class ReleaseGateTest(unittest.TestCase):
         )
         self.assertIn("cffi-2.0.0-cp314-cp314-macosx_11_0_arm64.whl", homebrew)
 
-    def test_debian_source_copy_excludes_local_credentials(self) -> None:
+    def test_debian_bootstrap_is_prebuilt_and_excludes_checkout_source(self) -> None:
         deb = (ROOT / "packaging" / "deb" / "build-deb.sh").read_text(encoding="utf-8")
 
-        self.assertIn('"$ROOT_DIR/pyproject.toml" "$SRC_DIR/pyproject.toml"', deb)
-        self.assertIn('"$ROOT_DIR/README.md" "$SRC_DIR/README.md"', deb)
-        self.assertIn('"$ROOT_DIR/nuvion_app/"', deb)
-        self.assertIn('"$SRC_DIR/nuvion_app/"', deb)
+        self.assertIn("BOOTSTRAP_BUNDLE_PATH", deb)
+        self.assertIn("BOOTSTRAP_BUNDLE_PATH is required", deb)
+        self.assertIn("DEB_BUILDER_IMAGE=\"ubuntu@sha256:", deb)
+        self.assertIn("bootstrap-agent-bundle.sha256", deb)
+        self.assertNotIn('SRC_DIR="$PKG_DIR/opt/nuv-agent/src"', deb)
         self.assertNotIn('"$ROOT_DIR/" \\\n', deb)
         self.assertNotIn(".gnupg", deb)
         self.assertNotIn("gha-creds-", deb)
@@ -148,11 +226,13 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertEqual(unit.count("/opt/nuv-agent/current/venv/bin/python"), 2)
         self.assertNotIn("ExecStartPre=/opt/nuv-agent/venv/bin/python", unit)
         self.assertIn(
-            "ExecStartPre=/usr/sbin/runuser -u nuvion -- "
-            "/opt/nuv-agent/current/venv/bin/python -s "
+            "ExecStartPre=/opt/nuv-agent/current/venv/bin/python -s "
             "-m nuvion_app.runtime.settings_boot_guard",
             unit,
         )
+        self.assertNotIn("PermissionsStartOnly", unit)
+        self.assertNotIn("/usr/sbin/runuser", unit)
+        self.assertNotIn("docker.service", unit)
         self.assertLess(
             unit.index("-m nuvion_app.runtime.settings_boot_guard"),
             unit.index("from nuvion_app.runtime.bootstrap import ensure_ready"),
@@ -164,8 +244,10 @@ class ReleaseGateTest(unittest.TestCase):
         postinst = (ROOT / "packaging" / "deb" / "postinst").read_text(
             encoding="utf-8"
         )
-        self.assertIn('readonly NUVION_CURRENT="/opt/nuv-agent/current"', postinst)
-        self.assertIn('ln -s /opt/nuv-agent "$NUVION_CURRENT"', postinst)
+        self.assertIn('readonly BOOTSTRAP_ROOT="$INSTALL_ROOT/bootstrap"', postinst)
+        self.assertIn("atomic_slot_link current", postinst)
+        self.assertNotIn('readonly NUVION_CURRENT="/opt/nuv-agent/current"', postinst)
+        self.assertNotIn('ln -s /opt/nuv-agent "$NUVION_CURRENT"', postinst)
 
 
 if __name__ == "__main__":

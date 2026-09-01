@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly INSTALL_ROOT="/opt/nuv-agent"
+readonly CURRENT_LINK="$INSTALL_ROOT/current"
+
+if [ ! -L "$CURRENT_LINK" ]; then
+  echo "NUVION current release pointer is missing or unsafe" >&2
+  exit 126
+fi
+active_slot="$(readlink "$CURRENT_LINK")"
+case "$active_slot" in
+  releases/*)
+    [[ "$active_slot" =~ ^releases/[0-9a-f]{64}$ ]] || {
+      echo "NUVION release slot identity is unsafe" >&2
+      exit 126
+    }
+    ;;
+  bootstrap/*)
+    [[ "$active_slot" =~ ^bootstrap/[0-9A-Za-z][0-9A-Za-z._+-]{0,99}$ ]] || {
+      echo "NUVION bootstrap slot identity is unsafe" >&2
+      exit 126
+    }
+    ;;
+  *)
+    echo "NUVION current release pointer target is unsafe" >&2
+    exit 126
+    ;;
+esac
+
+readonly ENTRYPOINT="$CURRENT_LINK/bin/nuv-agent"
+
+if [ ! -x "$ENTRYPOINT" ] || [ -L "$ENTRYPOINT" ]; then
+  echo "NUVION active release entrypoint is missing or unsafe" >&2
+  exit 126
+fi
+
+export NUVION_ACTIVE_SLOT="$active_slot"
+if [[ "$active_slot" == releases/* ]]; then
+  readonly RELEASE_BOM="$CURRENT_LINK/.nuvion/release-bom.json"
+  if [ ! -f "$RELEASE_BOM" ] || [ -L "$RELEASE_BOM" ]; then
+    echo "NUVION active release BOM is missing or unsafe" >&2
+    exit 126
+  fi
+  export NUVION_RELEASE_BOM_PATH="$RELEASE_BOM"
+  export NUVION_EXPECTED_BOM_DIGEST="sha256:${active_slot#releases/}"
+fi
+exec "$ENTRYPOINT" "$@"

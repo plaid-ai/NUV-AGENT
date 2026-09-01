@@ -1046,6 +1046,58 @@ class DurableReconcileStore:
                     use_reservation=True,
                 )
 
+    def defer_for_retry(
+        self,
+        command: VerifiedFleetCommand,
+        *,
+        owner: str,
+        reported_state: Mapping[str, Any],
+        checkpoint: Mapping[str, Any],
+        retry_after_seconds: float,
+    ) -> None:
+        """Persist a non-restart effect retry behind a capped lease deadline."""
+
+        now_epoch = self._monotonic_clock()
+        now = self._wall_clock()
+        retry_at = now_epoch + max(1.0, min(float(retry_after_seconds), 300.0))
+        state = {**command.payload, **dict(reported_state)}
+        with self.inbox.transaction(immediate=True) as connection:
+            job = connection.execute(
+                "SELECT * FROM fleet_reconcile_job WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if job is None:
+                raise LookupError(f"reconcile job not found: {command.command_id}")
+            if str(job["phase"]) in TERMINAL_JOB_PHASES:
+                return
+            if str(job["lease_owner"] or "") != owner:
+                raise RuntimeError("reconcile lease changed before retry deferral")
+            connection.execute(
+                """
+                UPDATE fleet_reconcile_job
+                SET phase = ?, checkpoint_json = ?, lease_owner = NULL,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE command_id = ?
+                """,
+                (
+                    JOB_PHASE_VERIFYING,
+                    self._json(checkpoint),
+                    retry_at,
+                    now,
+                    command.command_id,
+                ),
+            )
+            self._append_history(
+                connection,
+                command.command_id,
+                from_phase=str(job["phase"]),
+                to_phase=JOB_PHASE_VERIFYING,
+                code="EFFECT_RETRY_DEFERRED",
+                message="external effect will retry without restarting the Agent",
+                state={**state, "retryAt": retry_at},
+                now=now,
+            )
+
     def requeue_waiting_restart(self, *, process_instance_id: str) -> int:
         now = self._wall_clock()
         requeued = 0
