@@ -200,9 +200,10 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             mock.patch.object(
                 pipeline,
                 "updater_telemetry_cache_updated_at",
-                pipeline.time.monotonic() - 100.0,
+                1.0,
             ),
             mock.patch.object(pipeline, "UPDATER_TELEMETRY_TTL_SEC", 1.0),
+            mock.patch.object(pipeline.time, "monotonic", return_value=200.0),
         ):
             stale = pipeline.get_cached_updater_runtime_telemetry()
 
