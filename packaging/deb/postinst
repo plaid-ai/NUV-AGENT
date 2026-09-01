@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+install_profile="${NUVION_INSTALL_PROFILE:-full}"
+case "$install_profile" in
+  full)
+    package_spec="/opt/nuv-agent/src[zsad,triton]"
+    ;;
+  runtime)
+    package_spec="/opt/nuv-agent/src[triton]"
+    ;;
+  base)
+    package_spec="/opt/nuv-agent/src"
+    ;;
+  *)
+    echo "Unsupported NUVION_INSTALL_PROFILE: $install_profile (expected full, runtime, or base)" >&2
+    exit 2
+    ;;
+esac
+
+install_autostart="${NUVION_INSTALL_AUTOSTART:-true}"
+install_autostart="${install_autostart,,}"
+case "$install_autostart" in
+  1|true|yes|on)
+    install_autostart=true
+    ;;
+  0|false|no|off)
+    install_autostart=false
+    ;;
+  *)
+    echo "Unsupported NUVION_INSTALL_AUTOSTART: $install_autostart" >&2
+    exit 2
+    ;;
+esac
+
 print_nuv_agent_banner() {
   printf '%s\n' \
 ' _   _ _   ___      _    ____ _____ _   _ _____' \
@@ -53,14 +85,19 @@ fi
 if command -v python3 >/dev/null 2>&1; then
   python3 -m venv --clear --system-site-packages /opt/nuv-agent/venv
   /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade pip >/dev/null
-  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "/opt/nuv-agent/src[zsad,triton]" >/dev/null
+  /opt/nuv-agent/venv/bin/pip install --no-cache-dir --upgrade "$package_spec" >/dev/null
   /opt/nuv-agent/venv/bin/python -m nuvion_app.cli doctor --config /etc/nuv-agent/agent.env --fix >/dev/null 2>&1 || true
 fi
 
 systemctl daemon-reload || true
-systemctl enable --now nuv-agent.service || true
+if [ "$install_autostart" = true ]; then
+  systemctl enable --now nuv-agent.service || true
+else
+  systemctl stop nuv-agent.service || true
+  systemctl disable nuv-agent.service || true
+fi
 
 echo
 print_nuv_agent_banner
 echo
-echo "nuv-agent installed. Run: nuv-agent setup"
+echo "nuv-agent installed (profile=$install_profile, autostart=$install_autostart). Run: nuv-agent setup"

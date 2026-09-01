@@ -87,6 +87,7 @@ def _append_video_transforms(pipeline: str) -> str:
 class LinuxVideoDeviceInfo:
     path: str
     name: str = ""
+    driver: str = ""
 
 
 def _video_device_sort_key(name: str) -> tuple[int, str]:
@@ -103,6 +104,20 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _read_linux_video_driver(sys_device_dir: Path) -> str:
+    uevent = _read_text(sys_device_dir / "device" / "uevent")
+    for line in uevent.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "DRIVER":
+            return value.strip()
+
+    driver_link = sys_device_dir / "device" / "driver"
+    try:
+        return driver_link.resolve(strict=True).name
+    except OSError:
+        return ""
+
+
 def _linux_video_devices(
     *,
     dev_root: str = "/dev",
@@ -111,8 +126,10 @@ def _linux_video_devices(
     devices: list[LinuxVideoDeviceInfo] = []
     sys_class_dir = Path(sys_class_root)
     for node in sorted(Path(dev_root).glob("video*"), key=lambda path: _video_device_sort_key(path.name)):
-        name = _read_text(sys_class_dir / node.name / "name")
-        devices.append(LinuxVideoDeviceInfo(path=str(node), name=name))
+        sys_device_dir = sys_class_dir / node.name
+        name = _read_text(sys_device_dir / "name")
+        driver = _read_linux_video_driver(sys_device_dir)
+        devices.append(LinuxVideoDeviceInfo(path=str(node), name=name, driver=driver))
     return devices
 
 
@@ -150,6 +167,40 @@ def _is_probable_jetson_csi_device(device: LinuxVideoDeviceInfo | None) -> bool:
         return False
     name = device.name.lower()
     return any(marker in name for marker in ("vi-output", "tegra", "camrtc", "nvargus"))
+
+
+def _is_probable_linux_camera_device(device: LinuxVideoDeviceInfo | None) -> bool:
+    if device is None:
+        return False
+
+    metadata = f"{device.name} {device.driver}".strip().lower()
+    if not metadata:
+        return False
+
+    codec_markers = (
+        "codec",
+        "decoder",
+        "encoder",
+        "m2m",
+        "msm_vidc",
+        "iris_vpu",
+        "vicodec",
+    )
+    if any(marker in metadata for marker in codec_markers):
+        return False
+
+    if _is_probable_jetson_csi_device(device):
+        return True
+
+    camera_markers = (
+        "uvcvideo",
+        "uvc",
+        "usb camera",
+        "webcam",
+        "camera",
+        "capture",
+    )
+    return any(marker in metadata for marker in camera_markers)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -228,12 +279,13 @@ def _pick_linux_v4l2_device(
     *,
     preference: str,
 ) -> LinuxVideoDeviceInfo | None:
-    usb_devices = [device for device in devices if not _is_probable_jetson_csi_device(device)]
+    camera_devices = [device for device in devices if _is_probable_linux_camera_device(device)]
+    usb_devices = [device for device in camera_devices if not _is_probable_jetson_csi_device(device)]
     if preference == "usb" and usb_devices:
         return usb_devices[0]
     if preference == "usb":
         return None
-    return devices[0] if devices else None
+    return camera_devices[0] if camera_devices else None
 
 
 def _build_standard_camera_pipeline(source: str, width: int, height: int, fps: int) -> str:

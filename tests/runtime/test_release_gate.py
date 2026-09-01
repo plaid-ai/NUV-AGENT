@@ -63,7 +63,13 @@ class ReleaseGateTest(unittest.TestCase):
 
         self.assertEqual(workflow.count("generate-release-bom.py"), 2)
         self.assertIn("${{ steps.sdist_bom.outputs.path }}", workflow)
-        for profile in ("rpi5_deepx_dx_m1", "ventuno_q", "jetson_orin_nx", "macos_dev"):
+        for profile in (
+            "rpi5_deepx_dx_m1",
+            "ventuno_q",
+            "jetson_orin_nx",
+            "iq9075_dev",
+            "macos_dev",
+        ):
             self.assertIn(f"--platform-profile {profile}", workflow)
         self.assertIn('--component-sha "$COMPONENT_SHA"', workflow)
         self.assertIn("--artifact-kind deb", workflow)

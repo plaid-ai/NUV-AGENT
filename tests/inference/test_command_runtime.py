@@ -726,6 +726,62 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("IDENTITY_SCOPE_MISMATCH", str(raised.exception))
 
+    def test_iq9075_dev_uses_dedicated_root_owned_trust_domain(self) -> None:
+        identity = SimpleNamespace(
+            identity_status="DEV",
+            platform_profile="iq9075_dev",
+            capabilities=frozenset({"command.config.apply"}),
+        )
+        with (
+            mock.patch(
+                "nuvion_app.inference.command_runtime.load_fleet_command_keyring",
+                return_value=object(),
+            ) as load_keyring,
+            mock.patch.object(DurableCommandInbox, "bind_identity") as bind_identity,
+        ):
+            build_fleet_command_runtime(
+                base_url="https://api.example.test",
+                access_token_provider=lambda: "token",
+                ack_sender=lambda _destination, _payload: True,
+                device_id="sp-3-iq9075-dev",
+                space_id=3,
+                keyring_path=self.root / "iq9075-keyring.json",
+                inbox_path=self.root / "iq9075.sqlite3",
+                platform_identity=identity,
+            )
+
+        load_keyring.assert_called_once_with(
+            self.root / "iq9075-keyring.json",
+            expected_trust_domain="iq9075-dev",
+            require_root_owner=True,
+        )
+        bind_identity.assert_called_once_with(
+            device_id="sp-3-iq9075-dev",
+            space_id=3,
+            trust_domain="iq9075-dev",
+        )
+
+    def test_unknown_dev_profile_is_not_mapped_to_production(self) -> None:
+        identity = SimpleNamespace(
+            identity_status="DEV",
+            platform_profile="unexpected_dev",
+            capabilities=frozenset({"command.config.apply"}),
+        )
+
+        with self.assertRaisesRegex(
+            FleetCommandRuntimeError, "does not support DEV platform profile"
+        ):
+            build_fleet_command_runtime(
+                base_url="https://api.example.test",
+                access_token_provider=lambda: "token",
+                ack_sender=lambda _destination, _payload: True,
+                device_id="sp-3-unknown-dev",
+                space_id=3,
+                keyring_path=self.root / "unused-keyring.json",
+                inbox_path=self.root / "unknown.sqlite3",
+                platform_identity=identity,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

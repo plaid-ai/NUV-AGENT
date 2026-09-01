@@ -41,6 +41,7 @@ from nuvion_app.inference.fleet_command import (
 from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
+    PROFILE_IQ9075_DEV,
     PROFILE_MACOS_DEV,
     PlatformIdentity,
     resolve_platform_identity,
@@ -110,7 +111,7 @@ def _read_integrity_file(path: Path, *, require_root_owner: bool) -> bytes:
             )
         if require_root_owner and metadata.st_uid != 0:
             raise FleetCommandRuntimeError(
-                "production Fleet command keyring must be owned by root"
+                "Fleet command keyring for this trust domain must be owned by root"
             )
         if metadata.st_mode & 0o022:
             raise FleetCommandRuntimeError(
@@ -489,18 +490,31 @@ def build_fleet_command_runtime(
             "Fleet command runtime requires verified platform identity, "
             f"got {platform_identity.identity_status}"
         )
-    development = platform_identity.platform_profile == PROFILE_MACOS_DEV
+    if platform_identity.identity_status == IDENTITY_STATUS_VERIFIED:
+        trust_domain = "production"
+        require_root_owner = True
+    elif platform_identity.platform_profile == PROFILE_MACOS_DEV:
+        trust_domain = "macos-dev"
+        require_root_owner = False
+    elif platform_identity.platform_profile == PROFILE_IQ9075_DEV:
+        trust_domain = "iq9075-dev"
+        require_root_owner = True
+    else:
+        raise FleetCommandRuntimeError(
+            "Fleet command runtime does not support DEV platform profile "
+            f"{platform_identity.platform_profile}"
+        )
     keyring = load_fleet_command_keyring(
         keyring_path,
-        expected_trust_domain="macos-dev" if development else "production",
-        require_root_owner=not development,
+        expected_trust_domain=trust_domain,
+        require_root_owner=require_root_owner,
     )
     inbox = DurableCommandInbox(inbox_path)
     try:
         inbox.bind_identity(
             device_id=device_id,
             space_id=space_id,
-            trust_domain="macos-dev" if development else "production",
+            trust_domain=trust_domain,
         )
     except CommandInboxError as exc:
         raise FleetCommandRuntimeError(

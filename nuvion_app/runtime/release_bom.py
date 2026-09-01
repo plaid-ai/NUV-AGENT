@@ -20,7 +20,13 @@ _CONFIG_SCHEMA = re.compile(r"^[1-9][0-9]*$")
 _BOM_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,254}$")
 _ARTIFACT_BASENAME = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,254}$")
 _VALID_PLATFORM_PROFILES = frozenset(
-    {"rpi5_deepx_dx_m1", "ventuno_q", "jetson_orin_nx", "macos_dev"}
+    {
+        "rpi5_deepx_dx_m1",
+        "ventuno_q",
+        "jetson_orin_nx",
+        "iq9075_dev",
+        "macos_dev",
+    }
 )
 _VALID_ARTIFACT_KINDS = frozenset({"python-sdist", "deb", "model", "config"})
 

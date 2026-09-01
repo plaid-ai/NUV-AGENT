@@ -321,6 +321,7 @@ jobs:
             --platform-profile rpi5_deepx_dx_m1 \
             --platform-profile ventuno_q \
             --platform-profile jetson_orin_nx \
+            --platform-profile iq9075_dev \
             --artifact "$DEB_PATH" \
             --artifact-kind deb \
             --built-at "$BUILT_AT" \

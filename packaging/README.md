@@ -42,6 +42,24 @@ This script:
 
 Python requirement: 3.10+
 
+The maintainer script supports bounded install modes:
+
+- `NUVION_INSTALL_PROFILE=full` installs `zsad,triton` extras (default).
+- `NUVION_INSTALL_PROFILE=runtime` installs only the Triton client extra.
+- `NUVION_INSTALL_PROFILE=base` installs the control-plane and media runtime without
+  model backends. This is the initial IQ-9075 development-board profile.
+- `NUVION_INSTALL_AUTOSTART=false` installs the package but leaves the service
+  stopped and disabled until identity, camera, and credentials have been checked.
+
+For a Qualcomm IQ-9075 EVK, use `packaging/dev/install-iq9075.sh <deb>` and then
+`packaging/dev/test-iq9075.sh`. The installer accepts only Ubuntu arm64 on an
+IQ-9075/QCS9075 device tree, provisions a root-owned development identity, applies
+safe no-model/no-Fleet defaults, and deliberately does not start the Agent.
+Use `sudo packaging/dev/provision-iq9075.sh <credentials.json> --consume` to
+atomically install Dev device credentials without printing them. Add
+`--synthetic-camera` only for an isolated control-plane test when no UVC camera is
+attached; remove `NUVION_GST_SOURCE` before the physical-camera release gate.
+
 Runtime bootstrap:
 - `nuv-agent setup` / `nuv-agent run` now try to bootstrap Docker/Triton/model bundle automatically.
 - systemd unit includes docker dependency and bootstrap preflight.

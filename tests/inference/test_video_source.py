@@ -37,6 +37,66 @@ class VideoSourceTest(unittest.TestCase):
 
         self.assertIn("v4l2src device=/dev/video2", pipeline)
 
+    def test_build_camera_source_linux_auto_skips_iq9075_codec_nodes_for_uvc_camera(self) -> None:
+        fake_devices = [
+            LinuxVideoDeviceInfo(
+                path="/dev/video32",
+                name="msm_vidc_decoder",
+                driver="msm_vidc_v4l2",
+            ),
+            LinuxVideoDeviceInfo(
+                path="/dev/video33",
+                name="msm_vidc_encoder",
+                driver="msm_vidc_v4l2",
+            ),
+            LinuxVideoDeviceInfo(
+                path="/dev/video0",
+                name="USB Camera: USB Camera",
+                driver="uvcvideo",
+            ),
+        ]
+        with mock.patch("nuvion_app.inference.video_source._linux_video_devices", return_value=fake_devices):
+            with mock.patch("nuvion_app.inference.video_source._is_jetson_platform", return_value=False):
+                pipeline = build_video_source_pipeline(
+                    "auto",
+                    640,
+                    480,
+                    30,
+                    platform_name="linux",
+                )
+
+        self.assertIn("v4l2src device=/dev/video0", pipeline)
+        self.assertNotIn("device=/dev/video32", pipeline)
+        self.assertNotIn("device=/dev/video33", pipeline)
+
+    def test_build_camera_source_linux_auto_does_not_select_codec_only_nodes(self) -> None:
+        fake_devices = [
+            LinuxVideoDeviceInfo(
+                path="/dev/video32",
+                name="msm_vidc_decoder",
+                driver="msm_vidc_v4l2",
+            ),
+            LinuxVideoDeviceInfo(
+                path="/dev/video33",
+                name="msm_vidc_encoder",
+                driver="iris_vpu",
+            ),
+        ]
+        with mock.patch("nuvion_app.inference.video_source._linux_video_devices", return_value=fake_devices):
+            with mock.patch("nuvion_app.inference.video_source._is_jetson_platform", return_value=False):
+                with mock.patch("nuvion_app.inference.video_source._gst_element_available", return_value=False):
+                    pipeline = build_video_source_pipeline(
+                        "auto",
+                        640,
+                        480,
+                        30,
+                        platform_name="linux",
+                    )
+
+        self.assertIn("autovideosrc", pipeline)
+        self.assertNotIn("device=/dev/video32", pipeline)
+        self.assertNotIn("device=/dev/video33", pipeline)
+
     def test_build_camera_source_linux_auto_prefers_jetson_argus_for_csi(self) -> None:
         fake_devices = [LinuxVideoDeviceInfo(path="/dev/video0", name="vi-output, imx477 9-001a")]
         with mock.patch("nuvion_app.inference.video_source._linux_video_devices", return_value=fake_devices):

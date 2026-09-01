@@ -29,7 +29,12 @@ class ReleaseBomTest(unittest.TestCase):
             component_sha="a" * 40,
             config_schema="11",
             updater_version="0.1.113",
-            platform_profiles=["ventuno_q", "rpi5_deepx_dx_m1", "jetson_orin_nx"],
+            platform_profiles=[
+                "ventuno_q",
+                "rpi5_deepx_dx_m1",
+                "jetson_orin_nx",
+                "iq9075_dev",
+            ],
             artifact_path=artifact,
             artifact_kind="deb",
             built_at="2026-09-01T03:00:00Z",
@@ -48,7 +53,7 @@ class ReleaseBomTest(unittest.TestCase):
         self.assertEqual(verified.component_sha, "a" * 40)
         self.assertEqual(
             verified.platform_profiles,
-            ("jetson_orin_nx", "rpi5_deepx_dx_m1", "ventuno_q"),
+            ("iq9075_dev", "jetson_orin_nx", "rpi5_deepx_dx_m1", "ventuno_q"),
         )
         self.assertEqual(verified.to_telemetry()["bomDigest"], payload["bomDigest"])
         self.assertTrue(verified.to_telemetry()["artifactDigest"].startswith("sha256:"))
