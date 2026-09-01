@@ -17,6 +17,7 @@ import threading
 import glob
 import math
 import shutil
+import sqlite3
 import subprocess
 import urllib.request
 import urllib.error
@@ -31,6 +32,11 @@ import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
 from nuvion_app.inference.clip_segments import list_stable_segments
+from nuvion_app.inference.command_runtime import (
+    FleetCommandRuntime,
+    FleetCommandRuntimeError,
+    build_fleet_command_runtime_from_env,
+)
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.device_state import (
@@ -42,17 +48,32 @@ from nuvion_app.inference.device_state import (
     DeviceStateCoordinator,
 )
 from nuvion_app.inference.durable_events import (
+    DEFAULT_DLQ_MAX_BYTES,
     DEFAULT_DLQ_MAX_ROWS,
+    DEFAULT_CRITICAL_SAFETY_MAX_BYTES,
+    DEFAULT_DELIVERY_CLASS_BY_EVENT_TYPE,
+    DEFAULT_OUTBOX_MAX_AGE_SECONDS,
     DEFAULT_OUTBOX_MAX_BYTES,
     DEFAULT_OUTBOX_MAX_ROWS,
+    DELIVERY_CLASS_CRITICAL,
     EVENT_TYPE_ANOMALY,
+    EVENT_TYPE_CONNECTIVITY,
+    EVENT_TYPE_DEVICE_STATE,
+    EVENT_TYPE_METRIC,
     EVENT_TYPE_PRODUCTION,
     DurableEvent,
+    DurableEventCapacityError,
     DurableEventDelivery,
     DurableEventOutbox,
+    is_uncorrelated_permanent_event_rejection,
     parse_permanent_event_rejection,
     resolve_default_outbox_path,
     utc_now_iso,
+)
+from nuvion_app.inference.critical_event_safety import (
+    CriticalEventBackpressureError,
+    CriticalEventSafetyGate,
+    PendingCriticalEvent,
 )
 from nuvion_app.inference.face_tracking import FaceTrackingController
 from nuvion_app.inference.face_tracking import TrackingOverlaySnapshot
@@ -68,6 +89,7 @@ from nuvion_app.inference.signaling_contract import (
     AGENT_COMMAND_QUEUE_DEST,
     AGENT_ERROR_QUEUE_DEST,
     EVENT_ACK_QUEUE_DEST,
+    FLEET_COMMAND_QUEUE_DEST,
     REQUIRED_AGENT_SUBSCRIPTIONS,
 )
 from nuvion_app.inference.webrtc_signaling import (
@@ -260,6 +282,10 @@ CONNECTIVITY_WIFI_INTERFACE = (os.getenv("NUVION_WIFI_INTERFACE", "") or "").str
 
 OUTBOUND_QUEUE_MAX = int(os.getenv("NUVION_STOMP_QUEUE_MAX", "200"))
 EVENT_REPLAY_INTERVAL_SEC = parse_float(os.getenv("NUVION_EVENT_REPLAY_INTERVAL_SEC"), 5.0)
+FLEET_COMMAND_POLL_INTERVAL_SEC = parse_float(
+    os.getenv("NUVION_FLEET_COMMAND_POLL_INTERVAL_SEC"),
+    30.0,
+)
 EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
     DEFAULT_OUTBOX_MAX_ROWS,
@@ -268,9 +294,21 @@ EVENT_OUTBOX_MAX_BYTES = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_BYTES"),
     DEFAULT_OUTBOX_MAX_BYTES,
 )
+EVENT_CRITICAL_SAFETY_MAX_BYTES = parse_int_with_default(
+    os.getenv("NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES"),
+    DEFAULT_CRITICAL_SAFETY_MAX_BYTES,
+)
 EVENT_DLQ_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_DLQ_MAX_ROWS"),
     DEFAULT_DLQ_MAX_ROWS,
+)
+EVENT_DLQ_MAX_BYTES = parse_int_with_default(
+    os.getenv("NUVION_EVENT_DLQ_MAX_BYTES"),
+    DEFAULT_DLQ_MAX_BYTES,
+)
+EVENT_OUTBOX_MAX_AGE_SECONDS = parse_int_with_default(
+    os.getenv("NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS"),
+    DEFAULT_OUTBOX_MAX_AGE_SECONDS,
 )
 CLIP_EVENT_ACK_WAIT_SEC = parse_float(os.getenv("NUVION_CLIP_EVENT_ACK_WAIT_SEC"), 60.0)
 CLIP_STATUS_MAX_RETRIES = parse_int_with_default(os.getenv("NUVION_CLIP_STATUS_MAX_RETRIES"), 5)
@@ -304,8 +342,12 @@ last_sent_payloads_lock = threading.Lock()
 critical_event_delivery: DurableEventDelivery | None = None
 critical_event_outbox_init_attempted = False
 critical_event_outbox_lock = threading.Lock()
+critical_event_safety_gate = CriticalEventSafetyGate()
 device_state_coordinator: DeviceStateCoordinator | None = None
 device_state_coordinator_lock = threading.Lock()
+fleet_command_runtime: FleetCommandRuntime | None = None
+fleet_command_runtime_init_attempted = False
+fleet_command_runtime_lock = threading.Lock()
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
 
@@ -667,12 +709,28 @@ def initialize_durable_event_outbox() -> DurableEventDelivery | None:
                 max_rows=EVENT_OUTBOX_MAX_ROWS,
                 max_bytes=EVENT_OUTBOX_MAX_BYTES,
                 max_dead_letters=EVENT_DLQ_MAX_ROWS,
+                max_dead_letter_bytes=EVENT_DLQ_MAX_BYTES,
+                max_critical_safety_bytes=EVENT_CRITICAL_SAFETY_MAX_BYTES,
+                max_age_seconds=EVENT_OUTBOX_MAX_AGE_SECONDS,
             )
             critical_event_delivery = DurableEventDelivery(outbox)
+            retained = outbox.critical_safety_event()
+            if retained is not None:
+                critical_event_safety_gate.restore_retained(
+                    PendingCriticalEvent.create(
+                        event_type=retained.event_type,
+                        destination=retained.destination,
+                        payload=retained.payload,
+                        event_id=retained.event_id,
+                        occurred_at=retained.occurred_at,
+                    ),
+                    retained.last_error or "restored after process restart",
+                )
             log.info(
-                "[OUTBOX] ready path=%s pending=%d",
+                "[OUTBOX] ready path=%s retained=%d blocked=%d",
                 outbox.path,
                 outbox.count(),
+                outbox.blocked_count(),
             )
         except Exception as exc:
             critical_event_delivery = None
@@ -726,8 +784,102 @@ def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True
     return True
 
 
+def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
+    global fleet_command_runtime, fleet_command_runtime_init_attempted
+    with fleet_command_runtime_lock:
+        if fleet_command_runtime_init_attempted:
+            return fleet_command_runtime
+        fleet_command_runtime_init_attempted = True
+        try:
+            fleet_command_runtime = build_fleet_command_runtime_from_env(
+                base_url=SERVER_BASE_URL,
+                access_token_provider=lambda: get_auth_token() or "",
+                ack_sender=lambda destination, payload: enqueue_stomp_message(
+                    destination,
+                    payload,
+                    remember=False,
+                ),
+            )
+        except (FleetCommandRuntimeError, OSError, sqlite3.Error, ValueError) as exc:
+            log.error("[FLEET-COMMAND] disabled by invalid fail-closed configuration: %s", exc)
+            fleet_command_runtime = None
+        if fleet_command_runtime is None:
+            log.info("[FLEET-COMMAND] runtime disabled")
+        else:
+            log.info(
+                "[FLEET-COMMAND] durable inbox ready path=%s lastSequence=%d",
+                fleet_command_runtime.inbox.path,
+                fleet_command_runtime.inbox.last_sequence(),
+            )
+        return fleet_command_runtime
+
+
 def _send_durable_event(event: DurableEvent) -> bool:
     return _try_enqueue_outbound(event.destination, event.payload, event.event_id)
+
+
+def persist_durable_event(
+    event_type: str,
+    destination: str,
+    payload: dict,
+    event_id: str | None = None,
+    occurred_at: str | None = None,
+    compaction_key: str | None = None,
+) -> DurableEvent | None:
+    delivery = initialize_durable_event_outbox()
+    if delivery is None:
+        return None
+    normalized_event_id = event_id or str(uuid.uuid4())
+    normalized_occurred_at = occurred_at or utc_now_iso()
+    try:
+        event = delivery.publish(
+            event_type=event_type,
+            destination=destination,
+            payload=payload,
+            event_id=normalized_event_id,
+            occurred_at=normalized_occurred_at,
+            sender=_send_durable_event,
+            compaction_key=compaction_key,
+        )
+        if event.dead_lettered:
+            log.error(
+                "[OUTBOX] duplicate event is already in DLQ type=%s eventId=%s",
+                event_type,
+                normalized_event_id,
+            )
+        elif event.dropped:
+            log.warning(
+                "[OUTBOX] non-critical event dropped type=%s eventId=%s",
+                event_type,
+                normalized_event_id,
+            )
+        return event
+    except DurableEventCapacityError:
+        if (
+            DEFAULT_DELIVERY_CLASS_BY_EVENT_TYPE.get(str(event_type).strip().upper())
+            == DELIVERY_CLASS_CRITICAL
+        ):
+            raise
+        log.error(
+            "[OUTBOX] non-critical capacity failure type=%s eventId=%s",
+            event_type,
+            normalized_event_id,
+        )
+        return None
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+    ) as exc:
+        log.error(
+            "[OUTBOX] persist failed type=%s eventId=%s: %s",
+            event_type,
+            normalized_event_id,
+            exc,
+        )
+        return None
 
 
 def persist_critical_event(
@@ -737,24 +889,145 @@ def persist_critical_event(
     event_id: str,
     occurred_at: str,
 ) -> DurableEvent | None:
+    retained = PendingCriticalEvent.create(
+        event_type=event_type,
+        destination=destination,
+        payload=payload,
+        event_id=event_id,
+        occurred_at=occurred_at,
+    )
+    try:
+        return critical_event_safety_gate.persist(
+            retained,
+            _persist_pending_critical_once,
+            _retain_failed_critical_event,
+            _clear_retained_critical_event,
+        )
+    except CriticalEventBackpressureError:
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+        raise
+
+
+def _persist_pending_critical_once(event: PendingCriticalEvent) -> DurableEvent:
     delivery = initialize_durable_event_outbox()
     if delivery is None:
-        return None
+        raise DurableEventCapacityError("critical outbox is unavailable")
     try:
-        event = delivery.publish(
-            event_type=event_type,
-            destination=destination,
-            payload=payload,
-            event_id=event_id,
-            occurred_at=occurred_at,
+        persisted = delivery.publish(
+            event_type=event.event_type,
+            destination=event.destination,
+            payload=event.payload,
+            event_id=event.event_id,
+            occurred_at=event.occurred_at,
             sender=_send_durable_event,
         )
-        if event.dead_lettered:
-            log.error("[OUTBOX] event routed to DLQ type=%s eventId=%s", event_type, event_id)
-        return event
-    except Exception as exc:
-        log.error("[OUTBOX] persist failed type=%s eventId=%s: %s", event_type, event_id, exc)
-        return None
+    except DurableEventCapacityError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise DurableEventCapacityError(
+            f"critical outbox persistence failed: {exc}"
+        ) from exc
+    if persisted.dead_lettered or persisted.dropped:
+        raise DurableEventCapacityError(
+            "critical event did not enter the pending durable outbox"
+        )
+    return persisted
+
+
+def _retain_failed_critical_event(
+    event: PendingCriticalEvent,
+    reason: str,
+) -> None:
+    delivery = initialize_durable_event_outbox()
+    if delivery is None:
+        raise DurableEventCapacityError("critical safety slot is unavailable")
+    delivery.outbox.retain_critical_safety_event(
+        event_type=event.event_type,
+        destination=event.destination,
+        payload=event.payload,
+        event_id=event.event_id,
+        occurred_at=event.occurred_at,
+        last_error=reason,
+    )
+
+
+def _clear_retained_critical_event(event_id: str) -> bool:
+    if critical_event_delivery is None:
+        return False
+    return critical_event_delivery.outbox.clear_critical_safety_event(event_id)
+
+
+def retry_retained_critical_event() -> bool:
+    return critical_event_safety_gate.retry_retained(
+        _persist_pending_critical_once,
+        _clear_retained_critical_event,
+    )
+
+
+def build_event_outbox_runtime_health() -> dict:
+    if critical_event_delivery is None:
+        health = {
+            "pendingRows": 0,
+            "pendingBytes": 0,
+            "oldestCriticalAgeSeconds": None,
+            "dlqRows": 0,
+            "dlqBytes": 0,
+            "blockedRows": 0,
+            "capacityState": (
+                "UNAVAILABLE" if critical_event_outbox_init_attempted else "INITIALIZING"
+            ),
+        }
+    else:
+        try:
+            health = critical_event_delivery.outbox.health_snapshot().to_telemetry()
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            health = {
+                "pendingRows": 0,
+                "pendingBytes": 0,
+                "oldestCriticalAgeSeconds": None,
+                "dlqRows": 0,
+                "dlqBytes": 0,
+                "blockedRows": 0,
+                "capacityState": "UNAVAILABLE",
+                "healthError": str(exc)[:500],
+            }
+    safety = critical_event_safety_gate.health_overlay()
+    health.update(safety)
+    health["unsavedCriticalEvents"] = max(
+        int(health.get("criticalSafetyRows") or 0),
+        int(safety["unsavedCriticalEvents"]),
+    )
+    if safety["safetyStop"]:
+        health["capacityState"] = "OPERATOR_STOP"
+    elif safety["unsavedCriticalEvents"]:
+        health["capacityState"] = "BACKPRESSURE"
+    return health
+
+
+def persist_state_event(payload: dict) -> bool:
+    event = persist_durable_event(
+        EVENT_TYPE_DEVICE_STATE,
+        "/app/device/state",
+        payload,
+        compaction_key="device-state",
+    )
+    return event is not None and not event.dropped and not event.dead_lettered
+
+
+def persist_connectivity_event(payload: dict) -> bool:
+    event = persist_durable_event(
+        EVENT_TYPE_CONNECTIVITY,
+        "/app/device/connectivity",
+        payload,
+        compaction_key="connectivity",
+    )
+    return event is not None and not event.dropped and not event.dead_lettered
+
+
+def persist_metric_event(payload: dict) -> bool:
+    """Durably stage one best-effort metric; transport completion is its terminal ACK."""
+    event = persist_durable_event(EVENT_TYPE_METRIC, "/app/device/metric", payload)
+    return event is not None and not event.dropped and not event.dead_lettered
 
 
 def get_device_state_coordinator() -> DeviceStateCoordinator:
@@ -762,10 +1035,13 @@ def get_device_state_coordinator() -> DeviceStateCoordinator:
     with device_state_coordinator_lock:
         if device_state_coordinator is None:
             device_state_coordinator = DeviceStateCoordinator(
-                send_message=lambda payload: enqueue_stomp_message("/app/device/state", payload),
+                send_message=persist_state_event,
                 line_id=LINE_ID,
                 process_id=PROCESS_ID,
                 telemetry=build_runtime_telemetry(),
+                runtime_telemetry_provider=lambda: {
+                    "eventOutbox": build_event_outbox_runtime_health()
+                },
             )
         return device_state_coordinator
 
@@ -801,7 +1077,16 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
 async def durable_event_replay_sender() -> None:
     interval = max(1.0, EVENT_REPLAY_INTERVAL_SEC)
     while True:
-        if critical_event_delivery is not None:
+        if critical_event_safety_gate.pending_event() is not None:
+            if retry_retained_critical_event():
+                log.error(
+                    "[OUTBOX] retained critical event is now durable; "
+                    "operator stop remains until explicit recovery"
+                )
+        if (
+            critical_event_delivery is not None
+            and critical_event_safety_gate.replay_allowed()
+        ):
             critical_event_delivery.replay(
                 _send_durable_event,
                 limit=OUTBOUND_QUEUE_MAX,
@@ -865,7 +1150,7 @@ async def device_connectivity_sender(reporter: ConnectivityReporter):
         payload = reporter.build_transition_payload()
         if payload:
             coordinator.set_connectivity_status(str(payload.get("quality") or CONNECTIVITY_QUALITY_GOOD))
-        if payload and enqueue_stomp_message("/app/device/connectivity", payload):
+        if payload and persist_connectivity_event(payload):
             log.info(
                 "[CONNECTIVITY] sent quality=%s reason=%s rssi=%s loss=%s rtt=%s",
                 payload.get("quality"),
@@ -933,6 +1218,16 @@ async def handle_agent_error(body: str) -> None:
                 rejection.event_type,
                 rejection.rejection_code,
             )
+        return
+
+    if rejection is None and is_uncorrelated_permanent_event_rejection(payload):
+        reason = (
+            f"uncorrelated permanent event rejection path={path} code={code}: "
+            f"{detail or message}"
+        )
+        critical_event_safety_gate.enter_protocol_stop(reason)
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+        log.error("[OUTBOX] %s; critical replay stopped for operator action", reason)
         return
 
     if retryable:
@@ -1055,6 +1350,41 @@ async def handle_command_message(body: str):
     await handle_webrtc_uplink_command(data)
 
 
+async def handle_fleet_command_wakeup(body: str) -> None:
+    runtime = initialize_fleet_command_runtime()
+    if runtime is None:
+        log.warning("[FLEET-COMMAND] ignored wake-up because runtime is disabled")
+        return
+    try:
+        sent = await runtime.on_wakeup(body)
+        log.info("[FLEET-COMMAND] wake-up reconciled lifecycleAcks=%d", sent)
+    except Exception as exc:  # noqa: BLE001 - command remains durable for the next pull.
+        log.error(
+            "[FLEET-COMMAND] wake-up reconciliation failed type=%s detail=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
+
+
+async def fleet_command_poll_sender(runtime: FleetCommandRuntime) -> None:
+    interval = max(5.0, FLEET_COMMAND_POLL_INTERVAL_SEC)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            reconciled = await runtime.poll()
+            if reconciled:
+                log.info(
+                    "[FLEET-COMMAND] periodic reconciliation count=%d",
+                    reconciled,
+                )
+        except Exception as exc:  # noqa: BLE001 - durable journal retries next interval.
+            log.error(
+                "[FLEET-COMMAND] periodic reconciliation failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:500],
+            )
+
+
 async def signaling_client_main():
     global websocket, signaling_loop, outbound_queue
 
@@ -1063,6 +1393,7 @@ async def signaling_client_main():
     if outbound_queue is None:
         outbound_queue = asyncio.Queue(maxsize=OUTBOUND_QUEUE_MAX)
     initialize_durable_event_outbox()
+    command_runtime = initialize_fleet_command_runtime()
 
     while True:
         token = await login()
@@ -1120,6 +1451,7 @@ async def signaling_client_main():
                 stomp_heartbeat_task = asyncio.create_task(stomp_heartbeat_sender(ws, send_interval_ms))
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
                 connectivity_task = None
+                fleet_command_poll_task = None
                 if CONNECTIVITY_ENABLED:
                     connectivity_target_host = CONNECTIVITY_TARGET_HOST or extract_host_from_server_url(SERVER_BASE_URL)
                     connectivity_thresholds = ConnectivityThresholds(
@@ -1135,6 +1467,23 @@ async def signaling_client_main():
                     )
                     connectivity_task = asyncio.create_task(device_connectivity_sender(reporter))
 
+                if command_runtime is not None:
+                    try:
+                        reconciled = await command_runtime.on_connected()
+                        log.info(
+                            "[FLEET-COMMAND] reconnect reconciliation complete count=%d",
+                            reconciled,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - keep signaling online for retry/wake.
+                        log.error(
+                            "[FLEET-COMMAND] reconnect reconciliation failed type=%s detail=%s",
+                            type(exc).__name__,
+                            str(exc)[:500],
+                        )
+                    fleet_command_poll_task = asyncio.create_task(
+                        fleet_command_poll_sender(command_runtime)
+                    )
+
                 async for message in ws:
                     if not message.startswith("a["):
                         continue
@@ -1146,7 +1495,9 @@ async def signaling_client_main():
                         destination = frame["headers"].get("destination")
                         body = frame["body"]
 
-                        if destination and AGENT_COMMAND_QUEUE_DEST in destination:
+                        if destination and FLEET_COMMAND_QUEUE_DEST in destination:
+                            await handle_fleet_command_wakeup(body)
+                        elif destination and AGENT_COMMAND_QUEUE_DEST in destination:
                             await handle_command_message(body)
                         elif destination and AGENT_ERROR_QUEUE_DEST in destination:
                             await handle_agent_error(body)
@@ -1167,6 +1518,8 @@ async def signaling_client_main():
                 heartbeat_task.cancel()
             if "connectivity_task" in locals() and connectivity_task is not None:
                 connectivity_task.cancel()
+            if "fleet_command_poll_task" in locals() and fleet_command_poll_task is not None:
+                fleet_command_poll_task.cancel()
 
         log.info("[SIGNALING] Reconnecting in 10s...")
         await asyncio.sleep(10)
@@ -1384,9 +1737,6 @@ class NuvionEventState:
 
         event_id = str(uuid.uuid4())
         occurred_at = utc_now_iso()
-        if initialize_durable_event_outbox() is None:
-            return
-
         if status == "DEFECT" and status_changed and snapshot_object is None:
             snapshot_object = self.capture_snapshot_upload()
 
@@ -1418,9 +1768,6 @@ class NuvionEventState:
             return
         self.last_sent_status = status
         self.last_sent_at = now
-        if event.dead_lettered:
-            log.error("[ZSAD] Event quarantined before send eventId=%s status=%s", event.event_id, status)
-            return
         if status_changed:
             log.info("[ZSAD] Sent %s status (change): %s", status, tagged_message)
         else:
@@ -1650,13 +1997,14 @@ class NuvionEventState:
             "lineId": LINE_ID,
             "processId": PROCESS_ID,
         }
-        return persist_critical_event(
+        event = persist_critical_event(
             EVENT_TYPE_PRODUCTION,
             "/app/device/production",
             payload,
             event_id,
             occurred_at,
-        ) is not None
+        )
+        return event is not None and not event.dead_lettered and not event.dropped
 
     def _emit_overlay(self, text: str):
         if self.overlay_callback:
@@ -1687,6 +2035,9 @@ class NuvionEventState:
 
     def _zsad_worker(self):
         while self.running:
+            if critical_event_safety_gate.is_stopped():
+                time.sleep(0.25)
+                continue
             try:
                 frame = self.zero_shot_queue.get(timeout=0.5)
             except queue.Empty:
@@ -1708,16 +2059,24 @@ class NuvionEventState:
                         ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
                     )
                     self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
-                    if status == "DEFECT":
-                        self.send_status("DEFECT", label, f"Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
-                    else:
-                        self.send_status("NORMAL", label, f"Recovered to normal: {label} ({score:.2f})", "INFO")
+                    try:
+                        if status == "DEFECT":
+                            self.send_status("DEFECT", label, f"Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
+                        else:
+                            self.send_status("NORMAL", label, f"Recovered to normal: {label} ({score:.2f})", "INFO")
+                    except CriticalEventBackpressureError as exc:
+                        log.critical("[SAFETY-STOP] %s", exc)
+                        continue
 
                     if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                         now = time.time()
                         if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
-                            if self.report_production(1):
-                                self.last_production_at = now
+                            try:
+                                if self.report_production(1):
+                                    self.last_production_at = now
+                            except CriticalEventBackpressureError as exc:
+                                log.critical("[SAFETY-STOP] %s", exc)
+                                continue
 
             elif self.backend == "triton":
                 try:
@@ -1742,16 +2101,24 @@ class NuvionEventState:
                 )
                 self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
 
-                if status == "DEFECT":
-                    self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING")
-                else:
-                    self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO")
+                try:
+                    if status == "DEFECT":
+                        self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING")
+                    else:
+                        self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO")
+                except CriticalEventBackpressureError as exc:
+                    log.critical("[SAFETY-STOP] %s", exc)
+                    continue
 
                 if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                     now = time.time()
                     if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
-                        if self.report_production(1):
-                            self.last_production_at = now
+                        try:
+                            if self.report_production(1):
+                                self.last_production_at = now
+                        except CriticalEventBackpressureError as exc:
+                            log.critical("[SAFETY-STOP] %s", exc)
+                            continue
 
     @staticmethod
     def _drain_queue_batch(work_queue: queue.Queue, first_item, max_items: int) -> list:

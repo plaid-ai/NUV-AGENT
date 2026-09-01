@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 DEVICE_STATE_RUNNING = "RUNNING"
@@ -31,7 +31,8 @@ class DeviceStateCoordinator:
         send_message: Callable[[dict[str, Any]], bool],
         line_id: int | None,
         process_id: int | None,
-        telemetry: dict[str, str] | None = None,
+        telemetry: Mapping[str, Any] | None = None,
+        runtime_telemetry_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._send_message = send_message
         self._line_id = line_id
@@ -41,6 +42,7 @@ class DeviceStateCoordinator:
         self._inspection_status = INSPECTION_STATUS_NORMAL
         self._connectivity_status = CONNECTIVITY_QUALITY_GOOD
         self._telemetry = dict(telemetry or {})
+        self._runtime_telemetry_provider = runtime_telemetry_provider
 
     def emit_heartbeat(self) -> bool:
         return self._send_message(self.current_payload())
@@ -128,6 +130,15 @@ class DeviceStateCoordinator:
             "connectivityStatus": self._connectivity_status,
         }
         payload.update(self._telemetry)
+        if self._runtime_telemetry_provider is not None:
+            dynamic_telemetry = dict(self._runtime_telemetry_provider())
+            runtime_telemetry = payload.get("runtimeTelemetry")
+            if isinstance(runtime_telemetry, Mapping):
+                merged_runtime_telemetry = dict(runtime_telemetry)
+                merged_runtime_telemetry.update(dynamic_telemetry)
+                payload["runtimeTelemetry"] = merged_runtime_telemetry
+            else:
+                payload["runtimeTelemetry"] = dynamic_telemetry
         return payload
 
     def _message_locked(self, status: str) -> str:

@@ -15,7 +15,7 @@ from nuvion_app.runtime.inference_mode import (
     normalize_siglip_device,
 )
 
-CURRENT_CONFIG_SCHEMA_VERSION = "10"
+CURRENT_CONFIG_SCHEMA_VERSION = "11"
 _LEGACY_HOST_REPLACEMENTS = {
     "api.nuvion-dev.plaidai.io": "api.nuvion-dev.plaidlabs.ai",
     "webrtc.nuvion-dev.plaidai.io": "webrtc.nuvion-dev.plaidlabs.ai",
@@ -200,11 +200,23 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     for key, default in (
         ("NUVION_EVENT_OUTBOX_MAX_ROWS", 10_000),
         ("NUVION_EVENT_OUTBOX_MAX_BYTES", 64 * 1024 * 1024),
+        ("NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES", 64 * 1024 * 1024),
+        ("NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS", 30 * 24 * 60 * 60),
         ("NUVION_EVENT_DLQ_MAX_ROWS", 10_000),
+        ("NUVION_EVENT_DLQ_MAX_BYTES", 64 * 1024 * 1024),
     ):
         normalized = _normalize_int(values.get(key, ""), default)
         if str(normalized) != str(values.get(key, "")):
             update(key, str(normalized), f"normalize {key.lower()}")
+
+    outbox_max_bytes = int(values["NUVION_EVENT_OUTBOX_MAX_BYTES"])
+    critical_safety_max_bytes = int(values["NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES"])
+    if critical_safety_max_bytes < outbox_max_bytes:
+        update(
+            "NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES",
+            str(outbox_max_bytes),
+            "critical safety reserve must fit every normal outbox event",
+        )
 
     base_url = (values.get("NUVION_MODEL_SERVER_BASE_URL", "") or "").strip()
     if not base_url:
@@ -390,7 +402,10 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
         "NUVION_MOTOR_COMMAND_INTERVAL_SEC",
         "NUVION_EVENT_OUTBOX_MAX_ROWS",
         "NUVION_EVENT_OUTBOX_MAX_BYTES",
+        "NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES",
+        "NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS",
         "NUVION_EVENT_DLQ_MAX_ROWS",
+        "NUVION_EVENT_DLQ_MAX_BYTES",
     ):
         try:
             parsed = float(str(values.get(key, "")).strip())

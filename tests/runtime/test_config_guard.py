@@ -6,10 +6,25 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION, ensure_runtime_config, guard_config
+from nuvion_app.runtime.config_guard import (
+    CURRENT_CONFIG_SCHEMA_VERSION,
+    ensure_runtime_config,
+    guard_config,
+)
 
 
 class ConfigGuardTest(unittest.TestCase):
+    def test_current_schema_is_version_11_for_durable_outbox_contract(self) -> None:
+        self.assertEqual(CURRENT_CONFIG_SCHEMA_VERSION, "11")
+        template = (
+            Path(__file__).parents[2] / "nuvion_app" / "config_template.env"
+        ).read_text(encoding="utf-8")
+        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=11", template)
+        example = (Path(__file__).parents[2] / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("NUVION_CONFIG_SCHEMA_VERSION=11", example)
+
     def test_guard_normalizes_invalid_outbox_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"
@@ -22,7 +37,10 @@ class ConfigGuardTest(unittest.TestCase):
                         "NUVION_ZSAD_BACKEND=none",
                         "NUVION_EVENT_OUTBOX_MAX_ROWS=0",
                         "NUVION_EVENT_OUTBOX_MAX_BYTES=invalid",
+                        "NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES=1",
+                        "NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS=0",
                         "NUVION_EVENT_DLQ_MAX_ROWS=-1",
+                        "NUVION_EVENT_DLQ_MAX_BYTES=invalid",
                         "",
                     ]
                 ),
@@ -33,7 +51,13 @@ class ConfigGuardTest(unittest.TestCase):
 
             self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_ROWS"], "10000")
             self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_BYTES"], "67108864")
+            self.assertEqual(
+                report.values["NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES"],
+                "67108864",
+            )
+            self.assertEqual(report.values["NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS"], "2592000")
             self.assertEqual(report.values["NUVION_EVENT_DLQ_MAX_ROWS"], "10000")
+            self.assertEqual(report.values["NUVION_EVENT_DLQ_MAX_BYTES"], "67108864")
 
     def test_runtime_migration_replaces_dotenv_origin_values_in_current_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

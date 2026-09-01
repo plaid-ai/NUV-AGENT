@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKG_NAME="nuv-agent"
-VERSION="${VERSION:-0.1.113}"
+VERSION="${VERSION:-0.1.114}"
 ARCH="${ARCH:-$(dpkg --print-architecture)}"
 BUILD_ROOT="${BUILD_ROOT:-$(mktemp -d)}"
 
@@ -33,14 +33,15 @@ chmod 0755 "$PKG_DIR/DEBIAN/postinst" "$PKG_DIR/DEBIAN/prerm"
 
 SRC_DIR="$PKG_DIR/opt/nuv-agent/src"
 mkdir -p "$SRC_DIR"
+install -m 0644 "$ROOT_DIR/pyproject.toml" "$SRC_DIR/pyproject.toml"
+install -m 0644 "$ROOT_DIR/README.md" "$SRC_DIR/README.md"
+mkdir -p "$SRC_DIR/nuvion_app"
 rsync -a \
-  --exclude ".git" \
-  --exclude "dist" \
-  --exclude ".venv*" \
   --exclude "__pycache__" \
-  --exclude ".pytest_cache" \
-  "$ROOT_DIR/" \
-  "$SRC_DIR/"
+  --exclude "*.pyc" \
+  --exclude "*.pyo" \
+  "$ROOT_DIR/nuvion_app/" \
+  "$SRC_DIR/nuvion_app/"
 
 cp "$ROOT_DIR/nuvion_app/config_template.env" "$PKG_DIR/opt/nuv-agent/share/agent.env.example"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent.service" "$PKG_DIR/lib/systemd/system/nuv-agent.service"

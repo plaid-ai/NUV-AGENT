@@ -232,11 +232,16 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
 - `NUVION_DEVICE_STATE_INTERVAL_SEC`: `/app/device/state` heartbeat 주기(초, 기본 `30`)
-- `NUVION_EVENT_OUTBOX_PATH`: anomaly/production SQLite outbox 경로 (systemd 기본 `/var/lib/nuv-agent/events.sqlite3`)
-- `NUVION_EVENT_REPLAY_INTERVAL_SEC`: ACK 미수신 event 재전송 주기(초, 기본 `5`)
+- `NUVION_EVENT_OUTBOX_PATH`: anomaly/production/state/connectivity SQLite outbox 경로 (systemd 기본 `/var/lib/nuv-agent/events.sqlite3`)
+- `NUVION_EVENT_REPLAY_INTERVAL_SEC`: terminal 확인 전 event 재전송 주기(초, 기본 `5`)
 - `NUVION_EVENT_OUTBOX_MAX_ROWS`: replay 대기 event 최대 행 수(기본 `10000`)
-- `NUVION_EVENT_OUTBOX_MAX_BYTES`: replay 대기 payload 논리 크기 한도(기본 `67108864`, 64 MiB)
-- `NUVION_EVENT_DLQ_MAX_ROWS`: DLQ 보존 행 수(기본 `10000`, 초과 시 가장 오래된 DLQ 행 제거)
+- `NUVION_EVENT_OUTBOX_MAX_BYTES`: payload와 destination/metadata를 포함한 logical record 한도(기본 `67108864`, 64 MiB)
+- `NUVION_EVENT_CRITICAL_SAFETY_MAX_BYTES`: 정상 quota가 가득 찬 순간의 CRITICAL 관측 1건을 crash-safe하게 보존하는 별도 SQLite safety slot byte 한도(기본 `67108864`). 정상 outbox보다 작게 설정할 수 없으며, outbox+slot의 총 hard cap은 기본 128 MiB이다.
+- `NUVION_EVENT_OUTBOX_MAX_AGE_SECONDS`: STATE/METRIC 최대 보존 기간(기본 `2592000`, CRITICAL에는 미적용)
+- `NUVION_EVENT_DLQ_MAX_ROWS`: permanent rejection DLQ 보존 행 수(기본 `10000`, 낮은 priority가 높은 priority를 제거하지 않음)
+- `NUVION_EVENT_DLQ_MAX_BYTES`: payload와 rejection metadata를 포함한 DLQ logical record 한도(기본 `67108864`)
+
+CRITICAL event는 server application ACK(`ACCEPTED`/`DUPLICATE`)까지 outbox에 남는다. 정상 quota가 부족하면 같은 eventId와 canonical payload를 단일 `critical_safety_slot`에 먼저 commit한 뒤 inspection을 operator-stop하며, restart 후에도 그 slot을 복원해 정상 outbox로 옮긴다. 정상 outbox로 옮겨진 뒤에도 명시적인 operator recovery 전에는 inspection을 자동 재개하지 않는다. BE가 아직 application ACK를 보내지 않는 STATE/METRIC은 WebSocket transport send 완료를 terminal success로 간주하며, send 실패 시 SQLite에 남아 reconnect 후 replay된다. Permanent rejection을 DLQ에 full payload로 수용할 수 없으면 원본 payload는 `DLQ_BLOCKED` 상태로 보존되고 replay에서 제외되며 `DurableEventOutbox.blocked_events()`로 조회할 수 있다.
 - `NUVION_CONNECTIVITY_ENABLED`: `/app/device/connectivity` 보고 활성화 (`true|false`)
 - `NUVION_CONNECTIVITY_INTERVAL_SEC`: 연결 품질 샘플링 주기(초, 기본 `10`)
 - `NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC`: 전이 이벤트 최소 전송 간격(초, 기본 `30`)
@@ -255,7 +260,7 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_MODEL_SERVER_ACCESS_TOKEN`: 사전 발급 토큰(선택). 미지정 시 setup에서 저장된 device credential로 로그인 후 다운로드
 - `NUVION_MODEL_PROFILE`: pull-model 프로필 (`runtime|light|full`)
 - `NUVION_MODEL_DIR`: pull-model 기본 저장 루트
-- `NUVION_CONFIG_SCHEMA_VERSION`: config schema 버전 (`doctor --fix`로 자동 보정)
+- `NUVION_CONFIG_SCHEMA_VERSION`: config schema 버전 (현재 `11`, `doctor --fix`로 자동 보정)
 - `NUVION_RUNTIME_BOOTSTRAP_ENABLED`: setup/run bootstrap 전체 on/off
 - `NUVION_HOMEBREW_AUTOINSTALL`: macOS Homebrew 자동 설치 허용
 - `NUVION_DOCKER_AUTOINSTALL`: Docker/Colima(또는 docker.io) 자동 설치 허용
@@ -292,6 +297,13 @@ macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to s
 - 재연결 또는 ACK timeout 시 동일한 `eventId`로 replay하므로 서버는 `eventId` 기준 idempotency를 제공해야 합니다.
 - Pending quota 초과 시 기존 event를 밀어내지 않고 신규 event를 DLQ로 격리하는 reject-new 정책을 사용합니다.
 - state heartbeat에는 legacy `status`와 함께 `runtimeStatus`, `inspectionStatus`, `connectivityStatus`, `agentVersion`, `componentSha`, `configSchema`, `modelPointer`, `modelVersion`이 포함됩니다.
+- Fleet command를 사용할 때는 `NUVION_FLEET_COMMAND_ENABLED=true`, `NUVION_SPACE_ID`,
+  `NUVION_FLEET_COMMAND_KEYRING_PATH`를 provision합니다. Agent는
+  `/user/queue/fleet.command` wake-up 후 BE journal을 pull하고, device/space-bound Ed25519 JWS를
+  검증한 뒤 SQLite inbox와 desired-state checkpoint를 먼저 기록합니다. 공통 runtime은
+  `IN_PROGRESS`까지만 ACK하며 NUV-436/437/439 reconciler가 실제 effect와 health check 후
+  terminal ACK를 기록해야 합니다. macOS 개발 keyring(`macos-dev`)과 생산 keyring
+  (`production`)은 서로 호환되지 않습니다.
 
 Connectivity 보고 정책:
 - macOS는 `airport -I`, Linux(Jetson)는 `iw dev <iface> link`에서 RSSI를 수집합니다.

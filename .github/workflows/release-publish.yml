@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -46,24 +47,56 @@ jobs:
             echo "Invalid release tag: $TAG" >&2
             exit 1
           fi
+          if ! git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "Release ref is not an existing tag: $TAG" >&2
+            exit 1
+          fi
           VERSION="${TAG#v}"
-          COMPONENT_SHA=$(git rev-parse HEAD)
+          COMPONENT_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$HEAD_SHA" != "$COMPONENT_SHA" ]; then
+            echo "Checked out HEAD does not match release tag $TAG" >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Release checkout must be clean before stamping" >&2
+            git status --short >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "component_sha=$COMPONENT_SHA" >> $GITHUB_OUTPUT
           python packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
+          if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
+            echo "Release stamp modified unexpected files" >&2
+            git status --short >&2
+            exit 1
+          fi
 
       - name: Test source in clean environment
         env:
           NUV_AGENT_CONFIG: ${{ runner.temp }}/nuv-agent-release-test-${{ github.run_id }}-${{ github.run_attempt }}.env
         run: |
-          python -m venv .release-test-venv
-          .release-test-venv/bin/python -m pip install --upgrade pip
-          .release-test-venv/bin/python -m pip install .
-          .release-test-venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+          RELEASE_TEST_VENV="${RUNNER_TEMP}/nuv-agent-source-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python -m venv "$RELEASE_TEST_VENV"
+          "$RELEASE_TEST_VENV/bin/python" -m pip install --upgrade pip
+          "$RELEASE_TEST_VENV/bin/python" -m pip install .
+          "$RELEASE_TEST_VENV/bin/python" packaging/release/run-isolated-tests.py
+
+      - name: Verify tested release tree
+        run: |
+          if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
+            echo "Release tests modified the source tree" >&2
+            git status --short >&2
+            exit 1
+          fi
 
       - name: Build sdist
+        env:
+          COMPONENT_SHA: ${{ steps.release_meta.outputs.component_sha }}
         run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")
+          export SOURCE_DATE_EPOCH
           python -m pip install --upgrade build
           python -m build --sdist --outdir dist
           ls -la dist
@@ -73,11 +106,12 @@ jobs:
           NUV_AGENT_CONFIG: ${{ runner.temp }}/nuv-agent-release-test-${{ github.run_id }}-${{ github.run_attempt }}.env
         run: |
           TARBALL="dist/nuv_agent-${{ steps.release_meta.outputs.version }}.tar.gz"
-          python -m venv .release-smoke-venv
-          .release-smoke-venv/bin/python -m pip install --upgrade pip
-          .release-smoke-venv/bin/python -m pip install --no-cache-dir "$TARBALL"
-          .release-smoke-venv/bin/python -c "from nuvion_app import build_info; assert build_info.AGENT_VERSION == '${{ steps.release_meta.outputs.version }}'; assert build_info.COMPONENT_SHA == '${{ steps.release_meta.outputs.component_sha }}'"
-          .release-smoke-venv/bin/nuv-agent --help >/dev/null
+          RELEASE_SMOKE_VENV="${RUNNER_TEMP}/nuv-agent-sdist-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python -m venv "$RELEASE_SMOKE_VENV"
+          "$RELEASE_SMOKE_VENV/bin/python" -m pip install --upgrade pip
+          "$RELEASE_SMOKE_VENV/bin/python" -m pip install --no-cache-dir "$TARBALL"
+          "$RELEASE_SMOKE_VENV/bin/python" -c "from nuvion_app import build_info; assert build_info.AGENT_VERSION == '${{ steps.release_meta.outputs.version }}'; assert build_info.COMPONENT_SHA == '${{ steps.release_meta.outputs.component_sha }}'"
+          "$RELEASE_SMOKE_VENV/bin/nuv-agent" --help >/dev/null
 
       - name: Compute SHA256
         id: sha
@@ -89,11 +123,51 @@ jobs:
           echo "tag=${{ steps.release_meta.outputs.tag }}" >> $GITHUB_OUTPUT
           echo "version=${{ steps.release_meta.outputs.version }}" >> $GITHUB_OUTPUT
 
+      - name: Generate immutable sdist BOM
+        id: sdist_bom
+        env:
+          VERSION: ${{ steps.release_meta.outputs.version }}
+          COMPONENT_SHA: ${{ steps.release_meta.outputs.component_sha }}
+          TARBALL: ${{ steps.sha.outputs.tarball }}
+        run: |
+          CONFIG_SCHEMA=$(python -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
+          BUILT_AT=$(git show -s --format=%cI "$COMPONENT_SHA")
+          BOM_PATH="dist/nuv_agent-${VERSION}-sdist.release-bom.json"
+          python packaging/release/generate-release-bom.py \
+            --bom-id "nuv-agent-${VERSION}-sdist" \
+            --version "$VERSION" \
+            --component-sha "$COMPONENT_SHA" \
+            --config-schema "$CONFIG_SCHEMA" \
+            --updater-version "$VERSION" \
+            --platform-profile macos_dev \
+            --artifact "$TARBALL" \
+            --artifact-kind python-sdist \
+            --built-at "$BUILT_AT" \
+            --output "$BOM_PATH"
+          echo "path=$BOM_PATH" >> $GITHUB_OUTPUT
+
+      - name: Verify existing GitHub release asset digests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.sha.outputs.tag }}
+          TARBALL: ${{ steps.sha.outputs.tarball }}
+          BOM_PATH: ${{ steps.sdist_bom.outputs.path }}
+        run: |
+          python packaging/release/verify-github-release-assets.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --asset "$TARBALL" \
+            --asset "$BOM_PATH"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.sha.outputs.tag }}
-          files: ${{ steps.sha.outputs.tarball }}
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            ${{ steps.sha.outputs.tarball }}
+            ${{ steps.sdist_bom.outputs.path }}
 
       - name: Update Homebrew tap
         if: env.TAP_REPO != ''
@@ -148,7 +222,23 @@ jobs:
         env:
           COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
           VERSION: ${{ needs.release.outputs.release_version }}
-        run: python3 packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [ "$ACTUAL_SHA" != "$COMPONENT_SHA" ]; then
+            echo "APT checkout does not match the release component SHA" >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "APT checkout must be clean before stamping" >&2
+            git status --short >&2
+            exit 1
+          fi
+          python3 packaging/release/stamp-build-info.py --sha "$COMPONENT_SHA" --version "$VERSION"
+          if [ "$(git status --porcelain --untracked-files=all)" != " M nuvion_app/build_info.py" ]; then
+            echo "APT release stamp modified unexpected files" >&2
+            git status --short >&2
+            exit 1
+          fi
 
       - name: Install build deps
         run: |
@@ -197,18 +287,39 @@ jobs:
       - name: Build deb
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
         run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")
+          export SOURCE_DATE_EPOCH
           cd packaging/deb
           ./build-deb.sh
 
       - name: Publish to APT (GCS)
         env:
           GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMPONENT_SHA: ${{ needs.release.outputs.component_sha }}
         run: |
-          DEB_PATH="dist/nuv-agent_${{ steps.version.outputs.version }}_arm64.deb"
+          DEB_PATH="dist/nuv-agent_${VERSION}_arm64.deb"
           if [ ! -f "$DEB_PATH" ]; then
             echo "Deb not found at $DEB_PATH" >&2
             ls -la dist || true
             exit 1
           fi
-          packaging/apt/publish-gcs.sh "$DEB_PATH"
+          CONFIG_SCHEMA=$(python3 -c "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
+          BUILT_AT=$(git show -s --format=%cI "$COMPONENT_SHA")
+          BOM_PATH="dist/nuv-agent_${VERSION}_arm64.release-bom.json"
+          python3 packaging/release/generate-release-bom.py \
+            --bom-id "nuv-agent-${VERSION}-arm64" \
+            --version "$VERSION" \
+            --component-sha "$COMPONENT_SHA" \
+            --config-schema "$CONFIG_SCHEMA" \
+            --updater-version "$VERSION" \
+            --platform-profile rpi5_deepx_dx_m1 \
+            --platform-profile ventuno_q \
+            --platform-profile jetson_orin_nx \
+            --artifact "$DEB_PATH" \
+            --artifact-kind deb \
+            --built-at "$BUILT_AT" \
+            --output "$BOM_PATH"
+          packaging/apt/publish-gcs.sh "$DEB_PATH" "$BOM_PATH"

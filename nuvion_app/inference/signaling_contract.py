@@ -1,9 +1,11 @@
 AGENT_COMMAND_QUEUE_DEST = "/user/queue/command"
 AGENT_ERROR_QUEUE_DEST = "/user/queue/agent.error"
 EVENT_ACK_QUEUE_DEST = "/user/queue/event.ack"
+FLEET_COMMAND_QUEUE_DEST = "/user/queue/fleet.command"
 
 REQUIRED_AGENT_SUBSCRIPTIONS = (
     AGENT_COMMAND_QUEUE_DEST,
     AGENT_ERROR_QUEUE_DEST,
     EVENT_ACK_QUEUE_DEST,
+    FLEET_COMMAND_QUEUE_DEST,
 )

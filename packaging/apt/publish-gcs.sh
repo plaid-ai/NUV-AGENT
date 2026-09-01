@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-  echo "Usage: $0 /path/to/nuv-agent_*.deb" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 /path/to/nuv-agent_*.deb [/path/to/release-bom.json]" >&2
   exit 1
 fi
 
@@ -11,6 +11,14 @@ DEB_PATH="$(realpath "$DEB_PATH")"
 if [ ! -f "$DEB_PATH" ]; then
   echo "Deb not found: $DEB_PATH" >&2
   exit 1
+fi
+BOM_PATH="${2:-}"
+if [ -n "$BOM_PATH" ]; then
+  BOM_PATH="$(realpath "$BOM_PATH")"
+  if [ ! -f "$BOM_PATH" ]; then
+    echo "Release BOM not found: $BOM_PATH" >&2
+    exit 1
+  fi
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +34,7 @@ PUBLIC_DIR="$ROOT_DIR/.aptly/public"
 PUBLIC_KEY_PATH="$PUBLIC_DIR/public.gpg"
 INSTALL_SCRIPT_SRC="$ROOT_DIR/install-apt.sh"
 INSTALL_SCRIPT_DST="$PUBLIC_DIR/install-apt.sh"
+PROJECT_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
 
 aptly -config="$APTLY_CONFIG" repo create -distribution="$DIST" -component="$COMPONENT" "$REPO_NAME" || true
 aptly -config="$APTLY_CONFIG" repo add "$REPO_NAME" "$DEB_PATH"
@@ -61,6 +70,47 @@ if [ -f "$INSTALL_SCRIPT_SRC" ]; then
   chmod 0644 "$INSTALL_SCRIPT_DST"
 fi
 
+PUBLISHED_BOM_PATHS=()
+if [ -n "$BOM_PATH" ]; then
+  if [[ ! "${VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "VERSION must be an exact semantic version when publishing a BOM" >&2
+    exit 1
+  fi
+  BOM_METADATA=$(PYTHONPATH="$PROJECT_ROOT" python3 - "$BOM_PATH" "$DEB_PATH" <<'PY'
+from pathlib import Path
+import sys
+
+from nuvion_app.runtime.release_bom import load_release_bom, verify_release_artifact
+
+bom = load_release_bom(Path(sys.argv[1]))
+verify_release_artifact(bom, Path(sys.argv[2]))
+print(f"{bom.bom_digest}\t{bom.agent_version}")
+PY
+  )
+  IFS=$'\t' read -r BOM_DIGEST BOM_VERSION <<< "$BOM_METADATA"
+  if [ "$BOM_VERSION" != "$VERSION" ]; then
+    echo "Release BOM version does not match VERSION" >&2
+    exit 1
+  fi
+
+  VERSION_BOM_DIR="$PUBLIC_DIR/releases/$VERSION"
+  CONTENT_BOM_DIR="$PUBLIC_DIR/releases/by-bom-sha256/$BOM_DIGEST"
+  mkdir -p "$VERSION_BOM_DIR" "$CONTENT_BOM_DIR"
+  VERSION_BOM_PATH="$VERSION_BOM_DIR/$(basename "$BOM_PATH")"
+  CONTENT_BOM_PATH="$CONTENT_BOM_DIR/$(basename "$BOM_PATH")"
+  for destination in "$VERSION_BOM_PATH" "$CONTENT_BOM_PATH"; do
+    if [ -e "$destination" ]; then
+      if ! cmp -s "$BOM_PATH" "$destination"; then
+        echo "Refusing to overwrite an existing release BOM: $destination" >&2
+        exit 1
+      fi
+    else
+      install -m 0644 "$BOM_PATH" "$destination"
+    fi
+  done
+  PUBLISHED_BOM_PATHS+=("$VERSION_BOM_PATH" "$CONTENT_BOM_PATH")
+fi
+
 RELEASE_FILE="$PUBLIC_DIR/dists/$DIST/Release"
 if [ ! -f "$RELEASE_FILE" ]; then
   echo "No published repo found (missing $RELEASE_FILE)" >&2
@@ -70,7 +120,27 @@ fi
 echo "Syncing to gs://$BUCKET"
 # Requires: gcloud auth login, gsutil configured
 
+for published_bom in "${PUBLISHED_BOM_PATHS[@]}"; do
+  relative_path="${published_bom#"$PUBLIC_DIR/"}"
+  remote_path="gs://$BUCKET/$relative_path"
+  if gsutil -q stat "$remote_path"; then
+    if ! gsutil cat "$remote_path" | cmp -s - "$published_bom"; then
+      echo "Refusing to overwrite an existing remote BOM: $remote_path" >&2
+      exit 1
+    fi
+  fi
+done
+
 gsutil -m -h "Cache-Control:$CACHE_CONTROL" rsync -r "$PUBLIC_DIR" "gs://$BUCKET"
 gsutil -m setmeta -h "Cache-Control:$CACHE_CONTROL" "gs://$BUCKET/**" >/dev/null
+
+for published_bom in "${PUBLISHED_BOM_PATHS[@]}"; do
+  relative_path="${published_bom#"$PUBLIC_DIR/"}"
+  if ! gsutil cat "gs://$BUCKET/$relative_path" | cmp -s - "$published_bom"; then
+    echo "Published BOM verification failed: gs://$BUCKET/$relative_path" >&2
+    exit 1
+  fi
+  echo "Verified BOM: gs://$BUCKET/$relative_path"
+done
 
 echo "Published: https://$BUCKET"

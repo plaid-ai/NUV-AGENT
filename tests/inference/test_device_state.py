@@ -26,7 +26,7 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
             telemetry={
                 "agentVersion": "0.1.113",
                 "componentSha": "abc123",
-                "configSchema": "10",
+                "configSchema": "11",
                 "modelPointer": "anomalyclip/prod",
                 "modelVersion": "v0001",
             },
@@ -52,7 +52,7 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
                     "connectivityStatus": CONNECTIVITY_QUALITY_GOOD,
                     "agentVersion": "0.1.113",
                     "componentSha": "abc123",
-                    "configSchema": "10",
+                    "configSchema": "11",
                     "modelPointer": "anomalyclip/prod",
                     "modelVersion": "v0001",
                 }
@@ -142,6 +142,27 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(self.sent_payloads[0]["status"], DEVICE_STATE_ERROR)
         self.assertEqual(self.sent_payloads[0]["inspectionStatus"], INSPECTION_STATUS_DEFECT)
+
+    def test_runtime_telemetry_provider_refreshes_outbox_health_each_heartbeat(self) -> None:
+        health = {"pendingRows": 1, "capacityState": "HEALTHY"}
+        coordinator = DeviceStateCoordinator(
+            send_message=self._capture,
+            line_id=1,
+            process_id=2,
+            telemetry={"runtimeTelemetry": {"agentVersion": "0.1.113"}},
+            runtime_telemetry_provider=lambda: {"eventOutbox": dict(health)},
+        )
+
+        coordinator.emit_heartbeat()
+        health.update({"pendingRows": 2, "capacityState": "OPERATOR_STOP"})
+        coordinator.emit_heartbeat()
+
+        first = self.sent_payloads[0]["runtimeTelemetry"]
+        second = self.sent_payloads[1]["runtimeTelemetry"]
+        self.assertEqual(first["eventOutbox"]["pendingRows"], 1)
+        self.assertEqual(second["eventOutbox"]["pendingRows"], 2)
+        self.assertEqual(second["eventOutbox"]["capacityState"], "OPERATOR_STOP")
+        self.assertEqual(second["agentVersion"], "0.1.113")
 
 
 if __name__ == "__main__":

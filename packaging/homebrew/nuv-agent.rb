@@ -5,9 +5,11 @@ class NuvAgent < Formula
   homepage "https://github.com/plaid-ai/NUV-agent"
   url "__URL__"
   sha256 "__SHA256__"
-  version "0.1.113"
+  version "0.1.114"
   license "Proprietary"
 
+  depends_on :macos
+  depends_on arch: :arm64
   depends_on "python@3.14"
   depends_on "gstreamer"
   depends_on "libnice-gstreamer"
@@ -23,6 +25,21 @@ class NuvAgent < Formula
   resource "numpy" do
     url "https://files.pythonhosted.org/packages/25/7a/1fee4329abc705a469a4afe6e69b1ef7e915117747886327104a8493a955/numpy-2.4.2-cp314-cp314-macosx_11_0_arm64.whl"
     sha256 "d1240d50adff70c2a88217698ca844723068533f3f5c5fa6ee2e3220e3bdb000"
+  end
+
+  resource "cryptography" do
+    url "https://files.pythonhosted.org/packages/8d/99/157aae7949a5f30d51fcb1a9851e8ebd5c74bf99b5285d8bb4b8b9ee641e/cryptography-46.0.4-cp311-abi3-macosx_10_9_universal2.whl"
+    sha256 "281526e865ed4166009e235afadf3a4c4cba6056f99336a99efba65336fd5485"
+  end
+
+  resource "cffi" do
+    url "https://files.pythonhosted.org/packages/59/dd/27e9fa567a23931c838c6b02d0764611c62290062a6d4e8ff7863daf9730/cffi-2.0.0-cp314-cp314-macosx_11_0_arm64.whl"
+    sha256 "c654de545946e0db659b3400168c9ad31b5d29593291482c43e3564effbcee13"
+  end
+
+  resource "pycparser" do
+    url "https://files.pythonhosted.org/packages/a0/e3/59cd50310fc9b59512193629e1984c1f95e5c8ae6e5d8c69532ccc65a7fe/pycparser-2.23-py3-none-any.whl"
+    sha256 "e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934"
   end
 
   resource "python-dotenv" do
