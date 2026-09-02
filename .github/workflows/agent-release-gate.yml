@@ -155,6 +155,10 @@ jobs:
           HF_HOME: ${{ runner.temp }}/huggingface
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
+          # GitHub's 14 GB macOS runner trips the MPS recommended-set limit
+          # even for this exact FP16 model. Disable only PyTorch's allocator
+          # watermark for this bounded one-shot probe; assert actual usage below.
+          PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
           MODEL_PATH: ${{ steps.model.outputs.path }}
           MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
         run: |
@@ -185,8 +189,12 @@ jobs:
               device_preference="mps",
           )
           assert detector.ready and detector._device == "mps"
+          assert detector._inference_dtype == torch.float16
+          assert next(detector._model.parameters()).dtype == torch.float16
           result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
           assert result is not None and len(result["scores"]) == 2
+          assert torch.mps.current_allocated_memory() < 2 * 1024**3
+          assert torch.mps.driver_allocated_memory() < 4 * 1024**3
           PY
 
       - name: Remove the ephemeral candidate tap

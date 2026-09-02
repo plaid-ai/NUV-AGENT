@@ -294,6 +294,9 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
+        self.assertIn('PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"', macos)
+        self.assertIn("detector._inference_dtype == torch.float16", macos)
+        self.assertIn("torch.mps.current_allocated_memory() < 2 * 1024**3", macos)
         self.assertIn(
             "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
         )
