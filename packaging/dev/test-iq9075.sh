@@ -76,12 +76,109 @@ timeout 20s gst-launch-1.0 -q \
   videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast ! \
   h264parse ! rtph264pay pt=96 ! fakesink sync=false
 
-if [ "$camera_mode" = "oak" ]; then
-  if [ ! -x /opt/nuv-agent/current/venv/bin/python ]; then
-    die "nuv-agent current slot venv is missing"
-  fi
+agent_python=/opt/nuv-agent/current/venv/bin/python
+[ -x "$agent_python" ] || die "nuv-agent current slot venv is missing"
 
-  oak_python=(/opt/nuv-agent/current/venv/bin/python)
+echo "[iq9075-e2e] checking disposable WebRTC branches across signaling resets"
+G_DEBUG=fatal-criticals timeout 20s "$agent_python" <<'PY'
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstWebRTC", "1.0")
+gi.require_version("GstSdp", "1.0")
+from gi.repository import GLib, Gst  # noqa: E402
+
+from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
+
+Gst.init(None)
+pipeline = Gst.parse_launch(
+    "videotestsrc is-live=true ! "
+    "video/x-raw,width=640,height=480,framerate=30/1 ! "
+    "videoconvert ! "
+    "x264enc tune=zerolatency speed-preset=ultrafast bitrate=800 key-int-max=30 ! "
+    "rtph264pay config-interval=1 pt=96 ! "
+    "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
+    "tee name=webrtc_uplink_tee allow-not-linked=true"
+)
+sent = []
+controller = WebRTCUplinkController(
+    send_message=lambda destination, payload, remember: (
+        sent.append((destination, payload["sessionId"], remember)) or True
+    )
+)
+if not controller.attach_pipeline(pipeline):
+    raise RuntimeError("WebRTC RTP tee attachment failed")
+if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+    raise RuntimeError("WebRTC reset test pipeline failed to enter PLAYING")
+
+loop = GLib.MainLoop()
+branch_names = []
+
+
+def start(session_id):
+    controller.start(
+        {
+            "broadcastId": "iq9075-release-test",
+            "sessionId": session_id,
+            "iceServers": [],
+        }
+    )
+    return False
+
+
+def reset():
+    if controller._branch is not None:
+        branch_names.append(controller._branch.webrtcbin.get_name())
+    controller.on_signaling_reset()
+    return False
+
+
+GLib.timeout_add(300, reset)
+GLib.timeout_add(450, start, "session-2")
+GLib.timeout_add(750, reset)
+GLib.timeout_add(900, start, "session-3")
+GLib.timeout_add(1300, lambda: (loop.quit(), False)[1])
+start("session-1")
+loop.run()
+
+health = controller.runtime_health_snapshot()
+if controller._branch is not None:
+    branch_names.append(controller._branch.webrtcbin.get_name())
+controller.stop(send_signal=False)
+context = GLib.MainContext.default()
+while context.pending():
+    context.iteration(False)
+pipeline.set_state(Gst.State.NULL)
+
+issues = []
+bus = pipeline.get_bus()
+while True:
+    message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+    if message is None:
+        break
+    if message.type == Gst.MessageType.ERROR:
+        error, debug = message.parse_error()
+    else:
+        error, debug = message.parse_warning()
+    issues.append((message.type.value_nick, str(error), debug))
+
+expected_branches = [
+    "webrtc_uplink_session_1",
+    "webrtc_uplink_session_3",
+    "webrtc_uplink_session_5",
+]
+offers = [item for item in sent if item[0].endswith("/offer")]
+if branch_names != expected_branches:
+    raise RuntimeError(f"WebRTC branches were reused or skipped: {branch_names}")
+if health.get("sessionId") != "session-3" or len(offers) != 3:
+    raise RuntimeError(f"WebRTC re-offer evidence is incomplete: health={health} offers={offers}")
+if issues:
+    raise RuntimeError(f"WebRTC reset emitted GStreamer bus failures: {issues}")
+print("[iq9075-e2e] disposable WebRTC reset/re-offer: PASS")
+PY
+
+if [ "$camera_mode" = "oak" ]; then
+  oak_python=("$agent_python")
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
     oak_python=(runuser -u nuvion -- /opt/nuv-agent/current/venv/bin/python)

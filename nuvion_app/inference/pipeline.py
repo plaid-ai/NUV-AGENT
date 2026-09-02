@@ -712,7 +712,7 @@ def build_uplink_pipeline(
             f"{encoder_pipeline}"
             f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
             "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-            "webrtc_uplink."
+            "tee name=webrtc_uplink_tee allow-not-linked=true"
         )
 
     segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
@@ -725,7 +725,7 @@ def build_uplink_pipeline(
         "h264parse config-interval=1 ! "
         f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
         "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-        "webrtc_uplink. "
+        "tee name=webrtc_uplink_tee allow-not-linked=true "
         "stream_split. ! queue ! "
         f"{clip_encoder_pipeline}"
         "h264parse config-interval=1 ! "
@@ -2135,6 +2135,12 @@ async def signaling_client_main():
             log.error("[SIGNALING] WebSocket error: %s", exc)
         finally:
             _set_update_commit_signaling_ready(False)
+            controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+            if controller is not None:
+                # A transport reconnect is an exact WebRTC generation boundary.
+                # Tear down the disposable media branch immediately instead of
+                # retaining stale ICE/SDP and sticky-event state until re-login.
+                controller.on_signaling_reset()
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
@@ -3159,8 +3165,6 @@ class GStreamerInferenceApp:
                 f"{overlay_pipeline}"
                 f"{uplink_pipeline}"
             )
-
-        pipeline_string = f"{pipeline_string} webrtcbin name=webrtc_uplink bundle-policy=max-bundle latency=0"
 
         log.info("[PIPELINE] %s", pipeline_string)
         self.pipeline = Gst.parse_launch(pipeline_string)

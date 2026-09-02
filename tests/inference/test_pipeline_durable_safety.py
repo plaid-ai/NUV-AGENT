@@ -167,6 +167,11 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         )
 
         self.assertIn("tee name=stream_split", description)
+        self.assertIn(
+            "tee name=webrtc_uplink_tee allow-not-linked=true",
+            description,
+        )
+        self.assertNotIn("webrtcbin", description)
         self.assertEqual(description.count("x264enc"), 2)
         self.assertIn("x264enc name=video_encoder", description)
         self.assertIn("name=video_encoder tune=zerolatency speed-preset=faster bitrate=1750", description)

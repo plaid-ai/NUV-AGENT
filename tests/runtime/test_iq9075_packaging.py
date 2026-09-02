@@ -228,6 +228,11 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("/dev/v4l/by-id", e2e)
         self.assertIn('driver" = "uvcvideo"', e2e)
         self.assertIn("timeout 20s gst-launch-1.0", e2e)
+        self.assertIn("G_DEBUG=fatal-criticals", e2e)
+        self.assertIn("WebRTCUplinkController", e2e)
+        self.assertIn("controller.on_signaling_reset()", e2e)
+        self.assertIn('"webrtc_uplink_session_5"', e2e)
+        self.assertIn("Gst.MessageType.ERROR | Gst.MessageType.WARNING", e2e)
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)
         self.assertNotIn("curl ", e2e)
 

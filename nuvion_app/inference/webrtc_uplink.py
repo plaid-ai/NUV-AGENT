@@ -171,9 +171,13 @@ class WebRTCStatsAccumulator:
                 elapsed = timestamp - previous.get("timestamp", timestamp)
                 # WebRTC/GStreamer timestamps are normally microseconds; accept
                 # millisecond test fixtures as well.
-                elapsed_seconds = elapsed / (1_000_000.0 if elapsed > 10_000 else 1000.0)
+                elapsed_seconds = elapsed / (
+                    1_000_000.0 if elapsed > 10_000 else 1000.0
+                )
                 if elapsed_seconds > 0 and byte_delta is not None:
-                    sample["sendBitrateKbps"] = byte_delta * 8.0 / elapsed_seconds / 1000.0
+                    sample["sendBitrateKbps"] = (
+                        byte_delta * 8.0 / elapsed_seconds / 1000.0
+                    )
         elif fraction_lost is not None:
             sample["outboundPacketLossPct"] = (
                 fraction_lost * 100.0 if fraction_lost <= 1.0 else fraction_lost
@@ -190,6 +194,40 @@ class WebRTCUplinkSession:
     ice_servers: list[dict[str, Any]]
 
 
+@dataclass
+class _WebRTCBranch:
+    """One disposable WebRTC media branch owned by exactly one generation."""
+
+    generation: int
+    session_id: str
+    queue: Gst.Element
+    webrtcbin: Gst.Element
+    tee_src_pad: Gst.Pad
+    queue_sink_pad: Gst.Pad
+    queue_src_pad: Gst.Pad
+    webrtc_sink_pad: Gst.Pad
+    signal_handler_ids: tuple[int, ...]
+
+
+def _request_pad(element: Gst.Element, template_name: str) -> Gst.Pad | None:
+    request_pad_simple = getattr(element, "request_pad_simple", None)
+    if callable(request_pad_simple):
+        return request_pad_simple(template_name)
+    # Ubuntu 24.04 has request_pad_simple. Keep the fallback for older local
+    # developer GStreamer builds without making it the production path.
+    get_request_pad = getattr(element, "get_request_pad", None)
+    return get_request_pad(template_name) if callable(get_request_pad) else None
+
+
+def _unlink_exact(source_pad: Gst.Pad, expected_peer: Gst.Pad) -> bool:
+    peer = source_pad.get_peer()
+    if peer is None:
+        return True
+    if peer != expected_peer:
+        return False
+    return bool(source_pad.unlink(peer))
+
+
 class WebRTCUplinkController:
     def __init__(
         self,
@@ -200,11 +238,13 @@ class WebRTCUplinkController:
         self._send_message = send_message
         self._default_force_relay = default_force_relay
         self._pipeline: Gst.Pipeline | None = None
-        self._webrtcbin: Gst.Element | None = None
+        self._uplink_tee: Gst.Element | None = None
+        self._branch: _WebRTCBranch | None = None
+        self._branch_cleanup_failed = False
         self._session: WebRTCUplinkSession | None = None
         self._stop_sent = False
         self._stats_accumulator = WebRTCStatsAccumulator()
-        self._stats_lock = threading.Lock()
+        self._stats_lock = threading.RLock()
         self._latest_outbound_stats: dict[str, Any] | None = None
         self._stats_generation = 0
         self._connection_state = "new"
@@ -215,20 +255,28 @@ class WebRTCUplinkController:
         self._first_outbound_progress_at: float | None = None
         self._last_outbound_progress_at: float | None = None
 
-    def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
+    def attach_pipeline(
+        self,
+        pipeline: Gst.Pipeline,
+        element_name: str = "webrtc_uplink_tee",
+    ) -> bool:
         self._pipeline = pipeline
-        self._webrtcbin = pipeline.get_by_name(element_name)
-        if not self._webrtcbin:
+        self._uplink_tee = pipeline.get_by_name(element_name)
+        if not self._uplink_tee:
             log.warning("[WEBRTC-UPLINK] element '%s' not found.", element_name)
             return False
-
-        self._webrtcbin.connect("on-ice-candidate", self._on_ice_candidate)
-        self._webrtcbin.connect("notify::connection-state", self._on_connection_state_changed)
-        self._webrtcbin.connect("notify::ice-connection-state", self._on_ice_connection_state_changed)
         return True
 
     def has_pipeline(self) -> bool:
-        return self._webrtcbin is not None
+        with self._stats_lock:
+            return (
+                self._pipeline is not None
+                and self._uplink_tee is not None
+                and self._session is not None
+                and self._branch is not None
+                and self._branch.generation == self._stats_generation
+                and not self._branch_cleanup_failed
+            )
 
     def runtime_health_snapshot(self) -> dict[str, Any]:
         """Return current-session live RTP evidence without exposing SDP or ICE secrets."""
@@ -236,7 +284,14 @@ class WebRTCUplinkController:
         with self._stats_lock:
             session_id = self._session.session_id if self._session else None
             return {
-                "hasPipeline": self._webrtcbin is not None,
+                "hasPipeline": (
+                    self._pipeline is not None
+                    and self._uplink_tee is not None
+                    and self._session is not None
+                    and self._branch is not None
+                    and self._branch.generation == self._stats_generation
+                    and not self._branch_cleanup_failed
+                ),
                 "sessionId": session_id,
                 "generation": self._stats_generation,
                 "connectionState": self._connection_state,
@@ -264,33 +319,40 @@ class WebRTCUplinkController:
         session_id = str(payload.get("sessionId") or "").strip()
         broadcast_id = str(payload.get("broadcastId") or "").strip()
         if not session_id or not broadcast_id:
-            log.warning("[WEBRTC-UPLINK] start payload missing sessionId or broadcastId: %s", payload)
-            return
-
-        if self._session and self._session.session_id == session_id:
-            log.info("[WEBRTC-UPLINK] ignoring duplicate start for sessionId=%s", session_id)
+            log.warning(
+                "[WEBRTC-UPLINK] start payload missing sessionId or broadcastId: %s",
+                payload,
+            )
             return
 
         ice_servers = parse_ice_servers(payload.get("iceServers"))
         force_relay = bool(payload.get("forceRelay", self._default_force_relay))
-        self._session = WebRTCUplinkSession(
+        session = WebRTCUplinkSession(
             broadcast_id=broadcast_id,
             session_id=session_id,
             force_relay=force_relay,
             ice_servers=ice_servers,
         )
-        self._stop_sent = False
         with self._stats_lock:
+            if self._session and self._session.session_id == session_id:
+                log.info(
+                    "[WEBRTC-UPLINK] ignoring duplicate start for sessionId=%s",
+                    session_id,
+                )
+                return
             self._stats_generation += 1
+            generation = self._stats_generation
+            self._session = session
+            self._stop_sent = False
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
             self._reset_runtime_health_locked()
-        GLib.idle_add(self._start_on_main_loop)
+        GLib.idle_add(self._start_on_main_loop, generation, session_id)
 
     def request_outbound_stats(self) -> bool:
-        if not self._webrtcbin or not self._session:
-            return False
         with self._stats_lock:
+            if self._session is None or self._branch is None:
+                return False
             generation = self._stats_generation
             session_id = self._session.session_id
         return bool(
@@ -314,21 +376,23 @@ class WebRTCUplinkController:
     ) -> bool:
         with self._stats_lock:
             current = self._session
+            branch = self._branch
             if (
                 generation != self._stats_generation
                 or current is None
                 or current.session_id != session_id
+                or branch is None
+                or branch.generation != generation
+                or self._branch_cleanup_failed
             ):
                 return False
-        if not self._webrtcbin:
-            return False
         try:
             promise = Gst.Promise.new_with_change_func(
                 self._on_stats_created,
-                (generation, session_id),
+                (generation, session_id, branch.webrtcbin),
                 None,
             )
-            self._webrtcbin.emit("get-stats", None, promise)
+            branch.webrtcbin.emit("get-stats", None, promise)
         except Exception as exc:  # noqa: BLE001 - unsupported stats must not stop RTC.
             log.debug("[WEBRTC-UPLINK] get-stats unavailable: %s", exc)
         return False
@@ -346,10 +410,13 @@ class WebRTCUplinkController:
             with self._stats_lock:
                 if (
                     not isinstance(token, tuple)
-                    or len(token) != 2
+                    or len(token) != 3
                     or token[0] != self._stats_generation
                     or self._session is None
                     or token[1] != self._session.session_id
+                    or self._branch is None
+                    or token[2] is not self._branch.webrtcbin
+                    or self._branch_cleanup_failed
                 ):
                     return
                 sample = self._stats_accumulator.observe(reply)
@@ -371,17 +438,23 @@ class WebRTCUplinkController:
             log.debug("[WEBRTC-UPLINK] failed to normalize outbound stats: %s", exc)
 
     def apply_answer(self, payload: dict[str, Any]) -> None:
-        if not self._session or not self._matches_session(payload):
-            return
         sdp = str(payload.get("sdp") or "").strip()
         if not sdp:
             log.warning("[WEBRTC-UPLINK] answer payload missing sdp.")
             return
-        GLib.idle_add(self._apply_answer_on_main_loop, sdp)
+        with self._stats_lock:
+            if not self._matches_session_locked(payload):
+                return
+            generation = self._stats_generation
+            session_id = self._session.session_id
+        GLib.idle_add(
+            self._apply_answer_on_main_loop,
+            generation,
+            session_id,
+            sdp,
+        )
 
     def add_remote_ice_candidate(self, payload: dict[str, Any]) -> None:
-        if not self._session or not self._matches_session(payload):
-            return
         candidate_payload = payload.get("candidate")
         if isinstance(candidate_payload, dict):
             candidate = str(candidate_payload.get("candidate") or "").strip()
@@ -393,120 +466,492 @@ class WebRTCUplinkController:
             sdp_mline_index = payload.get("sdpMLineIndex")
 
         if not candidate:
-            log.warning("[WEBRTC-UPLINK] remote ICE payload missing candidate: %s", payload)
+            log.warning(
+                "[WEBRTC-UPLINK] remote ICE payload missing candidate: %s", payload
+            )
             return
 
         try:
             mline_index = int(sdp_mline_index) if sdp_mline_index is not None else 0
         except (TypeError, ValueError):
             mline_index = 0
-        GLib.idle_add(self._add_remote_candidate_on_main_loop, mline_index, candidate, sdp_mid)
+        with self._stats_lock:
+            if not self._matches_session_locked(payload):
+                return
+            generation = self._stats_generation
+            session_id = self._session.session_id
+        GLib.idle_add(
+            self._add_remote_candidate_on_main_loop,
+            generation,
+            session_id,
+            mline_index,
+            candidate,
+            sdp_mid,
+        )
 
     def handle_remote_state(self, payload: dict[str, Any]) -> None:
-        if not self._session or not self._matches_session(payload):
-            return
-        state = str(payload.get("state") or payload.get("connectionState") or "").strip().lower()
+        with self._stats_lock:
+            if not self._matches_session_locked(payload):
+                return
+        state = (
+            str(payload.get("state") or payload.get("connectionState") or "")
+            .strip()
+            .lower()
+        )
         if state in {"failed", "closed", "stopped"}:
-            log.warning("[WEBRTC-UPLINK] remote state=%s. stopping local session.", state)
+            log.warning(
+                "[WEBRTC-UPLINK] remote state=%s. stopping local session.", state
+            )
             self.stop(send_signal=False)
 
     def stop(self, *, send_signal: bool = True) -> None:
-        if send_signal and self._session and not self._stop_sent:
-            self._send_stop_message()
         with self._stats_lock:
-            session_id = self._session.session_id if self._session else None
+            session = self._session
+            branch_generation = self._branch.generation if self._branch else None
+            if session is None and branch_generation is None:
+                self._stats_accumulator.reset()
+                self._latest_outbound_stats = None
+                self._reset_runtime_health_locked()
+                return
+            should_send = bool(send_signal and session and not self._stop_sent)
             self._stats_generation += 1
-            generation = self._stats_generation
-            self._stats_accumulator.reset()
-            self._latest_outbound_stats = None
-            self._reset_runtime_health_locked()
-        GLib.idle_add(self._stop_on_main_loop, generation, session_id)
-
-    def on_signaling_reset(self) -> None:
-        self._stop_sent = False
-        with self._stats_lock:
-            self._stats_generation += 1
-            self._stats_accumulator.reset()
-            self._latest_outbound_stats = None
-            self._reset_runtime_health_locked()
-
-    def _matches_session(self, payload: dict[str, Any]) -> bool:
-        session_id = str(payload.get("sessionId") or "").strip()
-        return bool(self._session and session_id and session_id == self._session.session_id)
-
-    def _start_on_main_loop(self) -> bool:
-        if not self._webrtcbin or not self._session:
-            return False
-
-        stun_server, turn_servers = to_gst_ice_server_config(self._session.ice_servers)
-        self._webrtcbin.set_property("stun-server", stun_server or "")
-        self._webrtcbin.set_property("turn-server", turn_servers[0] if turn_servers else "")
-        policy = GstWebRTC.WebRTCICETransportPolicy.RELAY if self._session.force_relay else GstWebRTC.WebRTCICETransportPolicy.ALL
-        self._webrtcbin.set_property("ice-transport-policy", policy)
-        self._webrtcbin.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
-
-        promise = Gst.Promise.new_with_change_func(self._on_offer_created, None, None)
-        self._webrtcbin.emit("create-offer", None, promise)
-        log.info(
-            "[WEBRTC-UPLINK] creating offer. sessionId=%s relay=%s",
-            self._session.session_id,
-            self._session.force_relay,
-        )
-        return False
-
-    def _stop_on_main_loop(
-        self,
-        generation: int,
-        session_id: str | None,
-    ) -> bool:
-        with self._stats_lock:
-            if generation != self._stats_generation:
-                return False
-            if (
-                session_id is not None
-                and self._session is not None
-                and self._session.session_id != session_id
-            ):
-                return False
+            stop_generation = self._stats_generation
             self._session = None
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
             self._reset_runtime_health_locked()
-        if self._pipeline:
-            try:
-                self._pipeline.send_event(Gst.Event.new_flush_start())
-                self._pipeline.send_event(Gst.Event.new_flush_stop(False))
-            except Exception as exc:  # noqa: BLE001 - teardown is best effort.
-                log.debug("[WEBRTC-UPLINK] pipeline flush failed: %s", exc)
-        return False
+        if should_send and session is not None:
+            sent = self._send_stop_message_for(session)
+            with self._stats_lock:
+                if self._stats_generation == stop_generation and self._session is None:
+                    self._stop_sent = sent
+        if branch_generation is not None:
+            GLib.idle_add(self._stop_on_main_loop, branch_generation)
 
-    def _apply_answer_on_main_loop(self, sdp_text: str) -> bool:
-        if not self._webrtcbin:
+    def on_signaling_reset(self) -> None:
+        # A WebSocket reconnect is a hard session boundary. Reusing a
+        # webrtcbin after remote signaling disappears leaves ICE/transceivers
+        # and GStreamer sticky-event state behind, which can make the next RTP
+        # session consume buffers before receiving a SEGMENT event.
+        self.stop(send_signal=False)
+        with self._stats_lock:
+            self._stop_sent = False
+
+    def _matches_session_locked(self, payload: dict[str, Any]) -> bool:
+        session_id = str(payload.get("sessionId") or "").strip()
+        return bool(
+            self._session and session_id and session_id == self._session.session_id
+        )
+
+    def _start_on_main_loop(self, generation: int, session_id: str) -> bool:
+        with self._stats_lock:
+            session = self._session
+            if (
+                generation != self._stats_generation
+                or session is None
+                or session.session_id != session_id
+            ):
+                return False
+            if self._branch_cleanup_failed:
+                log.error(
+                    "[WEBRTC-UPLINK] refusing generation=%s after incomplete branch cleanup",
+                    generation,
+                )
+                self._abort_current_session_on_main_loop(generation, session_id)
+                return False
+
+        # Every offer gets a physically new queue, request pads and webrtcbin.
+        # The permanent tee is allow-not-linked, so removing the previous branch
+        # cannot turn an expected signaling reset into a pipeline-wide NOT_LINKED
+        # failure. Linking the fresh tee pad last causes GStreamer to replay its
+        # sticky STREAM_START/CAPS/SEGMENT events before the first RTP buffer.
+        if not self._teardown_branch_on_main_loop():
+            log.error(
+                "[WEBRTC-UPLINK] branch teardown failed; refusing generation=%s",
+                generation,
+            )
+            self._abort_current_session_on_main_loop(generation, session_id)
             return False
 
-        description = _build_session_description(GstWebRTC.WebRTCSDPType.ANSWER, sdp_text)
+        with self._stats_lock:
+            if (
+                generation != self._stats_generation
+                or self._session is None
+                or self._session.session_id != session_id
+            ):
+                return False
+            session = self._session
+
+        branch = self._create_branch_on_main_loop(generation, session)
+        if branch is None:
+            self._abort_current_session_on_main_loop(generation, session_id)
+            return False
+
+        with self._stats_lock:
+            if (
+                generation != self._stats_generation
+                or self._session is None
+                or self._session.session_id != session_id
+                or self._branch is not branch
+            ):
+                self._teardown_branch_on_main_loop(generation)
+                return False
+
+        token = (generation, session_id, branch.webrtcbin)
+        promise = Gst.Promise.new_with_change_func(
+            self._on_offer_created,
+            token,
+            None,
+        )
+        branch.webrtcbin.emit("create-offer", None, promise)
+        log.info(
+            "[WEBRTC-UPLINK] creating fresh offer. sessionId=%s generation=%s relay=%s",
+            session_id,
+            generation,
+            session.force_relay,
+        )
+        return False
+
+    def _create_branch_on_main_loop(
+        self,
+        generation: int,
+        session: WebRTCUplinkSession,
+    ) -> _WebRTCBranch | None:
+        pipeline = self._pipeline
+        uplink_tee = self._uplink_tee
+        if pipeline is None or uplink_tee is None:
+            log.error("[WEBRTC-UPLINK] RTP tee is not attached")
+            return None
+
+        queue_element = Gst.ElementFactory.make(
+            "queue",
+            f"webrtc_uplink_queue_{generation}",
+        )
+        webrtcbin = Gst.ElementFactory.make(
+            "webrtcbin",
+            f"webrtc_uplink_session_{generation}",
+        )
+        if queue_element is None or webrtcbin is None:
+            log.error("[WEBRTC-UPLINK] failed to create disposable branch elements")
+            return None
+
+        queue_sink_pad = queue_element.get_static_pad("sink")
+        queue_src_pad = queue_element.get_static_pad("src")
+        tee_src_pad = _request_pad(uplink_tee, "src_%u")
+        webrtc_sink_pad = _request_pad(webrtcbin, "sink_%u")
+        if (
+            queue_sink_pad is None
+            or queue_src_pad is None
+            or tee_src_pad is None
+            or webrtc_sink_pad is None
+        ):
+            if tee_src_pad is not None:
+                uplink_tee.release_request_pad(tee_src_pad)
+            if webrtc_sink_pad is not None:
+                webrtcbin.release_request_pad(webrtc_sink_pad)
+            log.error("[WEBRTC-UPLINK] failed to allocate disposable branch pads")
+            return None
+
+        branch = _WebRTCBranch(
+            generation=generation,
+            session_id=session.session_id,
+            queue=queue_element,
+            webrtcbin=webrtcbin,
+            tee_src_pad=tee_src_pad,
+            queue_sink_pad=queue_sink_pad,
+            queue_src_pad=queue_src_pad,
+            webrtc_sink_pad=webrtc_sink_pad,
+            signal_handler_ids=(),
+        )
+        with self._stats_lock:
+            self._branch = branch
+            self._branch_cleanup_failed = False
+
+        try:
+            pipeline.add(queue_element)
+            if queue_element.get_parent() is not pipeline:
+                raise RuntimeError("failed to add queue to pipeline")
+            pipeline.add(webrtcbin)
+            if webrtcbin.get_parent() is not pipeline:
+                raise RuntimeError("failed to add webrtcbin to pipeline")
+
+            stun_server, turn_servers = to_gst_ice_server_config(session.ice_servers)
+            webrtcbin.set_property("stun-server", stun_server or "")
+            webrtcbin.set_property(
+                "turn-server",
+                turn_servers[0] if turn_servers else "",
+            )
+            policy = (
+                GstWebRTC.WebRTCICETransportPolicy.RELAY
+                if session.force_relay
+                else GstWebRTC.WebRTCICETransportPolicy.ALL
+            )
+            webrtcbin.set_property("ice-transport-policy", policy)
+            webrtcbin.set_property(
+                "bundle-policy",
+                GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE,
+            )
+            webrtcbin.set_property("latency", 0)
+            queue_element.set_property("max-size-buffers", 60)
+            queue_element.set_property("max-size-bytes", 0)
+            queue_element.set_property("max-size-time", 0)
+            queue_element.set_property("leaky", 2)
+
+            if queue_src_pad.link(webrtc_sink_pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("failed to link queue to webrtcbin")
+
+            handler_ids: list[int] = []
+            for signal_name, callback in (
+                ("on-ice-candidate", self._on_ice_candidate),
+                ("notify::connection-state", self._on_connection_state_changed),
+                (
+                    "notify::ice-connection-state",
+                    self._on_ice_connection_state_changed,
+                ),
+            ):
+                handler_ids.append(
+                    webrtcbin.connect(
+                        signal_name,
+                        callback,
+                        generation,
+                        session.session_id,
+                    )
+                )
+                branch.signal_handler_ids = tuple(handler_ids)
+
+            # Bring up downstream while it is still isolated, then attach the
+            # tee request pad as the final operation. This guarantees that the
+            # fresh branch receives sticky events before any media buffer.
+            if not webrtcbin.sync_state_with_parent():
+                raise RuntimeError("failed to sync webrtcbin state")
+            if not queue_element.sync_state_with_parent():
+                raise RuntimeError("failed to sync queue state")
+            if tee_src_pad.link(queue_sink_pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("failed to link RTP tee to fresh queue")
+        except Exception as exc:  # noqa: BLE001 - a partial branch must fail closed.
+            log.error(
+                "[WEBRTC-UPLINK] disposable branch creation failed: %s",
+                exc,
+            )
+            self._teardown_branch_on_main_loop(generation)
+            return None
+        return branch
+
+    def _teardown_branch_on_main_loop(
+        self,
+        expected_generation: int | None = None,
+    ) -> bool:
+        with self._stats_lock:
+            branch = self._branch
+            if branch is None:
+                return not self._branch_cleanup_failed
+            if (
+                expected_generation is not None
+                and branch.generation != expected_generation
+            ):
+                return True
+
+        success = True
+        for handler_id in branch.signal_handler_ids:
+            try:
+                branch.webrtcbin.disconnect(handler_id)
+            except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+                success = False
+                log.error("[WEBRTC-UPLINK] signal disconnect failed: %s", exc)
+
+        try:
+            if not _unlink_exact(branch.tee_src_pad, branch.queue_sink_pad):
+                success = False
+        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+            success = False
+            log.error("[WEBRTC-UPLINK] tee unlink failed: %s", exc)
+
+        try:
+            if self._uplink_tee is None:
+                success = False
+            else:
+                self._uplink_tee.release_request_pad(branch.tee_src_pad)
+        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+            success = False
+            log.error("[WEBRTC-UPLINK] tee request-pad release failed: %s", exc)
+
+        # Stop downstream before the queue. Stopping a live queue first can
+        # wait indefinitely for its src task while webrtcbin is still PLAYING.
+        for element in (branch.webrtcbin, branch.queue):
+            try:
+                if element.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
+                    success = False
+            except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+                success = False
+                log.error("[WEBRTC-UPLINK] element stop failed: %s", exc)
+
+        try:
+            if not _unlink_exact(branch.queue_src_pad, branch.webrtc_sink_pad):
+                success = False
+        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+            success = False
+            log.error("[WEBRTC-UPLINK] webrtc unlink failed: %s", exc)
+
+        try:
+            branch.webrtcbin.release_request_pad(branch.webrtc_sink_pad)
+        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+            success = False
+            log.error("[WEBRTC-UPLINK] webrtc request-pad release failed: %s", exc)
+
+        pipeline = self._pipeline
+        if pipeline is None:
+            success = False
+        else:
+            for element in (branch.queue, branch.webrtcbin):
+                try:
+                    parent = element.get_parent()
+                    if parent is pipeline:
+                        pipeline.remove(element)
+                        if element.get_parent() is not None:
+                            success = False
+                    elif parent is not None and parent is not pipeline:
+                        success = False
+                except Exception as exc:  # noqa: BLE001 - continue the full teardown.
+                    success = False
+                    log.error("[WEBRTC-UPLINK] element removal failed: %s", exc)
+
+        with self._stats_lock:
+            if self._branch is branch:
+                if success:
+                    self._branch = None
+                    self._branch_cleanup_failed = False
+                else:
+                    # Do not create another branch over incompletely detached
+                    # request pads. Process restart is the only safe recovery.
+                    self._branch_cleanup_failed = True
+        if success:
+            log.info(
+                "[WEBRTC-UPLINK] disposed session branch generation=%s sessionId=%s",
+                branch.generation,
+                branch.session_id,
+            )
+        return success
+
+    def _abort_current_session_on_main_loop(
+        self,
+        generation: int,
+        session_id: str,
+    ) -> None:
+        session_to_signal: WebRTCUplinkSession | None = None
+        with self._stats_lock:
+            if (
+                generation != self._stats_generation
+                or self._session is None
+                or self._session.session_id != session_id
+            ):
+                return
+            session = self._session
+            self._session = None
+            self._stats_generation += 1
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
+            self._connection_state = "failed"
+            self._ice_connection_state = "failed"
+            if not self._stop_sent:
+                session_to_signal = session
+        if session_to_signal is not None:
+            self._send_stop_message_for(session_to_signal)
+
+    def _stop_on_main_loop(self, branch_generation: int) -> bool:
+        self._teardown_branch_on_main_loop(branch_generation)
+        return False
+
+    def _active_branch_for_token(
+        self,
+        generation: int,
+        session_id: str,
+        element: Gst.Element | None = None,
+    ) -> _WebRTCBranch | None:
+        with self._stats_lock:
+            branch = self._branch
+            if (
+                generation != self._stats_generation
+                or self._session is None
+                or self._session.session_id != session_id
+                or branch is None
+                or branch.generation != generation
+                or branch.session_id != session_id
+                or self._branch_cleanup_failed
+                or (element is not None and branch.webrtcbin is not element)
+            ):
+                return None
+            return branch
+
+    def _apply_answer_on_main_loop(
+        self,
+        generation: int,
+        session_id: str,
+        sdp_text: str,
+    ) -> bool:
+        branch = self._active_branch_for_token(generation, session_id)
+        if branch is None:
+            return False
+
+        description = _build_session_description(
+            GstWebRTC.WebRTCSDPType.ANSWER,
+            sdp_text,
+        )
         if description is None:
             log.error("[WEBRTC-UPLINK] failed to parse SDP answer.")
             return False
 
-        self._webrtcbin.emit("set-remote-description", description, Gst.Promise.new())
-        log.info("[WEBRTC-UPLINK] applied SDP answer.")
+        with self._stats_lock:
+            if self._active_branch_for_token(generation, session_id) is not branch:
+                return False
+            branch.webrtcbin.emit(
+                "set-remote-description",
+                description,
+                Gst.Promise.new(),
+            )
+        log.info(
+            "[WEBRTC-UPLINK] applied SDP answer. sessionId=%s generation=%s",
+            session_id,
+            generation,
+        )
         return False
 
     def _add_remote_candidate_on_main_loop(
         self,
+        generation: int,
+        session_id: str,
         mline_index: int,
         candidate: str,
         _sdp_mid: str | None,
     ) -> bool:
-        if not self._webrtcbin:
+        branch = self._active_branch_for_token(generation, session_id)
+        if branch is None:
             return False
-        self._webrtcbin.emit("add-ice-candidate", mline_index, candidate)
-        log.debug("[WEBRTC-UPLINK] added remote ICE candidate mline=%s", mline_index)
+        with self._stats_lock:
+            if self._active_branch_for_token(generation, session_id) is not branch:
+                return False
+            branch.webrtcbin.emit("add-ice-candidate", mline_index, candidate)
+        log.debug(
+            "[WEBRTC-UPLINK] added remote ICE candidate sessionId=%s generation=%s mline=%s",
+            session_id,
+            generation,
+            mline_index,
+        )
         return False
 
-    def _on_offer_created(self, promise: Gst.Promise, *_args: object) -> None:
-        if not self._webrtcbin or not self._session:
+    def _on_offer_created(
+        self,
+        promise: Gst.Promise,
+        token: object = None,
+        *_args: object,
+    ) -> None:
+        if not isinstance(token, tuple) or len(token) != 3:
+            return
+        generation, session_id, element = token
+        if not isinstance(generation, int) or not isinstance(session_id, str):
+            return
+        branch = self._active_branch_for_token(generation, session_id, element)
+        if branch is None:
             return
 
         reply = promise.get_reply()
@@ -519,42 +964,97 @@ class WebRTCUplinkController:
             log.error("[WEBRTC-UPLINK] offer promise missing offer value.")
             return
 
-        self._webrtcbin.emit("set-local-description", offer, Gst.Promise.new())
         sdp_text = offer.sdp.as_text()
-        payload = build_uplink_payload(
-            WEBRTC_UPLINK_OFFER,
-            self._session.broadcast_id,
-            self._session.session_id,
-            sdp=sdp_text,
-        )
+        with self._stats_lock:
+            session = self._session
+            if (
+                session is None
+                or session.session_id != session_id
+                or generation != self._stats_generation
+                or self._active_branch_for_token(
+                    generation,
+                    session_id,
+                    branch.webrtcbin,
+                )
+                is not branch
+            ):
+                return
+            branch.webrtcbin.emit(
+                "set-local-description",
+                offer,
+                Gst.Promise.new(),
+            )
+            payload = build_uplink_payload(
+                WEBRTC_UPLINK_OFFER,
+                session.broadcast_id,
+                session_id,
+                sdp=sdp_text,
+            )
         self._send_message(WEBRTC_UPLINK_OFFER_DEST, payload, True)
-        log.info("[WEBRTC-UPLINK] sent SDP offer. sessionId=%s", self._session.session_id)
+        log.info(
+            "[WEBRTC-UPLINK] sent SDP offer. sessionId=%s generation=%s",
+            session_id,
+            generation,
+        )
 
-    def _on_ice_candidate(self, _element: Gst.Element, mline_index: int, candidate: str) -> None:
-        if not self._session:
+    def _on_ice_candidate(
+        self,
+        element: Gst.Element,
+        mline_index: int,
+        candidate: str,
+        generation: int,
+        session_id: str,
+    ) -> None:
+        branch = self._active_branch_for_token(generation, session_id, element)
+        if branch is None:
             return
         candidate_text = str(candidate or "").strip()
         if not candidate_text:
             log.debug(
-                "[WEBRTC-UPLINK] skip empty local ICE candidate. sessionId=%s mline=%s",
-                self._session.session_id,
+                "[WEBRTC-UPLINK] skip empty local ICE candidate. sessionId=%s generation=%s mline=%s",
+                session_id,
+                generation,
                 mline_index,
             )
             return
-        payload = build_uplink_payload(
-            WEBRTC_UPLINK_ICE_CANDIDATE,
-            self._session.broadcast_id,
-            self._session.session_id,
-            candidate=candidate_text,
-            sdpMLineIndex=int(mline_index),
-            sdpMid="video",
-        )
+        with self._stats_lock:
+            session = self._session
+            if (
+                session is None
+                or session.session_id != session_id
+                or generation != self._stats_generation
+                or self._active_branch_for_token(
+                    generation,
+                    session_id,
+                    element,
+                )
+                is not branch
+            ):
+                return
+            payload = build_uplink_payload(
+                WEBRTC_UPLINK_ICE_CANDIDATE,
+                session.broadcast_id,
+                session_id,
+                candidate=candidate_text,
+                sdpMLineIndex=int(mline_index),
+                sdpMid="video",
+            )
         self._send_message(WEBRTC_UPLINK_ICE_CANDIDATE_DEST, payload, False)
 
-    def _on_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
+    def _on_connection_state_changed(
+        self,
+        element: Gst.Element,
+        _pspec: object,
+        generation: int,
+        session_id: str,
+    ) -> None:
+        if self._active_branch_for_token(generation, session_id, element) is None:
+            return
         state = element.get_property("connection-state")
         state_nick = str(getattr(state, "value_nick", str(state))).lower()
         with self._stats_lock:
+            if generation != self._stats_generation:
+                return
             if state_nick == "connected":
                 if self._connection_state != "connected":
                     self._connected_since = time.monotonic()
@@ -562,14 +1062,29 @@ class WebRTCUplinkController:
                 self._connected_since = None
                 self._reset_outbound_progress_locked()
             self._connection_state = state_nick
-        log.info("[WEBRTC-UPLINK] connection-state=%s", state_nick)
+            stop_sent = self._stop_sent
+        log.info(
+            "[WEBRTC-UPLINK] connection-state=%s generation=%s",
+            state_nick,
+            generation,
+        )
         if state_nick in {"failed", "closed"}:
-            self.stop(send_signal=not self._stop_sent)
+            self.stop(send_signal=not stop_sent)
 
-    def _on_ice_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
+    def _on_ice_connection_state_changed(
+        self,
+        element: Gst.Element,
+        _pspec: object,
+        generation: int,
+        session_id: str,
+    ) -> None:
+        if self._active_branch_for_token(generation, session_id, element) is None:
+            return
         state = element.get_property("ice-connection-state")
         state_nick = str(getattr(state, "value_nick", str(state))).lower()
         with self._stats_lock:
+            if generation != self._stats_generation:
+                return
             if state_nick in {"connected", "completed"}:
                 if self._ice_connection_state not in {"connected", "completed"}:
                     self._ice_connected_since = time.monotonic()
@@ -577,19 +1092,26 @@ class WebRTCUplinkController:
                 self._ice_connected_since = None
                 self._reset_outbound_progress_locked()
             self._ice_connection_state = state_nick
-        log.info("[WEBRTC-UPLINK] ice-connection-state=%s", state_nick)
-        if state_nick in {"failed", "closed", "disconnected"} and self._session:
-            self.stop(send_signal=not self._stop_sent)
+            stop_sent = self._stop_sent
+        log.info(
+            "[WEBRTC-UPLINK] ice-connection-state=%s generation=%s",
+            state_nick,
+            generation,
+        )
+        if state_nick in {"failed", "closed", "disconnected"}:
+            self.stop(send_signal=not stop_sent)
 
-    def _send_stop_message(self) -> None:
-        if not self._session:
-            return
+    def _send_stop_message_for(self, session: WebRTCUplinkSession) -> bool:
         payload = build_uplink_payload(
             WEBRTC_UPLINK_STOP,
-            self._session.broadcast_id,
-            self._session.session_id,
+            session.broadcast_id,
+            session.session_id,
         )
-        self._stop_sent = self._send_message(WEBRTC_UPLINK_STOP_DEST, payload, False)
+        return self._send_message(
+            WEBRTC_UPLINK_STOP_DEST,
+            payload,
+            False,
+        )
 
 
 def _build_session_description(
@@ -599,7 +1121,9 @@ def _build_session_description(
     result, sdp_message = GstSdp.SDPMessage.new()
     if result != GstSdp.SDPResult.OK:
         return None
-    parse_result = GstSdp.sdp_message_parse_buffer(bytes(sdp_text.encode("utf-8")), sdp_message)
+    parse_result = GstSdp.sdp_message_parse_buffer(
+        bytes(sdp_text.encode("utf-8")), sdp_message
+    )
     if parse_result != GstSdp.SDPResult.OK:
         return None
     return GstWebRTC.WebRTCSessionDescription.new(sdp_type, sdp_message)

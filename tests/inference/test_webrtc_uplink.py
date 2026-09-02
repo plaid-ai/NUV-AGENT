@@ -4,21 +4,28 @@ import importlib
 import sys
 import types
 import unittest
+from typing import Any, ClassVar
 
 
 class _FakeGLib:
-    calls: list[tuple[object, tuple[object, ...]]] = []
+    calls: ClassVar[list[tuple[Any, tuple[Any, ...]]]] = []
 
     @classmethod
-    def idle_add(cls, func: object, *args: object) -> int:
+    def idle_add(cls, func: Any, *args: Any) -> int:
         cls.calls.append((func, args))
         return len(cls.calls)
+
+    @classmethod
+    def drain(cls) -> None:
+        while cls.calls:
+            func, args = cls.calls.pop(0)
+            func(*args)
 
 
 class _FakePromise:
     @staticmethod
-    def new_with_change_func(*_args: object, **_kwargs: object) -> object:
-        return object()
+    def new_with_change_func(callback: Any, token: object, _notify: object) -> object:
+        return types.SimpleNamespace(callback=callback, token=token)
 
     @staticmethod
     def new() -> object:
@@ -32,11 +39,156 @@ class _FakeSessionDescription:
 
 
 class _ReplyPromise:
-    def __init__(self, reply: dict[str, object]) -> None:
+    def __init__(self, reply: Any) -> None:
         self.reply = reply
 
-    def get_reply(self) -> dict[str, object]:
+    def get_reply(self) -> Any:
         return self.reply
+
+
+class _Offer:
+    sdp = types.SimpleNamespace(as_text=lambda: "v=0\r\n")
+
+
+class _OfferReply:
+    def get_value(self, name: str) -> object | None:
+        return _Offer() if name == "offer" else None
+
+
+class _FakePad:
+    def __init__(self, owner: _FakeElement, name: str) -> None:
+        self.owner = owner
+        self.name = name
+        self.peer: _FakePad | None = None
+        self.released = False
+
+    def link(self, other: _FakePad) -> str:
+        if self.peer is not None or other.peer is not None:
+            return "was-linked"
+        self.peer = other
+        other.peer = self
+        _FakeElementFactory.trace.append(
+            ("link", self.owner.name, self.name, other.owner.name, other.name)
+        )
+        return "ok"
+
+    def unlink(self, other: _FakePad) -> bool:
+        if self.peer is not other or other.peer is not self:
+            return False
+        self.peer = None
+        other.peer = None
+        _FakeElementFactory.trace.append(
+            ("unlink", self.owner.name, self.name, other.owner.name, other.name)
+        )
+        return True
+
+    def get_peer(self) -> _FakePad | None:
+        return self.peer
+
+
+class _FakeElement:
+    def __init__(self, factory: str, name: str) -> None:
+        self.factory = factory
+        self.name = name
+        self.parent: _FakePipeline | None = None
+        self.properties: dict[str, object] = {}
+        self.emitted: list[tuple[str, tuple[object, ...]]] = []
+        self.released_pads: list[_FakePad] = []
+        self.state_changes: list[str] = []
+        self.state_result = "success"
+        self.sync_result = True
+        self.handlers: dict[int, tuple[str, Any, tuple[object, ...]]] = {}
+        self._next_handler = 1
+        self._request_pad_count = 0
+        self._static_pads: dict[str, _FakePad] = {}
+        if factory == "queue":
+            self._static_pads = {
+                "sink": _FakePad(self, "sink"),
+                "src": _FakePad(self, "src"),
+            }
+
+    def request_pad_simple(self, template_name: str) -> _FakePad:
+        self._request_pad_count += 1
+        return _FakePad(
+            self,
+            template_name.replace("%u", str(self._request_pad_count - 1)),
+        )
+
+    def release_request_pad(self, pad: _FakePad) -> None:
+        pad.released = True
+        self.released_pads.append(pad)
+        _FakeElementFactory.trace.append(("release", self.name, pad.name))
+
+    def get_static_pad(self, name: str) -> _FakePad | None:
+        return self._static_pads.get(name)
+
+    def set_property(self, name: str, value: object) -> None:
+        self.properties[name] = value
+
+    def get_property(self, name: str) -> object:
+        return self.properties.get(name, types.SimpleNamespace(value_nick="new"))
+
+    def connect(self, signal: str, callback: Any, *user_data: object) -> int:
+        handler_id = self._next_handler
+        self._next_handler += 1
+        self.handlers[handler_id] = (signal, callback, user_data)
+        return handler_id
+
+    def disconnect(self, handler_id: int) -> None:
+        del self.handlers[handler_id]
+
+    def sync_state_with_parent(self) -> bool:
+        _FakeElementFactory.trace.append(("sync", self.name))
+        return self.sync_result
+
+    def set_state(self, state: str) -> str:
+        self.state_changes.append(state)
+        _FakeElementFactory.trace.append(("state", self.name, state))
+        return self.state_result
+
+    def emit(self, signal: str, *args: object) -> None:
+        self.emitted.append((signal, args))
+
+    def get_parent(self) -> _FakePipeline | None:
+        return self.parent
+
+
+class _FakeElementFactory:
+    created: ClassVar[list[_FakeElement]] = []
+    trace: ClassVar[list[tuple[object, ...]]] = []
+
+    @classmethod
+    def make(cls, factory: str, name: str) -> _FakeElement:
+        element = _FakeElement(factory, name)
+        cls.created.append(element)
+        cls.trace.append(("make", factory, name))
+        return element
+
+
+class _FakePipeline:
+    def __init__(self) -> None:
+        self.tee = _FakeElement("tee", "webrtc_uplink_tee")
+        self.tee.parent = self
+        self.elements: list[_FakeElement] = [self.tee]
+
+    def get_by_name(self, name: str) -> _FakeElement | None:
+        return next((item for item in self.elements if item.name == name), None)
+
+    def add(self, element: _FakeElement) -> bool:
+        if element.parent is not None:
+            return False
+        element.parent = self
+        self.elements.append(element)
+        _FakeElementFactory.trace.append(("add", element.name))
+        return True
+
+    def remove(self, element: _FakeElement) -> bool:
+        if element.parent is not self:
+            return False
+        self.elements.remove(element)
+        element.parent = None
+        _FakeElementFactory.trace.append(("remove", element.name))
+        return True
 
 
 def _install_fake_gi() -> None:
@@ -48,7 +200,12 @@ def _install_fake_gi() -> None:
     repository.Gst = types.SimpleNamespace(
         Pipeline=object,
         Element=object,
+        Pad=object,
         Promise=_FakePromise,
+        ElementFactory=_FakeElementFactory,
+        PadLinkReturn=types.SimpleNamespace(OK="ok"),
+        State=types.SimpleNamespace(NULL="null"),
+        StateChangeReturn=types.SimpleNamespace(FAILURE="failure"),
     )
     repository.GstSdp = types.SimpleNamespace(
         SDPMessage=types.SimpleNamespace(new=lambda: (0, object())),
@@ -76,10 +233,34 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
     def setUp(self) -> None:
         _FakeGLib.calls.clear()
+        _FakeElementFactory.created.clear()
+        _FakeElementFactory.trace.clear()
+
+    def _controller(
+        self,
+        send_message: Any = None,
+    ) -> tuple[Any, _FakePipeline]:
+        controller = self.module.WebRTCUplinkController(
+            send_message=send_message or (lambda *_args: True)
+        )
+        pipeline = _FakePipeline()
+        self.assertTrue(controller.attach_pipeline(pipeline))
+        return controller, pipeline
+
+    @staticmethod
+    def _start(controller: Any, session_id: str) -> None:
+        controller.start(
+            {
+                "broadcastId": "device-1",
+                "sessionId": session_id,
+                "forceRelay": False,
+                "iceServers": [],
+            }
+        )
+        _FakeGLib.drain()
 
     def test_start_ignores_duplicate_session(self) -> None:
-        controller = self.module.WebRTCUplinkController(send_message=lambda *_args: True)
-
+        controller, _pipeline = self._controller()
         payload = {
             "broadcastId": "device-1",
             "sessionId": "session-1",
@@ -95,24 +276,39 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
     def test_on_ice_candidate_skips_empty_candidate(self) -> None:
         sent_messages: list[tuple[str, dict[str, object], bool]] = []
 
-        def send_message(destination: str, payload: dict[str, object], remember: bool) -> bool:
+        def send_message(
+            destination: str,
+            payload: dict[str, object],
+            remember: bool,
+        ) -> bool:
             sent_messages.append((destination, payload, remember))
             return True
 
-        controller = self.module.WebRTCUplinkController(send_message=send_message)
-        controller._session = self.module.WebRTCUplinkSession(
-            broadcast_id="device-1",
-            session_id="session-1",
-            force_relay=False,
-            ice_servers=[],
-        )
+        controller, _pipeline = self._controller(send_message)
+        self._start(controller, "session-1")
+        branch = controller._branch
+        generation = controller._stats_generation
 
-        controller._on_ice_candidate(None, 0, "")
-        controller._on_ice_candidate(None, 0, "   ")
+        controller._on_ice_candidate(
+            branch.webrtcbin,
+            0,
+            "",
+            generation,
+            "session-1",
+        )
+        controller._on_ice_candidate(
+            branch.webrtcbin,
+            0,
+            "   ",
+            generation,
+            "session-1",
+        )
 
         self.assertEqual(sent_messages, [])
 
-    def test_stats_accumulator_emits_interval_loss_rtt_and_feedback_deltas(self) -> None:
+    def test_stats_accumulator_emits_interval_loss_rtt_and_feedback_deltas(
+        self,
+    ) -> None:
         accumulator = self.module.WebRTCStatsAccumulator()
         first = {
             "outbound": {
@@ -157,25 +353,33 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertEqual(sample["outboundBytesDelta"], 125_000.0)
         self.assertAlmostEqual(sample["sendBitrateKbps"], 1000.0)
 
-    def test_runtime_health_requires_current_connected_session_and_rtp_progress(self) -> None:
-        controller = self.module.WebRTCUplinkController(
-            send_message=lambda *_args: True
+    def test_runtime_health_requires_current_connected_session_and_rtp_progress(
+        self,
+    ) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        generation = controller._stats_generation
+        branch.webrtcbin.properties["connection-state"] = types.SimpleNamespace(
+            value_nick="connected"
         )
-        controller._webrtcbin = object()
-        controller.start(
-            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
+        branch.webrtcbin.properties["ice-connection-state"] = types.SimpleNamespace(
+            value_nick="completed"
         )
 
-        class _StateElement:
-            def __init__(self, value: str) -> None:
-                self.value = value
-
-            def get_property(self, _name: str) -> object:
-                return types.SimpleNamespace(value_nick=self.value)
-
-        controller._on_connection_state_changed(_StateElement("connected"), None)
-        controller._on_ice_connection_state_changed(_StateElement("completed"), None)
-        token = (controller._stats_generation, "session-1")
+        controller._on_connection_state_changed(
+            branch.webrtcbin,
+            None,
+            generation,
+            "session-1",
+        )
+        controller._on_ice_connection_state_changed(
+            branch.webrtcbin,
+            None,
+            generation,
+            "session-1",
+        )
+        token = (generation, "session-1", branch.webrtcbin)
         for index in range(3):
             controller._on_stats_created(
                 _ReplyPromise(
@@ -205,21 +409,27 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         controller.on_signaling_reset()
         reset = controller.runtime_health_snapshot()
+        self.assertFalse(reset["hasPipeline"])
+        self.assertIsNone(reset["sessionId"])
         self.assertEqual(reset["connectionState"], "new")
         self.assertEqual(reset["outboundProgressSamples"], 0)
 
     def test_late_stats_callback_from_replaced_session_is_ignored(self) -> None:
-        controller = self.module.WebRTCUplinkController(
-            send_message=lambda *_args: True
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        old_branch = controller._branch
+        old_token = (
+            controller._stats_generation,
+            "session-1",
+            old_branch.webrtcbin,
         )
-        controller.start(
-            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
+        self._start(controller, "session-2")
+        new_branch = controller._branch
+        new_token = (
+            controller._stats_generation,
+            "session-2",
+            new_branch.webrtcbin,
         )
-        old_token = (controller._stats_generation, "session-1")
-        controller.start(
-            {"broadcastId": "device-1", "sessionId": "session-2", "iceServers": []}
-        )
-        new_token = (controller._stats_generation, "session-2")
         stats = {
             "type": "remote-inbound-rtp",
             "round-trip-time": 0.05,
@@ -235,13 +445,10 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
 
     def test_stop_invalidates_inflight_stats_before_glib_callback(self) -> None:
-        controller = self.module.WebRTCUplinkController(
-            send_message=lambda *_args: True
-        )
-        controller.start(
-            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
-        )
-        token = (controller._stats_generation, "session-1")
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
 
         controller.stop(send_signal=False)
         controller._on_stats_created(
@@ -255,6 +462,134 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
 
         self.assertIsNone(controller.take_latest_outbound_stats())
+
+    def test_reconnect_disposes_and_recreates_webrtc_branch(self) -> None:
+        controller, pipeline = self._controller()
+        self._start(controller, "session-1")
+        first = controller._branch
+        first_tee_pad = first.tee_src_pad
+        first_webrtc_pad = first.webrtc_sink_pad
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertIn("null", first.queue.state_changes)
+        self.assertIn("null", first.webrtcbin.state_changes)
+        self.assertTrue(first_tee_pad.released)
+        self.assertTrue(first_webrtc_pad.released)
+        self.assertNotIn(first.queue, pipeline.elements)
+        self.assertNotIn(first.webrtcbin, pipeline.elements)
+
+        _FakeElementFactory.trace.clear()
+        self._start(controller, "session-2")
+        second = controller._branch
+
+        self.assertIsNot(second.webrtcbin, first.webrtcbin)
+        self.assertIsNot(second.tee_src_pad, first.tee_src_pad)
+        self.assertIs(second.tee_src_pad.get_peer(), second.queue_sink_pad)
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in _FakeElementFactory.created
+                    if item.factory == "webrtcbin"
+                ]
+            ),
+            2,
+        )
+        sync_webrtc = _FakeElementFactory.trace.index(("sync", second.webrtcbin.name))
+        sync_queue = _FakeElementFactory.trace.index(("sync", second.queue.name))
+        link_tee = _FakeElementFactory.trace.index(
+            (
+                "link",
+                pipeline.tee.name,
+                second.tee_src_pad.name,
+                second.queue.name,
+                "sink",
+            )
+        )
+        self.assertLess(sync_webrtc, link_tee)
+        self.assertLess(sync_queue, link_tee)
+
+    def test_stale_generation_cannot_mutate_new_sdp_or_ice_state(self) -> None:
+        sent: list[tuple[str, dict[str, object], bool]] = []
+        controller, _pipeline = self._controller(
+            lambda destination, payload, remember: (
+                sent.append((destination, payload, remember)) or True
+            )
+        )
+        self._start(controller, "session-1")
+        first = controller._branch
+        first_generation = controller._stats_generation
+        old_offer_token = (first_generation, "session-1", first.webrtcbin)
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self._start(controller, "session-2")
+        second = controller._branch
+        sent.clear()
+
+        controller._apply_answer_on_main_loop(
+            first_generation,
+            "session-1",
+            "v=0\r\n",
+        )
+        controller._add_remote_candidate_on_main_loop(
+            first_generation,
+            "session-1",
+            0,
+            "candidate:old",
+            "video",
+        )
+        controller._on_ice_candidate(
+            first.webrtcbin,
+            0,
+            "candidate:late-local",
+            first_generation,
+            "session-1",
+        )
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), old_offer_token)
+
+        self.assertEqual(sent, [])
+        self.assertFalse(
+            any(
+                signal in {"set-remote-description", "add-ice-candidate"}
+                for signal, _args in second.webrtcbin.emitted
+            )
+        )
+
+    def test_incomplete_teardown_refuses_a_replacement_offer(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        first = controller._branch
+        first.queue.state_result = "failure"
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self.assertTrue(controller._branch_cleanup_failed)
+
+        create_count = len(
+            [
+                item
+                for item in _FakeElementFactory.created
+                if item.factory == "webrtcbin"
+            ]
+        )
+        self._start(controller, "session-2")
+
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in _FakeElementFactory.created
+                    if item.factory == "webrtcbin"
+                ]
+            ),
+            create_count,
+        )
+        self.assertIsNone(controller._session)
+        self.assertFalse(controller.runtime_health_snapshot()["hasPipeline"])
 
 
 if __name__ == "__main__":
