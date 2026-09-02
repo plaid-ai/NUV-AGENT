@@ -61,6 +61,8 @@ class ZeroShotDeviceResolveTest(unittest.TestCase):
 )
 class MacMpsZeroShotRegressionTest(unittest.TestCase):
     def test_offline_local_siglip_model_classifies_frame_on_mps(self) -> None:
+        import torch
+
         self.assertEqual(platform.system(), "Darwin")
         self.assertEqual(platform.machine(), "arm64")
         model_path = Path(os.environ["NUVION_ZSAD_REGRESSION_MODEL"]).resolve()
@@ -80,6 +82,8 @@ class MacMpsZeroShotRegressionTest(unittest.TestCase):
             )
             self.assertTrue(detector.ready)
             self.assertEqual(detector._device, "mps")
+            self.assertEqual(detector._inference_dtype, torch.float16)
+            self.assertEqual(next(detector._model.parameters()).dtype, torch.float16)
             self.assertEqual(detector.loaded_model_source(), str(model_path))
             result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
         self.assertIsNotNone(result)
