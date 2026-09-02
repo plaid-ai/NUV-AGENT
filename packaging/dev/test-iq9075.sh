@@ -185,14 +185,23 @@ cleanup_probe_runtime() {
 }
 trap cleanup_probe_runtime EXIT
 if [ "$(id -u)" -eq 0 ]; then
-  chown "$probe_user:$probe_group" "$probe_runtime_dir"
+  # Create the native capture roots while the mktemp parent is still root-only.
+  # The service user may traverse these directories, but cannot replace the
+  # files that the root shell later opens for redirection.
+  install -d -m 0711 -o root -g root \
+    "$probe_runtime_dir/native-capture" \
+    "$probe_runtime_dir/depthai-crashdumps"
+  # Keep the common parent root-owned so the service user cannot rename the
+  # protected capture directories. Per-purpose HOME/XDG directories below are
+  # still owned by the service user.
+  chmod 0711 "$probe_runtime_dir"
   for directory in home cache config runtime; do
     install -d -m 0700 -o "$probe_user" -g "$probe_group" \
       "$probe_runtime_dir/$directory"
   done
 else
   chmod 0700 "$probe_runtime_dir"
-  for directory in home cache config runtime; do
+  for directory in home cache config runtime native-capture depthai-crashdumps; do
     install -d -m 0700 "$probe_runtime_dir/$directory"
   done
 fi
@@ -442,6 +451,23 @@ print("[iq9075-e2e] disposable WebRTC reset/re-offer: PASS")
 PY
 
 if [ "$camera_mode" = "oak" ]; then
+  oak_native_capture="$probe_runtime_dir/native-capture/oak-native-output.log"
+  oak_crash_dump="$probe_runtime_dir/depthai-crashdumps/crash_dump.json"
+  if [ "$(id -u)" -eq 0 ]; then
+    install -m 0600 -o root -g root /dev/null "$oak_native_capture"
+    install -m 0600 -o "$probe_user" -g "$probe_group" /dev/null \
+      "$oak_crash_dump"
+    oak_native_capture_owner=0
+  else
+    install -m 0600 /dev/null "$oak_native_capture"
+    install -m 0600 /dev/null "$oak_crash_dump"
+    oak_native_capture_owner="$(id -u)"
+  fi
+  # The capture path is immutable to the service user in the root execution
+  # path. Open it read/write once and inherit the verified open file
+  # description as stdout+stderr; never perform a privileged O_TRUNC redirect
+  # through a user-writable pathname.
+  exec 9<>"$oak_native_capture"
   oak_python=(
     /usr/bin/env
     -C "$probe_runtime_dir"
@@ -449,10 +475,13 @@ if [ "$camera_mode" = "oak" ]; then
     "PYTHONPATH=${PYTHONPATH:-}"
     "PYTHONNOUSERSITE=1"
     "PYTHONDONTWRITEBYTECODE=1"
+    "DEPTHAI_CRASHDUMP=$oak_crash_dump"
+    "NUVION_IQ9075_OAK_NATIVE_CAPTURE=$oak_native_capture"
+    "NUVION_IQ9075_OAK_NATIVE_CAPTURE_OWNER=$oak_native_capture_owner"
     "NUVION_IQ9075_OAK_SOAK_SECONDS=${NUVION_IQ9075_OAK_SOAK_SECONDS:-120}"
     "NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN=${NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN:-2}"
     "NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB=${NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB:-32}"
-    "NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/oak-soak-result.json"
+    "NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/runtime/oak-soak-result.json"
     "NUVION_IQ9075_EXPECTED_VERSION=$expected_version"
     "NUVION_IQ9075_EXPECTED_COMPONENT_SHA=$expected_component_sha"
     "NUVION_IQ9075_EXPECTED_BOM_DIGEST=$expected_bom_digest"
@@ -475,10 +504,13 @@ if [ "$camera_mode" = "oak" ]; then
 
   echo "[iq9075-e2e] checking OAK-D capture as non-root user nuvion"
   set +e
-  timeout 720s "${oak_python[@]}" <<'PY'
+  timeout 720s "${oak_python[@]}" \
+    1>&9 2>&1 <<'PY'
 from importlib.metadata import version
 from pathlib import Path
 from datetime import datetime, timezone
+import ctypes
+import fcntl
 import gc
 import hashlib
 import json
@@ -486,6 +518,8 @@ import math
 import os
 import platform
 import re
+import stat
+import sys
 import threading
 import time
 import weakref
@@ -517,6 +551,35 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402,F401
+
+DEPTHAI_NATIVE_CRASH_MARKERS = (
+    re.compile(r"Device with id [^\r\n]{1,256} has crashed", re.IGNORECASE),
+    re.compile(
+        r"Device crashed, but no crash dump(?: payload)? could be extracted",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Device likely crashed", re.IGNORECASE),
+    re.compile(
+        r"Device crashed\.\s*Crash dump retrieval disabled",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"There was a fatal error\.\s*Crash dump (?:saved|could not be saved)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Device has crashed\.\s*Crash dump (?:stored|saved)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Fatal error\.\s*Please report to developers\.",
+        re.IGNORECASE,
+    ),
+)
+
+
+def depthai_native_capture_has_crash_marker(output_text):
+    return any(pattern.search(output_text) for pattern in DEPTHAI_NATIVE_CRASH_MARKERS)
 
 WIDTH = 640
 HEIGHT = 480
@@ -738,6 +801,44 @@ config = DepthAIConfig(
 
 Gst.init(None)
 runtime_root = Path(os.environ["XDG_RUNTIME_DIR"]).resolve(strict=True)
+probe_root = runtime_root.parent.resolve(strict=True)
+native_capture_path = Path(os.environ["NUVION_IQ9075_OAK_NATIVE_CAPTURE"])
+native_capture_owner = int(os.environ["NUVION_IQ9075_OAK_NATIVE_CAPTURE_OWNER"])
+native_capture_metadata = native_capture_path.lstat()
+stdout_fd_metadata = os.fstat(1)
+stderr_fd_metadata = os.fstat(2)
+if (
+    not native_capture_path.is_absolute()
+    or os.path.normpath(str(native_capture_path)) != str(native_capture_path)
+    or native_capture_path.parent.resolve(strict=True)
+    != probe_root / "native-capture"
+    or native_capture_path.name != "oak-native-output.log"
+    or native_capture_path.is_symlink()
+    or not stat.S_ISREG(native_capture_metadata.st_mode)
+    or stat.S_IMODE(native_capture_metadata.st_mode) != 0o600
+    or native_capture_metadata.st_uid != native_capture_owner
+    or (fcntl.fcntl(1, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDWR
+    or (native_capture_metadata.st_dev, native_capture_metadata.st_ino)
+    != (stdout_fd_metadata.st_dev, stdout_fd_metadata.st_ino)
+    or (stdout_fd_metadata.st_dev, stdout_fd_metadata.st_ino)
+    != (stderr_fd_metadata.st_dev, stderr_fd_metadata.st_ino)
+):
+    raise SystemExit("OAK native output capture escaped its protected root or file descriptor")
+crash_dump_path = Path(os.environ["DEPTHAI_CRASHDUMP"])
+crash_dump_metadata = crash_dump_path.lstat()
+if (
+    not crash_dump_path.is_absolute()
+    or os.path.normpath(str(crash_dump_path)) != str(crash_dump_path)
+    or crash_dump_path.parent.resolve(strict=True)
+    != probe_root / "depthai-crashdumps"
+    or crash_dump_path.name != "crash_dump.json"
+    or crash_dump_path.is_symlink()
+    or not stat.S_ISREG(crash_dump_metadata.st_mode)
+    or stat.S_IMODE(crash_dump_metadata.st_mode) != 0o600
+    or crash_dump_metadata.st_uid != os.getuid()
+    or crash_dump_metadata.st_size != 0
+):
+    raise SystemExit("DepthAI crash dump file escaped its protected root")
 segment_dir = runtime_root / "oak-soak-segments"
 segment_dir.mkdir(mode=0o700)
 segment_dir = segment_dir.resolve(strict=True)
@@ -1236,10 +1337,97 @@ finally:
     except Exception as exc:
         cleanup_errors.append(f"DepthAI teardown: {type(exc).__name__}: {exc}"[:1000])
     try:
+        if bridge.running:
+            cleanup_errors.append("DepthAI capture thread remained running after teardown")
+    except Exception as exc:
+        cleanup_errors.append(
+            f"DepthAI capture thread state: {type(exc).__name__}: {exc}"[:1000]
+        )
+    try:
+        current_crash_dump_metadata = crash_dump_path.lstat()
+        if (
+            crash_dump_path.is_symlink()
+            or not stat.S_ISREG(current_crash_dump_metadata.st_mode)
+            or stat.S_IMODE(current_crash_dump_metadata.st_mode) != 0o600
+            or current_crash_dump_metadata.st_uid != os.getuid()
+            or (current_crash_dump_metadata.st_dev, current_crash_dump_metadata.st_ino)
+            != (crash_dump_metadata.st_dev, crash_dump_metadata.st_ino)
+            or current_crash_dump_metadata.st_size > 16 * 1024 * 1024
+        ):
+            raise RuntimeError("unsafe or oversized DepthAI crash dump file")
+        crash_dump_descriptor = os.open(
+            crash_dump_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened_crash_dump_metadata = os.fstat(crash_dump_descriptor)
+            if (
+                not stat.S_ISREG(opened_crash_dump_metadata.st_mode)
+                or (opened_crash_dump_metadata.st_dev, opened_crash_dump_metadata.st_ino)
+                != (
+                    current_crash_dump_metadata.st_dev,
+                    current_crash_dump_metadata.st_ino,
+                )
+                or opened_crash_dump_metadata.st_size > 16 * 1024 * 1024
+            ):
+                raise RuntimeError("DepthAI crash dump file changed during inspection")
+        finally:
+            os.close(crash_dump_descriptor)
+        if current_crash_dump_metadata.st_size:
+            cleanup_errors.append(
+                "DepthAI crash dump detected: "
+                f"bytes={current_crash_dump_metadata.st_size}"
+            )
+    except Exception as exc:
+        cleanup_errors.append(
+            f"DepthAI crash dump inspection: {type(exc).__name__}: {exc}"[:1000]
+        )
+    try:
         pipeline.set_state(Gst.State.NULL)
         pipeline.get_state(5 * Gst.SECOND)
     except Exception as exc:
         cleanup_errors.append(f"GStreamer teardown: {type(exc).__name__}: {exc}"[:1000])
+    try:
+        # DepthAI v2.32 uses a C++ stdout sink. Flush both Python and C stdio,
+        # then inspect the inherited O_RDWR file description with pread so the
+        # read cannot race a pathname replacement or disturb the write offset.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        ctypes.CDLL(None).fflush(None)
+        os.fsync(1)
+        capture_metadata = native_capture_path.lstat()
+        current_stdout_metadata = os.fstat(1)
+        current_stderr_metadata = os.fstat(2)
+        if (
+            native_capture_path.is_symlink()
+            or not stat.S_ISREG(capture_metadata.st_mode)
+            or stat.S_IMODE(capture_metadata.st_mode) != 0o600
+            or capture_metadata.st_uid != native_capture_owner
+            or (capture_metadata.st_dev, capture_metadata.st_ino)
+            != (native_capture_metadata.st_dev, native_capture_metadata.st_ino)
+            or (capture_metadata.st_dev, capture_metadata.st_ino)
+            != (current_stdout_metadata.st_dev, current_stdout_metadata.st_ino)
+            or (current_stdout_metadata.st_dev, current_stdout_metadata.st_ino)
+            != (current_stderr_metadata.st_dev, current_stderr_metadata.st_ino)
+            or (fcntl.fcntl(1, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDWR
+            or capture_metadata.st_size > 1024 * 1024
+        ):
+            raise RuntimeError("unsafe or oversized native output capture")
+        native_output = os.pread(1, 1024 * 1024 + 1, 0)
+        if len(native_output) > 1024 * 1024:
+            raise RuntimeError("native output capture exceeded read bound")
+        native_output_text = native_output.decode("utf-8", errors="replace")
+        if depthai_native_capture_has_crash_marker(native_output_text):
+            cleanup_errors.append("DepthAI native output reported a device crash")
+            print(
+                "[iq9075-e2e] DepthAI native output contained a sanitized "
+                "firmware/device crash marker",
+                flush=True,
+            )
+    except Exception as exc:
+        cleanup_errors.append(
+            f"DepthAI native output inspection failed ({type(exc).__name__})"[:1000]
+        )
 
 evidence_path = Path(os.environ["NUVION_IQ9075_OAK_EVIDENCE_OUTPUT"])
 if evidence_path.parent.resolve(strict=True) != runtime_root or evidence_path.name != "oak-soak-result.json":
@@ -1365,14 +1553,86 @@ print(
 )
 PY
   oak_status=$?
+  exec 9>&-
+  /usr/bin/python3 -I - \
+    "$oak_native_capture" "$oak_native_capture_owner" <<'PY'
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+
+path = Path(sys.argv[1])
+expected_uid = int(sys.argv[2])
+metadata = path.lstat()
+if (
+    path.is_symlink()
+    or not stat.S_ISREG(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_uid != expected_uid
+    or metadata.st_size > 1024 * 1024
+):
+    print("[iq9075-e2e] protected native output capture validation failed")
+    raise SystemExit(91)
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        or opened.st_size > 1024 * 1024
+    ):
+        print("[iq9075-e2e] protected native output capture changed during read")
+        raise SystemExit(91)
+    raw = os.read(descriptor, 1024 * 1024 + 1)
+finally:
+    os.close(descriptor)
+if len(raw) > 1024 * 1024:
+    print("[iq9075-e2e] protected native output capture exceeded read bound")
+    raise SystemExit(91)
+text = raw.decode("utf-8", errors="replace")
+patterns = (
+    re.compile(r"Device with id [^\r\n]{1,256} has crashed", re.IGNORECASE),
+    re.compile(
+        r"Device crashed, but no crash dump(?: payload)? could be extracted",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Device likely crashed", re.IGNORECASE),
+    re.compile(r"Device crashed\.\s*Crash dump retrieval disabled", re.IGNORECASE),
+    re.compile(
+        r"There was a fatal error\.\s*Crash dump (?:saved|could not be saved)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Device has crashed\.\s*Crash dump (?:stored|saved)", re.IGNORECASE),
+    re.compile(r"Fatal error\.\s*Please report to developers\.", re.IGNORECASE),
+)
+crash_marker = any(pattern.search(text) for pattern in patterns)
+redacted = False
+for line in text.splitlines():
+    if "crash" in line.casefold():
+        if not redacted:
+            print("[iq9075-e2e] DepthAI native crash diagnostic redacted")
+            redacted = True
+        continue
+    print(line)
+if crash_marker:
+    if not redacted:
+        print("[iq9075-e2e] DepthAI native crash diagnostic redacted")
+    raise SystemExit(90)
+PY
+  oak_capture_status=$?
+  if [ "$oak_capture_status" -ne 0 ] && [ "$oak_status" -eq 0 ]; then
+    oak_status="$oak_capture_status"
+  fi
   set -e
-  if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/oak-soak-result.json" ]; then
+  if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/runtime/oak-soak-result.json" ]; then
     post_release_marker_sha="$(validate_release_identity)" || \
       die "candidate release identity changed after OAK soak"
     [ "$post_release_marker_sha" = "$release_marker_sha" ] || \
       die "candidate release marker changed during OAK soak"
     /usr/bin/python3 -I - \
-      "$probe_runtime_dir/oak-soak-result.json" "$evidence_output" "$(id -u)" <<'PY'
+      "$probe_runtime_dir/runtime/oak-soak-result.json" "$evidence_output" \
+      "$(id -u)" "$oak_status" <<'PY'
 import json
 import os
 import stat
@@ -1383,6 +1643,7 @@ from pathlib import Path
 source = Path(sys.argv[1])
 destination = Path(sys.argv[2])
 expected_uid = int(sys.argv[3])
+expected_process_status = int(sys.argv[4])
 if (
     not destination.is_absolute()
     or os.path.normpath(str(destination)) != str(destination)
@@ -1466,7 +1727,6 @@ if (
     or payload.get("kind") != "nuvion-iq9075-oak-soak-result"
 ):
     raise SystemExit("IQ9075 evidence source root schema is invalid")
-
 outcome = payload.get("outcome")
 cleanup_errors = outcome.get("cleanupErrors") if isinstance(outcome, dict) else None
 if (
@@ -1481,6 +1741,9 @@ if (
     )
 ):
     raise SystemExit("IQ9075 evidence outcome schema is invalid")
+expected_outcome = "passed" if expected_process_status == 0 else "failed"
+if outcome["status"] != expected_outcome:
+    raise SystemExit("IQ9075 evidence outcome does not match the OAK process status")
 if outcome["status"] == "passed":
     if outcome.get("error") is not None or cleanup_errors:
         raise SystemExit("passed IQ9075 evidence contains failure details")

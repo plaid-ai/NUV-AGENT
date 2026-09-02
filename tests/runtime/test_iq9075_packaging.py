@@ -316,8 +316,38 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("mktemp -d /tmp/nuvion-iq9075-e2e.XXXXXX", e2e)
         self.assertIn('"HOME=$probe_runtime_dir/home"', e2e)
         self.assertIn('"XDG_CACHE_HOME=$probe_runtime_dir/cache"', e2e)
+        self.assertIn(
+            '"DEPTHAI_CRASHDUMP=$oak_crash_dump"',
+            e2e,
+        )
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_NATIVE_CAPTURE=$oak_native_capture"',
+            e2e,
+        )
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_NATIVE_CAPTURE_OWNER=$oak_native_capture_owner"',
+            e2e,
+        )
+        self.assertIn('exec 9<>"$oak_native_capture"', e2e)
+        self.assertIn('1>&9 2>&1 <<\'PY\'', e2e)
+        self.assertNotIn('2>"$oak_native_stderr"', e2e)
+        self.assertIn('install -d -m 0711 -o root -g root', e2e)
+        self.assertIn('install -m 0600 -o root -g root /dev/null "$oak_native_capture"', e2e)
+        self.assertIn('chmod 0711 "$probe_runtime_dir"', e2e)
+        self.assertNotIn('chown "$probe_user:$probe_group" "$probe_runtime_dir"', e2e)
+        self.assertIn('install -m 0600 -o "$probe_user" -g "$probe_group"', e2e)
         self.assertIn('"XDG_CONFIG_HOME=$probe_runtime_dir/config"', e2e)
         self.assertIn('"XDG_RUNTIME_DIR=$probe_runtime_dir/runtime"', e2e)
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/runtime/'
+            'oak-soak-result.json"',
+            e2e,
+        )
+        self.assertNotIn(
+            '"NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/'
+            'oak-soak-result.json"',
+            e2e,
+        )
         self.assertIn('expected_version = "2.32.0.0"', e2e)
         self.assertIn("timeout 720s", e2e)
         self.assertIn("DepthAIFrameSource", e2e)
@@ -358,13 +388,32 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('"schemaVersion": 2', e2e)
         self.assertIn('"rssAnonSlopeMiBPerMin"', e2e)
         self.assertIn('cleanup_errors.append(f"DepthAI teardown:', e2e)
+        self.assertIn("DepthAI capture thread remained running after teardown", e2e)
+        self.assertIn("DepthAI crash dump detected:", e2e)
+        self.assertIn("current_crash_dump_metadata.st_size > 16 * 1024 * 1024", e2e)
+        self.assertIn("DepthAI crash dump file escaped its protected root", e2e)
+        self.assertIn("native_capture_path.is_symlink()", e2e)
+        self.assertIn("capture_metadata.st_size > 1024 * 1024", e2e)
+        self.assertIn("sys.stdout.flush()", e2e)
+        self.assertIn("sys.stderr.flush()", e2e)
+        self.assertIn("ctypes.CDLL(None).fflush(None)", e2e)
+        self.assertIn("os.fsync(1)", e2e)
+        self.assertIn("os.pread(1, 1024 * 1024 + 1, 0)", e2e)
+        self.assertIn("DepthAI native output reported a device crash", e2e)
+        bridge_close = e2e.index("bridge.close()")
+        bridge_running = e2e.index("if bridge.running:", bridge_close)
+        pipeline_null = e2e.index("pipeline.set_state(Gst.State.NULL)", bridge_running)
+        output_flush = e2e.index("sys.stdout.flush()", pipeline_null)
+        self.assertLess(bridge_close, bridge_running)
+        self.assertLess(bridge_running, pipeline_null)
+        self.assertLess(pipeline_null, output_flush)
         self.assertIn("[iq9075-e2e] preserved failure evidence:", e2e)
         self.assertGreaterEqual(e2e.count("os.link("), 2)
         self.assertGreaterEqual(e2e.count("time.monotonic_ns()"), 2)
         self.assertIn("IQ9075 evidence source root schema is invalid", e2e)
         self.assertIn("failed IQ9075 evidence lacks bounded failure details", e2e)
         evidence_copy = e2e.index(
-            'if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/oak-soak-result.json" ]'
+            'if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/runtime/oak-soak-result.json" ]'
         )
         oak_failure = e2e.index('if [ "$oak_status" -ne 0 ]', evidence_copy)
         self.assertLess(evidence_copy, oak_failure)
@@ -402,13 +451,93 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)
         self.assertNotIn("curl ", e2e)
 
+    def test_oak_native_output_detects_fileless_depthai_crash_markers(self) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        command = e2e.index('timeout 720s "${oak_python[@]}"')
+        start = e2e.index("<<'PY'\n", command) + len("<<'PY'\n")
+        end = e2e.index("\nPY\n  oak_status=$?", start)
+        tree = ast.parse(e2e[start:end])
+        selected_nodes = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name)
+                and target.id == "DEPTHAI_NATIVE_CRASH_MARKERS"
+                for target in node.targets
+            ):
+                selected_nodes.append(node)
+            elif (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "depthai_native_capture_has_crash_marker"
+            ):
+                selected_nodes.append(node)
+        self.assertEqual(len(selected_nodes), 2)
+        namespace: dict[str, object] = {"re": __import__("re")}
+        exec(  # noqa: S102 - execute only AST-selected diagnostic matcher code.
+            compile(
+                ast.Module(body=selected_nodes, type_ignores=[]),
+                "<iq9075-oak-native-output>",
+                "exec",
+            ),
+            namespace,
+        )
+        detected = namespace["depthai_native_capture_has_crash_marker"]
+
+        crash_lines = (
+            "Device with id 19443010DEADBEEF00 has crashed. Crash dump logs are stored",
+            "Device crashed, but no crash dump could be extracted.",
+            "Device crashed, but no crash dump payload could be extracted.",
+            "Device likely crashed but did not reboot in time to get the crash dump",
+            "Device crashed.\nCrash dump retrieval disabled.",
+            "There was a fatal error. Crash dump saved to /private/path",
+            "Device has crashed. Crash dump stored in a private cache",
+            "Fatal error. Please report to developers. Log: trap",
+        )
+        for line in crash_lines:
+            with self.subTest(line=line):
+                self.assertTrue(detected(line))
+        self.assertFalse(detected("Device closed normally; shutdown OK"))
+
+    def test_oak_native_capture_fd_routes_stdout_and_stderr_without_truncate_redirect(
+        self,
+    ) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        self.assertIn('exec 9<>"$oak_native_capture"', e2e)
+        self.assertIn('1>&9 2>&1 <<\'PY\'', e2e)
+        self.assertNotIn('2>"$oak_native_capture"', e2e)
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "native-output.log"
+            capture.touch(mode=0o600)
+            probe = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    """
+set -euo pipefail
+capture=$1
+exec 9<>"$capture"
+python3 -c 'import os; os.write(1, b"stdout-marker\\n"); os.write(2, b"stderr-marker\\n")' \
+  1>&9 2>&1
+exec 9>&-
+""",
+                    "bash",
+                    str(capture),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            captured = capture.read_text(encoding="utf-8")
+            self.assertIn("stdout-marker", captured)
+            self.assertIn("stderr-marker", captured)
+
     def test_oak_evidence_export_is_atomic_strict_and_preserves_failures(
         self,
     ) -> None:
         e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
         marker = (
-            '"$probe_runtime_dir/oak-soak-result.json" "$evidence_output" '
-            '"$(id -u)" <<\'PY\'\n'
+            '"$(id -u)" "$oak_status" <<\'PY\'\n'
         )
         start = e2e.index(marker) + len(marker)
         end = e2e.index(
@@ -425,8 +554,10 @@ class Iq9075PackagingTest(unittest.TestCase):
                 "startedAt": "2026-09-03T00:00:00Z",
                 "outcome": {
                     "status": status,
-                    "error": None if passed else "RuntimeError: RSS gate failed",
-                    "cleanupErrors": [],
+                    "error": None,
+                    "cleanupErrors": []
+                    if passed
+                    else ["DepthAI native output reported a device crash"],
                 },
                 "board": {
                     "productModel": "IQ9075_DEV",
@@ -506,6 +637,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                             str(source),
                             str(destination),
                             str(os.getuid()),
+                            "0" if status == "passed" else "1",
                         ],
                         input=exporter,
                         capture_output=True,
@@ -514,6 +646,12 @@ class Iq9075PackagingTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(destination.read_bytes(), raw)
+                    self.assertEqual(
+                        json.loads(destination.read_text(encoding="utf-8"))["outcome"][
+                            "status"
+                        ],
+                        status,
+                    )
                     self.assertEqual(
                         list(root.glob(f".{destination.name}.*.tmp")),
                         [],
@@ -527,6 +665,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                             str(source),
                             str(destination),
                             str(os.getuid()),
+                            "0" if status == "passed" else "1",
                         ],
                         input=exporter,
                         capture_output=True,
@@ -549,6 +688,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                     str(source),
                     str(destination),
                     str(os.getuid()),
+                    "1",
                 ],
                 input=exporter,
                 capture_output=True,
@@ -560,6 +700,7 @@ class Iq9075PackagingTest(unittest.TestCase):
 
             malformed_failure = payload("failed")
             malformed_failure["outcome"]["error"] = None
+            malformed_failure["outcome"]["cleanupErrors"] = []
             source = root / "malformed-failure-source.json"
             destination = root / "malformed-failure-evidence.json"
             source.write_text(
@@ -574,6 +715,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                     str(source),
                     str(destination),
                     str(os.getuid()),
+                    "1",
                 ],
                 input=exporter,
                 capture_output=True,
@@ -582,6 +724,29 @@ class Iq9075PackagingTest(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("lacks bounded failure details", rejected.stderr)
+            self.assertFalse(destination.exists())
+
+            mismatched = payload("passed")
+            source = root / "mismatched-status-source.json"
+            destination = root / "mismatched-status-evidence.json"
+            source.write_text(json.dumps(mismatched) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                    "1",
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("does not match the OAK process status", rejected.stderr)
             self.assertFalse(destination.exists())
 
     def test_packaging_shell_scripts_parse(self) -> None:

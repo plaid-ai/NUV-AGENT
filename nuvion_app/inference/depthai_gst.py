@@ -151,16 +151,34 @@ class DepthAIGStreamerBridge:
 
     def close(self, *, join_timeout: float = 5.0) -> None:
         self._stop.set()
+        timeout = max(float(join_timeout), 0.0)
+        thread = self._thread
+        current_thread = threading.current_thread()
+
+        # In the normal path, let the bounded/non-blocking DepthAI read return
+        # after observing _stop before closing its native queue/device. Closing
+        # those resources while tryGetAll() is active can race the SDK teardown.
+        if thread is not None and thread is not current_thread:
+            thread.join(timeout=timeout)
+
+        close_error: BaseException | None = None
         try:
             self.frame_source.close()
-        finally:
-            thread = self._thread
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(timeout=max(float(join_timeout), 0.0))
-                if thread.is_alive():
-                    self.log.warning("[DEPTHAI] capture thread did not stop before timeout")
-            if thread is None or not thread.is_alive():
-                self._thread = None
+        except BaseException as exc:  # Rejoin before preserving the close failure.
+            close_error = exc
+
+        # A reader that ignored the cooperative stop gets one forced close to
+        # interrupt native I/O and one more bounded opportunity to finish.
+        if thread is not None and thread is not current_thread and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                self.log.warning(
+                    "[DEPTHAI] capture thread did not stop after forced source close"
+                )
+        if thread is None or not thread.is_alive():
+            self._thread = None
+        if close_error is not None:
+            raise close_error
 
     def _record_failure(self, exc: BaseException) -> None:
         with self._lock:
