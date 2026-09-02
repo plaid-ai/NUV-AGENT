@@ -346,67 +346,95 @@ device_id = resolve_depthai_device_id(
 )
 
 usb_devices_root = Path("/sys/bus/usb/devices")
-usb_topology_re = re.compile(r"^2-1(?:\.[1-9][0-9]*)+$")
+usb_topology_re = re.compile(r"^[12]-1(?:\.[1-9][0-9]*)+$")
 sys_root = Path("/sys").resolve(strict=True)
+oak_products = {"2485": "bootloader", "f63b": "runtime"}
 
 
 def read_sysfs(device: Path, name: str) -> str:
-    try:
-        return (device / name).read_text(encoding="utf-8").strip().lower()
-    except OSError as exc:
-        raise SystemExit(f"cannot read OAK sysfs {name}: {exc}") from exc
+    return (device / name).read_text(encoding="utf-8").strip().lower()
 
 
-oak_usb_paths = []
-for candidate in sorted(usb_devices_root.iterdir(), key=lambda item: item.name):
-    if usb_topology_re.fullmatch(candidate.name) is None:
-        continue
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise SystemExit(f"cannot resolve USB1 downstream topology: {exc}") from exc
-    if not resolved.is_dir() or not resolved.is_relative_to(sys_root):
-        raise SystemExit("USB1 downstream topology escaped sysfs")
-    vendor_path = candidate / "idVendor"
-    product_path = candidate / "idProduct"
-    if not vendor_path.is_file() or not product_path.is_file():
-        continue
-    if (
-        read_sysfs(candidate, "idVendor"),
-        read_sysfs(candidate, "idProduct"),
-    ) == ("03e7", "f63b"):
-        oak_usb_paths.append(candidate)
+def discover_oak_usb_paths(products: set[str]) -> list[Path]:
+    matches = []
+    for candidate in sorted(usb_devices_root.iterdir(), key=lambda item: item.name):
+        if usb_topology_re.fullmatch(candidate.name) is None:
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            vendor = read_sysfs(candidate, "idVendor")
+            product = read_sysfs(candidate, "idProduct")
+        except OSError:
+            # DepthAI changes from USB2 bootloader to USB3 runtime identity.
+            # A disappearing sysfs entry during that bounded transition is not
+            # itself evidence of a second or unsafe device.
+            continue
+        if not resolved.is_dir() or not resolved.is_relative_to(sys_root):
+            raise SystemExit("USB1 downstream topology escaped sysfs")
+        if vendor == "03e7" and product in products:
+            matches.append(candidate)
+    return matches
+
+
+def require_runtime_oak(timeout_seconds: float) -> Path:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        runtime_paths = discover_oak_usb_paths({"f63b"})
+        if len(runtime_paths) > 1:
+            raise SystemExit(
+                "USB1 downstream must contain exactly one runtime OAK-D Lite"
+            )
+        if len(runtime_paths) == 1:
+            runtime_path = runtime_paths[0]
+            if not runtime_path.name.startswith("2-1."):
+                raise SystemExit("runtime OAK-D Lite must enumerate on USB3")
+            try:
+                speed_mbps = float(read_sysfs(runtime_path, "speed"))
+                driver_path = (runtime_path / "driver").resolve(strict=True)
+                expected_driver = Path("/sys/bus/usb/drivers/usb").resolve(
+                    strict=True
+                )
+            except (OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot validate runtime OAK USB identity: {exc}"
+                ) from exc
+            if driver_path != expected_driver or speed_mbps < 5000.0:
+                raise SystemExit(
+                    f"OAK-D Lite at {runtime_path.name} must use the exact USB "
+                    f"driver at 5Gbps; observed driver={driver_path.name} "
+                    f"speed={speed_mbps:g}Mbps"
+                )
+            return runtime_path
+        time.sleep(0.1)
+    raise SystemExit("OAK-D Lite did not enter USB3 runtime identity in time")
+
+
+oak_usb_paths = discover_oak_usb_paths(set(oak_products))
 
 if not oak_usb_paths:
-    print("[iq9075-e2e] no OAK-D device detected below USB1 hub 2-1", flush=True)
+    print("[iq9075-e2e] no OAK-D device detected below USB1 dual hub", flush=True)
     raise SystemExit(3)
 if len(oak_usb_paths) != 1:
-    raise SystemExit("USB1 downstream must contain exactly one 03e7:f63b OAK-D Lite")
-expected_usb_path = oak_usb_paths[0]
-vendor = read_sysfs(expected_usb_path, "idVendor")
-product = read_sysfs(expected_usb_path, "idProduct")
-speed = read_sysfs(expected_usb_path, "speed")
+    raise SystemExit("USB1 downstream must contain exactly one OAK-D Lite")
+initial_usb_path = oak_usb_paths[0]
 try:
-    driver_path = (expected_usb_path / "driver").resolve(strict=True)
-    expected_driver = Path("/sys/bus/usb/drivers/usb").resolve(strict=True)
+    initial_product = read_sysfs(initial_usb_path, "idProduct")
+    initial_speed_mbps = float(read_sysfs(initial_usb_path, "speed"))
 except OSError as exc:
-    raise SystemExit(f"cannot resolve OAK USB driver: {exc}") from exc
-if (vendor, product) != ("03e7", "f63b") or driver_path != expected_driver:
-    raise SystemExit(
-        f"exact OAK USB identity mismatch at {expected_usb_path.name}: "
-        f"vendor={vendor}, product={product}, driver={driver_path.name}"
-    )
-try:
-    speed_mbps = float(speed)
+    raise SystemExit(f"cannot read initial OAK USB identity: {exc}") from exc
 except ValueError as exc:
+    raise SystemExit("initial OAK USB speed is invalid") from exc
+initial_mode = oak_products.get(initial_product)
+if initial_mode is None:
+    raise SystemExit("initial OAK USB product identity is invalid")
+if initial_mode == "bootloader" and (
+    not initial_usb_path.name.startswith("1-1.") or initial_speed_mbps < 480.0
+):
     raise SystemExit(
-        f"invalid OAK USB speed at {expected_usb_path.name}: {speed!r}"
-    ) from exc
-if speed_mbps < 5000.0:
-    raise SystemExit(
-        f"OAK-D Lite at {expected_usb_path.name} must negotiate 5Gbps; "
-        f"observed {speed_mbps:g}Mbps"
+        "OAK bootloader must enumerate on the USB2 side of the USB1 dual hub"
     )
+if initial_mode == "runtime":
+    require_runtime_oak(2.0)
 
 available_devices = depthai.Device.getAllAvailableDevices()
 available_ids = {
@@ -526,6 +554,7 @@ def pull_and_validate_rtp(label: str) -> None:
 
 try:
     bridge.start()
+    runtime_usb_path = require_runtime_oak(startup_timeout)
     for index in range(30):
         message = bus.pop_filtered(Gst.MessageType.ERROR)
         if message is not None:
@@ -569,7 +598,8 @@ finally:
 
 print(
     "[iq9075-e2e] OAK-D Lite RGB/appsrc/H264/RTP bounded soak: PASS "
-    f"(depthai={installed_version}, samples={sample_count}, "
+    f"(depthai={installed_version}, usb={runtime_usb_path.name}, "
+    f"samples={sample_count}, "
     f"duration={soak_seconds}s, rssAnonGrowth={rss_growth_kib / 1024:.1f}MiB, "
     f"bridge={bridge.stats_snapshot()})"
 )
