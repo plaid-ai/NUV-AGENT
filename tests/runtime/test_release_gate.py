@@ -310,6 +310,8 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('REFERENCE_PATH="${RUNNER_TEMP}/siglip-reference-v1.json"', macos)
         self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", macos)
         self.assertIn('stat.S_IMODE(reference_stat.st_mode) == 0o600', macos)
+        self.assertIn('type(reference["schemaVersion"]) is int', macos)
+        self.assertIn("and 0.0 <= score <= 1.0", macos)
         reference = macos.index("reference_outputs.logits_per_image")
         post_reference_purge = macos.index("sudo purge", reference)
         mps_detector = macos.index("detector = ZeroShotAnomalyDetector")

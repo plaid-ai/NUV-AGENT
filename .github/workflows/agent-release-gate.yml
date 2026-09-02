@@ -279,6 +279,7 @@ jobs:
               "schemaVersion", "modelRevision", "labels", "scores"
           }
           labels = ["normal scene", "anomalous scene"]
+          assert type(reference["schemaVersion"]) is int
           assert reference["schemaVersion"] == 1
           assert reference["modelRevision"] == revision
           assert reference["labels"] == labels
@@ -288,6 +289,7 @@ jobs:
               isinstance(score, (int, float))
               and not isinstance(score, bool)
               and math.isfinite(score)
+              and 0.0 <= score <= 1.0
               for score in scores
           )
           reference_scores = torch.tensor(scores, dtype=torch.float32)
