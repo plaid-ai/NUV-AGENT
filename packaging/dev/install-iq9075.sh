@@ -6,7 +6,7 @@ readonly IDENTITY_PATH="/etc/nuv-agent/device-identity.json"
 readonly CONFIG_PATH="/etc/nuv-agent/agent.env"
 
 usage() {
-  echo "Usage: $0 /path/to/nuv-agent_<version>_arm64.deb [--camera oak|uvc]" >&2
+  echo "Usage: $0 /path/to/nuv-agent_<version>_arm64.deb --expected-version <version> --expected-sha256 <hex> [--camera oak|uvc]" >&2
 }
 
 die() {
@@ -31,6 +31,8 @@ fi
 deb_argument="$1"
 shift
 camera_mode="oak"
+expected_version=""
+expected_sha256=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --camera)
@@ -40,6 +42,24 @@ while [ "$#" -gt 0 ]; do
       ;;
     --camera=*)
       camera_mode="${1#*=}"
+      shift
+      ;;
+    --expected-version)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      expected_version="$2"
+      shift 2
+      ;;
+    --expected-version=*)
+      expected_version="${1#*=}"
+      shift
+      ;;
+    --expected-sha256)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      expected_sha256="$2"
+      shift 2
+      ;;
+    --expected-sha256=*)
+      expected_sha256="${1#*=}"
       shift
       ;;
     *)
@@ -52,12 +72,19 @@ case "$camera_mode" in
   oak|uvc) ;;
   *) die "--camera must be oak or uvc" ;;
 esac
+case "$expected_version" in
+  ''|*[!0-9A-Za-z.+~-]*) die "--expected-version is required and invalid" ;;
+esac
+[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] \
+  || die "--expected-sha256 must be exactly 64 lowercase hex characters"
 
 command -v dpkg-deb >/dev/null 2>&1 || die "dpkg-deb is required"
 command -v apt-get >/dev/null 2>&1 || die "apt-get is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v sudo >/dev/null 2>&1 || die "sudo is required"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
 
+[ ! -L "$deb_argument" ] || die "package must not be a symlink"
 deb_path="$(realpath "$deb_argument")"
 [ -f "$deb_path" ] || die "package not found: $deb_path"
 [ "$(dpkg --print-architecture)" = "arm64" ] || die "only Ubuntu arm64 is supported"
@@ -77,6 +104,10 @@ esac
 
 [ "$(dpkg-deb -f "$deb_path" Package)" = "nuv-agent" ] || die "package name must be nuv-agent"
 [ "$(dpkg-deb -f "$deb_path" Architecture)" = "arm64" ] || die "package architecture must be arm64"
+package_version="$(dpkg-deb -f "$deb_path" Version)"
+[ "$package_version" = "$expected_version" ] || die "package version mismatch: expected $expected_version, found $package_version"
+package_sha256="$(sha256sum "$deb_path" | awk '{print $1}')"
+[ "$package_sha256" = "$expected_sha256" ] || die "package SHA-256 mismatch"
 
 available_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
 case "$available_kib" in

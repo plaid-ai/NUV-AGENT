@@ -163,6 +163,9 @@ from nuvion_app.runtime.updater_client import (
     UpdaterClient,
     build_updater_capability_telemetry,
 )
+from nuvion_app.runtime.update_commit_readiness import (
+    evaluate_update_commit_readiness,
+)
 
 try:
     from nuvion_app.agent.triton_client import TritonAnomalyClient
@@ -412,6 +415,23 @@ UPDATER_TELEMETRY_TTL_SEC = parse_float(
     os.getenv("NUVION_UPDATER_TELEMETRY_TTL_SEC"),
     15.0,
 )
+UPDATE_COMMIT_STABLE_SEC = max(
+    10.0,
+    min(
+        parse_float(os.getenv("NUVION_UPDATE_COMMIT_STABLE_SEC"), 15.0),
+        60.0,
+    ),
+)
+UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC = max(
+    5.0,
+    min(
+        parse_float(
+            os.getenv("NUVION_UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC"),
+            20.0,
+        ),
+        60.0,
+    ),
+)
 EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
     DEFAULT_OUTBOX_MAX_ROWS,
@@ -489,6 +509,9 @@ updater_telemetry_cache_updated_at = 0.0
 updater_telemetry_cache_lock = threading.Lock()
 updater_public_state_provider: Callable[[], Mapping[str, object]] | None = None
 updater_public_state_lock = threading.Lock()
+update_commit_signaling_ready_since: float | None = None
+update_commit_stomp_last_send_at: float | None = None
+update_commit_signaling_lock = threading.Lock()
 FLEET_PROCESS_INSTANCE_ID = str(uuid.uuid4())
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
@@ -895,6 +918,7 @@ def _next_agent_retry_attempt(destination: str) -> int:
 
 
 def _reset_agent_ws_state() -> None:
+    _set_update_commit_signaling_ready(False)
     _set_agent_uplink_blocked(False, "")
     with agent_retry_lock:
         agent_retry_attempts.clear()
@@ -902,6 +926,50 @@ def _reset_agent_ws_state() -> None:
         critical_event_delivery.reset_for_reconnect()
     if g_app and getattr(g_app, "webrtc_uplink", None):
         g_app.webrtc_uplink.on_signaling_reset()
+
+
+def _set_update_commit_signaling_ready(ready: bool) -> None:
+    global update_commit_signaling_ready_since, update_commit_stomp_last_send_at
+    with update_commit_signaling_lock:
+        update_commit_signaling_ready_since = time.monotonic() if ready else None
+        update_commit_stomp_last_send_at = None
+
+
+def _mark_update_commit_stomp_send() -> None:
+    global update_commit_stomp_last_send_at
+    with update_commit_signaling_lock:
+        if update_commit_signaling_ready_since is not None:
+            update_commit_stomp_last_send_at = time.monotonic()
+
+
+def build_update_commit_readiness() -> dict[str, object]:
+    with update_commit_signaling_lock:
+        signaling_ready_since = update_commit_signaling_ready_since
+        stomp_last_send_at = update_commit_stomp_last_send_at
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    user_data = getattr(g_app, "user_data", None) if g_app else None
+    health_provider = getattr(controller, "runtime_health_snapshot", None)
+    with agent_uplink_lock:
+        stomp_blocked = agent_uplink_blocked
+    return evaluate_update_commit_readiness(
+        now_monotonic=time.monotonic(),
+        signaling_ready_since=signaling_ready_since,
+        stomp_last_send_at=stomp_last_send_at,
+        min_stable_seconds=UPDATE_COMMIT_STABLE_SEC,
+        max_evidence_age_seconds=UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC,
+        pipeline_running=(
+            g_app is not None
+            and getattr(g_app, "pipeline", None) is not None
+            and bool(getattr(user_data, "running", False))
+        ),
+        pipeline_last_frame_at=getattr(user_data, "last_frame_monotonic", None),
+        webrtc_health=(
+            health_provider() if callable(health_provider) else {}
+        ),
+        stomp_blocked=stomp_blocked,
+        event_outbox_health=build_event_outbox_runtime_health(),
+        command_outbox_health=build_command_observation_runtime_health(),
+    )
 
 
 def initialize_durable_event_outbox() -> DurableEventDelivery | None:
@@ -1003,6 +1071,7 @@ def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
                     AgentUpdateReconciler(
                         fleet_updater_client,
                         readiness_provider=_cached_agent_update_status,
+                        commit_readiness_provider=build_update_commit_readiness,
                     )
                 )
             fleet_command_runtime = build_fleet_command_runtime_from_env(
@@ -1436,6 +1505,7 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
         frame_str = build_send_frame(destination, payload)
         try:
             await ws.send(json.dumps([frame_str]))
+            _mark_update_commit_stomp_send()
             if event_id and critical_event_delivery is not None:
                 critical_event_delivery.mark_sent(event_id)
         except Exception as exc:
@@ -1504,6 +1574,7 @@ async def stomp_heartbeat_sender(
         await asyncio.sleep(interval_sec)
         try:
             await ws.send(json.dumps(["\n"]))
+            _mark_update_commit_stomp_send()
         except Exception as exc:
             log.warning("[SIGNALING] STOMP heartbeat send failed: %s", exc)
             raise
@@ -1947,8 +2018,10 @@ async def signaling_client_main():
                     connectivity_task = asyncio.create_task(device_connectivity_sender(reporter))
 
                 if command_runtime is not None:
+                    command_runtime_connected = False
                     try:
                         reconciled = await command_runtime.on_connected()
+                        command_runtime_connected = True
                         log.info(
                             "[FLEET-COMMAND] reconnect reconciliation complete count=%d",
                             reconciled,
@@ -1959,6 +2032,8 @@ async def signaling_client_main():
                             type(exc).__name__,
                             str(exc)[:500],
                         )
+                    if command_runtime_connected:
+                        _set_update_commit_signaling_ready(True)
                     fleet_command_poll_task = asyncio.create_task(
                         fleet_command_poll_sender(command_runtime)
                     )
@@ -1997,6 +2072,7 @@ async def signaling_client_main():
         except Exception as exc:
             log.error("[SIGNALING] WebSocket error: %s", exc)
         finally:
+            _set_update_commit_signaling_ready(False)
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
@@ -2039,6 +2115,7 @@ class NuvionEventState:
         self.last_sent_status = None
         self.last_sent_at = 0.0
         self.latest_frame = LatestFrameBuffer()
+        self.last_frame_monotonic: float | None = None
         self.clip_enabled = CLIP_ENABLED
         self.demo_mode = DEMO_MODE
         self.demo_tag = DEMO_TAG
@@ -2278,6 +2355,7 @@ class NuvionEventState:
 
     def remember_latest_frame(self, frame_rgb: np.ndarray) -> None:
         self.latest_frame.remember(frame_rgb)
+        self.last_frame_monotonic = time.monotonic()
 
     def capture_snapshot_upload(self) -> str | None:
         if not SNAPSHOT_ENABLED:

@@ -116,6 +116,14 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('camera_mode="oak"', installer)
         self.assertIn("--camera must be oak or uvc", installer)
         self.assertIn("preserve_if_present", installer)
+        self.assertIn("--expected-version", installer)
+        self.assertIn("--expected-sha256", installer)
+        self.assertIn('[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]', installer)
+        self.assertIn('dpkg-deb -f "$deb_path" Version', installer)
+        self.assertIn('sha256sum "$deb_path"', installer)
+        self.assertIn('package version mismatch', installer)
+        self.assertIn('package SHA-256 mismatch', installer)
+        self.assertIn('package must not be a symlink', installer)
 
     def test_iq9075_camera_config_update_is_idempotent(self) -> None:
         installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
@@ -212,7 +220,9 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('oak_status" -eq 3', e2e)
         self.assertIn('NUVION_GST_SOURCE must be empty', e2e)
         self.assertIn('NUVION_DEMO_MODE must be false', e2e)
-        self.assertIn('Path("/sys/bus/usb/devices").glob("*/idVendor")', e2e)
+        self.assertIn('Path("/sys/bus/usb/devices/2-1")', e2e)
+        self.assertIn('(vendor, product, driver) != ("03e7", "f63b", "usb")', e2e)
+        self.assertIn("speed_mbps < 5000.0", e2e)
         self.assertIn("OAK USB device is present but DepthAI could not enumerate it", e2e)
         self.assertIn("no OAK-D device detected", e2e)
         self.assertIn("/dev/v4l/by-id", e2e)
@@ -244,13 +254,21 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('"NUVION_DEMO_MODE": "false"', provisioner)
         self.assertIn("--synthetic-camera", provisioner)
         self.assertIn("--consume", provisioner)
+        self.assertIn("credential_path.lstat()", provisioner)
+        self.assertIn('getattr(os, "O_NOFOLLOW", 0)', provisioner)
+        self.assertIn("opened.st_dev, opened.st_ino", provisioner)
+        self.assertIn("credential_path.unlink()", provisioner)
+        self.assertNotIn('credentials_path="$(realpath', provisioner)
         self.assertNotIn('echo "$password"', provisioner)
 
     def test_provisioner_clears_stale_synthetic_source_in_physical_mode(self) -> None:
         provisioner = (
             ROOT / "packaging/dev/provision-iq9075.sh"
         ).read_text(encoding="utf-8")
-        marker = 'python3 - "$credentials_path" "$CONFIG_PATH" "$synthetic_camera" <<\'PY\'\n'
+        marker = (
+            'python3 - "$credentials_path" "$CONFIG_PATH" '
+            '"$synthetic_camera" "$consume" <<\'PY\'\n'
+        )
         updater = provisioner.split(marker, 1)[1].split("\nPY\n", 1)[0]
         updater = updater.replace(
             "os.chown(temporary, 0, config_path.stat().st_gid)",
@@ -286,6 +304,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                         str(credentials_path),
                         str(config_path),
                         synthetic,
+                        "false",
                     ],
                     input=updater,
                     check=True,
@@ -300,6 +319,25 @@ class Iq9075PackagingTest(unittest.TestCase):
             )
             self.assertEqual(values["NUVION_GST_SOURCE"], "")
             self.assertEqual(values["NUVION_DEMO_MODE"], "false")
+
+            symlink_path = root / "credentials-link.json"
+            symlink_path.symlink_to(credentials_path)
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(symlink_path),
+                    str(config_path),
+                    "false",
+                    "false",
+                ],
+                input=updater,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("regular file", rejected.stderr)
 
 
 if __name__ == "__main__":

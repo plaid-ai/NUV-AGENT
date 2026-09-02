@@ -153,7 +153,60 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertAlmostEqual(sample["outboundPacketLossPct"], 100 * 5 / 105)
         self.assertEqual(sample["nackDelta"], 2.0)
         self.assertEqual(sample["pliDelta"], 1.0)
+        self.assertEqual(sample["outboundPacketsDelta"], 100.0)
+        self.assertEqual(sample["outboundBytesDelta"], 125_000.0)
         self.assertAlmostEqual(sample["sendBitrateKbps"], 1000.0)
+
+    def test_runtime_health_requires_current_connected_session_and_rtp_progress(self) -> None:
+        controller = self.module.WebRTCUplinkController(
+            send_message=lambda *_args: True
+        )
+        controller._webrtcbin = object()
+        controller.start(
+            {"broadcastId": "device-1", "sessionId": "session-1", "iceServers": []}
+        )
+
+        class _StateElement:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def get_property(self, _name: str) -> object:
+                return types.SimpleNamespace(value_nick=self.value)
+
+        controller._on_connection_state_changed(_StateElement("connected"), None)
+        controller._on_ice_connection_state_changed(_StateElement("completed"), None)
+        token = (controller._stats_generation, "session-1")
+        for index in range(3):
+            controller._on_stats_created(
+                _ReplyPromise(
+                    {
+                        "outbound": {
+                            "type": "outbound-rtp",
+                            "timestamp": (index + 1) * 1_000_000,
+                            "packets-sent": (index + 1) * 100,
+                            "bytes-sent": (index + 1) * 100_000,
+                        },
+                        "remote": {
+                            "type": "remote-inbound-rtp",
+                            "round-trip-time": 0.05,
+                        },
+                    }
+                ),
+                token,
+            )
+
+        health = controller.runtime_health_snapshot()
+        self.assertTrue(health["hasPipeline"])
+        self.assertEqual(health["sessionId"], "session-1")
+        self.assertEqual(health["connectionState"], "connected")
+        self.assertEqual(health["iceConnectionState"], "completed")
+        self.assertEqual(health["outboundProgressSamples"], 2)
+        self.assertGreater(health["lastOutboundProgressAt"], 0.0)
+
+        controller.on_signaling_reset()
+        reset = controller.runtime_health_snapshot()
+        self.assertEqual(reset["connectionState"], "new")
+        self.assertEqual(reset["outboundProgressSamples"], 0)
 
     def test_late_stats_callback_from_replaced_session_is_ignored(self) -> None:
         controller = self.module.WebRTCUplinkController(

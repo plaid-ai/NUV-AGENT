@@ -157,7 +157,10 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         client = _Client(
             initial={"commandId": command.command_id, "phase": "FUNCTIONAL_HEALTHY"}
         )
-        outcome = AgentUpdateReconciler(client).reconcile(command)  # type: ignore[arg-type]
+        outcome = AgentUpdateReconciler(
+            client,  # type: ignore[arg-type]
+            commit_readiness_provider=lambda: {"ready": True, "reason": "READY"},
+        ).reconcile(command)
 
         self.assertEqual(outcome.status, "SUCCEEDED")
         self.assertEqual(outcome.reported_state["updatePhase"], "COMMITTED")
@@ -168,6 +171,48 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
             outcome.reported_state["functionalHealth"], "FUNCTIONAL_HEALTHY"
         )
         self.assertEqual(client.calls, ["STATUS", "COMMIT"])
+
+    def test_functional_health_waits_for_runtime_readiness_without_restart(self) -> None:
+        command = _command()
+        client = _Client(
+            initial={"commandId": command.command_id, "phase": "FUNCTIONAL_HEALTHY"}
+        )
+        outcome = AgentUpdateReconciler(
+            client,  # type: ignore[arg-type]
+            commit_readiness_provider=lambda: {
+                "ready": False,
+                "reason": "STOMP_SOAK_PENDING",
+            },
+        ).reconcile(command)
+
+        self.assertEqual(client.calls, ["STATUS"])
+        self.assertFalse(outcome.checkpoint["restartRequired"])
+        self.assertEqual(outcome.checkpoint["nextAction"], "RETRY_EFFECT")
+        self.assertEqual(outcome.checkpoint["detail"], "STOMP_SOAK_PENDING")
+
+    def test_missing_or_invalid_runtime_readiness_fails_closed(self) -> None:
+        command = _command()
+        for provider in (
+            None,
+            lambda: {"ready": True, "reason": "unsafe reason"},
+            lambda: (_ for _ in ()).throw(RuntimeError("unavailable")),
+        ):
+            with self.subTest(provider=provider):
+                client = _Client(
+                    initial={
+                        "commandId": command.command_id,
+                        "phase": "FUNCTIONAL_HEALTHY",
+                    }
+                )
+                outcome = AgentUpdateReconciler(
+                    client,  # type: ignore[arg-type]
+                    commit_readiness_provider=provider,
+                ).reconcile(command)
+                self.assertEqual(client.calls, ["STATUS"])
+                self.assertEqual(
+                    outcome.checkpoint["detail"],
+                    "RUNTIME_READINESS_UNAVAILABLE",
+                )
 
     def test_committed_without_strong_evidence_fails_closed(self) -> None:
         command = _command()

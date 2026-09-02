@@ -37,9 +37,11 @@ class AgentUpdateReconciler:
         client: UpdaterClient,
         *,
         readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
+        commit_readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.client = client
         self.readiness_provider = readiness_provider
+        self.commit_readiness_provider = commit_readiness_provider
 
     @property
     def ready(self) -> bool:
@@ -91,6 +93,17 @@ class AgentUpdateReconciler:
                 )
                 return self._deferred(command, update, restart_expected=True)
             if phase == "FUNCTIONAL_HEALTHY":
+                commit_readiness = self._commit_readiness()
+                if commit_readiness.get("ready") is not True:
+                    return self._deferred(
+                        command,
+                        update,
+                        restart_expected=False,
+                        detail=str(
+                            commit_readiness.get("reason")
+                            or "RUNTIME_READINESS_UNAVAILABLE"
+                        ),
+                    )
                 update = self.client.commit(command.command_id)
         except UpdaterClientError as exc:
             if exc.code in _TRANSIENT_UPDATER_CODES:
@@ -144,6 +157,44 @@ class AgentUpdateReconciler:
                 reported_state=self._reported(command, update),
             )
         return self._deferred(command, update, restart_expected=False)
+
+    def _commit_readiness(self) -> Mapping[str, Any]:
+        if self.commit_readiness_provider is None:
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        try:
+            readiness = self.commit_readiness_provider()
+        except Exception:  # noqa: BLE001 - malformed runtime evidence fails closed.
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        if not isinstance(readiness, Mapping):
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        reason = readiness.get("reason")
+        if (
+            readiness.get("ready") is not True
+            or not isinstance(reason, str)
+            or not reason
+            or len(reason) > 100
+            or not reason.replace("_", "").isalnum()
+        ):
+            return {
+                "ready": False,
+                "reason": (
+                    reason
+                    if isinstance(reason, str)
+                    and 0 < len(reason) <= 100
+                    and reason.replace("_", "").isalnum()
+                    else "RUNTIME_READINESS_UNAVAILABLE"
+                ),
+            }
+        return readiness
 
     def _deferred(
         self,
@@ -277,6 +328,7 @@ def configure_agent_update_reconciler(
     registry: Any,
     *,
     client: UpdaterClient | None = None,
+    commit_readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Install the durable handler while gating admission on live readiness.
 
@@ -289,5 +341,10 @@ def configure_agent_update_reconciler(
 
     updater_client = client or UpdaterClient()
     status = updater_client.capability_status()
-    registry.register(AgentUpdateReconciler(updater_client))
+    registry.register(
+        AgentUpdateReconciler(
+            updater_client,
+            commit_readiness_provider=commit_readiness_provider,
+        )
+    )
     return status

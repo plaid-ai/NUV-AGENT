@@ -132,17 +132,37 @@ device_id = resolve_depthai_device_id(
     str(values.get("NUVION_DEPTHAI_DEVICE_ID") or ""),
 )
 
-sysfs_oak_present = False
-for vendor_path in Path("/sys/bus/usb/devices").glob("*/idVendor"):
-    try:
-        if vendor_path.read_text(encoding="utf-8").strip().lower() == "03e7":
-            sysfs_oak_present = True
-            break
-    except OSError:
-        continue
-if not sysfs_oak_present:
-    print("[iq9075-e2e] no OAK-D device detected", flush=True)
+expected_usb_path = Path("/sys/bus/usb/devices/2-1")
+if not expected_usb_path.is_dir():
+    print("[iq9075-e2e] no OAK-D device detected at exact USB path 2-1", flush=True)
     raise SystemExit(3)
+
+def read_sysfs(name: str) -> str:
+    try:
+        return (expected_usb_path / name).read_text(encoding="utf-8").strip().lower()
+    except OSError as exc:
+        raise SystemExit(f"cannot read OAK sysfs {name}: {exc}") from exc
+
+vendor = read_sysfs("idVendor")
+product = read_sysfs("idProduct")
+speed = read_sysfs("speed")
+try:
+    driver = (expected_usb_path / "driver").resolve(strict=True).name
+except OSError as exc:
+    raise SystemExit(f"cannot resolve OAK USB driver: {exc}") from exc
+if (vendor, product, driver) != ("03e7", "f63b", "usb"):
+    raise SystemExit(
+        "exact OAK USB identity mismatch at 2-1: "
+        f"vendor={vendor}, product={product}, driver={driver}"
+    )
+try:
+    speed_mbps = float(speed)
+except ValueError as exc:
+    raise SystemExit(f"invalid OAK USB speed at 2-1: {speed!r}") from exc
+if speed_mbps < 5000.0:
+    raise SystemExit(
+        f"OAK-D Lite at 2-1 must negotiate 5Gbps; observed {speed_mbps:g}Mbps"
+    )
 
 available_devices = depthai.Device.getAllAvailableDevices()
 available_ids = {

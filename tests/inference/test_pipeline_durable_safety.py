@@ -64,6 +64,87 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_update_commit_readiness_uses_live_pipeline_stomp_rtp_and_outboxes(self) -> None:
+        class _Controller:
+            @staticmethod
+            def runtime_health_snapshot() -> dict[str, object]:
+                return {
+                    "hasPipeline": True,
+                    "sessionId": "canary-session",
+                    "generation": 4,
+                    "connectionState": "connected",
+                    "iceConnectionState": "completed",
+                    "connectedSince": 100.0,
+                    "iceConnectedSince": 100.0,
+                    "outboundProgressSamples": 3,
+                    "lastOutboundProgressAt": 128.0,
+                }
+
+        app = types.SimpleNamespace(
+            pipeline=object(),
+            user_data=types.SimpleNamespace(
+                running=True,
+                last_frame_monotonic=129.0,
+            ),
+            webrtc_uplink=_Controller(),
+        )
+        event_health = {
+            "capacityState": "HEALTHY",
+            "blockedRows": 0,
+            "unsavedCriticalEvents": 0,
+            "safetyStop": False,
+            "protocolStop": False,
+        }
+        command_health = {
+            "capacityState": "HEALTHY",
+            "dlqBlockedRows": 0,
+            "retentionPressure": False,
+        }
+        with (
+            mock.patch.object(pipeline, "g_app", app),
+            mock.patch.object(
+                pipeline,
+                "update_commit_signaling_ready_since",
+                100.0,
+            ),
+            mock.patch.object(
+                pipeline,
+                "update_commit_stomp_last_send_at",
+                125.0,
+            ),
+            mock.patch.object(pipeline, "agent_uplink_blocked", False),
+            mock.patch.object(
+                pipeline,
+                "build_event_outbox_runtime_health",
+                return_value=event_health,
+            ),
+            mock.patch.object(
+                pipeline,
+                "build_command_observation_runtime_health",
+                return_value=command_health,
+            ),
+            mock.patch.object(pipeline.time, "monotonic", return_value=130.0),
+        ):
+            readiness = pipeline.build_update_commit_readiness()
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["webrtcSessionId"], "canary-session")
+
+    def test_stomp_send_evidence_belongs_to_current_connection(self) -> None:
+        with mock.patch.object(
+            pipeline.time,
+            "monotonic",
+            side_effect=(100.0, 105.0, 110.0),
+        ):
+            pipeline._set_update_commit_signaling_ready(True)
+            pipeline._mark_update_commit_stomp_send()
+            self.assertEqual(pipeline.update_commit_signaling_ready_since, 100.0)
+            self.assertEqual(pipeline.update_commit_stomp_last_send_at, 105.0)
+            pipeline._set_update_commit_signaling_ready(False)
+
+        self.assertIsNone(pipeline.update_commit_signaling_ready_since)
+        self.assertIsNone(pipeline.update_commit_stomp_last_send_at)
+
     def test_config_label_array_storage_round_trips_without_csv_loss(self) -> None:
         labels = ["scratch,edge", "한글 label"]
         encoded = config_env_updates(

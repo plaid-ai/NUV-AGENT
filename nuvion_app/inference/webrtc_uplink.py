@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -134,6 +135,8 @@ class WebRTCStatsAccumulator:
                 0.0,
                 (current["packetsSent"] or 0.0) - previous.get("packetsSent", 0.0),
             )
+            if current["packetsSent"] is not None:
+                sample["outboundPacketsDelta"] = sent_delta
             lost_delta = max(
                 0.0,
                 (current["packetsLost"] or 0.0) - previous.get("packetsLost", 0.0),
@@ -157,13 +160,19 @@ class WebRTCStatsAccumulator:
                     )
             timestamp = current["timestamp"]
             bytes_sent = current["bytesSent"]
+            byte_delta: float | None = None
+            if bytes_sent is not None:
+                byte_delta = max(
+                    0.0,
+                    bytes_sent - previous.get("bytesSent", bytes_sent),
+                )
+                sample["outboundBytesDelta"] = byte_delta
             if timestamp is not None and bytes_sent is not None:
                 elapsed = timestamp - previous.get("timestamp", timestamp)
-                byte_delta = max(0.0, bytes_sent - previous.get("bytesSent", bytes_sent))
                 # WebRTC/GStreamer timestamps are normally microseconds; accept
                 # millisecond test fixtures as well.
                 elapsed_seconds = elapsed / (1_000_000.0 if elapsed > 10_000 else 1000.0)
-                if elapsed_seconds > 0:
+                if elapsed_seconds > 0 and byte_delta is not None:
                     sample["sendBitrateKbps"] = byte_delta * 8.0 / elapsed_seconds / 1000.0
         elif fraction_lost is not None:
             sample["outboundPacketLossPct"] = (
@@ -198,6 +207,13 @@ class WebRTCUplinkController:
         self._stats_lock = threading.Lock()
         self._latest_outbound_stats: dict[str, Any] | None = None
         self._stats_generation = 0
+        self._connection_state = "new"
+        self._ice_connection_state = "new"
+        self._connected_since: float | None = None
+        self._ice_connected_since: float | None = None
+        self._outbound_progress_samples = 0
+        self._first_outbound_progress_at: float | None = None
+        self._last_outbound_progress_at: float | None = None
 
     def attach_pipeline(self, pipeline: Gst.Pipeline, element_name: str = "webrtc_uplink") -> bool:
         self._pipeline = pipeline
@@ -213,6 +229,36 @@ class WebRTCUplinkController:
 
     def has_pipeline(self) -> bool:
         return self._webrtcbin is not None
+
+    def runtime_health_snapshot(self) -> dict[str, Any]:
+        """Return current-session live RTP evidence without exposing SDP or ICE secrets."""
+
+        with self._stats_lock:
+            session_id = self._session.session_id if self._session else None
+            return {
+                "hasPipeline": self._webrtcbin is not None,
+                "sessionId": session_id,
+                "generation": self._stats_generation,
+                "connectionState": self._connection_state,
+                "iceConnectionState": self._ice_connection_state,
+                "connectedSince": self._connected_since,
+                "iceConnectedSince": self._ice_connected_since,
+                "outboundProgressSamples": self._outbound_progress_samples,
+                "firstOutboundProgressAt": self._first_outbound_progress_at,
+                "lastOutboundProgressAt": self._last_outbound_progress_at,
+            }
+
+    def _reset_outbound_progress_locked(self) -> None:
+        self._outbound_progress_samples = 0
+        self._first_outbound_progress_at = None
+        self._last_outbound_progress_at = None
+
+    def _reset_runtime_health_locked(self) -> None:
+        self._connection_state = "new"
+        self._ice_connection_state = "new"
+        self._connected_since = None
+        self._ice_connected_since = None
+        self._reset_outbound_progress_locked()
 
     def start(self, payload: dict[str, Any]) -> None:
         session_id = str(payload.get("sessionId") or "").strip()
@@ -238,6 +284,7 @@ class WebRTCUplinkController:
             self._stats_generation += 1
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
         GLib.idle_add(self._start_on_main_loop)
 
     def request_outbound_stats(self) -> bool:
@@ -309,6 +356,17 @@ class WebRTCUplinkController:
                 if sample is None:
                     return
                 self._latest_outbound_stats = sample
+                packet_delta = _finite_number(sample.get("outboundPacketsDelta")) or 0.0
+                byte_delta = _finite_number(sample.get("outboundBytesDelta")) or 0.0
+                if packet_delta > 0.0 or byte_delta > 0.0:
+                    observed_at = time.monotonic()
+                    self._outbound_progress_samples = min(
+                        self._outbound_progress_samples + 1,
+                        1_000_000,
+                    )
+                    if self._first_outbound_progress_at is None:
+                        self._first_outbound_progress_at = observed_at
+                    self._last_outbound_progress_at = observed_at
         except Exception as exc:  # noqa: BLE001 - malformed stats are one missed sample.
             log.debug("[WEBRTC-UPLINK] failed to normalize outbound stats: %s", exc)
 
@@ -361,10 +419,16 @@ class WebRTCUplinkController:
             generation = self._stats_generation
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
         GLib.idle_add(self._stop_on_main_loop, generation, session_id)
 
     def on_signaling_reset(self) -> None:
         self._stop_sent = False
+        with self._stats_lock:
+            self._stats_generation += 1
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
 
     def _matches_session(self, payload: dict[str, Any]) -> bool:
         session_id = str(payload.get("sessionId") or "").strip()
@@ -407,6 +471,7 @@ class WebRTCUplinkController:
             self._session = None
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
         if self._pipeline:
             try:
                 self._pipeline.send_event(Gst.Event.new_flush_start())
@@ -488,14 +553,30 @@ class WebRTCUplinkController:
 
     def _on_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
         state = element.get_property("connection-state")
-        state_nick = getattr(state, "value_nick", str(state))
+        state_nick = str(getattr(state, "value_nick", str(state))).lower()
+        with self._stats_lock:
+            if state_nick == "connected":
+                if self._connection_state != "connected":
+                    self._connected_since = time.monotonic()
+            else:
+                self._connected_since = None
+                self._reset_outbound_progress_locked()
+            self._connection_state = state_nick
         log.info("[WEBRTC-UPLINK] connection-state=%s", state_nick)
         if state_nick in {"failed", "closed"}:
             self.stop(send_signal=not self._stop_sent)
 
     def _on_ice_connection_state_changed(self, element: Gst.Element, _pspec: object) -> None:
         state = element.get_property("ice-connection-state")
-        state_nick = getattr(state, "value_nick", str(state))
+        state_nick = str(getattr(state, "value_nick", str(state))).lower()
+        with self._stats_lock:
+            if state_nick in {"connected", "completed"}:
+                if self._ice_connection_state not in {"connected", "completed"}:
+                    self._ice_connected_since = time.monotonic()
+            else:
+                self._ice_connected_since = None
+                self._reset_outbound_progress_locked()
+            self._ice_connection_state = state_nick
         log.info("[WEBRTC-UPLINK] ice-connection-state=%s", state_nick)
         if state_nick in {"failed", "closed", "disconnected"} and self._session:
             self.stop(send_signal=not self._stop_sent)

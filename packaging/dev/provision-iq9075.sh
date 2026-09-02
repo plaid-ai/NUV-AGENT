@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
   die "run this command with sudo"
 fi
 
-credentials_path="$(realpath "$1")"
+credentials_path="$1"
 shift
 synthetic_camera=false
 consume=false
@@ -32,11 +32,11 @@ for option in "$@"; do
   esac
 done
 
-[ -f "$credentials_path" ] || die "credential file not found"
 [ ! -L "$credentials_path" ] || die "credential file must not be a symlink"
+[ -f "$credentials_path" ] || die "credential file not found"
 [ -f "$CONFIG_PATH" ] || die "nuv-agent config not found"
 
-python3 - "$credentials_path" "$CONFIG_PATH" "$synthetic_camera" <<'PY'
+python3 - "$credentials_path" "$CONFIG_PATH" "$synthetic_camera" "$consume" <<'PY'
 import json
 import os
 import pathlib
@@ -48,8 +48,9 @@ import tempfile
 credential_path = pathlib.Path(sys.argv[1])
 config_path = pathlib.Path(sys.argv[2])
 synthetic_camera = sys.argv[3] == "true"
+consume = sys.argv[4] == "true"
 
-metadata = credential_path.stat()
+metadata = credential_path.lstat()
 if not stat.S_ISREG(metadata.st_mode):
     raise SystemExit("credential input must be a regular file")
 if metadata.st_mode & 0o077:
@@ -57,7 +58,23 @@ if metadata.st_mode & 0o077:
 if metadata.st_size > 64 * 1024:
     raise SystemExit("credential input exceeds 64 KiB")
 
-payload = json.loads(credential_path.read_text(encoding="utf-8"))
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(credential_path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise SystemExit("credential input changed while opening")
+    raw = bytearray()
+    while len(raw) <= 64 * 1024:
+        chunk = os.read(descriptor, min(8192, 64 * 1024 + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+finally:
+    os.close(descriptor)
+if len(raw) > 64 * 1024:
+    raise SystemExit("credential input exceeds 64 KiB")
+payload = json.loads(bytes(raw).decode("utf-8"))
 space_id = payload.get("spaceId")
 username = str(payload.get("deviceUsername") or "").strip()
 password = str(payload.get("devicePassword") or "")
@@ -116,14 +133,19 @@ try:
 finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
+
+if consume:
+    current = credential_path.lstat()
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise SystemExit("credential input changed before secure consume")
+    credential_path.unlink()
 PY
 
 chown root:nuvion "$CONFIG_PATH"
 chmod 0660 "$CONFIG_PATH"
-
-if [ "$consume" = true ]; then
-  rm -f -- "$credentials_path"
-fi
 
 echo "[iq9075-provision] device credentials installed without displaying secrets"
 if [ "$synthetic_camera" = true ]; then
