@@ -335,7 +335,12 @@ def strict_json(payload: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def read_regular(path: Path, *, maximum: int) -> tuple[bytes, os.stat_result]:
+def read_regular(
+    path: Path,
+    *,
+    maximum: int,
+    kernel_virtual_size: bool = False,
+) -> tuple[bytes, os.stat_result]:
     try:
         before = path.lstat()
     except OSError as exc:
@@ -344,7 +349,9 @@ def read_regular(path: Path, *, maximum: int) -> tuple[bytes, os.stat_result]:
         ) from exc
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise HarnessError(f"unsafe non-regular file: {path.name}")
-    if before.st_size > maximum:
+    # sysfs attributes commonly report PAGE_SIZE rather than their readable
+    # payload length. The descriptor read below remains bounded to maximum + 1.
+    if not kernel_virtual_size and before.st_size > maximum:
         raise HarnessError(f"file exceeds size limit: {path.name}")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -1239,8 +1246,16 @@ class BoardHarness:
             product_path = device / "idProduct"
             if not vendor_path.exists() or not product_path.exists():
                 continue
-            vendor_payload, _ = read_regular(vendor_path, maximum=128)
-            product_payload, _ = read_regular(product_path, maximum=128)
+            vendor_payload, _ = read_regular(
+                vendor_path,
+                maximum=128,
+                kernel_virtual_size=True,
+            )
+            product_payload, _ = read_regular(
+                product_path,
+                maximum=128,
+                kernel_virtual_size=True,
+            )
             vendor = vendor_payload.decode("ascii", errors="strict").strip().lower()
             product = product_payload.decode("ascii", errors="strict").strip().lower()
             if (vendor, product) == (OAK_VENDOR, OAK_PRODUCT):
@@ -1271,7 +1286,11 @@ class BoardHarness:
             raise HarnessError("OAK USB topology endpoint is unavailable")
 
         def text(name: str) -> str:
-            payload, _ = read_regular(device / name, maximum=128)
+            payload, _ = read_regular(
+                device / name,
+                maximum=128,
+                kernel_virtual_size=True,
+            )
             return payload.decode("ascii", errors="strict").strip().lower()
 
         vendor = text("idVendor")

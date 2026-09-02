@@ -814,7 +814,11 @@ class OpenSshTransport:
             "-o",
             "GlobalKnownHostsFile=/dev/null",
             "-o",
-            "CheckHostIP=yes",
+            # Keep the run-pinned hostname entry immutable. OpenSSH otherwise
+            # appends the resolved Tailscale IP to UserKnownHostsFile.
+            "CheckHostIP=no",
+            "-o",
+            "UpdateHostKeys=no",
             "-o",
             "NumberOfPasswordPrompts=1",
             "-o",

@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -549,6 +550,63 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 self.assertEqual(oak["vendorId"], "03e7")
                 self.assertEqual(oak["productId"], "f63b")
                 self.assertNotEqual(oak["port"], BOARD.USB_ROOT_HUB)
+            finally:
+                fixture.close()
+
+    def test_oak_sysfs_virtual_size_is_bounded_by_read_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            attributes = {
+                fixture.paths.usb_devices / "2-1.1" / name
+                for name in ("idVendor", "idProduct", "speed", "serial")
+            }
+            original_lstat = Path.lstat
+            original_fstat = os.fstat
+            identities = {
+                (metadata.st_dev, metadata.st_ino)
+                for metadata in (original_lstat(path) for path in attributes)
+            }
+
+            def virtual_size(metadata: os.stat_result) -> os.stat_result:
+                fields = list(metadata)
+                fields[6] = 4096
+                return os.stat_result(fields)
+
+            def fake_lstat(path: Path) -> os.stat_result:
+                metadata = original_lstat(path)
+                return virtual_size(metadata) if path in attributes else metadata
+
+            def fake_fstat(descriptor: int) -> os.stat_result:
+                metadata = original_fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) in identities:
+                    return virtual_size(metadata)
+                return metadata
+
+            try:
+                with (
+                    mock.patch.object(Path, "lstat", new=fake_lstat),
+                    mock.patch.object(BOARD.os, "fstat", new=fake_fstat),
+                ):
+                    with self.assertRaisesRegex(
+                        BOARD.HarnessError,
+                        "file exceeds size limit: idVendor",
+                    ):
+                        BOARD.read_regular(
+                            fixture.paths.usb_devices / "2-1.1/idVendor",
+                            maximum=128,
+                        )
+                    self.assertEqual(fixture.harness.verify_oak()["vendorId"], "03e7")
+                    (fixture.paths.usb_devices / "2-1.1/serial").chmod(0o600)
+                    fixture._write(
+                        "/sys/bus/usb/devices/2-1.1/serial",
+                        "x" * 129,
+                        0o444,
+                    )
+                    with self.assertRaisesRegex(
+                        BOARD.HarnessError,
+                        "file exceeds size limit: serial",
+                    ):
+                        fixture.harness.verify_oak()
             finally:
                 fixture.close()
 
@@ -1370,6 +1428,8 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             for expected in (
                 "-F /dev/null",
                 "StrictHostKeyChecking=yes",
+                "CheckHostIP=no",
+                "UpdateHostKeys=no",
                 "ControlMaster=no",
                 "ControlPath=none",
                 "ProxyCommand=none",
@@ -1384,6 +1444,7 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
                 "PreferredAuthentications=password",
             ):
                 self.assertIn(expected, options)
+            self.assertNotIn("CheckHostIP=yes", options)
             self.assertNotIn("accept-new", options)
             with self.assertRaisesRegex(HOST.RunnerError, "duplicate JSON"):
                 HOST.strict_json('{"a":1,"a":2}', label="review repro")
