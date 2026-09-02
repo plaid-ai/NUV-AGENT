@@ -135,6 +135,11 @@ service with `sudo systemctl enable --now nuv-agent.service`.
 
 ### IQ9075 Fleet E2E harness
 
+Release administrators must complete
+[`release/v0.1.121-release-runbook.md`](release/v0.1.121-release-runbook.md)
+before pushing a release tag. Tag pushes are credential-free requests; only the
+protected default-branch publisher may access channel or signing credentials.
+
 `packaging/dev/run-iq9075-fleet-e2e.py` drives the root-owned board primitive
 installed at `/usr/local/libexec/nuvion/iq9075-board-e2e.py`. It accepts only the
 pinned `iq9075-dev` command/release/health keyring schemas and the fixed
@@ -205,13 +210,16 @@ OTA activation은 publisher-signed release-bom-v2만 허용하며 signed
 `releases/by-bom-sha256/<bom digest>/`에 exact artifact 및 detached signature와
 함께 create-only로 저장하고 업로드 전후 byte-compare합니다. APT job은 OTA signing
 key를 받지 않으며 OTA build/signing job은 APT GPG key를 받지 않습니다.
-GitHub release asset은 기존 동일 이름을 덮어쓰지 않도록 설정되어 있으므로, 이미 발행된
-version을 변경해야 할 때는 새 patch version을 발행해야 합니다.
+GitHub release는 먼저 draft로 asset을 모두 stage하고 distribution promotion manifest까지
+붙인 뒤 한 번만 publish합니다. Repository release immutability가 preflight에서 확인되므로
+publish 이후 tag와 asset은 수정/삭제할 수 없습니다. 이미 발행된 version을 변경해야 할
+때는 새 patch version을 발행해야 합니다.
 
 Required secrets:
 - `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)
 - `IQ9075_RELEASE_SIGNING_PRIVATE_KEY` (Ed25519 private publisher key)
-- `IQ9075_RELEASE_SIGNING_KEY_ID`
-- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON` (`trustDomain=iq9075-dev`)
+- Publisher key ID is pinned in `release-security-policy.json`, not a secret
+- `packaging/release/trusted-release-keyrings/iq9075-dev.json` is public,
+  protected-main verification material; it is deliberately not a secret
 
 To host an APT repo, use a tool like `aptly` or `reprepro`, then publish the generated `.deb`.

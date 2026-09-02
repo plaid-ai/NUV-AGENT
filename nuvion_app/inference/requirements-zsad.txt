@@ -1,3 +1,7 @@
 torch
-transformers<5
+transformers==5.16.1
+huggingface-hub==1.29.0
+hf-xet==1.6.0
+tokenizers==0.23.1
+safetensors==0.8.0
 Pillow

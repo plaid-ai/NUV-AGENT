@@ -12,6 +12,14 @@ if [ ! -f "$DEB_PATH" ]; then
   echo "Deb not found: $DEB_PATH" >&2
   exit 1
 fi
+ROLLBACK_DEB_PATH="${APT_PREVIOUS_DEB_PATH:-}"
+if [ -n "$ROLLBACK_DEB_PATH" ]; then
+  ROLLBACK_DEB_PATH="$(realpath "$ROLLBACK_DEB_PATH")"
+  if [ ! -f "$ROLLBACK_DEB_PATH" ] || [ "$ROLLBACK_DEB_PATH" = "$DEB_PATH" ]; then
+    echo "Previous rollback Deb is missing or aliases the current Deb" >&2
+    exit 1
+  fi
+fi
 BOM_PATH="${2:-}"
 SIGNATURE_PATH="${3:-}"
 BOM_ARTIFACT_PATH="${4:-$DEB_PATH}"
@@ -61,6 +69,12 @@ esac
 mkdir -p "$PUBLIC_DIR"
 if [ "$SKIP_APT_PUBLISH" = false ]; then
   aptly -config="$APTLY_CONFIG" repo create -distribution="$DIST" -component="$COMPONENT" "$REPO_NAME" || true
+  if [ -n "$ROLLBACK_DEB_PATH" ]; then
+    # The publisher database is ephemeral. Re-add the independently verified
+    # previous package so the signed Packages index always supports one-step
+    # rollback instead of merely retaining an unindexed pool object.
+    aptly -config="$APTLY_CONFIG" repo add "$REPO_NAME" "$ROLLBACK_DEB_PATH"
+  fi
   aptly -config="$APTLY_CONFIG" repo add "$REPO_NAME" "$DEB_PATH"
 
   if aptly -config="$APTLY_CONFIG" publish list | grep -q "^$DIST"; then
@@ -209,16 +223,17 @@ echo "Syncing to gs://$BUCKET"
 for published_release in "${PUBLISHED_RELEASE_PATHS[@]}"; do
   relative_path="${published_release#"$PUBLIC_DIR/"}"
   remote_path="gs://$BUCKET/$relative_path"
-  if gsutil -q stat "$remote_path"; then
-    if ! gsutil cat "$remote_path" | cmp -s - "$published_release"; then
+  # generation-match=0 is the Cloud Storage atomic create-only CAS. A 412 from
+  # an existing/concurrent writer is idempotent only when its bytes are exact.
+  if ! gcloud storage cp \
+    --if-generation-match=0 \
+    --cache-control="$CACHE_CONTROL" \
+    "$published_release" "$remote_path"; then
+    if ! gcloud storage cat "$remote_path" | cmp -s - "$published_release"; then
       echo "Refusing to overwrite existing immutable release bytes: $remote_path" >&2
       exit 1
     fi
   fi
-  # `cp -n` maps to a create-only object operation. If another publisher wins
-  # the race after the stat above, this job cannot overwrite its bytes; the
-  # post-copy comparison below then accepts only an identical object.
-  gsutil -h "Cache-Control:$CACHE_CONTROL" cp -n "$published_release" "$remote_path"
 done
 
 if [ "$SKIP_APT_PUBLISH" = false ]; then
@@ -230,7 +245,7 @@ fi
 
 for published_release in "${PUBLISHED_RELEASE_PATHS[@]}"; do
   relative_path="${published_release#"$PUBLIC_DIR/"}"
-  if ! gsutil cat "gs://$BUCKET/$relative_path" | cmp -s - "$published_release"; then
+  if ! gcloud storage cat "gs://$BUCKET/$relative_path" | cmp -s - "$published_release"; then
     echo "Published release verification failed: gs://$BUCKET/$relative_path" >&2
     exit 1
   fi

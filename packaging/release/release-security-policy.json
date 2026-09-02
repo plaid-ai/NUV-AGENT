@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "defaultBranch": "main",
+  "requiredStatusContext": "agent-release-gate",
+  "releaseAdminTeamId": 16128529,
+  "immutableReleases": true,
+  "trustedTagSignerFingerprints": [
+    "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+  ],
+  "legacyUnsignedReruns": {
+    "v0.1.120": "b354026f73d63a82ad4c64923f46dc400a73efcb"
+  },
+  "requiredEnvironments": {
+    "homebrew-release": {
+      "requireReviewers": true,
+      "preventSelfReview": true,
+      "reviewerTeamId": 16128529,
+      "requiredSecrets": ["HOMEBREW_TAP_TOKEN"]
+    },
+    "apt-release": {
+      "requireReviewers": true,
+      "preventSelfReview": true,
+      "reviewerTeamId": 16128529,
+      "requiredSecrets": [
+        "APT_GPG_PASSPHRASE",
+        "APT_GPG_PRIVATE_KEY",
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY"
+      ]
+    },
+    "iq9075-release": {
+      "requireReviewers": true,
+      "preventSelfReview": true,
+      "reviewerTeamId": 16128529,
+      "requiredSecrets": [
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY",
+        "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+      ]
+    }
+  },
+  "forbiddenRepositorySecrets": [
+    "APT_GPG_PASSPHRASE",
+    "APT_GPG_PRIVATE_KEY",
+    "GCP_PROJECT_ID",
+    "GCP_SA_KEY",
+    "HOMEBREW_TAP_TOKEN",
+    "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+  ],
+  "apt": {
+    "baseUrl": "https://apt.plaidai.io",
+    "bucket": "apt.plaidai.io",
+    "gpgFingerprint": "C6915E8C74A9C4B3EEFBA39FE5230C3090A66BC5",
+    "rollbackPackageCount": 1
+  },
+  "iq9075": {
+    "bucket": "apt.plaidai.io",
+    "trustDomain": "iq9075-dev",
+    "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
+    "publicKeyringSha256": "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",
+    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+    "target": {
+      "productModel": "IQ9075_DEV",
+      "platformProfile": "iq9075_dev",
+      "hardwareRevision": "QCS9075-EVK",
+      "architecture": "aarch64"
+    },
+    "legacyPromotedBaseline": {
+      "agentVersion": "0.1.120",
+      "releaseSequence": 1,
+      "bomDigest": "sha256:26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+    }
+  }
+}

@@ -10,6 +10,16 @@ This directory provides a minimal `aptly` flow to host a private APT repo.
 ## Publish to GCS (recommended)
 This flow syncs the published repo to `gs://apt.plaidai.io` and serves it via `https://apt.plaidai.io`.
 
+Release CI sets `APT_PREVIOUS_DEB_PATH` to the highest lower Agent version from
+the independently verified current `InRelease`. Because the aptly database is
+ephemeral, this explicitly keeps the current and previous packages in the new
+signed `Packages` index. Retaining an unindexed pool object is not considered a
+rollback path.
+
+Immutable pool/BOM/bundle objects and OTA reservation/promotion markers use
+Cloud Storage `ifGenerationMatch=0` create-only CAS, followed by exact remote
+byte comparison. `gsutil cp -n` is not used as a concurrency primitive.
+
 ```bash
 ./publish-gcs.sh /path/to/nuv-agent_0.1.0_arm64.deb
 ```
@@ -61,8 +71,18 @@ Required GitHub secrets:
 - `GCP_SA_KEY`: GCP service account JSON with write access to the bucket
 - `GCP_PROJECT_ID`: GCP project ID
 - `IQ9075_RELEASE_SIGNING_PRIVATE_KEY`: Ed25519 publisher private key material
-- `IQ9075_RELEASE_SIGNING_KEY_ID`: key id present in the public keyring
-- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON`: separate `iq9075-dev` release keyring JSON
+- Publisher key ID is protected-main metadata in `release-security-policy.json`
+- `packaging/release/trusted-release-keyrings/iq9075-dev.json`: protected-main
+  public verification keyring, byte-identical to the board keyring (not a secret)
+
+Runner requirement:
+
+- Release jobs are fixed to GitHub-hosted `ubuntu-24.04-arm`. The required
+  `agent-release-gate` depends on a secret-zero arm64 prerequisite job that
+  verifies native architecture and the exact hashed bundle lock. If that label
+  is unavailable to the repository, release remains blocked. Do not silently
+  move credentials to a long-lived self-hosted runner; provision a separately
+  reviewed ephemeral trusted-runner design first.
 
 Runner note:
 - Default is `ubuntu-24.04-arm`. If you don't have access, change the job to `self-hosted`
