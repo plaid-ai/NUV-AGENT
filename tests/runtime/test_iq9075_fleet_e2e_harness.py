@@ -442,6 +442,69 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(BOARD.HarnessError, "strict UTF-8 JSON"):
             BOARD.strict_json(b'{"value":NaN}', label="review repro")
 
+    def test_release_keyring_accepts_policy_spki_and_rejects_private_or_wrong_algorithm(
+        self,
+    ) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+
+        policy_keyring = (
+            ROOT
+            / "packaging/release/trusted-release-keyrings/iq9075-dev.json"
+        ).read_bytes()
+        validated = BOARD.validate_ed25519_keyring(
+            policy_keyring,
+            role="release",
+        )
+        self.assertEqual(validated["trustDomain"], "iq9075-dev")
+
+        private_der = ed25519.Ed25519PrivateKey.generate().private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        wrong_algorithm = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+
+        def release_keyring(material: bytes) -> bytes:
+            return json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "trustDomain": "iq9075-dev",
+                    "keys": {
+                        "release-dev": base64.b64encode(material).decode("ascii")
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+
+        for material in (private_der, wrong_algorithm):
+            with self.subTest(material_length=len(material)):
+                with self.assertRaisesRegex(
+                    BOARD.HarnessError,
+                    "raw 32-byte or canonical DER SPKI Ed25519",
+                ):
+                    BOARD.validate_ed25519_keyring(
+                        release_keyring(material),
+                        role="release",
+                    )
+
+        with self.assertRaisesRegex(BOARD.HarnessError, "canonical 32-byte"):
+            BOARD.validate_ed25519_keyring(
+                release_keyring(
+                    ed25519.Ed25519PrivateKey.generate()
+                    .public_key()
+                    .public_bytes(
+                        encoding=serialization.Encoding.DER,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                ),
+                role="command",
+            )
+
     def test_foundation_does_not_require_unprovisioned_updater(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))

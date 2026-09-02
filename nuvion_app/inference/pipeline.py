@@ -124,6 +124,7 @@ from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_START,
     WEBRTC_UPLINK_STATE,
     WEBRTC_UPLINK_STOP_DEST,
+    h264_level_from_profile_level_id,
     negotiate_stomp_send_interval_ms,
     parse_command_payload,
 )
@@ -701,6 +702,7 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
     target = int(bitrate_kbps)
     if target < 100 or target > 20_000:
         raise ValueError("encoder bitrate must be in [100, 20000] Kbps")
+    h264_level = h264_level_from_profile_level_id(H264_PROFILE_LEVEL_ID_ENV)
     return (
         "videoconvert ! "
         "video/x-raw,format=I420 ! "
@@ -715,7 +717,7 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
         "sliced-threads=true "
         "pass=cbr "
         "! "
-        f"video/x-h264,profile={H264_PROFILE_ENV} ! "
+        f"video/x-h264,profile={H264_PROFILE_ENV},level=(string){h264_level} ! "
     )
 
 
@@ -3170,6 +3172,9 @@ class GStreamerInferenceApp:
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
             default_force_relay=WEBRTC_FORCE_RELAY,
+            h264_profile_level_id=H264_PROFILE_LEVEL_ID_ENV,
+            h264_packetization_mode=H264_PACKETIZATION_MODE_ENV,
+            h264_level_asymmetry_allowed=H264_LEVEL_ASYMMETRY_ALLOWED_ENV,
         )
 
         self.pipeline = None

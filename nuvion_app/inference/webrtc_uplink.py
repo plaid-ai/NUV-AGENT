@@ -25,6 +25,8 @@ from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_STOP,
     WEBRTC_UPLINK_STOP_DEST,
     build_uplink_payload,
+    enforce_h264_offer_parameters,
+    normalize_h264_profile_level_id,
     parse_ice_servers,
     to_gst_ice_server_config,
 )
@@ -253,9 +255,23 @@ class WebRTCUplinkController:
             [str, dict[str, Any], bool, WebRTCSignalingToken], bool
         ],
         default_force_relay: bool = False,
+        h264_profile_level_id: str = "42e01f",
+        h264_packetization_mode: str = "1",
+        h264_level_asymmetry_allowed: str = "1",
     ) -> None:
         self._send_message = send_message
         self._default_force_relay = default_force_relay
+        self._h264_profile_level_id = normalize_h264_profile_level_id(
+            h264_profile_level_id
+        )
+        self._h264_packetization_mode = str(h264_packetization_mode or "").strip()
+        self._h264_level_asymmetry_allowed = str(
+            h264_level_asymmetry_allowed or ""
+        ).strip()
+        if self._h264_packetization_mode not in {"0", "1"}:
+            raise ValueError("H264 packetization-mode must be 0 or 1")
+        if self._h264_level_asymmetry_allowed not in {"0", "1"}:
+            raise ValueError("H264 level-asymmetry-allowed must be 0 or 1")
         self._pipeline: Gst.Pipeline | None = None
         self._uplink_tee: Gst.Element | None = None
         self._branch: _WebRTCBranch | None = None
@@ -1071,7 +1087,23 @@ class WebRTCUplinkController:
             log.error("[WEBRTC-UPLINK] offer promise missing offer value.")
             return
 
-        sdp_text = offer.sdp.as_text()
+        try:
+            sdp_text = enforce_h264_offer_parameters(
+                offer.sdp.as_text(),
+                profile_level_id=self._h264_profile_level_id,
+                packetization_mode=self._h264_packetization_mode,
+                level_asymmetry_allowed=self._h264_level_asymmetry_allowed,
+            )
+        except ValueError as exc:
+            log.error("[WEBRTC-UPLINK] refusing incompatible H264 offer: %s", exc)
+            return
+        local_offer = _build_session_description(
+            GstWebRTC.WebRTCSDPType.OFFER,
+            sdp_text,
+        )
+        if local_offer is None:
+            log.error("[WEBRTC-UPLINK] failed to parse canonical H264 SDP offer.")
+            return
         with self._stats_lock:
             session = self._session
             if (
@@ -1088,7 +1120,7 @@ class WebRTCUplinkController:
                 return
             branch.webrtcbin.emit(
                 "set-local-description",
-                offer,
+                local_offer,
                 Gst.Promise.new(),
             )
             payload = build_uplink_payload(

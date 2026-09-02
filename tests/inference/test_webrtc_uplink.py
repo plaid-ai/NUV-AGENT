@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from typing import Any, ClassVar
+from unittest import mock
 
 
 class _FakeGLib:
@@ -47,7 +48,14 @@ class _ReplyPromise:
 
 
 class _Offer:
-    sdp = types.SimpleNamespace(as_text=lambda: "v=0\r\n")
+    sdp = types.SimpleNamespace(
+        as_text=lambda: (
+            "v=0\r\n"
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+            "a=rtpmap:96 H264/90000\r\n"
+            "a=fmtp:96 packetization-mode=1;profile-level-id=42c01e\r\n"
+        )
+    )
 
 
 class _OfferReply:
@@ -215,7 +223,7 @@ def _install_fake_gi() -> None:
     repository.GstWebRTC = types.SimpleNamespace(
         WebRTCICETransportPolicy=types.SimpleNamespace(RELAY="relay", ALL="all"),
         WebRTCBundlePolicy=types.SimpleNamespace(MAX_BUNDLE="max-bundle"),
-        WebRTCSDPType=types.SimpleNamespace(ANSWER="answer"),
+        WebRTCSDPType=types.SimpleNamespace(ANSWER="answer", OFFER="offer"),
         WebRTCSessionDescription=_FakeSessionDescription,
     )
     gi.repository = repository
@@ -325,6 +333,38 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertTrue(controller.is_signaling_token_current(signaling_token))
         controller.on_signaling_reset()
         self.assertFalse(controller.is_signaling_token_current(signaling_token))
+
+    def test_offer_sets_and_sends_the_same_canonical_h264_sdp(self) -> None:
+        sent: list[dict[str, object]] = []
+        controller, _pipeline = self._controller(
+            lambda _destination, payload, _remember, _token: (
+                sent.append(payload) or True
+            )
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        local_offer = object()
+
+        with mock.patch.object(
+            self.module,
+            "_build_session_description",
+            return_value=local_offer,
+        ) as build_description:
+            controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
+
+        self.assertEqual(len(sent), 1)
+        canonical_sdp = sent[0]["sdp"]
+        self.assertIn("profile-level-id=42e01f", canonical_sdp)
+        self.assertNotIn("profile-level-id=42c01e", canonical_sdp)
+        build_description.assert_called_once_with("offer", canonical_sdp)
+        local_descriptions = [
+            args
+            for signal, args in branch.webrtcbin.emitted
+            if signal == "set-local-description"
+        ]
+        self.assertEqual(len(local_descriptions), 1)
+        self.assertIs(local_descriptions[0][0], local_offer)
 
     def test_repeated_stop_keeps_the_queued_terminal_token_current(self) -> None:
         sent: list[object] = []

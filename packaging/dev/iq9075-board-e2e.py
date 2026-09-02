@@ -541,10 +541,36 @@ def validate_ed25519_keyring(payload: bytes, *, role: str) -> dict[str, Any]:
             material = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise HarnessError(f"{role} public key is not canonical base64") from exc
-        if len(material) != 32 or base64.b64encode(material).decode("ascii") != encoded:
+        if base64.b64encode(material).decode("ascii") != encoded:
+            raise HarnessError(f"{role} public key is not canonical base64")
+        if role != "release" and len(material) != 32:
             raise HarnessError(
                 f"{role} key must be a canonical 32-byte Ed25519 public key"
             )
+        if role == "release":
+            try:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                    Ed25519PublicKey,
+                )
+
+                if len(material) == 32:
+                    public_key = Ed25519PublicKey.from_public_bytes(material)
+                else:
+                    public_key = serialization.load_der_public_key(material)
+                if not isinstance(public_key, Ed25519PublicKey):
+                    raise ValueError("release public key algorithm is not Ed25519")
+                canonical_der = public_key.public_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                if len(material) != 32 and canonical_der != material:
+                    raise ValueError("release public key DER is not canonical SPKI")
+            except (ImportError, TypeError, ValueError) as exc:
+                raise HarnessError(
+                    "release key must be a raw 32-byte or canonical DER SPKI "
+                    "Ed25519 public key"
+                ) from exc
     if b"PRIVATE KEY" in payload or b'"seed"' in payload.lower():
         raise HarnessError("private-like key material is forbidden")
     return value
