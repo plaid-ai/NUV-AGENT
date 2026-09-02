@@ -290,7 +290,9 @@ class ZeroShotAnomalyDetector:
                     del source
                 torch.mps.synchronize()
 
-        torch.mps.empty_cache()
+        # Keep PyTorch's bounded reusable staging/command allocations alive for
+        # the first inference. Returning them here can force a new shared-pool
+        # allocation after the private vision weights occupy unified memory.
         return vision_model.eval()
 
     def _load_mps_scoring_scalars(self, torch, model_source: Path):
