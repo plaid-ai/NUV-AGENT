@@ -279,9 +279,7 @@ class ZeroShotAnomalyDetector:
                 if position_ids.ndim != 2 or position_ids.shape[0] != 1:
                     raise RuntimeError("SigLIP position-id buffer shape is invalid")
                 position_ids.copy_(
-                    torch.arange(position_ids.shape[1], device=self._device).reshape(
-                        position_ids.shape
-                    )
+                    torch.arange(position_ids.shape[1]).reshape(position_ids.shape)
                 )
             elif buffers:
                 raise RuntimeError("SigLIP2 vision buffers are unsupported")

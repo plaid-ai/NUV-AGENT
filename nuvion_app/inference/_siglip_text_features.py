@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sys
@@ -76,10 +77,56 @@ def main() -> int:
     if text_cls is None or not hasattr(config, "text_config"):
         raise ValueError(f"unsupported text-feature model type: {model_type!r}")
 
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    texts = [f"This is a photo of {label}." for label in labels]
+    inputs = tokenizer(
+        texts,
+        padding="max_length",
+        max_length=64,
+        return_tensors="pt",
+    )
+    input_ids = inputs.get("input_ids")
+    if (
+        not isinstance(input_ids, torch.Tensor)
+        or input_ids.ndim != 2
+        or input_ids.numel() == 0
+        or input_ids.is_floating_point()
+    ):
+        raise ValueError("tokenizer input IDs are invalid")
+    token_ids = sorted({int(value) for value in input_ids.reshape(-1).tolist()})
+    original_vocab_size = getattr(config.text_config, "vocab_size", None)
+    if (
+        type(original_vocab_size) is not int
+        or original_vocab_size <= 0
+        or not token_ids
+        or token_ids[0] < 0
+        or token_ids[-1] >= original_vocab_size
+    ):
+        raise ValueError("tokenizer input IDs exceed the text checkpoint vocabulary")
+    token_index = {token_id: index for index, token_id in enumerate(token_ids)}
+    compact_input_ids = input_ids.clone()
+    for token_id, index in token_index.items():
+        compact_input_ids[input_ids == token_id] = index
+    inputs["input_ids"] = compact_input_ids
+
+    text_config = copy.deepcopy(config.text_config)
+    text_config.vocab_size = len(token_ids)
+    for attribute in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        original_id = getattr(text_config, attribute, None)
+        setattr(text_config, attribute, token_index.get(original_id))
+
     with torch.device("meta"):
-        model = text_cls(config.text_config)
+        model = text_cls(text_config)
     model = model.to(dtype=torch.float16)
     expected = model.state_dict(keep_vars=True)
+    embedding_keys = [
+        key
+        for key in expected
+        if key.endswith("embeddings.token_embedding.weight")
+    ]
+    if len(embedding_keys) != 1:
+        raise ValueError("SigLIP text embedding layout is unsupported")
+    embedding_key = embedding_keys[0]
     with safe_open(checkpoint, framework="pt", device="cpu") as weights:
         checkpoint_keys = set(weights.keys())
         text_keys = {
@@ -95,9 +142,12 @@ def main() -> int:
             raise ValueError("checkpoint text tensor set does not match model config")
         for model_key, target in expected.items():
             checkpoint_key = checkpoint_key_by_model_key[model_key]
-            if tuple(weights.get_slice(checkpoint_key).get_shape()) != tuple(
-                target.shape
-            ):
+            checkpoint_shape = tuple(weights.get_slice(checkpoint_key).get_shape())
+            if model_key == embedding_key:
+                expected_shape = (original_vocab_size, target.shape[1])
+            else:
+                expected_shape = tuple(target.shape)
+            if checkpoint_shape != expected_shape:
                 raise ValueError(f"checkpoint tensor shape mismatch: {checkpoint_key}")
 
         model.to_empty(device="cpu")
@@ -117,17 +167,22 @@ def main() -> int:
         with torch.no_grad():
             for model_key in sorted(expected):
                 checkpoint_key = checkpoint_key_by_model_key[model_key]
-                expected[model_key].copy_(weights.get_tensor(checkpoint_key))
+                if model_key == embedding_key:
+                    source = torch.cat(
+                        [
+                            weights.get_slice(checkpoint_key)[
+                                token_id : token_id + 1
+                            ]
+                            for token_id in token_ids
+                        ],
+                        dim=0,
+                    )
+                else:
+                    source = weights.get_tensor(checkpoint_key)
+                expected[model_key].copy_(source)
+                del source
     model.eval()
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-    texts = [f"This is a photo of {label}." for label in labels]
-    inputs = tokenizer(
-        texts,
-        padding="max_length",
-        max_length=64,
-        return_tensors="pt",
-    )
     inputs = {
         key: value.to(dtype=torch.float16) if value.is_floating_point() else value
         for key, value in inputs.items()

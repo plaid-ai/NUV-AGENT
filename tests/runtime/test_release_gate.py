@@ -349,9 +349,15 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('with torch.device("meta"):', text_worker)
         self.assertIn('model.to_empty(device="cpu")', text_worker)
         self.assertIn('from safetensors import safe_open', text_worker)
+        self.assertIn("text_config.vocab_size = len(token_ids)", text_worker)
+        self.assertIn("token_id : token_id + 1", text_worker)
         self.assertIn('with torch.device("meta"):', zero_shot)
         self.assertIn('vision_model.to_empty(device=self._device)', zero_shot)
         self.assertIn('from safetensors import safe_open', zero_shot)
+        self.assertNotIn(
+            "torch.arange(position_ids.shape[1], device=self._device)",
+            zero_shot,
+        )
         self.assertIn('[sys.executable, "-I", str(worker_path)]', zero_shot)
         self.assertIn(
             "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
