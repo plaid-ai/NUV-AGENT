@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1465,12 +1465,15 @@ class FleetRunner:
         arguments: Sequence[str] = (),
         *,
         timeout: float = 90,
+        validate: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         # Never skip a board call from a stale host journal. Every primitive
         # performs a live, idempotent reconcile and returns current proof.
         self.journal.mark(step, "RUNNING")
         try:
             result = self.transport.invoke_board(command, arguments, timeout=timeout)
+            if validate is not None:
+                validate(result)
         except BaseException:
             self.journal.mark(step, "FAILED")
             raise
@@ -1948,14 +1951,16 @@ class FleetRunner:
         }
 
     def cleanup(self) -> dict[str, Any]:
-        result = self._call(
+        return self._call(
             "cleanup",
             "cleanup",
             ["--run-id", self.run_id],
             timeout=180,
+            validate=lambda result: validate_cleanup_result(
+                result,
+                run_id=self.run_id,
+            ),
         )
-        validate_cleanup_result(result, run_id=self.run_id)
-        return result
 
 
 def build_parser() -> argparse.ArgumentParser:

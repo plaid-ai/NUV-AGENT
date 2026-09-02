@@ -1170,6 +1170,10 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
 
             self.assertEqual(transport.calls, 1)
             self.assertEqual(transport.assert_cleanup_command, "cleanup")
+            self.assertEqual(
+                runner.journal.state["steps"]["cleanup"]["status"],
+                "FAILED",
+            )
 
     def test_host_cleanup_accepts_only_exact_success_contract(self) -> None:
         run_id = str(uuid.uuid4())
