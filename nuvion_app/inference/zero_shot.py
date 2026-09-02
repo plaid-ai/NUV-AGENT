@@ -111,16 +111,19 @@ class ZeroShotAnomalyDetector:
         device = self._resolve_device(torch, self.device_preference)
 
         try:
-            model = AutoModel.from_pretrained(self.model_name)
             if device == "mps":
                 # Apple unified-memory runners can reject the transient FP32
-                # allocation before even a small SigLIP2 inference. MPS has
-                # native FP16 support, so keep both weights and floating-point
-                # inputs in FP16 instead of disabling PyTorch's memory guard.
+                # allocation before even a small SigLIP2 inference. Load the
+                # checkpoint directly as FP16 with the low-memory loader so a
+                # complete FP32 CPU copy never overlaps the MPS allocation.
                 self._inference_dtype = torch.float16
-                model = model.to(device=device, dtype=self._inference_dtype)
+                model = AutoModel.from_pretrained(
+                    self.model_name,
+                    dtype=self._inference_dtype,
+                    low_cpu_mem_usage=True,
+                ).to(device)
             else:
-                model = model.to(device)
+                model = AutoModel.from_pretrained(self.model_name).to(device)
             self._model = model.eval()
             self._processor = self._load_processor(transformers)
             self._torch = torch

@@ -297,6 +297,11 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"', macos)
         self.assertIn("detector._inference_dtype == torch.float16", macos)
         self.assertIn("torch.mps.current_allocated_memory() < 2 * 1024**3", macos)
+        zero_shot = (
+            ROOT / "nuvion_app" / "inference" / "zero_shot.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("low_cpu_mem_usage=True", zero_shot)
+        self.assertIn("dtype=self._inference_dtype", zero_shot)
         self.assertIn(
             "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
         )
