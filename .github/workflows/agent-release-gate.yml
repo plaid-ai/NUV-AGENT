@@ -392,6 +392,7 @@ jobs:
               "schemaVersion", "modelRevision", "labels", "scores"
           }
           labels = ["normal scene", "anomalous scene"]
+          frame = np.zeros((224, 224, 3), dtype=np.uint8)
           assert type(reference["schemaVersion"]) is int
           assert reference["schemaVersion"] == 1
           assert reference["modelRevision"] == revision
