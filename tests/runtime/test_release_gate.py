@@ -294,9 +294,12 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
-        self.assertIn('PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"', macos)
+        self.assertNotIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO", macos)
         self.assertIn("detector._inference_dtype == torch.float16", macos)
-        self.assertIn("torch.mps.current_allocated_memory() < 2 * 1024**3", macos)
+        self.assertIn("detector._model.text_model is None", macos)
+        self.assertIn(
+            "torch.mps.current_allocated_memory() < 512 * 1024**2", macos
+        )
         self.assertIn("sudo purge", macos)
         zero_shot = (
             ROOT / "nuvion_app" / "inference" / "zero_shot.py"

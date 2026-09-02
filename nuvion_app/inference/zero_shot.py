@@ -1,3 +1,4 @@
+import gc
 import logging
 import stat
 from pathlib import Path
@@ -84,6 +85,9 @@ class ZeroShotAnomalyDetector:
         self._processor = None
         self._device = None
         self._inference_dtype = None
+        self._mps_text_features = None
+        self._mps_logit_scale: float | None = None
+        self._mps_logit_bias: float | None = None
         self._loaded_model_source: str | None = None
 
         if not self.enabled:
@@ -121,7 +125,7 @@ class ZeroShotAnomalyDetector:
                     self.model_name,
                     dtype=self._inference_dtype,
                     low_cpu_mem_usage=True,
-                ).to(device)
+                )
             else:
                 model = AutoModel.from_pretrained(self.model_name).to(device)
             self._model = model.eval()
@@ -129,6 +133,8 @@ class ZeroShotAnomalyDetector:
             self._torch = torch
             self._Image = Image
             self._device = device
+            if device == "mps":
+                self._partition_mps_model()
             candidate = Path(self.model_name).expanduser()
             try:
                 metadata = candidate.lstat()
@@ -150,6 +156,38 @@ class ZeroShotAnomalyDetector:
         except Exception as exc:  # noqa: BLE001 - model loader is third-party.
             log.warning("Failed to load zero-shot model '%s': %s", self.model_name, exc)
             self.enabled = False
+
+    def _partition_mps_model(self) -> None:
+        """Cache static text features and keep only the vision tower on MPS."""
+
+        texts = [f"This is a photo of {label}." for label in self.labels]
+        text_inputs = self._processor(
+            text=texts,
+            padding="max_length",
+            max_length=64,
+            return_tensors="pt",
+        )
+        with self._torch.inference_mode():
+            text_features = self._model.get_text_features(**text_inputs)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        self._mps_logit_scale = float(
+            self._model.logit_scale.detach().float().exp().item()
+        )
+        self._mps_logit_bias = float(
+            self._model.logit_bias.detach().float().item()
+        )
+
+        # Labels never change after construction. Releasing the 538 MiB text
+        # tower leaves only the 177 MiB vision tower resident on constrained
+        # Apple unified-memory devices while preserving exact SigLIP logits.
+        self._model.text_model = None
+        gc.collect()
+        self._model.vision_model = self._model.vision_model.to(self._device).eval()
+        self._mps_text_features = text_features.to(
+            device=self._device,
+            dtype=self._inference_dtype,
+        )
 
     def loaded_model_source(self) -> str | None:
         """Exact local directory handed to the successful model loader, if any."""
@@ -193,14 +231,17 @@ class ZeroShotAnomalyDetector:
 
         try:
             image = self._Image.fromarray(frame_rgb)
-            texts = [f"This is a photo of {label}." for label in self.labels]
-            inputs = self._processor(
-                text=texts,
-                images=image,
-                padding="max_length",
-                max_length=64,
-                return_tensors="pt",
-            )
+            if self._mps_text_features is not None:
+                inputs = self._processor(images=image, return_tensors="pt")
+            else:
+                texts = [f"This is a photo of {label}." for label in self.labels]
+                inputs = self._processor(
+                    text=texts,
+                    images=image,
+                    padding="max_length",
+                    max_length=64,
+                    return_tensors="pt",
+                )
             inputs = {
                 key: (
                     value.to(device=self._device, dtype=self._inference_dtype)
@@ -211,16 +252,44 @@ class ZeroShotAnomalyDetector:
                 for key, value in inputs.items()
             }
             with self._torch.no_grad():
-                outputs = self._model(**inputs)
-
-            if hasattr(outputs, "logits_per_image") and outputs.logits_per_image is not None:
-                logits = outputs.logits_per_image
-            else:
-                image_features = self._model.get_image_features(**{k: inputs[k] for k in ("pixel_values",) if k in inputs})
-                text_features = self._model.get_text_features(**{k: inputs[k] for k in ("input_ids", "attention_mask") if k in inputs})
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                logits = image_features @ text_features.T
+                if self._mps_text_features is not None:
+                    image_features = self._model.get_image_features(**inputs)
+                    image_features = image_features / image_features.norm(
+                        dim=-1, keepdim=True
+                    )
+                    logits = image_features @ self._mps_text_features.T
+                    logits = (
+                        logits * self._mps_logit_scale + self._mps_logit_bias
+                    )
+                else:
+                    outputs = self._model(**inputs)
+                    if (
+                        hasattr(outputs, "logits_per_image")
+                        and outputs.logits_per_image is not None
+                    ):
+                        logits = outputs.logits_per_image
+                    else:
+                        image_features = self._model.get_image_features(
+                            **{
+                                key: inputs[key]
+                                for key in ("pixel_values",)
+                                if key in inputs
+                            }
+                        )
+                        text_features = self._model.get_text_features(
+                            **{
+                                key: inputs[key]
+                                for key in ("input_ids", "attention_mask")
+                                if key in inputs
+                            }
+                        )
+                        image_features = image_features / image_features.norm(
+                            dim=-1, keepdim=True
+                        )
+                        text_features = text_features / text_features.norm(
+                            dim=-1, keepdim=True
+                        )
+                        logits = image_features @ text_features.T
 
             probs = self._torch.sigmoid(logits).squeeze(0).tolist()
         except Exception as exc:  # noqa: BLE001 - inference backend is third-party.

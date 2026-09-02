@@ -84,6 +84,11 @@ class MacMpsZeroShotRegressionTest(unittest.TestCase):
             self.assertEqual(detector._device, "mps")
             self.assertEqual(detector._inference_dtype, torch.float16)
             self.assertEqual(next(detector._model.parameters()).dtype, torch.float16)
+            self.assertIsNone(detector._model.text_model)
+            self.assertEqual(
+                next(detector._model.vision_model.parameters()).device.type, "mps"
+            )
+            self.assertEqual(detector._mps_text_features.device.type, "mps")
             self.assertEqual(detector.loaded_model_source(), str(model_path))
             result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
         self.assertIsNotNone(result)
