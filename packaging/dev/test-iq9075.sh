@@ -340,6 +340,9 @@ if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
 
 loop = GLib.MainLoop()
 branch_names = []
+session_ids = ["session-1", "session-2", "session-3"]
+session_index = 0
+sequence_complete = False
 
 
 def start(session_id):
@@ -353,24 +356,46 @@ def start(session_id):
     return False
 
 
-def reset():
-    if controller._branch is not None:
-        branch_names.append(controller._branch.webrtcbin.get_name())
+def advance_after_offer():
+    global sequence_complete, session_index
+    offers = [item for item in sent if item[0].endswith("/offer")]
+    branch = controller._branch
+    if (
+        len(offers) <= session_index
+        or branch is None
+        or not branch.offer_enqueued
+    ):
+        return True
+    branch_names.append(branch.webrtcbin.get_name())
+    if session_index == len(session_ids) - 1:
+        sequence_complete = True
+        loop.quit()
+        return False
     controller.on_signaling_reset()
+    session_index += 1
+    start(session_ids[session_index])
+    return True
+
+
+def sequence_timeout():
+    loop.quit()
     return False
 
 
-GLib.timeout_add(300, reset)
-GLib.timeout_add(450, start, "session-2")
-GLib.timeout_add(750, reset)
-GLib.timeout_add(900, start, "session-3")
-GLib.timeout_add(1300, lambda: (loop.quit(), False)[1])
-start("session-1")
+advance_source = GLib.timeout_add(10, advance_after_offer)
+deadline_source = GLib.timeout_add(10_000, sequence_timeout)
+start(session_ids[0])
 loop.run()
+if sequence_complete:
+    GLib.source_remove(deadline_source)
+else:
+    GLib.source_remove(advance_source)
+    raise RuntimeError(
+        "WebRTC reset/re-offer sequence timed out: "
+        f"branches={branch_names} sent={sent}"
+    )
 
 health = controller.runtime_health_snapshot()
-if controller._branch is not None:
-    branch_names.append(controller._branch.webrtcbin.get_name())
 # Force one partial teardown after request-pad releases, then retry the same
 # branch. G_DEBUG=fatal-criticals makes any repeated release_request_pad fatal.
 controller._pipeline = None
@@ -408,7 +433,8 @@ expected_branches = [
 offers = [item for item in sent if item[0].endswith("/offer")]
 if branch_names != expected_branches:
     raise RuntimeError(f"WebRTC branches were reused or skipped: {branch_names}")
-if health.get("sessionId") != "session-3" or len(offers) != 3:
+offer_session_ids = [item[1] for item in offers]
+if health.get("sessionId") != "session-3" or offer_session_ids != session_ids:
     raise RuntimeError(f"WebRTC re-offer evidence is incomplete: health={health} offers={offers}")
 if issues:
     raise RuntimeError(f"WebRTC reset emitted GStreamer bus failures: {issues}")

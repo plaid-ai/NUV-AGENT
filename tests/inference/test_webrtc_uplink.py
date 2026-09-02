@@ -1020,6 +1020,45 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             )
         )
 
+    def test_reset_before_delayed_offer_drops_stale_and_sends_replacement(
+        self,
+    ) -> None:
+        sent: list[tuple[str, str]] = []
+        controller, _pipeline = self._controller(
+            lambda destination, payload, _remember, _token: (
+                sent.append((destination, payload["sessionId"])) or True
+            )
+        )
+        self._start(controller, "session-1")
+        first = controller._branch
+        delayed_first = next(
+            args[1]
+            for signal, args in first.webrtcbin.emitted
+            if signal == "create-offer"
+        )
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self._start(controller, "session-2")
+        second = controller._branch
+        second_offer = next(
+            args[1]
+            for signal, args in second.webrtcbin.emitted
+            if signal == "create-offer"
+        )
+
+        delayed_first.complete(reply=_OfferReply())
+        second_offer.complete(reply=_OfferReply())
+        _FakeGLib.drain()
+
+        offers = [
+            session_id
+            for destination, session_id in sent
+            if destination == self.module.WEBRTC_UPLINK_OFFER_DEST
+        ]
+        self.assertEqual(offers, ["session-2"])
+        self.assertIs(controller._branch, second)
+
     def test_incomplete_teardown_refuses_a_replacement_offer(self) -> None:
         fatal_reasons: list[str] = []
         controller, _pipeline = self._controller(
