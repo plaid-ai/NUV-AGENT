@@ -67,6 +67,10 @@ def _committed(command: VerifiedFleetCommand) -> dict[str, object]:
     }
 
 
+def _health_attestation(*_args: object) -> dict[str, str]:
+    return {"compactJws": "a.b.c"}
+
+
 class _Client:
     def __init__(self, *, initial: dict[str, object] | None = None) -> None:
         self.initial = initial
@@ -99,8 +103,22 @@ class _Client:
         self.calls.append("REPORT_FUNCTIONAL_HEALTH")
         return {"commandId": command_id, "phase": "FUNCTIONAL_HEALTHY"}
 
-    def commit(self, command_id: str) -> dict[str, object]:
+    def begin_commit_gate(self, command_id: str) -> dict[str, object]:
+        self.calls.append("BEGIN_COMMIT_GATE")
+        return {
+            "gateId": str(uuid.uuid5(uuid.NAMESPACE_URL, command_id)),
+        }
+
+    def commit(
+        self,
+        command_id: str,
+        *,
+        gate_id: str,
+        health_attestation_jws: str,
+    ) -> dict[str, object]:
         self.calls.append("COMMIT")
+        self.calls.append(f"GATE:{gate_id}")
+        self.calls.append(f"ATTESTATION:{health_attestation_jws}")
         command = _command()
         object.__setattr__(command, "command_id", command_id)
         return _committed(command)
@@ -118,6 +136,7 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         status = configure_agent_update_reconciler(
             registry,
             client=ready_client,
+            health_attestation_provider=_health_attestation,
         )
         self.assertTrue(status["capabilityAvailable"])
         registered = registry.get("AGENT_UPDATE")
@@ -130,7 +149,11 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
             "authenticatedHelper": False,
             "reason": "UNSAFE_UPDATER_PEER",
         }
-        configure_agent_update_reconciler(registry, client=unavailable)
+        configure_agent_update_reconciler(
+            registry,
+            client=unavailable,
+            health_attestation_provider=_health_attestation,
+        )
         self.assertIsInstance(
             registry.get("AGENT_UPDATE"),
             AgentUpdateReconciler,
@@ -160,6 +183,7 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         outcome = AgentUpdateReconciler(
             client,  # type: ignore[arg-type]
             commit_readiness_provider=lambda: {"ready": True, "reason": "READY"},
+            health_attestation_provider=_health_attestation,
         ).reconcile(command)
 
         self.assertEqual(outcome.status, "SUCCEEDED")
@@ -170,7 +194,44 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         self.assertEqual(
             outcome.reported_state["functionalHealth"], "FUNCTIONAL_HEALTHY"
         )
-        self.assertEqual(client.calls, ["STATUS", "COMMIT"])
+        self.assertEqual(client.calls[:3], ["STATUS", "BEGIN_COMMIT_GATE", "COMMIT"])
+        self.assertEqual(client.calls[4], "ATTESTATION:a.b.c")
+
+    def test_attestation_is_required_after_live_readiness_and_before_commit(self) -> None:
+        command = _command()
+        for provider, reason in (
+            (None, "HEALTH_ATTESTATION_UNAVAILABLE"),
+            (lambda *_args: {"compactJws": "invalid"}, "HEALTH_ATTESTATION_INVALID"),
+            (
+                lambda *_args: (_ for _ in ()).throw(OSError("offline")),
+                "HEALTH_ATTESTATION_UNAVAILABLE",
+            ),
+        ):
+            with self.subTest(reason=reason):
+                client = _Client(
+                    initial={
+                        "commandId": command.command_id,
+                        "phase": "FUNCTIONAL_HEALTHY",
+                    }
+                )
+                outcome = AgentUpdateReconciler(
+                    client,  # type: ignore[arg-type]
+                    commit_readiness_provider=lambda: {
+                        "ready": True,
+                        "reason": "READY",
+                    },
+                    health_attestation_provider=provider,
+                ).reconcile(command)
+
+                self.assertEqual(outcome.checkpoint["detail"], reason)
+                self.assertNotIn("COMMIT", client.calls)
+                if provider is None:
+                    self.assertEqual(client.calls, ["STATUS"])
+                else:
+                    self.assertEqual(
+                        client.calls,
+                        ["STATUS", "BEGIN_COMMIT_GATE"],
+                    )
 
     def test_functional_health_waits_for_runtime_readiness_without_restart(self) -> None:
         command = _command()
@@ -292,6 +353,7 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
                 AgentUpdateReconciler(
                     _Client(),  # type: ignore[arg-type]
                     readiness_provider=lambda: dict(readiness),
+                    health_attestation_provider=_health_attestation,
                 )
             )
             with mock.patch(

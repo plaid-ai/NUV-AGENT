@@ -26,6 +26,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -42,7 +43,10 @@ from nuvion_app.inference.command_runtime import (
 )
 from nuvion_app.inference.agent_update import AgentUpdateReconciler
 from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
-from nuvion_app.inference.fleet_command import COMMAND_CAPABILITY_BY_TYPE
+from nuvion_app.inference.fleet_command import (
+    COMMAND_CAPABILITY_BY_TYPE,
+    VerifiedFleetCommand,
+)
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.depthai_gst import DepthAIGStreamerBridge
@@ -153,6 +157,11 @@ from nuvion_app.runtime.inference_mode import (
 )
 from nuvion_app.model_store import DEFAULT_MODEL_POINTER
 from nuvion_app.runtime.model_guard import resolve_effective_profile, resolve_model_dir
+from nuvion_app.runtime.platform_identity import (
+    IDENTITY_STATUS_DEV,
+    IDENTITY_STATUS_VERIFIED,
+    resolve_platform_identity,
+)
 from nuvion_app.runtime.telemetry import (
     build_runtime_telemetry,
     merge_runtime_public_state,
@@ -165,6 +174,10 @@ from nuvion_app.runtime.updater_client import (
 )
 from nuvion_app.runtime.update_commit_readiness import (
     evaluate_update_commit_readiness,
+)
+from nuvion_app.runtime.update_health_attestation import (
+    build_health_attestation_request,
+    request_health_attestation,
 )
 
 try:
@@ -512,6 +525,8 @@ updater_public_state_lock = threading.Lock()
 update_commit_signaling_ready_since: float | None = None
 update_commit_stomp_last_send_at: float | None = None
 update_commit_signaling_lock = threading.Lock()
+agent_update_identity_cache: dict[str, object] | None = None
+agent_update_identity_lock = threading.Lock()
 FLEET_PROCESS_INSTANCE_ID = str(uuid.uuid4())
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
@@ -972,6 +987,50 @@ def build_update_commit_readiness() -> dict[str, object]:
     )
 
 
+def _agent_update_platform_identity() -> dict[str, object]:
+    global agent_update_identity_cache
+    with agent_update_identity_lock:
+        if agent_update_identity_cache is None:
+            identity = resolve_platform_identity()
+            if identity.identity_status not in {
+                IDENTITY_STATUS_VERIFIED,
+                IDENTITY_STATUS_DEV,
+            }:
+                raise RuntimeError("platform identity is not verified for Agent update")
+            agent_update_identity_cache = {
+                "productModel": identity.product_model,
+                "platformProfile": identity.platform_profile,
+                "hardwareRevision": identity.hardware_revision,
+                "architecture": identity.architecture,
+            }
+        return dict(agent_update_identity_cache)
+
+
+def request_agent_update_health_attestation(
+    command: VerifiedFleetCommand,
+    update: Mapping[str, Any],
+    gate: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    request = build_health_attestation_request(
+        device_id=command.device_id,
+        command_id=command.command_id,
+        expected_bom_digest=str(command.payload.get("bomDigest") or ""),
+        expected_component_sha=str(update.get("componentSha") or ""),
+        expected_release_sequence=update.get("releaseSequence"),
+        gate=gate,
+        identity=_agent_update_platform_identity(),
+    )
+    return request_health_attestation(
+        request,
+        transport=lambda payload: api_request(
+            "POST",
+            "/devices/me/agent-update-health-attestations",
+            payload,
+            timeout=10,
+        ),
+    )
+
+
 def initialize_durable_event_outbox() -> DurableEventDelivery | None:
     global critical_event_delivery, critical_event_outbox_init_attempted
     with critical_event_outbox_lock:
@@ -1072,6 +1131,9 @@ def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
                         fleet_updater_client,
                         readiness_provider=_cached_agent_update_status,
                         commit_readiness_provider=build_update_commit_readiness,
+                        health_attestation_provider=(
+                            request_agent_update_health_attestation
+                        ),
                     )
                 )
             fleet_command_runtime = build_fleet_command_runtime_from_env(
