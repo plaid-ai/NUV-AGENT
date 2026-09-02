@@ -249,7 +249,9 @@ class BoardPaths:
             usb_devices=p("/sys/bus/usb/devices"),
             usb_unbind=p("/sys/bus/usb/drivers/usb/unbind"),
             usb_bind=p("/sys/bus/usb/drivers/usb/bind"),
-            os_release=p("/etc/os-release"),
+            # Ubuntu exposes /etc/os-release as a symlink. Read the canonical
+            # vendor file so the strict regular-file reader remains fail closed.
+            os_release=p("/usr/lib/os-release"),
             device_model=p("/proc/device-tree/model"),
         )
 

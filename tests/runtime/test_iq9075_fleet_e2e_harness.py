@@ -194,7 +194,10 @@ class HarnessFixture:
         )
 
     def _seed(self) -> None:
-        self._write("/etc/os-release", 'ID=ubuntu\nVERSION_ID="24.04"\n', 0o644)
+        self._write("/usr/lib/os-release", 'ID=ubuntu\nVERSION_ID="24.04"\n', 0o644)
+        etc_os_release = self.root / "etc/os-release"
+        etc_os_release.parent.mkdir(parents=True, exist_ok=True)
+        etc_os_release.symlink_to("../usr/lib/os-release")
         self._write("/proc/device-tree/model", "Thundercomm IQ-9075 QCS9075\0", 0o444)
         self._write("/sys/bus/usb/devices/2-1/idVendor", "1d6b\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1/idProduct", "0003\n", 0o444)
@@ -425,6 +428,19 @@ class HarnessFixture:
 
 
 class Iq9075FleetBoardHarnessTest(unittest.TestCase):
+    def test_default_os_release_uses_canonical_file_with_ubuntu_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                self.assertEqual(
+                    fixture.paths.os_release,
+                    fixture.root / "usr/lib/os-release",
+                )
+                self.assertTrue((fixture.root / "etc/os-release").is_symlink())
+                self.assertTrue(fixture.harness.preflight(fixture.run_id)["verified"])
+            finally:
+                fixture.close()
+
     def test_fixed_destinations_and_strict_public_key_schemas(self) -> None:
         self.assertNotIn("--keyring-path", BOARD.build_parser().format_help())
         self.assertEqual(
