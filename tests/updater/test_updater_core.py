@@ -204,6 +204,7 @@ class UpdaterCoreTest(unittest.TestCase):
         *,
         sequence: int = 10,
         device_id: str | None = None,
+        expires_at: datetime | None = None,
         extra_payload: dict[str, object] | None = None,
     ) -> tuple[str, str]:
         command_id = str(uuid.uuid4())
@@ -223,7 +224,7 @@ class UpdaterCoreTest(unittest.TestCase):
             "type": "AGENT_UPDATE",
             "schemaVersion": 1,
             "issuedAt": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "expiresAt": (now + timedelta(minutes=10))
+            "expiresAt": (expires_at or now + timedelta(minutes=10))
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
             "sequence": sequence,
@@ -264,6 +265,7 @@ class UpdaterCoreTest(unittest.TestCase):
             "challenge": gate.challenge,
             "deviceId": self.binding.device_id,
             "commandId": gate.command_id,
+            "commandExpiresAt": gate.command_expires_at,
             "bomDigest": gate.bom_digest,
             "componentSha": gate.component_sha,
             "releaseSequence": gate.release_sequence,
@@ -451,6 +453,7 @@ class UpdaterCoreTest(unittest.TestCase):
         self.assertEqual(len(gate.challenge), 43)
         self.assertEqual(len(base64.urlsafe_b64decode(gate.challenge + "=")), 32)
         self.assertEqual(gate.health_deadline, functional.health_deadline)
+        self.assertEqual(gate.command_expires_at, self.store.get(command_id).command_expires_at)
         self.assertEqual(
             controller.begin_commit_gate(command_id, peer_pid=4242), gate
         )
@@ -530,6 +533,18 @@ class UpdaterCoreTest(unittest.TestCase):
                 "wrong-component",
                 self._health_attestation(
                     gate, claims_override={"componentSha": "b" * 40}
+                ),
+                "HEALTH_ATTESTATION_MISMATCH",
+            ),
+            (
+                "wrong-command-expiry",
+                self._health_attestation(
+                    gate,
+                    claims_override={
+                        "commandExpiresAt": (
+                            datetime.now(timezone.utc) + timedelta(hours=1)
+                        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                    },
                 ),
                 "HEALTH_ATTESTATION_MISMATCH",
             ),
@@ -775,6 +790,7 @@ class UpdaterCoreTest(unittest.TestCase):
             compact_jws=compact,
             target_version=str(verified.payload["targetVersion"]),
             bom_digest=str(verified.payload["bomDigest"]),
+            command_expires_at=verified.expires_at,
         )
         self.store.transition(
             command_id,
@@ -789,6 +805,74 @@ class UpdaterCoreTest(unittest.TestCase):
 
         self.assertEqual(reopened.phase, UpdatePhase.VERIFIED)
         self.assertEqual(reopened.command_id, command_id)
+        self.assertEqual(reopened.command_expires_at, verified.expires_at)
+
+    def test_restart_refuses_an_expired_download_from_the_root_journal(self) -> None:
+        payload, _ = self._publish(version="0.1.135", release_sequence=15)
+        command_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+        command_id, compact = self._command(
+            payload,
+            sequence=51,
+            expires_at=command_expiry,
+        )
+        verified = self.verifier.verify(compact)
+        self.store.authorize(
+            command_id=command_id,
+            sequence=verified.sequence,
+            compact_jws=compact,
+            target_version=str(verified.payload["targetVersion"]),
+            bom_digest=str(verified.payload["bomDigest"]),
+            command_expires_at=verified.expires_at,
+        )
+        self.store.transition(
+            command_id,
+            UpdatePhase.DOWNLOADING,
+            allowed_from={UpdatePhase.AUTHORIZED},
+        )
+
+        recovered = self._controller(
+            store=UpdaterStore(self.state_path, require_root_owner=False),
+            slots=ReleaseSlotManager(self.install_root, require_root_owner=False),
+            clock=lambda: command_expiry,
+        ).recover()
+
+        assert recovered is not None
+        self.assertEqual(recovered.phase, UpdatePhase.FAILED)
+        self.assertEqual(recovered.error_code, "COMMAND_EXPIRED")
+
+    def test_commit_wall_clock_expiry_rolls_back_before_attestation_consumption(self) -> None:
+        payload, _ = self._publish(version="0.1.136", release_sequence=16)
+        command_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+        command_id, command = self._command(
+            payload,
+            sequence=52,
+            expires_at=command_expiry,
+        )
+        controller = self._controller()
+        controller.authorize_and_stage(command)
+        controller.activate(command_id)
+        controller.report_boot_health(command_id, healthy=True)
+        controller.report_functional_health(command_id, healthy=True)
+        gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+        compact_jws = self._health_attestation(gate)
+
+        expired = self._controller(clock=lambda: command_expiry)
+        with self.assertRaises(UpdaterError) as raised:
+            expired.commit(
+                command_id,
+                gate_id=gate.gate_id,
+                health_attestation_jws=compact_jws,
+                peer_pid=4242,
+            )
+
+        self.assertEqual(raised.exception.code, "INVALID_PHASE")
+        rolled_back = self.store.get(command_id)
+        assert rolled_back is not None
+        self.assertEqual(rolled_back.phase, UpdatePhase.ROLLED_BACK)
+        self.assertEqual(rolled_back.message, "COMMAND_EXPIRED")
+        persisted_gate = self.store.commit_gate(command_id)
+        assert persisted_gate is not None
+        self.assertIsNone(persisted_gate.consumed_at)
 
     def test_recovery_cleans_cache_left_after_verified_transition_crash(self) -> None:
         payload, _ = self._publish(version="0.1.134", release_sequence=14)
@@ -1020,6 +1104,10 @@ class UpdaterCoreTest(unittest.TestCase):
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(updater_command)")
         }
+        gate_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(updater_commit_gate)")
+        }
         tables = {
             row[0]
             for row in connection.execute(
@@ -1028,8 +1116,9 @@ class UpdaterCoreTest(unittest.TestCase):
         }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         connection.close()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertIn("updater_commit_gate", tables)
+        self.assertIn("command_expires_at", gate_columns)
         self.assertTrue(
             {
                 "artifact_digest",
@@ -1037,6 +1126,7 @@ class UpdaterCoreTest(unittest.TestCase):
                 "config_schema",
                 "bom_verification_status",
                 "previous_version",
+                "command_expires_at",
             }.issubset(columns)
         )
 

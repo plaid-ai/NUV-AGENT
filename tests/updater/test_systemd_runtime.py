@@ -82,6 +82,7 @@ class SystemdRuntimeTest(unittest.TestCase):
             compact_jws_sha256="b" * 64,
             target_version="0.1.116",
             bom_digest=str(self.bom_payload["bomDigest"]),
+            command_expires_at="2026-09-01T10:10:00.000Z",
             phase=UpdatePhase.ACTIVATING,
             candidate_slot=str(self.slot),
             previous_slot="releases/" + "0" * 64,

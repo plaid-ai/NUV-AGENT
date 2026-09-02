@@ -143,6 +143,7 @@ class ExpectedHealthAttestation:
     trust_domain: str
     device_id: str
     command_id: str
+    command_expires_at: datetime
     bom_digest: str
     component_sha: str
     release_sequence: int
@@ -253,6 +254,7 @@ class HealthAttestationVerifier:
             "challenge",
             "deviceId",
             "commandId",
+            "commandExpiresAt",
             "bomDigest",
             "componentSha",
             "releaseSequence",
@@ -324,6 +326,14 @@ class HealthAttestationVerifier:
 
         issued_at = _timestamp(claims.get("issuedAt"), "issuedAt")
         expires_at = _timestamp(claims.get("expiresAt"), "expiresAt")
+        command_expires_at = _timestamp(
+            claims.get("commandExpiresAt"), "commandExpiresAt"
+        )
+        if command_expires_at != expected.command_expires_at:
+            raise UpdaterSecurityError(
+                "HEALTH_ATTESTATION_MISMATCH",
+                "commandExpiresAt does not match the accepted command",
+            )
         if expires_at <= issued_at or expires_at - issued_at > self.max_ttl:
             raise UpdaterSecurityError(
                 "INVALID_HEALTH_ATTESTATION_TTL", "attestation TTL must be in (0, 60s]"
@@ -332,6 +342,16 @@ class HealthAttestationVerifier:
         if now.tzinfo is None or now.utcoffset() is None:
             raise RuntimeError("health attestation clock must be timezone-aware")
         now = now.astimezone(timezone.utc)
+        if expires_at > command_expires_at:
+            raise UpdaterSecurityError(
+                "INVALID_HEALTH_ATTESTATION_TTL",
+                "attestation expires after the accepted command",
+            )
+        if now >= command_expires_at:
+            raise UpdaterSecurityError(
+                "HEALTH_ATTESTATION_COMMAND_EXPIRED",
+                "accepted command has expired",
+            )
         if issued_at > now + self.allowed_clock_skew:
             raise UpdaterSecurityError(
                 "HEALTH_ATTESTATION_NOT_YET_VALID", "attestation was issued in the future"

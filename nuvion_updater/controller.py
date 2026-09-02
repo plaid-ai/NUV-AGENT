@@ -138,18 +138,20 @@ class UpdaterController:
             compact_jws=command.compact_jws,
             target_version=str(command.payload["targetVersion"]),
             bom_digest=str(command.payload["bomDigest"]),
+            command_expires_at=command.expires_at,
         )
         if duplicate and state.phase not in {
             UpdatePhase.AUTHORIZED,
             UpdatePhase.DOWNLOADING,
             UpdatePhase.STAGING,
         }:
-            return state
+            return self._enforce_command_expiry(state)
         return self._stage_authorized(state)
 
     def status(self, command_id: str | None = None) -> dict[str, object]:
         state = self.store.get(command_id) if command_id else self.store.current()
         if state is not None:
+            state = self._enforce_command_expiry(state)
             state = self._enforce_health_deadline(state)
         return {
             "capabilityAvailable": self.capability_available,
@@ -286,6 +288,7 @@ class UpdaterController:
             or state.component_sha is None
             or state.release_sequence is None
             or state.health_deadline is None
+            or state.command_expires_at is None
         ):
             raise UpdaterError(
                 "INVALID_JOURNAL", "commit gate release identity is incomplete"
@@ -302,6 +305,7 @@ class UpdaterController:
             component_sha=state.component_sha,
             release_sequence=state.release_sequence,
             health_deadline=state.health_deadline,
+            command_expires_at=state.command_expires_at,
         )
 
     def commit(
@@ -340,7 +344,7 @@ class UpdaterController:
         # Signature verification and local process inspection must not extend
         # the persisted absolute deadline. Timeout follows the existing
         # watchdog rollback path.
-        state = self._enforce_health_deadline(state)
+        state = self._require_state(command_id)
         if state.phase not in {UpdatePhase.FUNCTIONAL_HEALTHY, UpdatePhase.COMMITTED}:
             return state
         second_process = self._capture_commit_process(state, peer_pid)
@@ -421,6 +425,10 @@ class UpdaterController:
         if state.terminal:
             self.repository.cleanup_release(state.bom_digest)
             return state
+        state = self._enforce_command_expiry(state)
+        if state.terminal:
+            self.repository.cleanup_release(state.bom_digest)
+            return state
         if state.phase in {
             UpdatePhase.AUTHORIZED,
             UpdatePhase.DOWNLOADING,
@@ -461,6 +469,7 @@ class UpdaterController:
 
     def _stage_authorized(self, state: UpdateState) -> UpdateState:
         try:
+            state = self._require_live_staging_command(state)
             if state.phase == UpdatePhase.AUTHORIZED:
                 state = self.store.transition(
                     state.command_id,
@@ -510,12 +519,14 @@ class UpdaterController:
             if fetched.artifact_path is None:
                 raise UpdaterError("DOWNLOAD_FAILED", "artifact was not downloaded")
             verify_release_artifact(bom, fetched.artifact_path)
+            state = self._require_live_staging_command(state)
             slot = self.slots.stage_bundle(
                 bom=bom,
                 bom_path=fetched.bom_path,
                 signature_path=fetched.signature_path,
                 artifact_path=fetched.artifact_path,
             )
+            state = self._require_live_staging_command(state)
             verified_state = self.store.transition(
                 state.command_id,
                 UpdatePhase.VERIFIED,
@@ -584,7 +595,62 @@ class UpdaterController:
         state = self.store.get(command_id)
         if state is None:
             raise UpdaterError("UPDATE_NOT_FOUND", "update command is not journaled")
+        state = self._enforce_command_expiry(state)
         return self._enforce_health_deadline(state)
+
+    def _require_live_staging_command(self, state: UpdateState) -> UpdateState:
+        state = self._enforce_command_expiry(state)
+        if state.phase == UpdatePhase.FAILED and state.error_code in {
+            "COMMAND_EXPIRED",
+            "COMMAND_EXPIRY_MISSING",
+        }:
+            raise UpdaterSecurityError(
+                state.error_code,
+                state.message or "accepted command is no longer live",
+            )
+        return state
+
+    def _enforce_command_expiry(self, state: UpdateState) -> UpdateState:
+        if state.terminal or state.phase == UpdatePhase.ROLLING_BACK:
+            return state
+        expiry = self._parse_command_expiry(state.command_expires_at)
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError("updater clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        code = "COMMAND_EXPIRY_MISSING" if expiry is None else "COMMAND_EXPIRED"
+        if expiry is not None and now < expiry:
+            return state
+        if state.phase in {
+            UpdatePhase.AUTHORIZED,
+            UpdatePhase.DOWNLOADING,
+            UpdatePhase.STAGING,
+            UpdatePhase.VERIFIED,
+        }:
+            return self.store.transition(
+                state.command_id,
+                UpdatePhase.FAILED,
+                allowed_from={state.phase},
+                error_code=code,
+                message=(
+                    "accepted command has no durable expiry"
+                    if expiry is None
+                    else "accepted command expired before activation"
+                ),
+            )
+        return self.rollback(state.command_id, reason=code)
+
+    @staticmethod
+    def _parse_command_expiry(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
 
     def _enforce_health_deadline(self, state: UpdateState) -> UpdateState:
         if state.phase not in {
@@ -630,6 +696,7 @@ class UpdaterController:
             return state
         if state.phase == UpdatePhase.ROLLING_BACK:
             return self.rollback(state.command_id, reason=state.message or "WATCHDOG")
+        state = self._enforce_command_expiry(state)
         return self._enforce_health_deadline(state)
 
     def _recover_restore_target(self, state: UpdateState) -> str:
@@ -676,12 +743,19 @@ class UpdaterController:
         self,
         gate: CommitGate,
     ) -> ExpectedHealthAttestation:
+        command_expires_at = self._parse_command_expiry(gate.command_expires_at)
+        if command_expires_at is None:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_BINDING_MISMATCH",
+                "commit gate command expiry is invalid",
+            )
         return ExpectedHealthAttestation(
             gate_id=gate.gate_id,
             challenge=gate.challenge,
             trust_domain=self.binding.trust_domain,
             device_id=self.binding.device_id,
             command_id=gate.command_id,
+            command_expires_at=command_expires_at,
             bom_digest=gate.bom_digest,
             component_sha=gate.component_sha,
             release_sequence=gate.release_sequence,

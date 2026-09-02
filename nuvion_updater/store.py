@@ -51,6 +51,7 @@ class UpdateState:
     compact_jws_sha256: str
     target_version: str
     bom_digest: str
+    command_expires_at: str | None
     phase: UpdatePhase
     candidate_slot: str | None
     previous_slot: str | None
@@ -82,6 +83,7 @@ class UpdateState:
             "updatedAt": self.updated_at,
         }
         optional = {
+            "commandExpiresAt": self.command_expires_at,
             "candidateSlot": self.candidate_slot,
             "previousSlot": self.previous_slot,
             "previousVersion": self.previous_version,
@@ -120,6 +122,7 @@ class UpdateState:
 @dataclass(frozen=True)
 class CommitGate:
     command_id: str
+    command_expires_at: str
     gate_id: str
     challenge: str
     peer_pid: int
@@ -150,6 +153,7 @@ class CommitGate:
             "gateId": self.gate_id,
             "challenge": self.challenge,
             "commandId": self.command_id,
+            "commandExpiresAt": self.command_expires_at,
             "bomDigest": self.bom_digest,
             "componentSha": self.component_sha,
             "releaseSequence": self.release_sequence,
@@ -234,7 +238,7 @@ class UpdaterStore:
                 schema_version = int(
                     connection.execute("PRAGMA user_version").fetchone()[0]
                 )
-                if schema_version not in {0, 1, 2, 3}:
+                if schema_version not in {0, 1, 2, 3, 4}:
                     raise UpdaterSecurityError(
                         "UNSUPPORTED_JOURNAL_SCHEMA",
                         f"unsupported updater journal schema: {schema_version}",
@@ -248,6 +252,7 @@ class UpdaterStore:
                         compact_jws_sha256 TEXT NOT NULL,
                         target_version TEXT NOT NULL,
                         bom_digest TEXT NOT NULL,
+                        command_expires_at TEXT NOT NULL,
                         phase TEXT NOT NULL,
                         candidate_slot TEXT,
                         previous_slot TEXT,
@@ -283,6 +288,7 @@ class UpdaterStore:
 
                     CREATE TABLE IF NOT EXISTS updater_commit_gate (
                         command_id TEXT PRIMARY KEY,
+                        command_expires_at TEXT NOT NULL,
                         gate_id TEXT NOT NULL UNIQUE,
                         challenge TEXT NOT NULL UNIQUE,
                         peer_pid INTEGER NOT NULL CHECK (peer_pid > 0),
@@ -317,6 +323,7 @@ class UpdaterStore:
                     ).fetchall()
                 }
                 migrations = {
+                    "command_expires_at": "TEXT",
                     "previous_version": "TEXT",
                     "artifact_digest": "TEXT",
                     "component_sha": "TEXT",
@@ -329,7 +336,18 @@ class UpdaterStore:
                         connection.execute(
                             f"ALTER TABLE updater_command ADD COLUMN {column} {declaration}"
                         )
-                connection.execute("PRAGMA user_version = 3")
+                gate_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(updater_commit_gate)"
+                    ).fetchall()
+                }
+                if "command_expires_at" not in gate_columns:
+                    connection.execute(
+                        "ALTER TABLE updater_commit_gate "
+                        "ADD COLUMN command_expires_at TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 4")
                 connection.commit()
             finally:
                 connection.close()
@@ -348,6 +366,7 @@ class UpdaterStore:
         compact_jws: str,
         target_version: str,
         bom_digest: str,
+        command_expires_at: str,
     ) -> tuple[UpdateState, bool]:
         digest = hashlib.sha256(compact_jws.encode("ascii")).hexdigest()
         now = self._clock()
@@ -362,6 +381,7 @@ class UpdaterStore:
                     or state.compact_jws_sha256 != digest
                     or state.target_version != target_version
                     or state.bom_digest != bom_digest
+                    or state.command_expires_at != command_expires_at
                 ):
                     raise UpdaterSecurityError(
                         "COMMAND_COLLISION",
@@ -397,8 +417,9 @@ class UpdaterStore:
                 """
                 INSERT INTO updater_command (
                     command_id, sequence, compact_jws, compact_jws_sha256,
-                    target_version, bom_digest, phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    target_version, bom_digest, command_expires_at, phase,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -407,6 +428,7 @@ class UpdaterStore:
                     digest,
                     target_version,
                     bom_digest,
+                    command_expires_at,
                     UpdatePhase.AUTHORIZED.value,
                     now,
                     now,
@@ -666,6 +688,7 @@ class UpdaterStore:
         component_sha: str,
         release_sequence: int,
         health_deadline: str,
+        command_expires_at: str,
     ) -> CommitGate:
         """Create one immutable process-bound gate without extending its lease."""
 
@@ -696,6 +719,7 @@ class UpdaterStore:
                     component_sha,
                     release_sequence,
                     health_deadline,
+                    command_expires_at,
                 )
                 actual = (
                     gate.peer_pid,
@@ -706,6 +730,7 @@ class UpdaterStore:
                     gate.component_sha,
                     gate.release_sequence,
                     gate.health_deadline,
+                    gate.command_expires_at,
                 )
                 if actual != expected:
                     raise UpdaterSecurityError(
@@ -718,8 +743,8 @@ class UpdaterStore:
                 INSERT INTO updater_commit_gate (
                     command_id, gate_id, challenge, peer_pid, agent_start_ticks,
                     boot_id, candidate_slot, bom_digest, component_sha,
-                    release_sequence, health_deadline, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    release_sequence, health_deadline, command_expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -733,6 +758,7 @@ class UpdaterStore:
                     component_sha,
                     release_sequence,
                     health_deadline,
+                    command_expires_at,
                     now,
                 ),
             )
@@ -954,6 +980,7 @@ class UpdaterStore:
             compact_jws_sha256=str(row["compact_jws_sha256"]),
             target_version=str(row["target_version"]),
             bom_digest=str(row["bom_digest"]),
+            command_expires_at=row["command_expires_at"],
             phase=UpdatePhase(str(row["phase"])),
             candidate_slot=row["candidate_slot"],
             previous_slot=row["previous_slot"],
@@ -979,6 +1006,7 @@ class UpdaterStore:
     def _gate_row(row: sqlite3.Row) -> CommitGate:
         return CommitGate(
             command_id=str(row["command_id"]),
+            command_expires_at=str(row["command_expires_at"]),
             gate_id=str(row["gate_id"]),
             challenge=str(row["challenge"]),
             peer_pid=int(row["peer_pid"]),
