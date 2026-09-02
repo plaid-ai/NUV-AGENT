@@ -274,14 +274,15 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertEqual(len(_FakeGLib.calls), 1)
 
     def test_on_ice_candidate_skips_empty_candidate(self) -> None:
-        sent_messages: list[tuple[str, dict[str, object], bool]] = []
+        sent_messages: list[tuple[str, dict[str, object], bool, object]] = []
 
         def send_message(
             destination: str,
             payload: dict[str, object],
             remember: bool,
+            signaling_token: object,
         ) -> bool:
-            sent_messages.append((destination, payload, remember))
+            sent_messages.append((destination, payload, remember, signaling_token))
             return True
 
         controller, _pipeline = self._controller(send_message)
@@ -305,6 +306,45 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
 
         self.assertEqual(sent_messages, [])
+
+    def test_offer_transport_token_is_invalidated_by_signaling_reset(self) -> None:
+        sent: list[tuple[str, object]] = []
+        controller, _pipeline = self._controller(
+            lambda destination, _payload, _remember, token: (
+                sent.append((destination, token)) or True
+            )
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
+
+        self.assertEqual(len(sent), 1)
+        signaling_token = sent[0][1]
+        self.assertTrue(controller.is_signaling_token_current(signaling_token))
+        controller.on_signaling_reset()
+        self.assertFalse(controller.is_signaling_token_current(signaling_token))
+
+    def test_repeated_stop_keeps_the_queued_terminal_token_current(self) -> None:
+        sent: list[object] = []
+        controller, _pipeline = self._controller(
+            lambda _destination, _payload, _remember, token: (
+                sent.append(token) or True
+            )
+        )
+        self._start(controller, "session-1")
+
+        controller.stop()
+        self.assertEqual(len(sent), 1)
+        stop_token = sent[0]
+        generation = controller._stats_generation
+        self.assertTrue(controller.is_signaling_token_current(stop_token))
+
+        controller.stop()
+
+        self.assertEqual(controller._stats_generation, generation)
+        self.assertTrue(controller.is_signaling_token_current(stop_token))
 
     def test_stats_accumulator_emits_interval_loss_rtt_and_feedback_deltas(
         self,
@@ -515,7 +555,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
     def test_stale_generation_cannot_mutate_new_sdp_or_ice_state(self) -> None:
         sent: list[tuple[str, dict[str, object], bool]] = []
         controller, _pipeline = self._controller(
-            lambda destination, payload, remember: (
+            lambda destination, payload, remember, _token: (
                 sent.append((destination, payload, remember)) or True
             )
         )
@@ -568,6 +608,12 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller.on_signaling_reset()
         _FakeGLib.drain()
         self.assertTrue(controller._branch_cleanup_failed)
+        released_once = (
+            len(controller._uplink_tee.released_pads),
+            len(first.webrtcbin.released_pads),
+        )
+        self.assertEqual(released_once, (1, 1))
+        self.assertEqual(first.signal_handler_ids, [])
 
         create_count = len(
             [
@@ -590,6 +636,17 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
         self.assertIsNone(controller._session)
         self.assertFalse(controller.runtime_health_snapshot()["hasPipeline"])
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self.assertEqual(
+            (
+                len(controller._uplink_tee.released_pads),
+                len(first.webrtcbin.released_pads),
+            ),
+            released_once,
+        )
+        self.assertEqual(first.signal_handler_ids, [])
 
 
 if __name__ == "__main__":

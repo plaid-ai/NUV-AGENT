@@ -54,6 +54,11 @@ SEMVER_RE = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
+BOOTSTRAP_FAILURE_RE = re.compile(
+    r"^out-of-band updater bootstrap failed: "
+    r"primary=[A-Za-z0-9 .:_-]{1,160}; "
+    r"cleanup=(?:none|[A-Za-z0-9._:-]+(?:,[A-Za-z0-9._:-]+)*)$"
+)
 BOARD_COMMANDS = frozenset(
     {
         "identity",
@@ -195,12 +200,66 @@ def control(field):
         raise SystemExit("cannot inspect bootstrap package")
     return result.stdout.strip()
 
-ensure_root_directory(bootstrap_root.parent, 0o700)
-ensure_root_directory(bootstrap_root, 0o700)
-safe_rmtree(private)
-private.mkdir(mode=0o700)
-previous_version = query_package_version()
+RUNTIME_UNITS = (
+    "nuv-agent.service",
+    "nuv-agent-updater.socket",
+    "nuv-agent-updater.service",
+)
+
+def quiesce_runtime():
+    errors = []
+    for unit in RUNTIME_UNITS:
+        for action in ("stop", "disable"):
+            try:
+                result = subprocess.run(
+                    ["/usr/bin/systemctl", action, unit],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    errors.append(f"{unit}:{action}:rc{result.returncode}")
+            except BaseException as exc:
+                errors.append(f"{unit}:{action}:{type(exc).__name__}")
+    for unit in RUNTIME_UNITS:
+        for action, expected in (("is-active", "inactive"), ("is-enabled", "disabled")):
+            try:
+                result = subprocess.run(
+                    ["/usr/bin/systemctl", action, unit],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                    text=True,
+                )
+                if result.stdout.strip() != expected:
+                    errors.append(f"{unit}:{action}:not-{expected}")
+            except BaseException as exc:
+                errors.append(f"{unit}:{action}:{type(exc).__name__}")
+    return errors
+
+def stable_failure(exc):
+    if isinstance(exc, SystemExit) and isinstance(exc.code, str) and re.fullmatch(r"[A-Za-z0-9 .:_-]{1,160}", exc.code):
+        return exc.code
+    return type(exc).__name__
+
+def bootstrap_failure_message(primary, cleanup):
+    primary_text = primary or "none"
+    cleanup_text = ",".join(cleanup) if cleanup else "none"
+    return f"out-of-band updater bootstrap failed: primary={primary_text}; cleanup={cleanup_text}"
+
+primary_failure = None
+cleanup_failures = []
+evidence = None
 try:
+    ensure_root_directory(bootstrap_root.parent, 0o700)
+    ensure_root_directory(bootstrap_root, 0o700)
+    safe_rmtree(private)
+    private.mkdir(mode=0o700)
+    previous_version = query_package_version()
     copy_verified(installer_source, private_installer, installer_sha, 2 * 1024 * 1024)
     copy_verified(deb_source, private_deb, deb_sha, 4 * 1024 * 1024 * 1024)
     if control("Package") != "nuv-agent" or control("Architecture") != "arm64" or control("Version") != version:
@@ -223,13 +282,6 @@ try:
     )
     if installed.returncode != 0:
         raise SystemExit("out-of-band updater bootstrap failed")
-    for command in (
-        ["/usr/bin/systemctl", "disable", "--now", "nuv-agent.service"],
-        ["/usr/bin/systemctl", "disable", "--now", "nuv-agent-updater.socket"],
-        ["/usr/bin/systemctl", "stop", "nuv-agent-updater.service"],
-    ):
-        if subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False).returncode != 0:
-            raise SystemExit("cannot leave bootstrap runtime safely stopped")
     installed_version = query_package_version()
     if installed_version != version:
         raise SystemExit("installed package version mismatch")
@@ -249,13 +301,7 @@ try:
     current_slot = os.readlink(current)
     if re.fullmatch(r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})", current_slot) is None:
         raise SystemExit("bootstrap current slot is invalid")
-    inactive = all(
-        subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", unit], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False).returncode != 0
-        for unit in ("nuv-agent.service", "nuv-agent-updater.service", "nuv-agent-updater.socket")
-    )
-    if not inactive:
-        raise SystemExit("bootstrap left a runtime unit active")
-    print(json.dumps({
+    evidence = {
         "schemaVersion": 1,
         "protocolVersion": "iq9075-fleet-e2e-v2",
         "runId": run_id,
@@ -268,12 +314,27 @@ try:
         "updaterCodeVersion": UPDATER_VERSION,
         "boardToolSha256": tool_sha,
         "currentSlot": current_slot,
-        "servicesInactive": True,
-    }, sort_keys=True, separators=(",", ":")))
+    }
+except BaseException as exc:
+    primary_failure = stable_failure(exc)
 finally:
-    safe_unlink(installer_source)
-    safe_unlink(deb_source)
-    safe_rmtree(private)
+    cleanup_failures.extend(quiesce_runtime())
+    for label, cleanup in (
+        ("installer-staging", lambda: safe_unlink(installer_source)),
+        ("package-staging", lambda: safe_unlink(deb_source)),
+        ("private-staging", lambda: safe_rmtree(private)),
+    ):
+        try:
+            cleanup()
+        except BaseException as exc:
+            cleanup_failures.append(f"{label}:{type(exc).__name__}")
+
+if primary_failure is not None or cleanup_failures:
+    raise SystemExit(bootstrap_failure_message(primary_failure, cleanup_failures))
+if not isinstance(evidence, dict):
+    raise SystemExit("out-of-band updater bootstrap produced no evidence")
+evidence["servicesInactive"] = True
+print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
 """.strip()
 
 BOOTSTRAP_CLEANUP_PROGRAM = r"""
@@ -812,6 +873,12 @@ class OpenSshTransport:
     @staticmethod
     def _parse_result(result: ProcessResult, *, operation: str) -> dict[str, Any]:
         if result.returncode != 0:
+            if operation == "out-of-band-updater-bootstrap":
+                stderr = result.stderr.decode("utf-8", errors="replace")
+                for line in reversed(stderr.splitlines()):
+                    detail = line.strip()
+                    if BOOTSTRAP_FAILURE_RE.fullmatch(detail):
+                        raise RunnerError(detail)
             raise RunnerError(f"remote operation failed: {operation}")
         lines = [
             line
@@ -1342,6 +1409,37 @@ def validate_final_evidence(
     assert_no_secret_material(evidence)
 
 
+def validate_cleanup_result(result: Mapping[str, Any], *, run_id: str) -> None:
+    allowed = {
+        "schemaVersion",
+        "runId",
+        "complete",
+        "recovered",
+        "phase",
+        "idempotent",
+    }
+    if not set(result).issubset(allowed) or not {
+        "schemaVersion",
+        "runId",
+        "complete",
+        "recovered",
+        "phase",
+    }.issubset(result):
+        raise RunnerError("cleanup response fields are invalid")
+    if (
+        result.get("schemaVersion") != 1
+        or result.get("runId") != run_id
+        or result.get("complete") is not True
+        or not isinstance(result.get("recovered"), bool)
+        or result.get("phase") not in {None, "RESTORED"}
+        or (
+            "idempotent" in result
+            and not isinstance(result.get("idempotent"), bool)
+        )
+    ):
+        raise RunnerError("board cleanup did not reach the exact restored state")
+
+
 class FleetRunner:
     def __init__(
         self,
@@ -1850,7 +1948,14 @@ class FleetRunner:
         }
 
     def cleanup(self) -> dict[str, Any]:
-        return self._call("cleanup", "cleanup", ["--run-id", self.run_id], timeout=180)
+        result = self._call(
+            "cleanup",
+            "cleanup",
+            ["--run-id", self.run_id],
+            timeout=180,
+        )
+        validate_cleanup_result(result, run_id=self.run_id)
+        return result
 
 
 def build_parser() -> argparse.ArgumentParser:

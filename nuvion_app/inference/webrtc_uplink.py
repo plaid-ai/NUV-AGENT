@@ -194,6 +194,15 @@ class WebRTCUplinkSession:
     ice_servers: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class WebRTCSignalingToken:
+    """Ownership token checked again by the transport immediately before send."""
+
+    generation: int
+    session_id: str
+    terminal: bool = False
+
+
 @dataclass
 class _WebRTCBranch:
     """One disposable WebRTC media branch owned by exactly one generation."""
@@ -206,7 +215,15 @@ class _WebRTCBranch:
     queue_sink_pad: Gst.Pad
     queue_src_pad: Gst.Pad
     webrtc_sink_pad: Gst.Pad
-    signal_handler_ids: tuple[int, ...]
+    signal_handler_ids: list[int]
+    tee_unlinked: bool = False
+    tee_pad_released: bool = False
+    webrtc_stopped: bool = False
+    queue_stopped: bool = False
+    webrtc_unlinked: bool = False
+    webrtc_pad_released: bool = False
+    queue_removed: bool = False
+    webrtc_removed: bool = False
 
 
 def _request_pad(element: Gst.Element, template_name: str) -> Gst.Pad | None:
@@ -232,7 +249,9 @@ class WebRTCUplinkController:
     def __init__(
         self,
         *,
-        send_message: Callable[[str, dict[str, Any], bool], bool],
+        send_message: Callable[
+            [str, dict[str, Any], bool, WebRTCSignalingToken], bool
+        ],
         default_force_relay: bool = False,
     ) -> None:
         self._send_message = send_message
@@ -242,6 +261,7 @@ class WebRTCUplinkController:
         self._branch: _WebRTCBranch | None = None
         self._branch_cleanup_failed = False
         self._session: WebRTCUplinkSession | None = None
+        self._terminal_session_id: str | None = None
         self._stop_sent = False
         self._stats_accumulator = WebRTCStatsAccumulator()
         self._stats_lock = threading.RLock()
@@ -343,6 +363,7 @@ class WebRTCUplinkController:
             self._stats_generation += 1
             generation = self._stats_generation
             self._session = session
+            self._terminal_session_id = None
             self._stop_sent = False
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
@@ -508,20 +529,38 @@ class WebRTCUplinkController:
         with self._stats_lock:
             session = self._session
             branch_generation = self._branch.generation if self._branch else None
-            if session is None and branch_generation is None:
+            if session is None:
                 self._stats_accumulator.reset()
                 self._latest_outbound_stats = None
                 self._reset_runtime_health_locked()
-                return
-            should_send = bool(send_signal and session and not self._stop_sent)
-            self._stats_generation += 1
-            stop_generation = self._stats_generation
-            self._session = None
-            self._stats_accumulator.reset()
-            self._latest_outbound_stats = None
-            self._reset_runtime_health_locked()
+                already_stopped = True
+                should_send = False
+                stop_generation = self._stats_generation
+            else:
+                already_stopped = False
+                should_send = bool(send_signal and not self._stop_sent)
+                self._stats_generation += 1
+                stop_generation = self._stats_generation
+                self._session = None
+                self._terminal_session_id = (
+                    session.session_id if should_send else None
+                )
+                self._stats_accumulator.reset()
+                self._latest_outbound_stats = None
+                self._reset_runtime_health_locked()
+        if already_stopped:
+            if branch_generation is not None:
+                GLib.idle_add(self._stop_on_main_loop, branch_generation)
+            return
         if should_send and session is not None:
-            sent = self._send_stop_message_for(session)
+            sent = self._send_stop_message_for(
+                session,
+                WebRTCSignalingToken(
+                    stop_generation,
+                    session.session_id,
+                    terminal=True,
+                ),
+            )
             with self._stats_lock:
                 if self._stats_generation == stop_generation and self._session is None:
                     self._stop_sent = sent
@@ -533,9 +572,38 @@ class WebRTCUplinkController:
         # webrtcbin after remote signaling disappears leaves ICE/transceivers
         # and GStreamer sticky-event state behind, which can make the next RTP
         # session consume buffers before receiving a SEGMENT event.
-        self.stop(send_signal=False)
         with self._stats_lock:
+            branch_generation = self._branch.generation if self._branch else None
+            self._stats_generation += 1
+            self._session = None
+            self._terminal_session_id = None
             self._stop_sent = False
+            self._stats_accumulator.reset()
+            self._latest_outbound_stats = None
+            self._reset_runtime_health_locked()
+        if branch_generation is not None:
+            GLib.idle_add(self._stop_on_main_loop, branch_generation)
+
+    def is_signaling_token_current(self, token: WebRTCSignalingToken) -> bool:
+        if not isinstance(token, WebRTCSignalingToken):
+            return False
+        with self._stats_lock:
+            if token.generation != self._stats_generation:
+                return False
+            if token.terminal:
+                return bool(
+                    self._session is None
+                    and self._terminal_session_id == token.session_id
+                )
+            branch = self._branch
+            return bool(
+                self._session is not None
+                and self._session.session_id == token.session_id
+                and branch is not None
+                and branch.generation == token.generation
+                and branch.session_id == token.session_id
+                and not self._branch_cleanup_failed
+            )
 
     def _matches_session_locked(self, payload: dict[str, Any]) -> bool:
         session_id = str(payload.get("sessionId") or "").strip()
@@ -661,7 +729,7 @@ class WebRTCUplinkController:
             queue_sink_pad=queue_sink_pad,
             queue_src_pad=queue_src_pad,
             webrtc_sink_pad=webrtc_sink_pad,
-            signal_handler_ids=(),
+            signal_handler_ids=[],
         )
         with self._stats_lock:
             self._branch = branch
@@ -700,7 +768,6 @@ class WebRTCUplinkController:
             if queue_src_pad.link(webrtc_sink_pad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("failed to link queue to webrtcbin")
 
-            handler_ids: list[int] = []
             for signal_name, callback in (
                 ("on-ice-candidate", self._on_ice_candidate),
                 ("notify::connection-state", self._on_connection_state_changed),
@@ -709,7 +776,7 @@ class WebRTCUplinkController:
                     self._on_ice_connection_state_changed,
                 ),
             ):
-                handler_ids.append(
+                branch.signal_handler_ids.append(
                     webrtcbin.connect(
                         signal_name,
                         callback,
@@ -717,7 +784,6 @@ class WebRTCUplinkController:
                         session.session_id,
                     )
                 )
-                branch.signal_handler_ids = tuple(handler_ids)
 
             # Bring up downstream while it is still isolated, then attach the
             # tee request pad as the final operation. This guarantees that the
@@ -751,69 +817,100 @@ class WebRTCUplinkController:
             ):
                 return True
 
-        success = True
-        for handler_id in branch.signal_handler_ids:
+        for handler_id in tuple(branch.signal_handler_ids):
             try:
                 branch.webrtcbin.disconnect(handler_id)
-            except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-                success = False
+                branch.signal_handler_ids.remove(handler_id)
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
                 log.error("[WEBRTC-UPLINK] signal disconnect failed: %s", exc)
 
-        try:
-            if not _unlink_exact(branch.tee_src_pad, branch.queue_sink_pad):
-                success = False
-        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-            success = False
-            log.error("[WEBRTC-UPLINK] tee unlink failed: %s", exc)
-
-        try:
-            if self._uplink_tee is None:
-                success = False
-            else:
-                self._uplink_tee.release_request_pad(branch.tee_src_pad)
-        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-            success = False
-            log.error("[WEBRTC-UPLINK] tee request-pad release failed: %s", exc)
-
-        # Stop downstream before the queue. Stopping a live queue first can
-        # wait indefinitely for its src task while webrtcbin is still PLAYING.
-        for element in (branch.webrtcbin, branch.queue):
+        if not branch.tee_unlinked:
             try:
-                if element.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
-                    success = False
-            except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-                success = False
+                branch.tee_unlinked = _unlink_exact(
+                    branch.tee_src_pad,
+                    branch.queue_sink_pad,
+                )
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
+                log.error("[WEBRTC-UPLINK] tee unlink failed: %s", exc)
+
+        if branch.tee_unlinked and not branch.tee_pad_released:
+            try:
+                if self._uplink_tee is not None:
+                    self._uplink_tee.release_request_pad(branch.tee_src_pad)
+                    branch.tee_pad_released = True
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
+                log.error("[WEBRTC-UPLINK] tee request-pad release failed: %s", exc)
+
+        # Stop downstream before the queue. Each completion flag is monotonic:
+        # a later retry never repeats a successful request-pad release, handler
+        # disconnect, unlink, or bin removal.
+        for element, attribute in (
+            (branch.webrtcbin, "webrtc_stopped"),
+            (branch.queue, "queue_stopped"),
+        ):
+            if getattr(branch, attribute):
+                continue
+            try:
+                result = element.set_state(Gst.State.NULL)
+                if result != Gst.StateChangeReturn.FAILURE:
+                    setattr(branch, attribute, True)
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
                 log.error("[WEBRTC-UPLINK] element stop failed: %s", exc)
 
-        try:
-            if not _unlink_exact(branch.queue_src_pad, branch.webrtc_sink_pad):
-                success = False
-        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-            success = False
-            log.error("[WEBRTC-UPLINK] webrtc unlink failed: %s", exc)
+        if not branch.webrtc_unlinked:
+            try:
+                branch.webrtc_unlinked = _unlink_exact(
+                    branch.queue_src_pad,
+                    branch.webrtc_sink_pad,
+                )
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
+                log.error("[WEBRTC-UPLINK] webrtc unlink failed: %s", exc)
 
-        try:
-            branch.webrtcbin.release_request_pad(branch.webrtc_sink_pad)
-        except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-            success = False
-            log.error("[WEBRTC-UPLINK] webrtc request-pad release failed: %s", exc)
+        if branch.webrtc_unlinked and not branch.webrtc_pad_released:
+            try:
+                branch.webrtcbin.release_request_pad(branch.webrtc_sink_pad)
+                branch.webrtc_pad_released = True
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
+                log.error("[WEBRTC-UPLINK] webrtc request-pad release failed: %s", exc)
 
         pipeline = self._pipeline
-        if pipeline is None:
-            success = False
-        else:
-            for element in (branch.queue, branch.webrtcbin):
-                try:
+        for element, stopped, prerequisites, attribute in (
+            (
+                branch.queue,
+                branch.queue_stopped,
+                branch.tee_pad_released and branch.webrtc_unlinked,
+                "queue_removed",
+            ),
+            (
+                branch.webrtcbin,
+                branch.webrtc_stopped,
+                branch.webrtc_pad_released,
+                "webrtc_removed",
+            ),
+        ):
+            if getattr(branch, attribute) or not stopped or not prerequisites:
+                continue
+            try:
+                parent = element.get_parent()
+                if parent is pipeline and pipeline is not None:
+                    pipeline.remove(element)
                     parent = element.get_parent()
-                    if parent is pipeline:
-                        pipeline.remove(element)
-                        if element.get_parent() is not None:
-                            success = False
-                    elif parent is not None and parent is not pipeline:
-                        success = False
-                except Exception as exc:  # noqa: BLE001 - continue the full teardown.
-                    success = False
-                    log.error("[WEBRTC-UPLINK] element removal failed: %s", exc)
+                if parent is None:
+                    setattr(branch, attribute, True)
+            except Exception as exc:  # noqa: BLE001 - retry only this resource later.
+                log.error("[WEBRTC-UPLINK] element removal failed: %s", exc)
+
+        success = bool(
+            not branch.signal_handler_ids
+            and branch.tee_unlinked
+            and branch.tee_pad_released
+            and branch.webrtc_stopped
+            and branch.queue_stopped
+            and branch.webrtc_unlinked
+            and branch.webrtc_pad_released
+            and branch.queue_removed
+            and branch.webrtc_removed
+        )
 
         with self._stats_lock:
             if self._branch is branch:
@@ -838,6 +935,7 @@ class WebRTCUplinkController:
         session_id: str,
     ) -> None:
         session_to_signal: WebRTCUplinkSession | None = None
+        stop_token: WebRTCSignalingToken | None = None
         with self._stats_lock:
             if (
                 generation != self._stats_generation
@@ -848,6 +946,7 @@ class WebRTCUplinkController:
             session = self._session
             self._session = None
             self._stats_generation += 1
+            stop_generation = self._stats_generation
             self._stats_accumulator.reset()
             self._latest_outbound_stats = None
             self._reset_runtime_health_locked()
@@ -855,8 +954,16 @@ class WebRTCUplinkController:
             self._ice_connection_state = "failed"
             if not self._stop_sent:
                 session_to_signal = session
-        if session_to_signal is not None:
-            self._send_stop_message_for(session_to_signal)
+                self._terminal_session_id = session.session_id
+                stop_token = WebRTCSignalingToken(
+                    stop_generation,
+                    session.session_id,
+                    terminal=True,
+                )
+            else:
+                self._terminal_session_id = None
+        if session_to_signal is not None and stop_token is not None:
+            self._send_stop_message_for(session_to_signal, stop_token)
 
     def _stop_on_main_loop(self, branch_generation: int) -> bool:
         self._teardown_branch_on_main_loop(branch_generation)
@@ -990,7 +1097,15 @@ class WebRTCUplinkController:
                 session_id,
                 sdp=sdp_text,
             )
-        self._send_message(WEBRTC_UPLINK_OFFER_DEST, payload, True)
+            signaling_token = WebRTCSignalingToken(generation, session_id)
+        if not self.is_signaling_token_current(signaling_token):
+            return
+        self._send_message(
+            WEBRTC_UPLINK_OFFER_DEST,
+            payload,
+            True,
+            signaling_token,
+        )
         log.info(
             "[WEBRTC-UPLINK] sent SDP offer. sessionId=%s generation=%s",
             session_id,
@@ -1039,7 +1154,15 @@ class WebRTCUplinkController:
                 sdpMLineIndex=int(mline_index),
                 sdpMid="video",
             )
-        self._send_message(WEBRTC_UPLINK_ICE_CANDIDATE_DEST, payload, False)
+            signaling_token = WebRTCSignalingToken(generation, session_id)
+        if not self.is_signaling_token_current(signaling_token):
+            return
+        self._send_message(
+            WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+            payload,
+            False,
+            signaling_token,
+        )
 
     def _on_connection_state_changed(
         self,
@@ -1101,7 +1224,13 @@ class WebRTCUplinkController:
         if state_nick in {"failed", "closed", "disconnected"}:
             self.stop(send_signal=not stop_sent)
 
-    def _send_stop_message_for(self, session: WebRTCUplinkSession) -> bool:
+    def _send_stop_message_for(
+        self,
+        session: WebRTCUplinkSession,
+        signaling_token: WebRTCSignalingToken,
+    ) -> bool:
+        if not self.is_signaling_token_current(signaling_token):
+            return False
         payload = build_uplink_payload(
             WEBRTC_UPLINK_STOP,
             session.broadcast_id,
@@ -1111,6 +1240,7 @@ class WebRTCUplinkController:
             WEBRTC_UPLINK_STOP_DEST,
             payload,
             False,
+            signaling_token,
         )
 
 

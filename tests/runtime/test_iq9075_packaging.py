@@ -231,6 +231,7 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("G_DEBUG=fatal-criticals", e2e)
         self.assertIn("WebRTCUplinkController", e2e)
         self.assertIn("controller.on_signaling_reset()", e2e)
+        self.assertIn("partial teardown did not recover idempotently", e2e)
         self.assertIn('"webrtc_uplink_session_5"', e2e)
         self.assertIn("Gst.MessageType.ERROR | Gst.MessageType.WARNING", e2e)
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)

@@ -127,7 +127,10 @@ from nuvion_app.inference.webrtc_signaling import (
     negotiate_stomp_send_interval_ms,
     parse_command_payload,
 )
-from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
+from nuvion_app.inference.webrtc_uplink import (
+    WebRTCSignalingToken,
+    WebRTCUplinkController,
+)
 
 # Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
 # SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
@@ -484,11 +487,32 @@ AGENT_RETRY_DESTINATIONS = {
     WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
     WEBRTC_UPLINK_STOP_DEST,
 }
+WEBRTC_SIGNALING_DESTINATIONS = frozenset(
+    {
+        WEBRTC_UPLINK_OFFER_DEST,
+        WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+        WEBRTC_UPLINK_STOP_DEST,
+    }
+)
 
 websocket: websockets.WebSocketClientProtocol | None = None
 g_app = None
 signaling_loop: asyncio.AbstractEventLoop | None = None
-outbound_queue: asyncio.Queue | None = None
+@dataclass(frozen=True)
+class _OutboundMessage:
+    destination: str
+    payload: dict
+    event_id: str | None = None
+    signaling_token: WebRTCSignalingToken | None = None
+
+
+@dataclass(frozen=True)
+class _CachedPayload:
+    payload: dict
+    signaling_token: WebRTCSignalingToken | None = None
+
+
+outbound_queue: asyncio.Queue[_OutboundMessage] | None = None
 auth_token: str | None = None
 auth_token_lock = threading.Lock()
 agent_uplink_blocked = False
@@ -496,8 +520,9 @@ agent_uplink_block_reason = ""
 agent_uplink_lock = threading.Lock()
 agent_retry_attempts: dict[str, int] = {}
 agent_retry_lock = threading.Lock()
-last_sent_payloads: dict[str, dict] = {}
+last_sent_payloads: dict[str, _CachedPayload] = {}
 last_sent_payloads_lock = threading.Lock()
+webrtc_retry_tasks: set[asyncio.Task[None]] = set()
 critical_event_delivery: DurableEventDelivery | None = None
 critical_event_outbox_init_attempted = False
 critical_event_outbox_lock = threading.Lock()
@@ -883,19 +908,75 @@ def _clone_payload(payload: dict) -> dict:
     return json.loads(json.dumps(payload))
 
 
-def _remember_last_payload(destination: str, payload: dict) -> None:
+def _remember_last_payload(
+    destination: str,
+    payload: dict,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> None:
     if destination not in AGENT_RETRY_DESTINATIONS:
         return
     with last_sent_payloads_lock:
-        last_sent_payloads[destination] = _clone_payload(payload)
+        last_sent_payloads[destination] = _CachedPayload(
+            _clone_payload(payload),
+            signaling_token,
+        )
 
 
-def _get_last_payload(destination: str) -> dict | None:
+def _get_last_payload(destination: str) -> _CachedPayload | None:
     with last_sent_payloads_lock:
-        payload = last_sent_payloads.get(destination)
-        if payload is None:
+        cached = last_sent_payloads.get(destination)
+        if cached is None:
             return None
-        return _clone_payload(payload)
+        return _CachedPayload(
+            _clone_payload(cached.payload),
+            cached.signaling_token,
+        )
+
+
+def _is_signaling_token_current(token: WebRTCSignalingToken | None) -> bool:
+    if token is None:
+        return True
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    validator = getattr(controller, "is_signaling_token_current", None)
+    return bool(callable(validator) and validator(token))
+
+
+def _purge_webrtc_outbound_queue() -> int:
+    """Drop only volatile WebRTC frames; durable event envelopes are retained."""
+
+    pending = outbound_queue
+    if pending is None:
+        return 0
+    retained: list[_OutboundMessage] = []
+    dropped = 0
+    while True:
+        try:
+            item = pending.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item.destination in WEBRTC_SIGNALING_DESTINATIONS:
+            dropped += 1
+        else:
+            retained.append(item)
+        pending.task_done()
+    for item in retained:
+        pending.put_nowait(item)
+    return dropped
+
+
+def _reset_webrtc_signaling_transport() -> None:
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    if controller is not None:
+        controller.on_signaling_reset()
+    with last_sent_payloads_lock:
+        for destination in WEBRTC_SIGNALING_DESTINATIONS:
+            last_sent_payloads.pop(destination, None)
+    for task in tuple(webrtc_retry_tasks):
+        task.cancel()
+    webrtc_retry_tasks.clear()
+    dropped = _purge_webrtc_outbound_queue()
+    if dropped:
+        log.info("[WEBRTC-UPLINK] discarded stale queued signaling frames=%d", dropped)
 
 
 def _set_agent_uplink_blocked(blocked: bool, reason: str = "") -> None:
@@ -939,8 +1020,7 @@ def _reset_agent_ws_state() -> None:
         agent_retry_attempts.clear()
     if critical_event_delivery is not None:
         critical_event_delivery.reset_for_reconnect()
-    if g_app and getattr(g_app, "webrtc_uplink", None):
-        g_app.webrtc_uplink.on_signaling_reset()
+    _reset_webrtc_signaling_transport()
 
 
 def _set_update_commit_signaling_ready(ready: bool) -> None:
@@ -1072,7 +1152,14 @@ def initialize_durable_event_outbox() -> DurableEventDelivery | None:
         return critical_event_delivery
 
 
-def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None = None) -> bool:
+def _try_enqueue_outbound(
+    destination: str,
+    payload: dict,
+    event_id: str | None = None,
+    *,
+    signaling_token: WebRTCSignalingToken | None = None,
+    remember: bool = False,
+) -> bool:
     if outbound_queue is None or signaling_loop is None:
         return False
     completed = threading.Event()
@@ -1081,9 +1168,19 @@ def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None 
 
     def _enqueue() -> None:
         try:
-            if cancelled.is_set():
+            if cancelled.is_set() or not _is_signaling_token_current(signaling_token):
+                enqueued.append(False)
                 return
-            outbound_queue.put_nowait((destination, _clone_payload(payload), event_id))
+            outbound_queue.put_nowait(
+                _OutboundMessage(
+                    destination,
+                    _clone_payload(payload),
+                    event_id,
+                    signaling_token,
+                )
+            )
+            if remember:
+                _remember_last_payload(destination, payload, signaling_token)
             enqueued.append(True)
         except asyncio.QueueFull:
             enqueued.append(False)
@@ -1107,14 +1204,28 @@ def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None 
     return bool(enqueued and enqueued[0])
 
 
-def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
+def enqueue_stomp_message(
+    destination: str,
+    payload: dict,
+    remember: bool = True,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> bool:
     if _is_agent_uplink_blocked(destination):
         return False
-    if not _try_enqueue_outbound(destination, payload):
+    if destination in WEBRTC_SIGNALING_DESTINATIONS and signaling_token is None:
+        log.error("[STOMP] unscoped WebRTC signaling frame rejected=%s", destination)
+        return False
+    if signaling_token is not None and destination not in WEBRTC_SIGNALING_DESTINATIONS:
+        log.error("[STOMP] signaling token used for non-WebRTC destination=%s", destination)
+        return False
+    if not _try_enqueue_outbound(
+        destination,
+        payload,
+        signaling_token=signaling_token,
+        remember=remember,
+    ):
         log.warning("[STOMP] outbound unavailable or full for %s", destination)
         return False
-    if remember:
-        _remember_last_payload(destination, payload)
     return True
 
 
@@ -1555,7 +1666,17 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
     if outbound_queue is None:
         return
     while True:
-        destination, payload, event_id = await outbound_queue.get()
+        message = await outbound_queue.get()
+        destination = message.destination
+        payload = message.payload
+        event_id = message.event_id
+        if not _is_signaling_token_current(message.signaling_token):
+            outbound_queue.task_done()
+            log.info(
+                "[WEBRTC-UPLINK] dropped stale signaling frame before send destination=%s",
+                destination,
+            )
+            continue
         if (
             event_id
             and critical_event_delivery is not None
@@ -1687,9 +1808,15 @@ async def _enqueue_retry_after_delay(
     attempt: int,
     max_attempts: int,
     code: str,
+    signaling_token: WebRTCSignalingToken | None = None,
 ) -> None:
     await asyncio.sleep(delay_sec)
-    enqueued = enqueue_stomp_message(destination, payload, remember=False)
+    enqueued = enqueue_stomp_message(
+        destination,
+        payload,
+        remember=False,
+        signaling_token=signaling_token,
+    )
     if enqueued:
         log.warning(
             "[AGENT-ERROR] retry sent destination=%s code=%s attempt=%d/%d",
@@ -1758,8 +1885,8 @@ async def handle_agent_error(body: str) -> None:
             )
             return
 
-        last_payload = _get_last_payload(path)
-        if last_payload is None:
+        cached = _get_last_payload(path)
+        if cached is None:
             log.warning(
                 "[AGENT-ERROR][retryable] no cached payload. code=%s path=%s message=%s",
                 code,
@@ -1791,16 +1918,20 @@ async def handle_agent_error(body: str) -> None:
             message,
             detail,
         )
-        asyncio.create_task(
+        retry_task = asyncio.create_task(
             _enqueue_retry_after_delay(
                 destination=path,
-                payload=last_payload,
+                payload=cached.payload,
                 delay_sec=delay_sec,
                 attempt=attempt,
                 max_attempts=AGENT_ERROR_MAX_RETRIES,
                 code=code,
+                signaling_token=cached.signaling_token,
             )
         )
+        if path in WEBRTC_SIGNALING_DESTINATIONS:
+            webrtc_retry_tasks.add(retry_task)
+            retry_task.add_done_callback(webrtc_retry_tasks.discard)
         return
 
     _reset_agent_retry_attempt(path)
@@ -2135,12 +2266,10 @@ async def signaling_client_main():
             log.error("[SIGNALING] WebSocket error: %s", exc)
         finally:
             _set_update_commit_signaling_ready(False)
-            controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
-            if controller is not None:
-                # A transport reconnect is an exact WebRTC generation boundary.
-                # Tear down the disposable media branch immediately instead of
-                # retaining stale ICE/SDP and sticky-event state until re-login.
-                controller.on_signaling_reset()
+            # A transport reconnect is an exact WebRTC generation boundary.
+            # Invalidate the media branch and every volatile signaling envelope,
+            # cache entry and delayed retry before a new socket can consume them.
+            _reset_webrtc_signaling_transport()
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
@@ -3370,8 +3499,19 @@ class GStreamerInferenceApp:
             self.shutdown()
         return True
 
-    def send_webrtc_signal(self, destination: str, payload: dict, remember: bool) -> bool:
-        return enqueue_stomp_message(destination, payload, remember=remember)
+    def send_webrtc_signal(
+        self,
+        destination: str,
+        payload: dict,
+        remember: bool,
+        signaling_token: WebRTCSignalingToken,
+    ) -> bool:
+        return enqueue_stomp_message(
+            destination,
+            payload,
+            remember=remember,
+            signaling_token=signaling_token,
+        )
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()

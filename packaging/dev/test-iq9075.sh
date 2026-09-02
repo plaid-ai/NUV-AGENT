@@ -102,7 +102,7 @@ pipeline = Gst.parse_launch(
 )
 sent = []
 controller = WebRTCUplinkController(
-    send_message=lambda destination, payload, remember: (
+    send_message=lambda destination, payload, remember, _token: (
         sent.append((destination, payload["sessionId"], remember)) or True
     )
 )
@@ -144,6 +144,17 @@ loop.run()
 health = controller.runtime_health_snapshot()
 if controller._branch is not None:
     branch_names.append(controller._branch.webrtcbin.get_name())
+# Force one partial teardown after request-pad releases, then retry the same
+# branch. G_DEBUG=fatal-criticals makes any repeated release_request_pad fatal.
+controller._pipeline = None
+first_teardown = controller._teardown_branch_on_main_loop()
+controller._pipeline = pipeline
+second_teardown = controller._teardown_branch_on_main_loop()
+if first_teardown or not second_teardown:
+    raise RuntimeError(
+        "WebRTC partial teardown did not recover idempotently: "
+        f"first={first_teardown} second={second_teardown}"
+    )
 controller.stop(send_signal=False)
 context = GLib.MainContext.default()
 while context.pending():

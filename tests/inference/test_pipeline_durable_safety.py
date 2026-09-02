@@ -145,6 +145,138 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIsNone(pipeline.update_commit_signaling_ready_since)
         self.assertIsNone(pipeline.update_commit_stomp_last_send_at)
 
+    def test_signaling_reset_purges_only_volatile_webrtc_transport_state(self) -> None:
+        async def scenario() -> None:
+            token = pipeline.WebRTCSignalingToken(7, "session-old")
+            pending: asyncio.Queue[pipeline._OutboundMessage] = asyncio.Queue()
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    {"sessionId": "session-old"},
+                    signaling_token=token,
+                )
+            )
+            durable = pipeline._OutboundMessage(
+                "/app/device/state",
+                {"state": "RUNNING"},
+                event_id="durable-event-1",
+            )
+            pending.put_nowait(durable)
+            retry = asyncio.create_task(asyncio.sleep(60))
+            controller = types.SimpleNamespace(
+                reset_count=0,
+                on_signaling_reset=lambda: setattr(
+                    controller, "reset_count", controller.reset_count + 1
+                ),
+            )
+            with (
+                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(pipeline, "outbound_queue", pending),
+                mock.patch.object(pipeline, "last_sent_payloads", {}),
+                mock.patch.object(pipeline, "webrtc_retry_tasks", {retry}),
+            ):
+                pipeline._remember_last_payload(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    {"sessionId": "session-old"},
+                    token,
+                )
+                pipeline._remember_last_payload(
+                    "/app/device/state",
+                    {"state": "RUNNING"},
+                )
+
+                pipeline._reset_webrtc_signaling_transport()
+                await asyncio.sleep(0)
+
+                self.assertEqual(controller.reset_count, 1)
+                self.assertTrue(retry.cancelled())
+                self.assertNotIn(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    pipeline.last_sent_payloads,
+                )
+                self.assertIn("/app/device/state", pipeline.last_sent_payloads)
+                self.assertIs(pending.get_nowait(), durable)
+                self.assertTrue(pending.empty())
+
+        asyncio.run(scenario())
+
+    def test_unscoped_webrtc_signaling_cannot_bypass_generation_validation(self) -> None:
+        self.assertFalse(
+            pipeline.enqueue_stomp_message(
+                pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                {"sessionId": "unscoped"},
+            )
+        )
+
+    def test_outbound_sender_revalidates_token_without_dropping_durable_event(self) -> None:
+        async def scenario() -> None:
+            stale = pipeline.WebRTCSignalingToken(3, "session-old")
+            pending: asyncio.Queue[pipeline._OutboundMessage] = asyncio.Queue()
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                    {"sessionId": "session-old"},
+                    signaling_token=stale,
+                )
+            )
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    "/app/device/state",
+                    {"state": "RUNNING"},
+                    event_id="durable-event-1",
+                )
+            )
+            sent = asyncio.Event()
+
+            class _WebSocket:
+                def __init__(self) -> None:
+                    self.frames: list[str] = []
+
+                async def send(self, frame: str) -> None:
+                    self.frames.append(frame)
+                    sent.set()
+
+            class _Outbox:
+                @staticmethod
+                def is_pending(_event_id: str) -> bool:
+                    return True
+
+            class _Delivery:
+                outbox = _Outbox()
+
+                def __init__(self) -> None:
+                    self.marked: list[str] = []
+
+                def mark_sent(self, event_id: str) -> None:
+                    self.marked.append(event_id)
+
+                @staticmethod
+                def release(_event_id: str) -> None:
+                    return None
+
+            delivery = _Delivery()
+            controller = types.SimpleNamespace(
+                is_signaling_token_current=lambda _token: False
+            )
+            websocket = _WebSocket()
+            with (
+                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(pipeline, "outbound_queue", pending),
+                mock.patch.object(pipeline, "critical_event_delivery", delivery),
+            ):
+                sender = asyncio.create_task(pipeline.outbound_sender(websocket))
+                await asyncio.wait_for(sent.wait(), timeout=1)
+                sender.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await sender
+
+            self.assertEqual(len(websocket.frames), 1)
+            self.assertIn("/app/device/state", websocket.frames[0])
+            self.assertNotIn("session-old", websocket.frames[0])
+            self.assertEqual(delivery.marked, ["durable-event-1"])
+
+        asyncio.run(scenario())
+
     def test_config_label_array_storage_round_trips_without_csv_loss(self) -> None:
         labels = ["scratch,edge", "한글 label"]
         encoded = config_env_updates(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ast
 import hashlib
 import importlib.util
 import json
@@ -808,6 +809,27 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_completed_cleanup_releases_lease_left_by_final_crash_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision()
+                self.assertTrue(fixture.harness.cleanup(fixture.run_id)["complete"])
+                self.assertFalse(fixture.paths.active_run.exists())
+
+                # Recreate the only externally visible state of a crash between
+                # saving cleanup.complete and releasing the persistent lease.
+                fixture.harness._claim_active_run(fixture.run_id)
+                self.assertTrue(fixture.paths.active_run.exists())
+
+                resumed = fixture.harness.cleanup(fixture.run_id)
+
+                self.assertTrue(resumed["complete"])
+                self.assertTrue(resumed["idempotent"])
+                self.assertFalse(fixture.paths.active_run.exists())
+            finally:
+                fixture.close()
+
     def test_invalid_private_like_staging_is_removed_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
@@ -1057,6 +1079,66 @@ class PollingRunTransport:
 
 
 class Iq9075FleetHostHarnessTest(unittest.TestCase):
+    def test_host_cleanup_rejects_incomplete_board_restore(self) -> None:
+        class IncompleteCleanupTransport(FakeTransport):
+            def invoke_board(
+                self,
+                command: str,
+                arguments: Sequence[str] = (),
+                *,
+                timeout: float = 90,
+            ) -> dict[str, Any]:
+                del arguments, timeout
+                self.calls += 1
+                self.assert_cleanup_command = command
+                return {
+                    "schemaVersion": 1,
+                    "runId": run_id,
+                    "complete": False,
+                    "recovered": False,
+                    "phase": "RESTORING",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = str(uuid.uuid4())
+            output = Path(directory) / run_id
+            output.mkdir()
+            transport = IncompleteCleanupTransport()
+            runner = HOST.FleetRunner(
+                transport=transport,
+                journal=HOST.HostJournal(
+                    output / "journal.json",
+                    run_id=run_id,
+                    host="iq9075",
+                    fingerprint=HOST.DEFAULT_FINGERPRINT,
+                ),
+                output_dir=output,
+                run_id=run_id,
+            )
+
+            with self.assertRaisesRegex(HOST.RunnerError, "exact restored state"):
+                runner.cleanup()
+
+            self.assertEqual(transport.calls, 1)
+            self.assertEqual(transport.assert_cleanup_command, "cleanup")
+
+    def test_host_cleanup_accepts_only_exact_success_contract(self) -> None:
+        run_id = str(uuid.uuid4())
+        exact = {
+            "schemaVersion": 1,
+            "runId": run_id,
+            "complete": True,
+            "recovered": False,
+            "phase": "RESTORED",
+            "idempotent": True,
+        }
+
+        HOST.validate_cleanup_result(exact, run_id=run_id)
+        with self.assertRaises(HOST.RunnerError):
+            HOST.validate_cleanup_result({**exact, "unexpected": True}, run_id=run_id)
+        with self.assertRaises(HOST.RunnerError):
+            HOST.validate_cleanup_result(exact, run_id=str(uuid.uuid4()))
+
     def _known_hosts(self, root: Path) -> tuple[Path, str]:
         key = b"deterministic-iq9075-host-public-key"
         encoded = base64.b64encode(key).decode()
@@ -1367,12 +1449,102 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             'control("Architecture")',
             'UPDATER_VERSION != "0.2.0"',
             '"otaEvidence": False',
-            '"servicesInactive": True',
+            'evidence["servicesInactive"] = True',
         ):
             self.assertIn(required, HOST.BOOTSTRAP_REMOTE_PROGRAM)
         self.assertNotIn("shell=True", HOST.BOOTSTRAP_REMOTE_PROGRAM)
+        self.assertIn(
+            "cleanup_failures.extend(quiesce_runtime())",
+            HOST.BOOTSTRAP_REMOTE_PROGRAM,
+        )
         help_text = HOST.build_parser().format_help()
         self.assertIn("bootstrap-updater", help_text)
+
+    def test_bootstrap_quiesce_attempts_every_unit_and_preserves_both_errors(
+        self,
+    ) -> None:
+        syntax = ast.parse(HOST.BOOTSTRAP_REMOTE_PROGRAM)
+        functions = {
+            node.name: node
+            for node in syntax.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"quiesce_runtime", "bootstrap_failure_message"}
+        }
+        self.assertEqual(
+            set(functions),
+            {"quiesce_runtime", "bootstrap_failure_message"},
+        )
+
+        class FakeSubprocess:
+            DEVNULL = object()
+            PIPE = object()
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def run(self, argv: Sequence[str], **_kwargs: object) -> object:
+                action, unit = argv[1], argv[2]
+                self.calls.append((action, unit))
+                if action in {"stop", "disable"}:
+                    return SimpleNamespace(
+                        returncode=(
+                            1
+                            if (action, unit)
+                            == ("stop", "nuv-agent.service")
+                            else 0
+                        ),
+                        stdout="",
+                    )
+                return SimpleNamespace(
+                    returncode=3 if action == "is-active" else 1,
+                    stdout="inactive\n" if action == "is-active" else "disabled\n",
+                )
+
+        fake = FakeSubprocess()
+        namespace: dict[str, object] = {
+            "subprocess": fake,
+            "RUNTIME_UNITS": (
+                "nuv-agent.service",
+                "nuv-agent-updater.socket",
+                "nuv-agent-updater.service",
+            ),
+        }
+        extracted = ast.Module(body=list(functions.values()), type_ignores=[])
+        ast.fix_missing_locations(extracted)
+        exec(compile(extracted, "<bootstrap-functions>", "exec"), namespace)
+
+        errors = namespace["quiesce_runtime"]()
+        message = namespace["bootstrap_failure_message"](
+            "INSTALL_FAILED",
+            errors,
+        )
+
+        for unit in namespace["RUNTIME_UNITS"]:
+            self.assertIn(("stop", unit), fake.calls)
+            self.assertIn(("disable", unit), fake.calls)
+            self.assertIn(("is-active", unit), fake.calls)
+            self.assertIn(("is-enabled", unit), fake.calls)
+        self.assertIn("nuv-agent.service:stop:rc1", errors)
+        self.assertIn("primary=INSTALL_FAILED", message)
+        self.assertIn("cleanup=nuv-agent.service:stop:rc1", message)
+
+        safe_detail = (
+            "out-of-band updater bootstrap failed: primary=INSTALL_FAILED; "
+            "cleanup=nuv-agent.service:stop:rc1"
+        )
+        with self.assertRaisesRegex(
+            HOST.RunnerError,
+            "primary=INSTALL_FAILED.*cleanup=nuv-agent.service:stop:rc1",
+        ):
+            HOST.OpenSshTransport._parse_result(
+                HOST.ProcessResult(1, b"", (safe_detail + "\n").encode()),
+                operation="out-of-band-updater-bootstrap",
+            )
+        with self.assertRaisesRegex(HOST.RunnerError, "remote operation failed"):
+            HOST.OpenSshTransport._parse_result(
+                HOST.ProcessResult(1, b"", b"password=must-not-surface\n"),
+                operation="out-of-band-updater-bootstrap",
+            )
 
     def test_deb_installs_root_owned_board_tool_at_fixed_path(self) -> None:
         build = (ROOT / "packaging/deb/build-deb.sh").read_text(encoding="utf-8")

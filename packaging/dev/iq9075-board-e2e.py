@@ -2738,6 +2738,19 @@ class BoardHarness:
         with self._run_lock(run_id, usb=True, allow_unclaimed=True):
             state = self._load_state(run_id)
             if state.get("cleanup", {}).get("complete") is True:
+                fault = state.get("oakFault")
+                transaction = state.get("trustTransaction")
+                if (
+                    isinstance(fault, Mapping)
+                    and fault.get("armed") is True
+                ) or (
+                    isinstance(transaction, Mapping)
+                    and transaction.get("phase") != "RESTORED"
+                ):
+                    raise HarnessError("completed cleanup journal is not restored")
+                self._purge_run_sensitive_material(run_id)
+                if self.paths.active_run.exists() or self.paths.active_run.is_symlink():
+                    self._release_active_run(run_id)
                 return {
                     "schemaVersion": 1,
                     "runId": run_id,
@@ -2788,10 +2801,10 @@ class BoardHarness:
             )
             if complete:
                 self._purge_run_sensitive_material(run_id)
-                state["cleanup"] = {"complete": True, "completedAt": self.clock()}
-                self._save_state(run_id, state)
                 if self.paths.active_run.exists() or self.paths.active_run.is_symlink():
                     self._release_active_run(run_id)
+                state["cleanup"] = {"complete": True, "completedAt": self.clock()}
+                self._save_state(run_id, state)
             return {
                 "schemaVersion": 1,
                 "runId": run_id,
