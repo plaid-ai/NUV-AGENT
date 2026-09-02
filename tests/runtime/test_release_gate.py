@@ -305,7 +305,12 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
-        self.assertNotIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO", macos)
+        self.assertIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0", macos)
+        self.assertEqual(macos.count("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"), 1)
+        self.assertIn(
+            'os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"',
+            macos,
+        )
         self.assertIn("detector._inference_dtype == torch.float16", macos)
         self.assertIn(
             'detector._model.__class__.__name__ == "SiglipVisionModel"', macos

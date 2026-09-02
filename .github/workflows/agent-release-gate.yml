@@ -354,7 +354,12 @@ jobs:
           [ "$(shasum -a 256 "$REFERENCE_PATH" | awk '{print $1}')" = "$REFERENCE_SHA256" ]
           chmod 0600 "$REFERENCE_PATH"
           cd "$RUNNER_TEMP"
-          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
+          # GitHub's 8 GiB image can trip PyTorch's conservative dynamic
+          # watermark after Formula/model file I/O. This is scoped to the
+          # ephemeral proof process; parity and strict active/driver/delta
+          # bounds below still reject actual MPS over-allocation or growth.
+          PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 \
+            PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
           import json
           import math
           import os
@@ -370,6 +375,7 @@ jobs:
           formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
           reference_path = Path(os.environ["REFERENCE_PATH"])
           package_path = Path(nuvion_app.__file__).resolve()
+          assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"
           assert package_path.is_relative_to(formula_prefix / "libexec")
           assert torch.backends.mps.is_available()
           assert path.name == revision
