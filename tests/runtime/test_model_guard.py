@@ -10,6 +10,14 @@ from nuvion_app.runtime import model_guard
 
 
 class ModelGuardTest(unittest.TestCase):
+    def setUp(self) -> None:
+        environment = mock.patch.dict(os.environ, {}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for key in list(os.environ):
+            if key == "NUV_AGENT_CONFIG" or key.startswith("NUVION_"):
+                os.environ.pop(key, None)
+
     def test_resolve_effective_profile_darwin_override(self) -> None:
         with mock.patch.object(model_guard, "_should_use_full_triton_profile", return_value=True):
             with mock.patch.object(model_guard, "_is_darwin", return_value=True):

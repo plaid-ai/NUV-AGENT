@@ -14,6 +14,17 @@ from nuvion_app.runtime.config_guard import (
 
 
 class ConfigGuardTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Production intentionally treats process environment as an operator override. Keep this
+        # module hermetic when the full unittest suite has imported runtime code that populated
+        # NUVION_* values earlier in the same interpreter.
+        environment = mock.patch.dict(os.environ, {}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for key in list(os.environ):
+            if key == "NUV_AGENT_CONFIG" or key.startswith("NUVION_"):
+                os.environ.pop(key, None)
+
     def test_current_schema_is_version_12_for_depthai_camera_contract(self) -> None:
         self.assertEqual(CURRENT_CONFIG_SCHEMA_VERSION, "12")
         template = (
