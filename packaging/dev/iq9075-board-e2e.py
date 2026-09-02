@@ -31,7 +31,10 @@ from typing import Any
 PROTOCOL_VERSION = "iq9075-fleet-e2e-v2"
 REQUIRED_UPDATER_VERSION = "0.2.0"
 TRUST_DOMAIN = "iq9075-dev"
-USB_PORT = "2-1"
+USB_ROOT_HUB = "2-1"
+USB_TOPOLOGY_RE = re.compile(
+    rf"^{re.escape(USB_ROOT_HUB)}(?:\.[1-9][0-9]*)+$"
+)
 OAK_VENDOR = "03e7"
 OAK_PRODUCT = "f63b"
 OAK_MIN_SPEED_MBPS = 5000.0
@@ -219,7 +222,7 @@ class BoardPaths:
     global_fleet_lock: Path
     global_usb_lock: Path
     active_run: Path
-    usb_device: Path
+    usb_devices: Path
     usb_unbind: Path
     usb_bind: Path
     os_release: Path
@@ -242,7 +245,7 @@ class BoardPaths:
             global_fleet_lock=p("/run/lock/nuvion-fleet-e2e.lock"),
             global_usb_lock=p("/run/lock/nuvion-oak-e2e.lock"),
             active_run=p("/var/lib/nuvion-fleet-e2e/active-run.json"),
-            usb_device=p("/sys/bus/usb/devices/2-1"),
+            usb_devices=p("/sys/bus/usb/devices"),
             usb_unbind=p("/sys/bus/usb/drivers/usb/unbind"),
             usb_bind=p("/sys/bus/usb/drivers/usb/bind"),
             os_release=p("/etc/os-release"),
@@ -289,6 +292,13 @@ def canonical_run_id(value: str) -> str:
     if normalized != value or not RUN_ID_RE.fullmatch(normalized):
         raise HarnessError("runId must be a canonical UUIDv4")
     return normalized
+
+
+def canonical_oak_port(value: object) -> str:
+    port = str(value or "").strip()
+    if USB_TOPOLOGY_RE.fullmatch(port) is None:
+        raise HarnessError("OAK USB topology is outside the USB1 downstream hub")
+    return port
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -705,7 +715,7 @@ class BoardHarness:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         disk_usage: Callable[[str | Path], Any] = shutil.disk_usage,
-        usb_write_hook: Callable[[str], None] | None = None,
+        usb_write_hook: Callable[[str, str], None] | None = None,
     ) -> None:
         self.paths = paths or BoardPaths.from_root()
         self.runner = runner or CommandRunner()
@@ -1109,16 +1119,65 @@ class BoardHarness:
             return version
         return str(self._release_marker(target)["agentVersion"])
 
-    def verify_oak(self, *, require_bound: bool = True) -> dict[str, object]:
-        device = self.paths.usb_device
+    def _usb_device_path(self, port: str) -> Path:
+        return self.paths.usb_devices / canonical_oak_port(port)
+
+    def _oak_usb_devices(self) -> list[Path]:
+        devices_root = self.paths.usb_devices
+        metadata = devices_root.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise HarnessError("USB sysfs devices root is unsafe")
+        sys_root = (self.paths.root / "sys").resolve(strict=True)
+        matches: list[Path] = []
+        for device in sorted(devices_root.iterdir(), key=lambda item: item.name):
+            if USB_TOPOLOGY_RE.fullmatch(device.name) is None:
+                continue
+            metadata = device.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    resolved = device.resolve(strict=True)
+                except OSError as exc:
+                    raise HarnessError(
+                        "OAK USB topology endpoint is unavailable"
+                    ) from exc
+                if not resolved.is_dir() or not resolved.is_relative_to(sys_root):
+                    raise HarnessError("OAK USB topology endpoint is unsafe")
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise HarnessError("OAK USB topology endpoint is unsafe")
+            vendor_path = device / "idVendor"
+            product_path = device / "idProduct"
+            if not vendor_path.exists() or not product_path.exists():
+                continue
+            vendor_payload, _ = read_regular(vendor_path, maximum=128)
+            product_payload, _ = read_regular(product_path, maximum=128)
+            vendor = vendor_payload.decode("ascii", errors="strict").strip().lower()
+            product = product_payload.decode("ascii", errors="strict").strip().lower()
+            if (vendor, product) == (OAK_VENDOR, OAK_PRODUCT):
+                matches.append(device)
+        if len(matches) != 1:
+            raise HarnessError(
+                "USB1 downstream must contain exactly one OAK-D Lite"
+            )
+        return matches
+
+    def verify_oak(
+        self,
+        *,
+        require_bound: bool = True,
+        expected_port: str | None = None,
+    ) -> dict[str, object]:
+        expected = canonical_oak_port(expected_port) if expected_port else None
+        device = self._oak_usb_devices()[0]
+        if expected is not None and device.name != expected:
+            raise HarnessError("OAK USB topology changed from the journaled port")
         metadata = device.lstat()
         if stat.S_ISLNK(metadata.st_mode):
             resolved = device.resolve(strict=True)
             sys_root = (self.paths.root / "sys").resolve(strict=True)
             if not resolved.is_dir() or not resolved.is_relative_to(sys_root):
-                raise HarnessError("exact OAK USB device 2-1 is unsafe")
+                raise HarnessError("OAK USB topology endpoint is unsafe")
         elif not stat.S_ISDIR(metadata.st_mode):
-            raise HarnessError("exact OAK USB device 2-1 is unavailable")
+            raise HarnessError("OAK USB topology endpoint is unavailable")
 
         def text(name: str) -> str:
             payload, _ = read_regular(device / name, maximum=128)
@@ -1127,23 +1186,23 @@ class BoardHarness:
         vendor = text("idVendor")
         product = text("idProduct")
         if (vendor, product) != (OAK_VENDOR, OAK_PRODUCT):
-            raise HarnessError("USB 2-1 is not the expected OAK-D Lite")
+            raise HarnessError("USB topology is not the expected OAK-D Lite")
         try:
             speed = float(text("speed"))
         except ValueError as exc:
-            raise HarnessError("USB 2-1 speed is invalid") from exc
+            raise HarnessError("OAK USB speed is invalid") from exc
         if speed < OAK_MIN_SPEED_MBPS:
             raise HarnessError("OAK-D Lite must negotiate at 5Gbps")
         driver = device / "driver"
         bound = driver.is_symlink()
         if require_bound:
-            expected = (self.paths.root / "sys/bus/usb/drivers/usb").resolve(
+            expected_driver = (self.paths.root / "sys/bus/usb/drivers/usb").resolve(
                 strict=True
             )
-            if not bound or driver.resolve(strict=True) != expected:
+            if not bound or driver.resolve(strict=True) != expected_driver:
                 raise HarnessError("OAK-D Lite is not bound to the exact USB driver")
         return {
-            "port": USB_PORT,
+            "port": device.name,
             "vendorId": vendor,
             "productId": product,
             "speedMbps": int(speed),
@@ -2392,9 +2451,10 @@ class BoardHarness:
             raise HarnessError("deadman unit remains active")
         self.runner.run(["/usr/bin/systemctl", "reset-failed", unit], timeout=10)
 
-    def _write_usb(self, action: str) -> None:
+    def _write_usb(self, action: str, port: str) -> None:
         if action not in {"bind", "unbind"}:
             raise HarnessError("USB action is invalid")
+        safe_port = canonical_oak_port(port)
         path = self.paths.usb_bind if action == "bind" else self.paths.usb_unbind
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
@@ -2404,7 +2464,7 @@ class BoardHarness:
             os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         try:
-            payload = USB_PORT.encode("ascii")
+            payload = safe_port.encode("ascii")
             view = memoryview(payload)
             while view:
                 written = os.write(descriptor, view)
@@ -2414,45 +2474,54 @@ class BoardHarness:
         finally:
             os.close(descriptor)
         if self.usb_write_hook is not None:
-            self.usb_write_hook(action)
+            self.usb_write_hook(action, safe_port)
 
-    def _poll_detached(self, timeout: float = 15) -> None:
+    def _poll_detached(self, port: str, timeout: float = 15) -> None:
+        safe_port = canonical_oak_port(port)
+        device = self._usb_device_path(safe_port)
         deadline = self.monotonic() + timeout
         while self.monotonic() < deadline:
+            if not device.exists() and not device.is_symlink():
+                return
             try:
-                self.verify_oak(require_bound=False)
-                driver = self.paths.usb_device / "driver"
+                self.verify_oak(require_bound=False, expected_port=safe_port)
+                driver = device / "driver"
                 if not driver.exists() and not driver.is_symlink():
                     return
                 metadata = driver.lstat()
                 if not stat.S_ISLNK(metadata.st_mode):
                     raise HarnessError("OAK USB driver endpoint became unsafe")
-            except FileNotFoundError:
+            except (FileNotFoundError, HarnessError):
                 # The kernel may remove the device node entirely while an
                 # unbind/reset is in flight. Absence is detached; an identity
                 # mismatch while the node exists is not.
-                return
+                if not device.exists() and not device.is_symlink():
+                    return
+                raise
             self.sleeper(0.25)
-        raise HarnessError("OAK USB 2-1 did not detach after unbind")
+        raise HarnessError("OAK USB device did not detach after unbind")
 
-    def _recover_oak(self, timeout: float = 30) -> None:
+    def _recover_oak(self, port: str, timeout: float = 30) -> None:
+        safe_port = canonical_oak_port(port)
+        # Never write a journal-provided topology into the root usb bind
+        # endpoint until the still-present unbound device proves exact OAK
+        # identity, speed, USB1 ancestry, and global uniqueness.
+        self.verify_oak(require_bound=False, expected_port=safe_port)
         deadline = self.monotonic() + timeout
         last_error: BaseException | None = None
         while self.monotonic() < deadline:
             try:
-                self._write_usb("bind")
+                self._write_usb("bind", safe_port)
             except OSError as exc:
                 if exc.errno not in {errno.EBUSY, errno.EEXIST, errno.ENODEV}:
                     last_error = exc
             try:
-                self.verify_oak(require_bound=True)
+                self.verify_oak(require_bound=True, expected_port=safe_port)
                 return
             except (HarnessError, OSError) as exc:
                 last_error = exc
             self.sleeper(0.5)
-        raise HarnessError(
-            "OAK USB 2-1 did not recover before the deadline"
-        ) from last_error
+        raise HarnessError("OAK USB device did not recover before the deadline") from last_error
 
     def arm_oak_fault(self, run_id: str) -> dict[str, object]:
         with self._run_lock(run_id, usb=True):
@@ -2488,11 +2557,12 @@ class BoardHarness:
             digest = str(scenario["expectedBomDigest"])[7:]
             if self._slot_link("current", required=True) != f"releases/{digest}":
                 raise HarnessError("active slot is not the exact candidate")
-            self.verify_oak()
+            oak = self.verify_oak()
+            port = canonical_oak_port(oak["port"])
             fault = {
                 "armed": True,
                 "unit": self._deadman_unit(run_id),
-                "port": USB_PORT,
+                "port": port,
                 "commandId": scenario["expectedCommandId"],
                 "bomDigest": scenario["expectedBomDigest"],
                 "candidateSlot": scenario["expectedCandidateSlot"],
@@ -2513,11 +2583,11 @@ class BoardHarness:
                 signal.signal(signum, interrupted)
             recovered = False
             try:
-                self._write_usb("unbind")
-                self._poll_detached()
+                self._write_usb("unbind", port)
+                self._poll_detached(port)
                 if hold:
                     self.sleeper(float(hold))
-                self._recover_oak()
+                self._recover_oak(port)
                 latest = self._load_state(run_id)
                 latest_fault = latest.get("oakFault")
                 if not isinstance(latest_fault, dict):
@@ -2557,7 +2627,7 @@ class BoardHarness:
                 "schemaVersion": 1,
                 "runId": run_id,
                 "fault": "oak-usb-disconnect",
-                "port": USB_PORT,
+                "port": port,
                 "holdSeconds": hold,
                 "deadmanSeconds": DEADMAN_SECONDS,
                 "recovered": True,
@@ -2670,12 +2740,11 @@ class BoardHarness:
                 "recovered": False,
                 "complete": True,
             }
-        if fault.get("port") != USB_PORT or fault.get("unit") != self._deadman_unit(
-            run_id
-        ):
+        port = canonical_oak_port(fault.get("port"))
+        if fault.get("unit") != self._deadman_unit(run_id):
             raise HarnessError("OAK deadman ownership mismatch")
         if fault.get("armed") is not True:
-            self.verify_oak(require_bound=True)
+            self.verify_oak(require_bound=True, expected_port=port)
             return {
                 "schemaVersion": 1,
                 "runId": run_id,
@@ -2683,10 +2752,13 @@ class BoardHarness:
                 "recovered": False,
                 "complete": True,
             }
-        self._recover_oak()
+        self._recover_oak(port)
         latest = self._load_state(run_id)
         latest_fault = latest.get("oakFault")
-        if not isinstance(latest_fault, dict) or latest_fault.get("port") != USB_PORT:
+        if (
+            not isinstance(latest_fault, dict)
+            or latest_fault.get("port") != port
+        ):
             raise HarnessError("OAK fault journal changed during deadman recovery")
         latest_fault.update(
             {
@@ -2762,11 +2834,10 @@ class BoardHarness:
             fault = state.get("oakFault")
             recovered = False
             if isinstance(fault, dict) and fault.get("armed") is True:
-                if fault.get("port") != USB_PORT or fault.get(
-                    "unit"
-                ) != self._deadman_unit(run_id):
+                port = canonical_oak_port(fault.get("port"))
+                if fault.get("unit") != self._deadman_unit(run_id):
                     raise HarnessError("OAK cleanup ownership mismatch")
-                self._recover_oak()
+                self._recover_oak(port)
                 recovered = True
                 fault.update(
                     {"armed": False, "recovered": True, "recoveredAt": self.clock()}
@@ -2936,7 +3007,7 @@ class BoardHarness:
                 oak_gate = True
             except (HarnessError, OSError):
                 oak = {
-                    "port": USB_PORT,
+                    "port": None,
                     "vendorId": OAK_VENDOR,
                     "productId": OAK_PRODUCT,
                     "speedMbps": None,

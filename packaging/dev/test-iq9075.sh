@@ -43,13 +43,14 @@ die() {
 for command in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl timeout python3 readlink; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
+[ -x /usr/bin/python3 ] || die "/usr/bin/python3 is required"
 
 echo "[iq9075-e2e] checking GStreamer runtime"
 for element in v4l2src videoconvert jpegdec x264enc h264parse rtph264pay webrtcbin nicesrc; do
   gst-inspect-1.0 "$element" >/dev/null 2>&1 || die "missing GStreamer element: $element"
 done
 
-python3 <<'PY'
+/usr/bin/python3 -I <<'PY'
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -76,11 +77,60 @@ timeout 20s gst-launch-1.0 -q \
   videoconvert ! x264enc tune=zerolatency speed-preset=ultrafast ! \
   h264parse ! rtph264pay pt=96 ! fakesink sync=false
 
-agent_python=/opt/nuv-agent/current/venv/bin/python
-[ -x "$agent_python" ] || die "nuv-agent current slot venv is missing"
+default_agent_python=/opt/nuv-agent/current/venv/bin/python
+requested_agent_python="${NUVION_AGENT_PYTHON:-$default_agent_python}"
+set +e
+agent_python="$(/usr/bin/python3 -I - "$requested_agent_python" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+raw = sys.argv[1]
+path = Path(raw)
+normalized = os.path.normpath(raw)
+install_root = Path("/opt/nuv-agent").resolve(strict=True)
+if (
+    not path.is_absolute()
+    or raw != normalized
+    or not raw.startswith("/opt/nuv-agent/")
+    or path.name != "python"
+):
+    raise SystemExit(2)
+metadata = path.stat()
+parent = path.parent.resolve(strict=True)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != 0
+    or metadata.st_mode & 0o022
+    or not os.access(path, os.X_OK)
+    or not parent.is_relative_to(install_root)
+):
+    raise SystemExit(2)
+print(path)
+PY
+)"
+python_status=$?
+set -e
+[ "$python_status" -eq 0 ] && [ -n "$agent_python" ] || \
+  die "NUVION_AGENT_PYTHON must be a normalized root-owned executable /opt/nuv-agent/.../bin/python"
+if [ "$agent_python" != "$default_agent_python" ] || [ -n "${PYTHONPATH:-}" ]; then
+  echo "[iq9075-e2e] candidate Python/source override: pre-release hardware evidence only"
+fi
+
+webrtc_python=("$agent_python")
+if [ "$(id -u)" -eq 0 ]; then
+  command -v runuser >/dev/null 2>&1 || die "runuser is required for non-root Agent probes"
+  webrtc_python=(
+    runuser -u nuvion -- /usr/bin/env
+    "PYTHONPATH=${PYTHONPATH:-}"
+    "G_DEBUG=fatal-criticals"
+    "$agent_python"
+  )
+fi
 
 echo "[iq9075-e2e] checking disposable WebRTC branches across signaling resets"
-G_DEBUG=fatal-criticals timeout 20s "$agent_python" <<'PY'
+G_DEBUG=fatal-criticals timeout 20s "${webrtc_python[@]}" <<'PY'
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -192,16 +242,25 @@ if [ "$camera_mode" = "oak" ]; then
   oak_python=("$agent_python")
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
-    oak_python=(runuser -u nuvion -- /opt/nuv-agent/current/venv/bin/python)
+    oak_python=(
+      runuser -u nuvion -- /usr/bin/env
+      "PYTHONPATH=${PYTHONPATH:-}"
+      "NUVION_IQ9075_OAK_SOAK_SECONDS=${NUVION_IQ9075_OAK_SOAK_SECONDS:-120}"
+      "NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB=${NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB:-96}"
+      "$agent_python"
+    )
   elif [ "$(id -un)" != "nuvion" ]; then
     die "run the OAK test with sudo so capture can be verified as the nuvion service user"
   fi
 
   echo "[iq9075-e2e] checking OAK-D capture as non-root user nuvion"
   set +e
-  timeout 45s "${oak_python[@]}" <<'PY'
+  timeout 660s "${oak_python[@]}" <<'PY'
 from importlib.metadata import version
 from pathlib import Path
+import os
+import re
+import time
 
 import depthai
 from dotenv import dotenv_values
@@ -240,36 +299,67 @@ device_id = resolve_depthai_device_id(
     str(values.get("NUVION_DEPTHAI_DEVICE_ID") or ""),
 )
 
-expected_usb_path = Path("/sys/bus/usb/devices/2-1")
-if not expected_usb_path.is_dir():
-    print("[iq9075-e2e] no OAK-D device detected at exact USB path 2-1", flush=True)
-    raise SystemExit(3)
+usb_devices_root = Path("/sys/bus/usb/devices")
+usb_topology_re = re.compile(r"^2-1(?:\.[1-9][0-9]*)+$")
+sys_root = Path("/sys").resolve(strict=True)
 
-def read_sysfs(name: str) -> str:
+
+def read_sysfs(device: Path, name: str) -> str:
     try:
-        return (expected_usb_path / name).read_text(encoding="utf-8").strip().lower()
+        return (device / name).read_text(encoding="utf-8").strip().lower()
     except OSError as exc:
         raise SystemExit(f"cannot read OAK sysfs {name}: {exc}") from exc
 
-vendor = read_sysfs("idVendor")
-product = read_sysfs("idProduct")
-speed = read_sysfs("speed")
+
+oak_usb_paths = []
+for candidate in sorted(usb_devices_root.iterdir(), key=lambda item: item.name):
+    if usb_topology_re.fullmatch(candidate.name) is None:
+        continue
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"cannot resolve USB1 downstream topology: {exc}") from exc
+    if not resolved.is_dir() or not resolved.is_relative_to(sys_root):
+        raise SystemExit("USB1 downstream topology escaped sysfs")
+    vendor_path = candidate / "idVendor"
+    product_path = candidate / "idProduct"
+    if not vendor_path.is_file() or not product_path.is_file():
+        continue
+    if (
+        read_sysfs(candidate, "idVendor"),
+        read_sysfs(candidate, "idProduct"),
+    ) == ("03e7", "f63b"):
+        oak_usb_paths.append(candidate)
+
+if not oak_usb_paths:
+    print("[iq9075-e2e] no OAK-D device detected below USB1 hub 2-1", flush=True)
+    raise SystemExit(3)
+if len(oak_usb_paths) != 1:
+    raise SystemExit("USB1 downstream must contain exactly one 03e7:f63b OAK-D Lite")
+expected_usb_path = oak_usb_paths[0]
+vendor = read_sysfs(expected_usb_path, "idVendor")
+product = read_sysfs(expected_usb_path, "idProduct")
+speed = read_sysfs(expected_usb_path, "speed")
 try:
-    driver = (expected_usb_path / "driver").resolve(strict=True).name
+    driver_path = (expected_usb_path / "driver").resolve(strict=True)
+    expected_driver = Path("/sys/bus/usb/drivers/usb").resolve(strict=True)
 except OSError as exc:
     raise SystemExit(f"cannot resolve OAK USB driver: {exc}") from exc
-if (vendor, product, driver) != ("03e7", "f63b", "usb"):
+if (vendor, product) != ("03e7", "f63b") or driver_path != expected_driver:
     raise SystemExit(
-        "exact OAK USB identity mismatch at 2-1: "
-        f"vendor={vendor}, product={product}, driver={driver}"
+        f"exact OAK USB identity mismatch at {expected_usb_path.name}: "
+        f"vendor={vendor}, product={product}, driver={driver_path.name}"
     )
 try:
     speed_mbps = float(speed)
 except ValueError as exc:
-    raise SystemExit(f"invalid OAK USB speed at 2-1: {speed!r}") from exc
+    raise SystemExit(
+        f"invalid OAK USB speed at {expected_usb_path.name}: {speed!r}"
+    ) from exc
 if speed_mbps < 5000.0:
     raise SystemExit(
-        f"OAK-D Lite at 2-1 must negotiate 5Gbps; observed {speed_mbps:g}Mbps"
+        f"OAK-D Lite at {expected_usb_path.name} must negotiate 5Gbps; "
+        f"observed {speed_mbps:g}Mbps"
     )
 
 available_devices = depthai.Device.getAllAvailableDevices()
@@ -290,6 +380,14 @@ startup_timeout = float(
     values.get("NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC") or "15"
 )
 read_timeout = float(values.get("NUVION_DEPTHAI_READ_TIMEOUT_SEC") or "2")
+soak_seconds = int(os.getenv("NUVION_IQ9075_OAK_SOAK_SECONDS", "120"))
+max_rss_growth_mib = int(
+    os.getenv("NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB", "96")
+)
+if soak_seconds < 60 or soak_seconds > 600:
+    raise SystemExit("NUVION_IQ9075_OAK_SOAK_SECONDS must be in [60, 600]")
+if max_rss_growth_mib < 16 or max_rss_growth_mib > 512:
+    raise SystemExit("NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB must be in [16, 512]")
 
 config = DepthAIConfig(
     width=640,
@@ -308,7 +406,7 @@ pipeline = Gst.parse_launch(
     "videoconvert ! video/x-raw,format=I420 ! "
     "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 bframes=0 ! "
     "h264parse ! rtph264pay config-interval=-1 pt=96 ! "
-    "appsink name=rtp_sink max-buffers=30 drop=false sync=false"
+    "appsink name=rtp_sink max-buffers=2 drop=true sync=false"
 )
 appsrc = pipeline.get_by_name(DEPTHAI_APPSRC_NAME)
 rtp_sink = pipeline.get_by_name("rtp_sink")
@@ -332,6 +430,54 @@ if state_result == Gst.StateChangeReturn.FAILURE:
     raise SystemExit("OAK GStreamer pipeline failed to enter PLAYING")
 
 last_pts = None
+sample_count = 0
+
+
+def read_proc_status_kib(field: str) -> int:
+    prefix = f"{field}:"
+    for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == "kB" and parts[1].isdigit():
+                return int(parts[1])
+    raise RuntimeError(f"/proc/self/status is missing exact {field} kB evidence")
+
+
+def appsrc_level(name: str) -> int | None:
+    if appsrc.find_property(name) is None:
+        return None
+    return int(appsrc.get_property(name))
+
+
+def pull_and_validate_rtp(label: str) -> None:
+    global last_pts, sample_count
+    sample = rtp_sink.emit("try-pull-sample", 2 * Gst.SECOND)
+    if sample is None:
+        raise RuntimeError(f"timed out waiting for RTP sample {label}")
+    caps = sample.get_caps()
+    structure = caps.get_structure(0) if caps is not None else None
+    if structure is None or structure.get_name() != "application/x-rtp":
+        raise RuntimeError(f"unexpected RTP caps: {caps}")
+    if structure.get_string("encoding-name") != "H264":
+        raise RuntimeError(f"unexpected RTP encoding caps: {caps}")
+    buffer = sample.get_buffer()
+    if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE:
+        raise RuntimeError("RTP sample is missing a PTS")
+    if last_pts is not None and buffer.pts < last_pts:
+        raise RuntimeError("RTP sample PTS regressed")
+    last_pts = buffer.pts
+    sample_count += 1
+
+    level_buffers = appsrc_level("current-level-buffers")
+    level_bytes = appsrc_level("current-level-bytes")
+    if level_buffers is not None and level_buffers > 2:
+        raise RuntimeError(f"appsrc buffer bound exceeded: {level_buffers} > 2")
+    if level_bytes is not None and level_bytes > 2 * 640 * 480 * 3:
+        raise RuntimeError(
+            f"appsrc byte bound exceeded: {level_bytes} > {2 * 640 * 480 * 3}"
+        )
+
+
 try:
     bridge.start()
     for index in range(30):
@@ -339,21 +485,32 @@ try:
         if message is not None:
             error, debug = message.parse_error()
             raise RuntimeError(f"GStreamer bus error: {error}; debug={debug}")
-        sample = rtp_sink.emit("try-pull-sample", 2 * Gst.SECOND)
-        if sample is None:
-            raise RuntimeError(f"timed out waiting for RTP sample {index + 1}/30")
-        caps = sample.get_caps()
-        structure = caps.get_structure(0) if caps is not None else None
-        if structure is None or structure.get_name() != "application/x-rtp":
-            raise RuntimeError(f"unexpected RTP caps: {caps}")
-        if structure.get_string("encoding-name") != "H264":
-            raise RuntimeError(f"unexpected RTP encoding caps: {caps}")
-        buffer = sample.get_buffer()
-        if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE:
-            raise RuntimeError("RTP sample is missing a PTS")
-        if last_pts is not None and buffer.pts < last_pts:
-            raise RuntimeError("RTP sample PTS regressed")
-        last_pts = buffer.pts
+        pull_and_validate_rtp(f"{index + 1}/30")
+
+    soak_started = time.monotonic()
+    warmup_seconds = min(30.0, max(10.0, soak_seconds / 4.0))
+    baseline_at = soak_started + warmup_seconds
+    soak_deadline = soak_started + soak_seconds
+    baseline_rss_anon_kib = None
+    max_rss_anon_kib = 0
+    while time.monotonic() < soak_deadline:
+        pull_and_validate_rtp(f"soak-{sample_count + 1}")
+        now = time.monotonic()
+        rss_anon_kib = read_proc_status_kib("RssAnon")
+        if now >= baseline_at and baseline_rss_anon_kib is None:
+            baseline_rss_anon_kib = rss_anon_kib
+        if baseline_rss_anon_kib is not None:
+            max_rss_anon_kib = max(max_rss_anon_kib, rss_anon_kib)
+
+    if baseline_rss_anon_kib is None:
+        raise RuntimeError("OAK soak did not reach its RSS baseline boundary")
+    rss_growth_kib = max(0, max_rss_anon_kib - baseline_rss_anon_kib)
+    if rss_growth_kib > max_rss_growth_mib * 1024:
+        raise RuntimeError(
+            "OAK DepthAI/appsrc anonymous RSS growth exceeded bound: "
+            f"growth={rss_growth_kib / 1024:.1f}MiB "
+            f"limit={max_rss_growth_mib}MiB duration={soak_seconds}s"
+        )
     if bridge.failure is not None:
         raise RuntimeError(f"DepthAI bridge failed: {bridge.failure}")
     message = bus.pop_filtered(Gst.MessageType.ERROR)
@@ -365,8 +522,10 @@ finally:
     pipeline.set_state(Gst.State.NULL)
 
 print(
-    "[iq9075-e2e] OAK-D Lite RGB/appsrc/H264/RTP: PASS "
-    f"(depthai={installed_version}, samples=30)"
+    "[iq9075-e2e] OAK-D Lite RGB/appsrc/H264/RTP bounded soak: PASS "
+    f"(depthai={installed_version}, samples={sample_count}, "
+    f"duration={soak_seconds}s, rssAnonGrowth={rss_growth_kib / 1024:.1f}MiB, "
+    f"bridge={bridge.stats_snapshot()})"
 )
 PY
   oak_status=$?

@@ -195,12 +195,16 @@ class HarnessFixture:
     def _seed(self) -> None:
         self._write("/etc/os-release", 'ID=ubuntu\nVERSION_ID="24.04"\n', 0o644)
         self._write("/proc/device-tree/model", "Thundercomm IQ-9075 QCS9075\0", 0o444)
-        self._write("/sys/bus/usb/devices/2-1/idVendor", "03e7\n", 0o444)
-        self._write("/sys/bus/usb/devices/2-1/idProduct", "f63b\n", 0o444)
-        self._write("/sys/bus/usb/devices/2-1/speed", "5000\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1/idVendor", "1d6b\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1/idProduct", "0003\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1/speed", "10000\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1.1/idVendor", "03e7\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1.1/idProduct", "f63b\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1.1/speed", "5000\n", 0o444)
         self._write("/sys/bus/usb/drivers/usb/unbind", "", 0o600)
         self._write("/sys/bus/usb/drivers/usb/bind", "", 0o600)
         (self.root / "sys/bus/usb/devices/2-1/driver").symlink_to("../../drivers/usb")
+        (self.root / "sys/bus/usb/devices/2-1.1/driver").symlink_to("../../drivers/usb")
         self._write(
             "/etc/nuv-agent/agent.env",
             "NUVION_CONFIG_SCHEMA_VERSION=12\n"
@@ -225,8 +229,8 @@ class HarnessFixture:
         (install / "previous").symlink_to("bootstrap/0.1.119")
         self.paths.lock_root.mkdir(parents=True, exist_ok=True)
 
-    def _usb_hook(self, action: str) -> None:
-        driver = self.paths.usb_device / "driver"
+    def _usb_hook(self, action: str, port: str) -> None:
+        driver = self.paths.usb_devices / port / "driver"
         if action == "unbind":
             try:
                 driver.unlink()
@@ -447,6 +451,50 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 self.assertFalse(
                     any(call[0] == "/usr/sbin/runuser" for call in fixture.runner.calls)
                 )
+            finally:
+                fixture.close()
+
+    def test_oak_identity_resolves_unique_usb1_hub_downstream_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                oak = fixture.harness.verify_oak()
+
+                self.assertEqual(oak["port"], "2-1.1")
+                self.assertEqual(oak["vendorId"], "03e7")
+                self.assertEqual(oak["productId"], "f63b")
+                self.assertNotEqual(oak["port"], BOARD.USB_ROOT_HUB)
+            finally:
+                fixture.close()
+
+    def test_oak_identity_rejects_ambiguous_usb1_downstream_devices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture._write(
+                    "/sys/bus/usb/devices/2-1.2/idVendor",
+                    "03e7\n",
+                    0o444,
+                )
+                fixture._write(
+                    "/sys/bus/usb/devices/2-1.2/idProduct",
+                    "f63b\n",
+                    0o444,
+                )
+                fixture._write(
+                    "/sys/bus/usb/devices/2-1.2/speed",
+                    "5000\n",
+                    0o444,
+                )
+                (fixture.paths.usb_devices / "2-1.2/driver").symlink_to(
+                    "../../drivers/usb"
+                )
+
+                with self.assertRaisesRegex(
+                    BOARD.HarnessError,
+                    "exactly one OAK-D Lite",
+                ):
+                    fixture.harness.verify_oak()
             finally:
                 fixture.close()
 
@@ -706,8 +754,8 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                     "FUNCTIONAL_HEALTHY"
                 )
 
-                def never_rebind(action: str) -> None:
-                    driver = fixture.paths.usb_device / "driver"
+                def never_rebind(action: str, port: str) -> None:
+                    driver = fixture.paths.usb_devices / port / "driver"
                     if action == "unbind" and driver.exists():
                         driver.unlink()
 
@@ -716,6 +764,7 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                     fixture.harness.arm_oak_fault(fixture.run_id)
                 state = fixture.harness._load_state(fixture.run_id)
                 self.assertTrue(state["oakFault"]["armed"])
+                self.assertEqual(state["oakFault"]["port"], "2-1.1")
                 unit = fixture.harness._deadman_unit(fixture.run_id)
                 self.assertTrue(fixture.runner.deadmen[unit])
                 deadman_call = next(

@@ -308,10 +308,10 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIn("x264enc name=video_encoder", description)
         self.assertIn("name=video_encoder tune=zerolatency speed-preset=faster bitrate=1750", description)
         self.assertIn("x264enc name=clip_encoder", description)
+        self.assertEqual(description.count("max-size-buffers=2"), 2)
+        self.assertEqual(description.count("leaky=downstream"), 2)
         self.assertLess(
-            description.index("stream_split. ! queue ! x264enc")
-            if "stream_split. ! queue ! x264enc" in description
-            else description.index("name=video_encoder"),
+            description.index("name=video_encoder"),
             description.index("name=clip_encoder"),
         )
 

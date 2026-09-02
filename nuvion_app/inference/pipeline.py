@@ -719,6 +719,18 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
     )
 
 
+def build_bounded_live_queue(*, max_buffers: int = 2) -> str:
+    """Bound one live raw-video branch independently and prefer fresh frames."""
+
+    buffers = int(max_buffers)
+    if buffers <= 0 or buffers > 60:
+        raise ValueError("live queue max_buffers must be in [1, 60]")
+    return (
+        f"queue max-size-buffers={buffers} "
+        "max-size-bytes=0 max-size-time=0 leaky=downstream"
+    )
+
+
 def build_uplink_pipeline(
     *,
     rtp_ssrc: int,
@@ -743,15 +755,16 @@ def build_uplink_pipeline(
     segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
     segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
     clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
+    live_queue = build_bounded_live_queue()
     return (
         "tee name=stream_split "
-        "stream_split. ! queue ! "
+        f"stream_split. ! {live_queue} ! "
         f"{encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
         "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
         "tee name=webrtc_uplink_tee allow-not-linked=true "
-        "stream_split. ! queue ! "
+        f"stream_split. ! {live_queue} ! "
         f"{clip_encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
@@ -3270,27 +3283,28 @@ class GStreamerInferenceApp:
             clip_segments_dir=CLIP_SEGMENTS_DIR,
             video_bitrate_kbps=VIDEO_BITRATE_KBPS,
         )
+        live_queue = build_bounded_live_queue()
 
         if LOCAL_DISPLAY:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 f"{overlay_pipeline}"
                 "tee name=dt "
-                "dt. ! queue ! "
+                f"dt. ! {live_queue} ! "
                 f"{uplink_pipeline} "
-                "dt. ! queue ! videoconvert ! autovideosink sync=false"
+                f"dt. ! {live_queue} ! videoconvert ! autovideosink sync=false"
             )
         else:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 f"{overlay_pipeline}"
                 f"{uplink_pipeline}"
             )

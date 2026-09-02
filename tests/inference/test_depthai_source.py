@@ -289,6 +289,23 @@ class DepthAIFrameSourceTest(unittest.TestCase):
         self.assertTrue(np.all(rgb[..., 2] == 33))
         source.close()
 
+    def test_runtime_native_interleaved_frame_does_not_alias_sdk_packet_memory(self) -> None:
+        startup = _FakeNativePacket(np.zeros((3, 3, 4), dtype=np.uint8))
+        runtime = _FakeNativePacket(np.full((3, 4, 3), 7, dtype=np.uint8))
+        fake = _FakeDepthAI([startup])
+        source = DepthAIFrameSource(_config(), depthai_module=fake)
+        source.start()
+        source.read()
+        fake.output_queue.packets.append(runtime)
+
+        frame = source.read()
+        runtime.frame[:] = 9
+
+        self.assertTrue(frame.flags.owndata)
+        self.assertFalse(np.shares_memory(frame, runtime.frame))
+        self.assertTrue(np.all(frame == 7))
+        source.close()
+
     def test_read_timeout_is_deterministic_and_typed(self) -> None:
         clock = _FakeClock()
         fake = _FakeDepthAI([_packet(1)])

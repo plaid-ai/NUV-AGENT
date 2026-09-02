@@ -394,7 +394,10 @@ class DepthAIFrameSource:
                     raise ValueError("unexpected native RGB frame dtype")
                 # The camera is explicitly configured as RGB888p/RGB888i.
                 # getFrame() does not require opencv-python, unlike getCvFrame().
-                return np.ascontiguousarray(frame)
+                # Always detach from the SDK packet. ``getFrame()`` may expose
+                # packet-owned memory and ``ascontiguousarray`` is allowed to
+                # return that same allocation for interleaved RGB frames.
+                return np.array(frame, dtype=np.uint8, copy=True, order="C")
 
             frame = np.asarray(packet.getCvFrame())
             if (
@@ -404,7 +407,7 @@ class DepthAIFrameSource:
                 raise ValueError("unexpected OpenCV BGR frame")
             # Compatibility fallback for SDK packet doubles and older APIs:
             # getCvFrame() is OpenCV-ready BGR, so convert it to RGB.
-            return np.ascontiguousarray(frame[..., ::-1])
+            return np.array(frame[..., ::-1], dtype=np.uint8, copy=True, order="C")
         except Exception:
             if startup:
                 raise DepthAIStartupError("DepthAI produced an invalid startup RGB frame") from None

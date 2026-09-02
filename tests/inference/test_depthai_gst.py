@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -16,8 +17,9 @@ class _Buffer:
     def __init__(self, size: int) -> None:
         self.data = bytearray(size)
 
-    def fill(self, offset: int, data: bytes) -> None:
+    def fill(self, offset: int, data: bytes | memoryview) -> int:
         self.data[offset : offset + len(data)] = data
+        return len(data)
 
 
 class _Gst:
@@ -28,6 +30,12 @@ class _Gst:
         @staticmethod
         def new_allocate(_allocator, size: int, _params) -> _Buffer:
             return _Buffer(size)
+
+        @staticmethod
+        def new_wrapped(data: bytes) -> _Buffer:
+            buffer = _Buffer(len(data))
+            buffer.fill(0, data)
+            return buffer
 
 
 class _AppSrc:
@@ -42,6 +50,31 @@ class _AppSrc:
         self.buffers.append(buffer)
         self.pushed.set()
         return self.flow
+
+
+class _NonRetainingAppSrc:
+    def __init__(self) -> None:
+        self.buffer_refs: list[weakref.ReferenceType[_Buffer]] = []
+        self.properties = {
+            "current-level-buffers": 2,
+            "current-level-bytes": 72,
+            "current-level-time": 0,
+            "in": 5,
+            "out": 3,
+            "dropped": 2,
+        }
+
+    def emit(self, signal: str, buffer: _Buffer) -> str:
+        if signal != "push-buffer":
+            raise AssertionError(signal)
+        self.buffer_refs.append(weakref.ref(buffer))
+        return "OK"
+
+    def find_property(self, name: str) -> object | None:
+        return object() if name in self.properties else None
+
+    def get_property(self, name: str) -> int:
+        return self.properties[name]
 
 
 class _Source:
@@ -81,6 +114,19 @@ class _StuckSource:
 
 
 class DepthAIGStreamerBridgeTest(unittest.TestCase):
+    def test_metrics_interval_rejects_invalid_values(self) -> None:
+        for value in (-1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    DepthAIGStreamerBridge(
+                        frame_source=_Source([]),
+                        appsrc=_AppSrc(),
+                        gst=_Gst,
+                        width=4,
+                        height=3,
+                        metrics_interval_sec=value,
+                    )
+
     def test_thread_start_failure_closes_started_source(self) -> None:
         source = _Source([])
         bridge = DepthAIGStreamerBridge(
@@ -127,6 +173,43 @@ class DepthAIGStreamerBridgeTest(unittest.TestCase):
         self.assertEqual(bytes(appsrc.buffers[0].data), frame.tobytes())
         self.assertFalse(bridge.running)
         self.assertIsNone(bridge.failure)
+
+    def test_push_wraps_one_owned_frame_and_releases_wrapper(self) -> None:
+        class _WrappedOnlyGst:
+            FlowReturn = _Gst.FlowReturn
+
+            class Buffer:
+                @staticmethod
+                def new_allocate(*_args: object) -> _Buffer:
+                    raise AssertionError("separate native allocation is forbidden")
+
+                @staticmethod
+                def new_wrapped(data: bytes) -> _Buffer:
+                    buffer = _Buffer(len(data))
+                    buffer.fill(0, data)
+                    return buffer
+
+        frame = np.arange(4 * 3 * 3, dtype=np.uint8).reshape(3, 4, 3)
+        appsrc = _NonRetainingAppSrc()
+        bridge = DepthAIGStreamerBridge(
+            frame_source=_Source([]),
+            appsrc=appsrc,
+            gst=_WrappedOnlyGst,
+            width=4,
+            height=3,
+            metrics_interval_sec=0,
+        )
+
+        bridge._push(frame)
+        stats = bridge.stats_snapshot()
+
+        self.assertEqual(stats.push_attempts, 1)
+        self.assertEqual(stats.push_succeeded, 1)
+        self.assertEqual(stats.push_failed, 0)
+        self.assertEqual(stats.appsrc_current_level_buffers, 2)
+        self.assertEqual(stats.appsrc_current_level_bytes, 72)
+        self.assertEqual(stats.appsrc_dropped, 2)
+        self.assertIsNone(appsrc.buffer_refs[0]())
 
     def test_invalid_frame_surfaces_failure_callback(self) -> None:
         source = _Source([np.zeros((2, 2, 3), dtype=np.uint8)])

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -12,6 +15,21 @@ from nuvion_app.inference.depthai_source import DepthAITimeoutError
 
 class DepthAIGStreamerBridgeError(RuntimeError):
     """Raised when a DepthAI frame cannot be delivered to GStreamer."""
+
+
+@dataclass(frozen=True)
+class DepthAIGStreamerBridgeStats:
+    """Bounded bridge/appsrc counters safe to sample from another thread."""
+
+    push_attempts: int
+    push_succeeded: int
+    push_failed: int
+    appsrc_current_level_buffers: int | None
+    appsrc_current_level_bytes: int | None
+    appsrc_current_level_time: int | None
+    appsrc_in: int | None
+    appsrc_out: int | None
+    appsrc_dropped: int | None
 
 
 class DepthAIGStreamerBridge:
@@ -27,6 +45,7 @@ class DepthAIGStreamerBridge:
         height: int,
         read_timeout: float = 2.0,
         max_consecutive_timeouts: int = 3,
+        metrics_interval_sec: float = 30.0,
         on_failure: Callable[[BaseException], None] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -37,12 +56,22 @@ class DepthAIGStreamerBridge:
         self.height = int(height)
         self.read_timeout = max(float(read_timeout), 0.1)
         self.max_consecutive_timeouts = max(int(max_consecutive_timeouts), 1)
+        self.metrics_interval_sec = float(metrics_interval_sec)
+        if (
+            not math.isfinite(self.metrics_interval_sec)
+            or self.metrics_interval_sec < 0
+        ):
+            raise ValueError("metrics_interval_sec must be finite and not negative")
         self.on_failure = on_failure
         self.log = logger or logging.getLogger(__name__)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._failure: BaseException | None = None
         self._lock = threading.Lock()
+        self._push_attempts = 0
+        self._push_succeeded = 0
+        self._push_failed = 0
+        self._next_metrics_at = 0.0
 
     @property
     def failure(self) -> BaseException | None:
@@ -54,12 +83,58 @@ class DepthAIGStreamerBridge:
         thread = self._thread
         return thread is not None and thread.is_alive()
 
+    @staticmethod
+    def _optional_uint_property(element: Any, name: str) -> int | None:
+        try:
+            find_property = getattr(element, "find_property", None)
+            if callable(find_property) and find_property(name) is None:
+                return None
+            get_property = getattr(element, "get_property", None)
+            if not callable(get_property):
+                return None
+            value = get_property(name)
+            return int(value) if value is not None else None
+        except Exception:  # noqa: BLE001 - diagnostics must not stop capture.
+            return None
+
+    def stats_snapshot(self) -> DepthAIGStreamerBridgeStats:
+        """Return bridge counters plus optional version-dependent appsrc levels."""
+
+        with self._lock:
+            attempts = self._push_attempts
+            succeeded = self._push_succeeded
+            failed = self._push_failed
+        return DepthAIGStreamerBridgeStats(
+            push_attempts=attempts,
+            push_succeeded=succeeded,
+            push_failed=failed,
+            appsrc_current_level_buffers=self._optional_uint_property(
+                self.appsrc,
+                "current-level-buffers",
+            ),
+            appsrc_current_level_bytes=self._optional_uint_property(
+                self.appsrc,
+                "current-level-bytes",
+            ),
+            appsrc_current_level_time=self._optional_uint_property(
+                self.appsrc,
+                "current-level-time",
+            ),
+            appsrc_in=self._optional_uint_property(self.appsrc, "in"),
+            appsrc_out=self._optional_uint_property(self.appsrc, "out"),
+            appsrc_dropped=self._optional_uint_property(self.appsrc, "dropped"),
+        )
+
     def start(self) -> None:
         if self.running:
             return
         self._stop.clear()
         with self._lock:
             self._failure = None
+            self._push_attempts = 0
+            self._push_succeeded = 0
+            self._push_failed = 0
+        self._next_metrics_at = time.monotonic() + self.metrics_interval_sec
         self.frame_source.start()
         try:
             thread = threading.Thread(
@@ -110,11 +185,51 @@ class DepthAIGStreamerBridge:
         return np.ascontiguousarray(array)
 
     def _push(self, frame: np.ndarray) -> None:
-        buffer = self.gst.Buffer.new_allocate(None, int(frame.nbytes), None)
-        buffer.fill(0, frame.tobytes())
-        flow = self.appsrc.emit("push-buffer", buffer)
+        with self._lock:
+            self._push_attempts += 1
+        try:
+            # A single owned bytes object crosses the PyGObject boundary.
+            # ``new_allocate`` + ``fill`` creates a second full-size native
+            # allocation/copy; passing a memoryview avoids that allocation but
+            # PyGObject marshals it byte-by-byte and cannot sustain 30 fps.
+            buffer = self.gst.Buffer.new_wrapped(frame.tobytes())
+            flow = self.appsrc.emit("push-buffer", buffer)
+            # appsrc keeps its own native reference when needed. Do not retain
+            # the PyGObject wrapper across pump iterations.
+            del buffer
+        except BaseException:
+            with self._lock:
+                self._push_failed += 1
+            raise
         if flow != self.gst.FlowReturn.OK:
+            with self._lock:
+                self._push_failed += 1
             raise DepthAIGStreamerBridgeError(f"GStreamer appsrc push failed: {flow}")
+        with self._lock:
+            self._push_succeeded += 1
+        self._maybe_log_metrics()
+
+    def _maybe_log_metrics(self) -> None:
+        if self.metrics_interval_sec <= 0:
+            return
+        now = time.monotonic()
+        if now < self._next_metrics_at:
+            return
+        self._next_metrics_at = now + self.metrics_interval_sec
+        stats = self.stats_snapshot()
+        self.log.info(
+            "[DEPTHAI] bridge push=%d ok=%d failed=%d "
+            "appsrc_buffers=%s appsrc_bytes=%s appsrc_in=%s "
+            "appsrc_out=%s appsrc_dropped=%s",
+            stats.push_attempts,
+            stats.push_succeeded,
+            stats.push_failed,
+            stats.appsrc_current_level_buffers,
+            stats.appsrc_current_level_bytes,
+            stats.appsrc_in,
+            stats.appsrc_out,
+            stats.appsrc_dropped,
+        )
 
     def _pump(self) -> None:
         consecutive_timeouts = 0
