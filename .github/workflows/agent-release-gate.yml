@@ -165,10 +165,16 @@ jobs:
           sudo purge
           FORMULA_PREFIX="$(brew --prefix nuv-agent)"
           FORMULA_PYTHON="$FORMULA_PREFIX/libexec/bin/python"
+          REFERENCE_PATH="${RUNNER_TEMP}/siglip-reference-v1.json"
           export FORMULA_PREFIX
+          export REFERENCE_PATH
+          trap 'rm -f "$REFERENCE_PATH"' EXIT
           cd "$RUNNER_TEMP"
+          # Compute the CPU oracle in its own process. Process exit returns the
+          # full reference model to macOS before the real MPS proof starts.
           PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
-          import gc
+          import json
+          import math
           import os
           from pathlib import Path
           import numpy as np
@@ -176,12 +182,13 @@ jobs:
           from huggingface_hub import snapshot_download
           from transformers import AutoModel, AutoProcessor
           import nuvion_app
-          from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
           path = Path(os.environ["MODEL_PATH"]).resolve()
           revision = os.environ["MODEL_REVISION"]
           formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
+          reference_path = Path(os.environ["REFERENCE_PATH"])
           package_path = Path(nuvion_app.__file__).resolve()
           assert package_path.is_relative_to(formula_prefix / "libexec")
+          assert reference_path.parent.resolve() == Path(os.environ["RUNNER_TEMP"]).resolve()
           assert path.name == revision
           assert Path(snapshot_download(
               repo_id="google/siglip2-base-patch16-224",
@@ -215,8 +222,75 @@ jobs:
           reference_scores = torch.sigmoid(
               reference_outputs.logits_per_image
           ).squeeze(0).float()
-          del reference_inputs, reference_outputs, reference_model, reference_processor
-          gc.collect()
+          scores = [float(score) for score in reference_scores]
+          assert len(scores) == len(labels) and all(math.isfinite(score) for score in scores)
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          if hasattr(os, "O_NOFOLLOW"):
+              flags |= os.O_NOFOLLOW
+          descriptor = os.open(reference_path, flags, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              json.dump(
+                  {
+                      "schemaVersion": 1,
+                      "modelRevision": revision,
+                      "labels": labels,
+                      "scores": scores,
+                  },
+                  output,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              output.flush()
+              os.fsync(output.fileno())
+          PY
+
+          # The hosted runner uses unified memory. Purge file-backed caches only
+          # after the CPU oracle process has released every model allocation.
+          sync
+          sudo purge
+          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import stat
+          import numpy as np
+          import torch
+          from huggingface_hub import snapshot_download
+          import nuvion_app
+          from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+          path = Path(os.environ["MODEL_PATH"]).resolve()
+          revision = os.environ["MODEL_REVISION"]
+          formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
+          reference_path = Path(os.environ["REFERENCE_PATH"])
+          package_path = Path(nuvion_app.__file__).resolve()
+          assert package_path.is_relative_to(formula_prefix / "libexec")
+          assert path.name == revision
+          assert Path(snapshot_download(
+              repo_id="google/siglip2-base-patch16-224",
+              revision=revision,
+              local_files_only=True,
+          )).resolve() == path
+          reference_stat = reference_path.lstat()
+          assert stat.S_ISREG(reference_stat.st_mode)
+          assert stat.S_IMODE(reference_stat.st_mode) == 0o600
+          reference = json.loads(reference_path.read_text(encoding="utf-8"))
+          assert set(reference) == {
+              "schemaVersion", "modelRevision", "labels", "scores"
+          }
+          labels = ["normal scene", "anomalous scene"]
+          assert reference["schemaVersion"] == 1
+          assert reference["modelRevision"] == revision
+          assert reference["labels"] == labels
+          scores = reference["scores"]
+          assert isinstance(scores, list) and len(scores) == len(labels)
+          assert all(
+              isinstance(score, (int, float))
+              and not isinstance(score, bool)
+              and math.isfinite(score)
+              for score in scores
+          )
+          reference_scores = torch.tensor(scores, dtype=torch.float32)
 
           detector = ZeroShotAnomalyDetector(
               enabled=True,

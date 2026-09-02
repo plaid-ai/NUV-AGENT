@@ -301,9 +301,20 @@ class ReleaseGateTest(unittest.TestCase):
             "torch.mps.current_allocated_memory() < 512 * 1024**2", macos
         )
         self.assertIn('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -', macos)
+        self.assertEqual(
+            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 2
+        )
         self.assertIn('package_path.is_relative_to(formula_prefix / "libexec")', macos)
         self.assertIn("reference_outputs.logits_per_image", macos)
         self.assertIn("observed_scores, reference_scores", macos)
+        self.assertIn('REFERENCE_PATH="${RUNNER_TEMP}/siglip-reference-v1.json"', macos)
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", macos)
+        self.assertIn('stat.S_IMODE(reference_stat.st_mode) == 0o600', macos)
+        reference = macos.index("reference_outputs.logits_per_image")
+        post_reference_purge = macos.index("sudo purge", reference)
+        mps_detector = macos.index("detector = ZeroShotAnomalyDetector")
+        self.assertLess(reference, post_reference_purge)
+        self.assertLess(post_reference_purge, mps_detector)
         self.assertIn("for _ in range(16):", macos)
         self.assertIn("stable_bytes + 16 * 1024**2", macos)
         self.assertIn("sudo purge", macos)
