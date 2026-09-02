@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from publisher_trust import PublisherTrustError, publisher_surface
+
 
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -80,6 +82,8 @@ def _ruleset_covers(
     include: str,
     required_rules: set[str],
     required_status_context: str | None = None,
+    required_status_integration_id: int | None = None,
+    require_pull_request_hardening: bool = False,
     required_bypass_team_id: int | None = None,
     required_bypass_mode: str | None = None,
 ) -> bool:
@@ -95,7 +99,13 @@ def _ruleset_covers(
             continue
         ref_name = conditions.get("ref_name")
         includes = ref_name.get("include") if isinstance(ref_name, dict) else None
-        if not isinstance(includes, list) or include not in includes:
+        excludes = ref_name.get("exclude") if isinstance(ref_name, dict) else None
+        if (
+            not isinstance(includes, list)
+            or include not in includes
+            or not isinstance(excludes, list)
+            or excludes
+        ):
             continue
         rules = ruleset.get("rules")
         if not isinstance(rules, list):
@@ -130,22 +140,50 @@ def _ruleset_covers(
                 for rule in rules
                 if isinstance(rule, dict) and rule.get("type") == "required_status_checks"
             ]
-            contexts: set[str] = set()
-            for rule in status_rules:
-                parameters = rule.get("parameters")
-                checks = (
-                    parameters.get("required_status_checks")
-                    if isinstance(parameters, dict)
-                    else None
-                )
-                if not isinstance(checks, list):
-                    continue
-                contexts.update(
-                    check.get("context")
-                    for check in checks
-                    if isinstance(check, dict) and isinstance(check.get("context"), str)
-                )
-            if required_status_context not in contexts:
+            if len(status_rules) != 1:
+                continue
+            parameters = status_rules[0].get("parameters")
+            checks = (
+                parameters.get("required_status_checks")
+                if isinstance(parameters, dict)
+                else None
+            )
+            if (
+                not isinstance(parameters, dict)
+                or parameters.get("strict_required_status_checks_policy") is not True
+                or parameters.get("do_not_enforce_on_create") is not False
+                or checks
+                != [
+                    {
+                        "context": required_status_context,
+                        "integration_id": required_status_integration_id,
+                    }
+                ]
+            ):
+                continue
+        if require_pull_request_hardening:
+            pull_request_rules = [
+                rule
+                for rule in rules
+                if isinstance(rule, dict) and rule.get("type") == "pull_request"
+            ]
+            if len(pull_request_rules) != 1:
+                continue
+            parameters = pull_request_rules[0].get("parameters")
+            approvals = (
+                parameters.get("required_approving_review_count")
+                if isinstance(parameters, dict)
+                else None
+            )
+            if (
+                isinstance(approvals, bool)
+                or not isinstance(approvals, int)
+                or approvals != 0
+                or parameters.get("dismiss_stale_reviews_on_push") is not False
+                or parameters.get("require_code_owner_review") is not False
+                or parameters.get("require_last_push_approval") is not False
+                or parameters.get("required_review_thread_resolution") is not True
+            ):
                 continue
         return True
     return False
@@ -168,6 +206,7 @@ def verify_settings(
     required_status_context = policy.get("requiredStatusContext")
     environments = policy.get("requiredEnvironments")
     release_admin_team_id = policy.get("releaseAdminTeamId")
+    governance = policy.get("governance")
     if (
         not isinstance(default_branch, str)
         or not isinstance(required_status_context, str)
@@ -177,6 +216,13 @@ def verify_settings(
         or not isinstance(release_admin_team_id, int)
         or release_admin_team_id < 1
         or policy.get("immutableReleases") is not True
+        or governance
+        != {
+            "pullRequestApprovals": 0,
+            "environmentReviewers": 0,
+            "requiredStatusContext": required_status_context,
+            "requiredStatusIntegrationId": 15368,
+        }
         or set(environments)
         != {"homebrew-release", "apt-release", "iq9075-release"}
     ):
@@ -209,6 +255,8 @@ def verify_settings(
         include=f"refs/heads/{default_branch}",
         required_rules={"deletion", "non_fast_forward", "pull_request", "required_status_checks"},
         required_status_context=required_status_context,
+        required_status_integration_id=15368,
+        require_pull_request_hardening=True,
         required_bypass_team_id=release_admin_team_id,
         required_bypass_mode="pull_request",
     ):
@@ -241,9 +289,9 @@ def verify_settings(
                 "reviewerTeamId",
                 "requiredSecrets",
             }
-            or requirements.get("requireReviewers") is not True
-            or requirements.get("preventSelfReview") is not True
-            or requirements.get("reviewerTeamId") != release_admin_team_id
+            or requirements.get("requireReviewers") is not False
+            or requirements.get("preventSelfReview") is not False
+            or requirements.get("reviewerTeamId") is not None
             or not isinstance(required_secrets, list)
             or not required_secrets
             or not all(
@@ -264,38 +312,11 @@ def verify_settings(
             or branch_policy.get("custom_branch_policies") is not False
         ):
             raise SettingsError(f"environment {name} is not restricted to protected branches")
-        if requirements.get("requireReviewers") is True:
-            protection_rules = environment.get("protection_rules")
-            reviewer_rules = (
-                [
-                    rule
-                    for rule in protection_rules
-                    if isinstance(rule, dict)
-                    and rule.get("type") == "required_reviewers"
-                ]
-                if isinstance(protection_rules, list)
-                else []
+        protection_rules = environment.get("protection_rules")
+        if not isinstance(protection_rules, list) or protection_rules:
+            raise SettingsError(
+                f"environment {name} must have no approval or wait protection rules"
             )
-            if len(reviewer_rules) != 1:
-                raise SettingsError(f"environment {name} has no required reviewer gate")
-            reviewer_rule = reviewer_rules[0]
-            reviewers = reviewer_rule.get("reviewers")
-            reviewer_team_ids = {
-                reviewer.get("reviewer", {}).get("id")
-                for reviewer in reviewers
-                if isinstance(reviewer, dict)
-                and reviewer.get("type") == "Team"
-                and isinstance(reviewer.get("reviewer"), dict)
-            } if isinstance(reviewers, list) else set()
-            if (
-                reviewer_team_ids != {release_admin_team_id}
-                or not isinstance(reviewers, list)
-                or len(reviewers) != 1
-                or reviewer_rule.get("prevent_self_review") is not True
-            ):
-                raise SettingsError(
-                    f"environment {name} reviewer identity or self-review policy is invalid"
-                )
 
     if include_secret_scopes:
         expected_variables = {
@@ -343,6 +364,7 @@ def verify_settings(
         "defaultBranch": default_branch,
         "trustedPublisherSha": trusted_publisher_sha,
         "secretScopesChecked": include_secret_scopes,
+        "governance": governance,
         "status": "VERIFIED",
     }
 
@@ -353,6 +375,7 @@ def main() -> int:
     parser.add_argument("--token-env", default="GITHUB_TOKEN")
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--trusted-publisher-sha", required=True)
+    parser.add_argument("--publisher-root", type=Path)
     parser.add_argument("--include-secret-scopes", action="store_true")
     parser.add_argument("--attestation-output", type=Path)
     parser.add_argument("--valid-hours", type=int, default=24)
@@ -373,6 +396,12 @@ def main() -> int:
                 )
             if arguments.valid_hours < 1 or arguments.valid_hours > 24:
                 raise SettingsError("settings attestation validity must be 1..24 hours")
+            if arguments.publisher_root is None:
+                raise SettingsError("settings attestation requires --publisher-root")
+            surface = publisher_surface(
+                arguments.publisher_root,
+                expected_sha=arguments.trusted_publisher_sha,
+            )
             now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
             expires = now + dt.timedelta(hours=arguments.valid_hours)
             policy_bytes = arguments.policy.resolve().read_bytes()
@@ -380,15 +409,18 @@ def main() -> int:
                 "schemaVersion": 1,
                 "kind": "nuvion-release-settings-attestation",
                 "repository": arguments.repository,
+                "publisherTreeSha256": surface["publisherTreeSha256"],
                 "policySha256": hashlib.sha256(policy_bytes).hexdigest(),
                 "verifiedAt": now.isoformat().replace("+00:00", "Z"),
                 "expiresAt": expires.isoformat().replace("+00:00", "Z"),
                 "settings": {
                     "defaultBranch": result["defaultBranch"],
+                    "governance": result["governance"],
                     "secretScopesChecked": result["secretScopesChecked"],
                     "status": result["status"],
                 },
                 "trustedPublisherSha": result["trustedPublisherSha"],
+                "workflowSha256": surface["workflowSha256"],
             }
             output = arguments.attestation_output.resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -405,7 +437,7 @@ def main() -> int:
             except FileExistsError as exc:
                 raise SettingsError("settings attestation output already exists") from exc
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    except (OSError, SettingsError) as exc:
+    except (OSError, PublisherTrustError, SettingsError) as exc:
         parser.error(str(exc))
     return 0
 

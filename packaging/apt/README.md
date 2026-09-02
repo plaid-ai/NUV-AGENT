@@ -16,9 +16,12 @@ ephemeral, this explicitly keeps the current and previous packages in the new
 signed `Packages` index. Retaining an unindexed pool object is not considered a
 rollback path.
 
-Immutable pool/BOM/bundle objects and OTA reservation/promotion markers use
+Immutable pool/by-hash/BOM/bundle objects and OTA reservation/promotion markers use
 Cloud Storage `ifGenerationMatch=0` create-only CAS, followed by exact remote
-byte comparison. `gsutil cp -n` is not used as a concurrency primitive.
+byte comparison. APT is generated with `Acquire-By-Hash: yes`; ordinary
+metadata is uploaded only after immutable by-hash objects and signed
+`InRelease` is the last discovery write. No remote delete or `gsutil cp -n`
+concurrency assumption is used, so every partial stage is safely rerunnable.
 
 ```bash
 ./publish-gcs.sh /path/to/nuv-agent_0.1.0_arm64.deb
@@ -45,7 +48,7 @@ VERSION=0.1.120 \
 다르면 publish를 거부합니다.
 
 Requirements:
-- `gcloud` + `gsutil`
+- `gcloud storage`
 - A GCS bucket named `apt.plaidai.io`
 - A public HTTPS endpoint for the bucket (Cloud CDN + HTTPS Load Balancer recommended)
 
@@ -78,15 +81,11 @@ Required GitHub secrets:
 Runner requirement:
 
 - Release jobs are fixed to GitHub-hosted `ubuntu-24.04-arm`. The required
-  `agent-release-gate` depends on a secret-zero arm64 prerequisite job that
-  verifies native architecture and the exact hashed bundle lock. If that label
-  is unavailable to the repository, release remains blocked. Do not silently
-  move credentials to a long-lived self-hosted runner; provision a separately
-  reviewed ephemeral trusted-runner design first.
-
-Runner note:
-- Default is `ubuntu-24.04-arm`. If you don't have access, change the job to `self-hosted`
-  and attach an arm64 runner (e.g., Jetson or Graviton).
+  `agent-release-gate` depends on secret-zero `ubuntu-24.04-arm` and `macos-14`
+  prerequisites that verify the locked bundle and actual Formula/MPS tuple.
+  A queued, unavailable, or failed prerequisite blocks release. Do not replace
+  it with a long-lived self-hosted runner or bypass its status without a
+  separately reviewed runner design.
 
 Provisioning (GCP):
 - `packaging/apt/gcp/setup-apt-hosting.sh`

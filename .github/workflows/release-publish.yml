@@ -24,6 +24,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Publisher trust rejects ignored execution surfaces such as Python bytecode.
+  PYTHONDONTWRITEBYTECODE: "1"
+
 concurrency:
   # Homebrew and APT contain mutable channel pointers. Serialize every trusted
   # publisher run, not merely runs for the same tag.
@@ -44,7 +48,6 @@ jobs:
       component_sha: ${{ steps.identity.outputs.component_sha }}
       trusted_publisher_sha: ${{ steps.identity.outputs.trusted_publisher_sha }}
       built_at: ${{ steps.identity.outputs.built_at }}
-      legacy_rerun: ${{ steps.identity.outputs.legacy_rerun }}
       requested_sequence: ${{ steps.request.outputs.requested_sequence }}
     steps:
       - name: Resolve request without credentials
@@ -132,25 +135,32 @@ jobs:
           path: settings-evidence
           persist-credentials: false
           sparse-checkout: |
+            .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
             packaging/release/release-settings-attestation.json.asc
 
       - name: Verify settings evidence checkout identity
         env:
+          DEFAULT_BRANCH_SHA: ${{ github.sha }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$WORKFLOW_SHA" = "$DEFAULT_BRANCH_SHA" ] \
+            || { echo "executing workflow is not from the event's protected-main SHA" >&2; exit 1; }
           [ "$(git -C settings-evidence rev-parse HEAD)" = "$WORKFLOW_SHA" ]
           [ -z "$(git -C settings-evidence status --porcelain --untracked-files=all)" ]
 
       - name: Verify short-lived signed GitHub settings audit
         env:
           TRUSTED_PUBLISHER_SHA: ${{ steps.request.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python3 publisher/packaging/release/verify-release-settings-attestation.py \
             --repository "$GITHUB_REPOSITORY" \
             --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
             --policy publisher/packaging/release/release-security-policy.json \
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
@@ -179,17 +189,11 @@ jobs:
       - name: Enforce audited dependency release readiness
         env:
           VERSION: ${{ steps.identity.outputs.version }}
-          LEGACY_RERUN: ${{ steps.identity.outputs.legacy_rerun }}
         run: |
           set -euo pipefail
-          legacy=()
-          if [ "$LEGACY_RERUN" = "true" ]; then
-            legacy+=(--allow-legacy)
-          fi
           python3 publisher/packaging/release/verify-release-readiness.py \
             --policy publisher/packaging/release/release-readiness.json \
-            --version "$VERSION" \
-            "${legacy[@]}"
+            --version "$VERSION"
 
   release-build:
     name: Test and build keyless generic release
@@ -407,12 +411,17 @@ jobs:
           retention-days: 1
 
   github-release-publish:
-    name: Stage GitHub release draft
+    name: Publish immutable GitHub source release
     runs-on: ubuntu-latest
     needs: [release-preflight, release-build, iq9075-ota-build]
     permissions:
       contents: write
     environment: homebrew-release
+    outputs:
+      source_plan_name: ${{ steps.source-plan.outputs.name }}
+      source_plan_sha256: ${{ steps.source-plan.outputs.sha256 }}
+      formula_name: ${{ steps.source-plan.outputs.formula_name }}
+      formula_sha256: ${{ steps.source-plan.outputs.formula_sha256 }}
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -421,51 +430,148 @@ jobs:
           path: publisher
           persist-credentials: false
 
+      - name: Checkout signed settings evidence from workflow definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: settings-evidence
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/release-publish.yml
+            packaging/release/release-settings-attestation.json
+            packaging/release/release-settings-attestation.json.asc
+
+      - name: Revalidate protected-job publisher trust before credentials
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Download keyless generic artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: distribution-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
-      - name: Verify transferred generic artifacts
+      - name: Download keyless IQ9075 artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Generate immutable source plan from exact transferred artifacts
+        id: source-plan
         env:
+          VERSION: ${{ needs.release-preflight.outputs.release_version }}
+          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
           SDIST_SHA256: ${{ needs.release-build.outputs.sdist_sha256 }}
           BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
           BOM_SHA256: ${{ needs.release-build.outputs.sdist_bom_sha256 }}
+          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.iq9075-ota-build.outputs.bundle_sha256 }}
+          DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
+          DEB_SHA256: ${{ needs.iq9075-ota-build.outputs.deb_sha256 }}
+          FORMULA_TEMPLATE_SHA256: ${{ needs.release-build.outputs.formula_sha256 }}
         run: |
           set -euo pipefail
           [ "$(sha256sum "dist/$SDIST_NAME" | awk '{print $1}')" = "$SDIST_SHA256" ]
           [ "$(sha256sum "dist/$BOM_NAME" | awk '{print $1}')" = "$BOM_SHA256" ]
+          [ "$(sha256sum "dist/$BUNDLE_NAME" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          [ "$(sha256sum "dist/$DEB_NAME" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(sha256sum dist/nuv-agent.rb | awk '{print $1}')" = "$FORMULA_TEMPLATE_SHA256" ]
+          FORMULA_NAME="nuv-agent-${VERSION}.rb"
+          cp dist/nuv-agent.rb "dist/$FORMULA_NAME"
+          FORMULA_PATH="dist/$FORMULA_NAME" \
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${SDIST_NAME}" \
+          SHA256="$SDIST_SHA256" VERSION="$VERSION" \
+            publisher/packaging/release/update-homebrew-formula.sh
+          ! grep -q '__URL__\|__SHA256__' "dist/$FORMULA_NAME"
+          NAME="nuv_agent-${VERSION}-distribution-source-plan.json"
+          PYTHONPATH=publisher python3 \
+            publisher/packaging/release/generate-release-promotion.py distribution-plan \
+              --version "$VERSION" \
+              --tag "$RELEASE_TAG" \
+              --component-sha "$COMPONENT_SHA" \
+              --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --security-policy publisher/packaging/release/release-security-policy.json \
+              --sdist "dist/$SDIST_NAME" \
+              --sdist-bom "dist/$BOM_NAME" \
+              --formula "dist/$FORMULA_NAME" \
+              --bundle "dist/$BUNDLE_NAME" \
+              --deb "dist/$DEB_NAME" \
+              --output "dist/$NAME"
+          {
+            echo "name=$NAME"
+            echo "sha256=$(sha256sum "dist/$NAME" | awk '{print $1}')"
+            echo "formula_name=$FORMULA_NAME"
+            echo "formula_sha256=$(sha256sum "dist/$FORMULA_NAME" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Stage exact assets without publishing the release
+      - name: Revalidate trust immediately before GitHub credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
+      - name: Finalize exact immutable GitHub release before live channels
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
-          LEGACY_RERUN: ${{ needs.release-preflight.outputs.legacy_rerun }}
           SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
           BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
+          SOURCE_PLAN_NAME: ${{ steps.source-plan.outputs.name }}
+          FORMULA_NAME: ${{ steps.source-plan.outputs.formula_name }}
         run: |
           set -euo pipefail
-          legacy=()
-          if [ "$LEGACY_RERUN" = "true" ]; then
-            legacy+=(--allow-legacy-mutable)
-          fi
+          [ -n "$GITHUB_TOKEN" ] || { echo "job-scoped GitHub token is unavailable" >&2; exit 1; }
           PYTHONPATH=publisher python3 \
             publisher/packaging/release/publish-github-release.py \
               --repository "$GITHUB_REPOSITORY" \
               --tag "$RELEASE_TAG" \
               --component-sha "$COMPONENT_SHA" \
-              --phase stage \
+              --phase finalize \
               --asset "dist/$SDIST_NAME" \
               --asset "dist/$BOM_NAME" \
-              "${legacy[@]}"
+              --asset "dist/$FORMULA_NAME" \
+              --asset "dist/$SOURCE_PLAN_NAME"
+
+      - name: Transfer immutable source plan to channel publishers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: distribution-source-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ steps.source-plan.outputs.name }}
+            dist/${{ steps.source-plan.outputs.formula_name }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
   homebrew-publish:
     name: Publish Homebrew channel
     runs-on: ubuntu-latest
-    needs: [release-preflight, release-build, github-release-publish]
+    needs: [release-preflight, github-release-publish]
     environment: homebrew-release
     permissions:
       contents: read
@@ -480,33 +586,75 @@ jobs:
           path: publisher
           persist-credentials: false
 
-      - name: Download reviewed formula as data
+      - name: Checkout signed settings evidence from workflow definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: settings-evidence
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/release-publish.yml
+            packaging/release/release-settings-attestation.json
+            packaging/release/release-settings-attestation.json.asc
+
+      - name: Revalidate protected-job publisher trust before credentials
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
+      - name: Download immutable GitHub source plan and formula
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: distribution-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: distribution-source-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
       - name: Verify formula transfer before credential use
         env:
-          FORMULA_SHA256: ${{ needs.release-build.outputs.formula_sha256 }}
+          FORMULA_NAME: ${{ needs.github-release-publish.outputs.formula_name }}
+          FORMULA_SHA256: ${{ needs.github-release-publish.outputs.formula_sha256 }}
         run: |
-          [ "$(sha256sum dist/nuv-agent.rb | awk '{print $1}')" = "$FORMULA_SHA256" ]
+          [ "$(sha256sum "dist/$FORMULA_NAME" | awk '{print $1}')" = "$FORMULA_SHA256" ]
+
+      - name: Revalidate trust immediately before Homebrew credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Update Homebrew tap with trusted publisher
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
-          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
-          SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
-          SDIST_SHA256: ${{ needs.release-build.outputs.sdist_sha256 }}
+          FORMULA_NAME: ${{ needs.github-release-publish.outputs.formula_name }}
         run: |
           set -euo pipefail
           [ -n "$GH_TOKEN" ] || { echo "HOMEBREW_TAP_TOKEN is not set" >&2; exit 1; }
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
-          cp dist/nuv-agent.rb "tap/$FORMULA_PATH"
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${SDIST_NAME}"
-          FORMULA_PATH="tap/$FORMULA_PATH" URL="$URL" SHA256="$SDIST_SHA256" VERSION="$VERSION" \
-            publisher/packaging/release/update-homebrew-formula.sh
+          cp "dist/$FORMULA_NAME" candidate.rb
+          python3 publisher/packaging/release/verify-homebrew-promotion.py \
+            --current "tap/$FORMULA_PATH" \
+            --candidate candidate.rb \
+            --version "$VERSION"
+          cp candidate.rb "tap/$FORMULA_PATH"
           cd tap
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git"
           git config user.email "release-bot@plaidai.io"
@@ -520,15 +668,18 @@ jobs:
           fi
 
   apt-publish:
-    name: Publish signed APT channel with previous rollback package
+    name: Publish signed APT channel and final distribution promotion
     runs-on: ubuntu-latest
-    needs: [release-preflight, iq9075-ota-build, homebrew-publish]
+    needs:
+      [release-preflight, release-build, iq9075-ota-build, github-release-publish, homebrew-publish]
     environment: apt-release
     permissions:
       contents: read
     outputs:
       rollback_version: ${{ steps.rollback.outputs.version }}
       rollback_sha256: ${{ steps.rollback.outputs.sha256 }}
+      promotion_name: ${{ steps.promotion.outputs.name }}
+      promotion_sha256: ${{ steps.promotion.outputs.sha256 }}
     env:
       GNUPGHOME: ${{ github.workspace }}/.gnupg
       GPG_KEY_ID: E5230C3090A66BC5
@@ -541,6 +692,32 @@ jobs:
           path: publisher
           persist-credentials: false
 
+      - name: Checkout signed settings evidence from workflow definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: settings-evidence
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/release-publish.yml
+            packaging/release/release-settings-attestation.json
+            packaging/release/release-settings-attestation.json.asc
+
+      - name: Revalidate protected-job publisher trust before credentials
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Install publisher runtime before credentials
         run: |
           sudo apt-get update
@@ -550,6 +727,18 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: iq9075-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Download keyless generic artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: distribution-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Download immutable GitHub source plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: distribution-source-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
       - name: Verify transferred deb identity
@@ -563,20 +752,72 @@ jobs:
         id: rollback
         env:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
-          LEGACY_RERUN: ${{ needs.release-preflight.outputs.legacy_rerun }}
         run: |
           set -euo pipefail
-          extra=()
-          if [ "$LEGACY_RERUN" = "true" ]; then
-            extra+=(--allow-none)
-          fi
           python3 publisher/packaging/release/prepare-apt-rollback.py \
             --base-url https://apt.plaidai.io \
             --expected-fingerprint C6915E8C74A9C4B3EEFBA39FE5230C3090A66BC5 \
             --current-version "$VERSION" \
             --output-dir dist/rollback \
-            --github-output "$GITHUB_OUTPUT" \
-            "${extra[@]}"
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Precompute exact final distribution promotion before credentials
+        id: promotion
+        env:
+          VERSION: ${{ needs.release-preflight.outputs.release_version }}
+          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
+          BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
+          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
+          DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
+          SOURCE_PLAN_NAME: ${{ needs.github-release-publish.outputs.source_plan_name }}
+          SOURCE_PLAN_SHA256: ${{ needs.github-release-publish.outputs.source_plan_sha256 }}
+          FORMULA_NAME: ${{ needs.github-release-publish.outputs.formula_name }}
+          FORMULA_SHA256: ${{ needs.github-release-publish.outputs.formula_sha256 }}
+          ROLLBACK_VERSION: ${{ steps.rollback.outputs.version }}
+          ROLLBACK_SHA256: ${{ steps.rollback.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [ "$(sha256sum "dist/$SOURCE_PLAN_NAME" | awk '{print $1}')" = "$SOURCE_PLAN_SHA256" ]
+          [ "$(sha256sum "dist/$FORMULA_NAME" | awk '{print $1}')" = "$FORMULA_SHA256" ]
+          NAME="nuv_agent-${VERSION}-distribution-promotion.json"
+          PYTHONPATH=publisher python3 \
+            publisher/packaging/release/generate-release-promotion.py distribution \
+              --version "$VERSION" \
+              --tag "$RELEASE_TAG" \
+              --component-sha "$COMPONENT_SHA" \
+              --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --security-policy publisher/packaging/release/release-security-policy.json \
+              --source-plan "dist/$SOURCE_PLAN_NAME" \
+              --sdist "dist/$SDIST_NAME" \
+              --sdist-bom "dist/$BOM_NAME" \
+              --formula "dist/$FORMULA_NAME" \
+              --bundle "dist/$BUNDLE_NAME" \
+              --deb "dist/$DEB_NAME" \
+              --rollback-version "$ROLLBACK_VERSION" \
+              --rollback-sha256 "$ROLLBACK_SHA256" \
+              --output "dist/$NAME"
+          {
+            echo "name=$NAME"
+            echo "sha256=$(sha256sum "dist/$NAME" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Revalidate trust immediately before APT credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Import APT signing key
         env:
@@ -619,99 +860,14 @@ jobs:
           APT_PREVIOUS_DEB_PATH="$ROLLBACK_DEB_PATH" \
             publisher/packaging/apt/publish-gcs.sh "$DEB_PATH"
 
-  finalize-distribution:
-    name: Publish final distribution promotion manifest
-    runs-on: ubuntu-latest
-    needs:
-      [release-preflight, release-build, iq9075-ota-build, github-release-publish, homebrew-publish, apt-publish]
-    permissions:
-      contents: write
-    environment: homebrew-release
-    outputs:
-      promotion_name: ${{ steps.promotion.outputs.name }}
-      promotion_sha256: ${{ steps.promotion.outputs.sha256 }}
-    steps:
-      - name: Checkout trusted publisher only
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
-          path: publisher
-          persist-credentials: false
-
-      - name: Download generic build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: distribution-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist
-
-      - name: Download IQ9075 build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: iq9075-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist
-
-      - name: Generate deterministic distribution promotion
-        id: promotion
+      - name: Publish final distribution promotion after both live channels
         env:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
-          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
-          COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
-          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
-          SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
-          BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
-          BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
-          DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
-          ROLLBACK_VERSION: ${{ needs.apt-publish.outputs.rollback_version }}
-          ROLLBACK_SHA256: ${{ needs.apt-publish.outputs.rollback_sha256 }}
-        run: |
-          set -euo pipefail
-          NAME="nuv_agent-${VERSION}-distribution-promotion.json"
-          rollback=()
-          if [ "$ROLLBACK_VERSION" != "none" ]; then
-            rollback+=(--rollback-version "$ROLLBACK_VERSION" --rollback-sha256 "$ROLLBACK_SHA256")
-          fi
-          PYTHONPATH=publisher python3 \
-            publisher/packaging/release/generate-release-promotion.py distribution \
-              --version "$VERSION" \
-              --tag "$RELEASE_TAG" \
-              --component-sha "$COMPONENT_SHA" \
-              --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
-              --sdist "dist/$SDIST_NAME" \
-              --sdist-bom "dist/$BOM_NAME" \
-              --bundle "dist/$BUNDLE_NAME" \
-              --deb "dist/$DEB_NAME" \
-              "${rollback[@]}" \
-              --output "dist/$NAME"
-          {
-            echo "name=$NAME"
-            echo "sha256=$(sha256sum "dist/$NAME" | awk '{print $1}')"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Attach promotion and publish immutable GitHub release
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
-          COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
-          LEGACY_RERUN: ${{ needs.release-preflight.outputs.legacy_rerun }}
-          SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
-          BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
           PROMOTION_NAME: ${{ steps.promotion.outputs.name }}
         run: |
-          set -euo pipefail
-          legacy=()
-          if [ "$LEGACY_RERUN" = "true" ]; then
-            legacy+=(--allow-legacy-mutable)
-          fi
-          PYTHONPATH=publisher python3 \
-            publisher/packaging/release/publish-github-release.py \
-              --repository "$GITHUB_REPOSITORY" \
-              --tag "$RELEASE_TAG" \
-              --component-sha "$COMPONENT_SHA" \
-              --phase finalize \
-              --asset "dist/$SDIST_NAME" \
-              --asset "dist/$BOM_NAME" \
-              --asset "dist/$PROMOTION_NAME" \
-              "${legacy[@]}"
+          publisher/packaging/release/publish-immutable-gcs-file.sh \
+            "dist/$PROMOTION_NAME" apt.plaidai.io \
+            "releases/promotions/distribution/${VERSION}.json"
 
       - name: Transfer final distribution promotion to OTA gate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -726,7 +882,7 @@ jobs:
     name: Reserve, sign, publish, and promote IQ9075 OTA
     if: github.event_name == 'workflow_dispatch' && inputs.publish_iq9075_ota == true
     runs-on: ubuntu-latest
-    needs: [release-preflight, iq9075-ota-build, finalize-distribution]
+    needs: [release-preflight, iq9075-ota-build, apt-publish]
     environment: iq9075-release
     concurrency:
       group: iq9075-ota-global-publisher
@@ -740,6 +896,32 @@ jobs:
           ref: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           path: publisher
           persist-credentials: false
+
+      - name: Checkout signed settings evidence from workflow definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: settings-evidence
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/release-publish.yml
+            packaging/release/release-settings-attestation.json
+            packaging/release/release-settings-attestation.json.asc
+
+      - name: Revalidate protected-job publisher trust before credentials
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Install signer runtime before credentials
         run: |
@@ -764,8 +946,8 @@ jobs:
           BUNDLE_SHA256: ${{ needs.iq9075-ota-build.outputs.bundle_sha256 }}
           DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
           DEB_SHA256: ${{ needs.iq9075-ota-build.outputs.deb_sha256 }}
-          PROMOTION_NAME: ${{ needs.finalize-distribution.outputs.promotion_name }}
-          PROMOTION_SHA256: ${{ needs.finalize-distribution.outputs.promotion_sha256 }}
+          PROMOTION_NAME: ${{ needs.apt-publish.outputs.promotion_name }}
+          PROMOTION_SHA256: ${{ needs.apt-publish.outputs.promotion_sha256 }}
         run: |
           set -euo pipefail
           [ "$(sha256sum "dist/$BUNDLE_NAME" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
@@ -798,6 +980,21 @@ jobs:
               --built-at "$BUILT_AT" \
               --output dist/iq9075-sequence-reservation.json \
               --github-output "$GITHUB_OUTPUT"
+
+      - name: Revalidate trust immediately before OTA credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Authenticate OTA-only GCP publisher
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -901,7 +1098,7 @@ jobs:
       - name: Generate and atomically publish final OTA promotion
         env:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
-          PROMOTION_NAME: ${{ needs.finalize-distribution.outputs.promotion_name }}
+          PROMOTION_NAME: ${{ needs.apt-publish.outputs.promotion_name }}
         run: |
           set -euo pipefail
           BOM_PATH="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"

@@ -124,7 +124,7 @@ def _write_new(path: Path, payload: Mapping[str, Any]) -> None:
         raise PromotionError("promotion output already exists") from exc
 
 
-def build_distribution(arguments: argparse.Namespace) -> dict[str, Any]:
+def _distribution_identity(arguments: argparse.Namespace) -> dict[str, Any]:
     version = arguments.version
     if not SEMVER.fullmatch(version) or arguments.tag != f"v{version}":
         raise PromotionError("distribution version/tag identity is invalid")
@@ -132,6 +132,62 @@ def build_distribution(arguments: argparse.Namespace) -> dict[str, Any]:
         arguments.trusted_publisher_sha
     ):
         raise PromotionError("distribution commit identity is invalid")
+    _, security_policy = _strict_json_artifact(arguments.security_policy)
+    governance = security_policy.get("governance")
+    if governance != {
+        "pullRequestApprovals": 0,
+        "environmentReviewers": 0,
+        "requiredStatusContext": "agent-release-gate",
+        "requiredStatusIntegrationId": 15368,
+    }:
+        raise PromotionError("release governance policy is not the approved zero-approval contract")
+    return {
+        "agentVersion": version,
+        "releaseTag": arguments.tag,
+        "componentSha": arguments.component_sha,
+        "trustedPublisherSha": arguments.trusted_publisher_sha,
+        "governance": governance,
+        "artifacts": {
+            "pythonSdist": _artifact(arguments.sdist),
+            "sdistBom": _artifact(arguments.sdist_bom),
+            "homebrewFormula": _artifact(arguments.formula),
+            "iq9075Bundle": _artifact(arguments.bundle),
+            "iq9075Deb": _artifact(arguments.deb),
+        },
+    }
+
+
+def build_distribution_plan(arguments: argparse.Namespace) -> dict[str, Any]:
+    identity = _distribution_identity(arguments)
+    return {
+        "schemaVersion": 1,
+        "kind": "nuvion-distribution-source-plan",
+        "status": "SOURCE_IMMUTABLE",
+        **identity,
+        "channels": {
+            "apt": "PENDING",
+            "github": "IMMUTABLE",
+            "homebrew": "PENDING",
+        },
+    }
+
+
+def build_distribution(arguments: argparse.Namespace) -> dict[str, Any]:
+    identity = _distribution_identity(arguments)
+    plan_metadata, plan = _strict_json_artifact(arguments.source_plan)
+    expected_plan = {
+        "schemaVersion": 1,
+        "kind": "nuvion-distribution-source-plan",
+        "status": "SOURCE_IMMUTABLE",
+        **identity,
+        "channels": {
+            "apt": "PENDING",
+            "github": "IMMUTABLE",
+            "homebrew": "PENDING",
+        },
+    }
+    if plan != expected_plan:
+        raise PromotionError("immutable GitHub source plan differs from channel artifacts")
     rollback: dict[str, str] | None = None
     if arguments.rollback_version or arguments.rollback_sha256:
         if not SEMVER.fullmatch(arguments.rollback_version or "") or not SHA256.fullmatch(
@@ -146,20 +202,12 @@ def build_distribution(arguments: argparse.Namespace) -> dict[str, Any]:
         "schemaVersion": 1,
         "kind": "nuvion-distribution-promotion",
         "status": "PROMOTED",
-        "agentVersion": version,
-        "releaseTag": arguments.tag,
-        "componentSha": arguments.component_sha,
-        "trustedPublisherSha": arguments.trusted_publisher_sha,
+        **identity,
+        "sourcePlanDigest": f"sha256:{plan_metadata['sha256']}",
         "channels": {
             "apt": "PUBLISHED",
-            "github": "PUBLISHED",
+            "github": "IMMUTABLE",
             "homebrew": "PUBLISHED",
-        },
-        "artifacts": {
-            "pythonSdist": _artifact(arguments.sdist),
-            "sdistBom": _artifact(arguments.sdist_bom),
-            "iq9075Bundle": _artifact(arguments.bundle),
-            "iq9075Deb": _artifact(arguments.deb),
         },
         "rollbackPackage": rollback,
     }
@@ -190,6 +238,8 @@ def build_ota(arguments: argparse.Namespace) -> dict[str, Any]:
         "releaseTag",
         "componentSha",
         "trustedPublisherSha",
+        "governance",
+        "sourcePlanDigest",
         "channels",
         "artifacts",
         "rollbackPackage",
@@ -205,14 +255,24 @@ def build_ota(arguments: argparse.Namespace) -> dict[str, Any]:
         or manifest.get("componentSha") != bom.component_sha
         or not isinstance(manifest.get("trustedPublisherSha"), str)
         or not SHA.fullmatch(manifest["trustedPublisherSha"])
+        or manifest.get("governance")
+        != {
+            "pullRequestApprovals": 0,
+            "environmentReviewers": 0,
+            "requiredStatusContext": "agent-release-gate",
+            "requiredStatusIntegrationId": 15368,
+        }
         or manifest.get("channels")
-        != {"apt": "PUBLISHED", "github": "PUBLISHED", "homebrew": "PUBLISHED"}
+        != {"apt": "PUBLISHED", "github": "IMMUTABLE", "homebrew": "PUBLISHED"}
+        or not isinstance(manifest.get("sourcePlanDigest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["sourcePlanDigest"]) is None
     ):
         raise PromotionError("distribution promotion identity is inconsistent with OTA BOM")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != {
         "pythonSdist",
         "sdistBom",
+        "homebrewFormula",
         "iq9075Bundle",
         "iq9075Deb",
     }:
@@ -258,17 +318,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     distribution = subcommands.add_parser("distribution")
-    distribution.add_argument("--version", required=True)
-    distribution.add_argument("--tag", required=True)
-    distribution.add_argument("--component-sha", required=True)
-    distribution.add_argument("--trusted-publisher-sha", required=True)
-    distribution.add_argument("--sdist", type=Path, required=True)
-    distribution.add_argument("--sdist-bom", type=Path, required=True)
-    distribution.add_argument("--bundle", type=Path, required=True)
-    distribution.add_argument("--deb", type=Path, required=True)
+    plan = subcommands.add_parser("distribution-plan")
+    for command in (distribution, plan):
+        command.add_argument("--version", required=True)
+        command.add_argument("--tag", required=True)
+        command.add_argument("--component-sha", required=True)
+        command.add_argument("--trusted-publisher-sha", required=True)
+        command.add_argument("--security-policy", type=Path, required=True)
+        command.add_argument("--sdist", type=Path, required=True)
+        command.add_argument("--sdist-bom", type=Path, required=True)
+        command.add_argument("--formula", type=Path, required=True)
+        command.add_argument("--bundle", type=Path, required=True)
+        command.add_argument("--deb", type=Path, required=True)
+        command.add_argument("--output", type=Path, required=True)
+    distribution.add_argument("--source-plan", type=Path, required=True)
     distribution.add_argument("--rollback-version")
     distribution.add_argument("--rollback-sha256")
-    distribution.add_argument("--output", type=Path, required=True)
     ota = subcommands.add_parser("ota")
     ota.add_argument("--distribution-promotion", type=Path, required=True)
     ota.add_argument("--bom", type=Path, required=True)
@@ -278,7 +343,12 @@ def main() -> int:
     ota.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     try:
-        payload = build_distribution(arguments) if arguments.command == "distribution" else build_ota(arguments)
+        if arguments.command == "distribution-plan":
+            payload = build_distribution_plan(arguments)
+        elif arguments.command == "distribution":
+            payload = build_distribution(arguments)
+        else:
+            payload = build_ota(arguments)
         _write_new(arguments.output.resolve(), payload)
         print(arguments.output.resolve())
     except (PromotionError, ValueError) as exc:

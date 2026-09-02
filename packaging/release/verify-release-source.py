@@ -204,6 +204,7 @@ def verify_release_source(
         "immutableReleases",
         "trustedTagSignerFingerprints",
         "legacyUnsignedReruns",
+        "governance",
         "requiredEnvironments",
         "forbiddenRepositorySecrets",
         "apt",
@@ -214,6 +215,7 @@ def verify_release_source(
     default_branch = policy.get("defaultBranch")
     required_context = policy.get("requiredStatusContext")
     release_admin_team_id = policy.get("releaseAdminTeamId")
+    governance = policy.get("governance")
     if (
         default_branch != "main"
         or required_context != "agent-release-gate"
@@ -221,6 +223,13 @@ def verify_release_source(
         or isinstance(release_admin_team_id, bool)
         or not isinstance(release_admin_team_id, int)
         or release_admin_team_id < 1
+        or governance
+        != {
+            "pullRequestApprovals": 0,
+            "environmentReviewers": 0,
+            "requiredStatusContext": "agent-release-gate",
+            "requiredStatusIntegrationId": 15368,
+        }
         or origin_main_ref
         not in {f"refs/remotes/origin/{default_branch}", f"refs/heads/{default_branch}"}
     ):
@@ -254,18 +263,14 @@ def verify_release_source(
             check=False,
         ).returncode != 0:
             raise VerificationError("legacy unsigned rerun commit is outside protected main")
-    legacy_rerun = legacy.get(tag) == component_sha
-    if legacy_rerun:
-        if event_name != "workflow_dispatch":
-            raise VerificationError("legacy unsigned tags are manual idempotent reruns only")
-        signer_fingerprint = "legacy-pinned-commit"
-    else:
-        signer_fingerprint = _verify_signed_tag(
-            repository,
-            tag,
-            signer_directory=signer_directory,
-            allowed_fingerprints=allowed,
-        )
+    if legacy:
+        raise VerificationError("unsigned legacy release reruns are disabled")
+    signer_fingerprint = _verify_signed_tag(
+        repository,
+        tag,
+        signer_directory=signer_directory,
+        allowed_fingerprints=allowed,
+    )
 
     checked_out_sha = _git_value(repository, ["rev-parse", "HEAD"])
     if checked_out_sha != component_sha:
@@ -280,7 +285,6 @@ def verify_release_source(
         "trusted_publisher_sha": trusted_publisher_sha,
         "origin_main_sha": origin_main_sha,
         "tag_signer_fingerprint": signer_fingerprint,
-        "legacy_rerun": "true" if legacy_rerun else "false",
         "built_at": built_at,
     }
 

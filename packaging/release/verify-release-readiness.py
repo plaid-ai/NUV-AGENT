@@ -12,7 +12,6 @@ from typing import Any
 
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 BLOCKER_ID = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,127}$")
-LEGACY_VERSION = "0.1.120"
 
 
 class ReadinessError(RuntimeError):
@@ -44,13 +43,9 @@ def _load(path: Path) -> dict[str, Any]:
     return payload
 
 
-def verify_readiness(path: Path, *, version: str, allow_legacy: bool) -> None:
+def verify_readiness(path: Path, *, version: str) -> None:
     if not SEMVER.fullmatch(version):
         raise ReadinessError("release readiness version must be exact SemVer")
-    if allow_legacy:
-        if version != LEGACY_VERSION:
-            raise ReadinessError("release readiness legacy exception is restricted to v0.1.120")
-        return
     payload = _load(path)
     releases = payload["releases"]
     for configured_version in releases:
@@ -87,13 +82,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--allow-legacy", action="store_true")
     arguments = parser.parse_args()
     try:
         verify_readiness(
             arguments.policy,
             version=arguments.version,
-            allow_legacy=arguments.allow_legacy,
         )
     except ReadinessError as exc:
         parser.error(str(exc))

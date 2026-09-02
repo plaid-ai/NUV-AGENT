@@ -210,10 +210,11 @@ OTA activation은 publisher-signed release-bom-v2만 허용하며 signed
 `releases/by-bom-sha256/<bom digest>/`에 exact artifact 및 detached signature와
 함께 create-only로 저장하고 업로드 전후 byte-compare합니다. APT job은 OTA signing
 key를 받지 않으며 OTA build/signing job은 APT GPG key를 받지 않습니다.
-GitHub release는 먼저 draft로 asset을 모두 stage하고 distribution promotion manifest까지
-붙인 뒤 한 번만 publish합니다. Repository release immutability가 preflight에서 확인되므로
-publish 이후 tag와 asset은 수정/삭제할 수 없습니다. 이미 발행된 version을 변경해야 할
-때는 새 patch version을 발행해야 합니다.
+GitHub release는 sdist/BOM/source-plan을 모두 검증한 뒤 live channel보다 먼저 immutable로
+finalize합니다. 이후 Homebrew와 APT를 idempotent하게 승격하고, 양쪽 성공 뒤에만
+create-only distribution promotion marker를 기록합니다. Repository release immutability가
+preflight에서 확인되므로 publish 이후 tag와 asset은 수정/삭제할 수 없습니다. 이미 발행된
+version을 변경해야 할 때는 새 signed patch version을 발행해야 합니다.
 
 Required secrets:
 - `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)
@@ -221,5 +222,10 @@ Required secrets:
 - Publisher key ID is pinned in `release-security-policy.json`, not a secret
 - `packaging/release/trusted-release-keyrings/iq9075-dev.json` is public,
   protected-main verification material; it is deliberately not a secret
+
+모든 credential job은 24시간 이내 platform-admin signed settings attestation을
+protected environment 진입 직후와 첫 secret 사용 직전에 다시 검증합니다. Attestation은 exact
+trusted publisher commit의 전체 tracked surface와 default-branch workflow bytes를 묶습니다.
+Unsigned legacy tag(v0.1.120 포함)는 이 publisher에서 지원하지 않습니다.
 
 To host an APT repo, use a tool like `aptly` or `reprepro`, then publish the generated `.deb`.

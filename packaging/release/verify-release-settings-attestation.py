@@ -14,6 +14,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from publisher_trust import (
+    PublisherTrustError,
+    publisher_surface,
+    verify_executing_workflow,
+)
+
 
 FINGERPRINT = re.compile(r"^[0-9A-F]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -104,6 +110,12 @@ def _verify_signature(
 ) -> str:
     if signature_path.is_symlink() or not signature_path.is_file():
         raise AttestationError("settings attestation signature is unavailable")
+    try:
+        signature_size = signature_path.stat().st_size
+    except OSError as exc:
+        raise AttestationError("cannot stat settings attestation signature") from exc
+    if signature_size < 1 or signature_size > MAX_DOCUMENT_BYTES:
+        raise AttestationError("settings attestation signature size is invalid")
     public_keys = sorted(signer_directory.glob("*.asc"))
     if not public_keys:
         raise AttestationError("settings attestation signer directory is empty")
@@ -169,6 +181,8 @@ def verify_attestation(
     signer_directory: Path,
     repository: str,
     trusted_publisher_sha: str,
+    publisher_root: Path,
+    executing_workflow: Path,
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     if not REPOSITORY.fullmatch(repository):
@@ -193,6 +207,8 @@ def verify_attestation(
         "kind",
         "repository",
         "trustedPublisherSha",
+        "publisherTreeSha256",
+        "workflowSha256",
         "policySha256",
         "verifiedAt",
         "expiresAt",
@@ -205,12 +221,17 @@ def verify_attestation(
         or attestation.get("kind") != "nuvion-release-settings-attestation"
         or attestation.get("repository") != repository
         or attestation.get("trustedPublisherSha") != trusted_publisher_sha
+        or not isinstance(attestation.get("publisherTreeSha256"), str)
+        or not SHA256.fullmatch(attestation["publisherTreeSha256"])
+        or not isinstance(attestation.get("workflowSha256"), str)
+        or not SHA256.fullmatch(attestation["workflowSha256"])
         or not isinstance(attestation.get("policySha256"), str)
         or not SHA256.fullmatch(attestation["policySha256"])
         or attestation["policySha256"] != hashlib.sha256(policy_raw).hexdigest()
         or settings
         != {
             "defaultBranch": policy.get("defaultBranch"),
+            "governance": policy.get("governance"),
             "secretScopesChecked": True,
             "status": "VERIFIED",
         }
@@ -233,10 +254,25 @@ def verify_attestation(
         signer_directory=signer_directory,
         allowed_fingerprints=set(fingerprints),
     )
+    surface = publisher_surface(
+        publisher_root,
+        expected_sha=trusted_publisher_sha,
+    )
+    if surface["publisherTreeSha256"] != attestation["publisherTreeSha256"]:
+        raise AttestationError("trusted publisher tree differs from signed attestation")
+    verify_executing_workflow(
+        publisher_root,
+        executing_workflow,
+        expected_workflow_sha256=attestation["workflowSha256"],
+    )
+    if surface["workflowSha256"] != attestation["workflowSha256"]:
+        raise AttestationError("trusted publisher workflow digest differs from attestation")
     return {
         "schemaVersion": 1,
         "repository": repository,
         "trustedPublisherSha": trusted_publisher_sha,
+        "publisherTreeSha256": attestation["publisherTreeSha256"],
+        "workflowSha256": attestation["workflowSha256"],
         "policySha256": attestation["policySha256"],
         "signerFingerprint": signer,
         "expiresAt": attestation["expiresAt"],
@@ -252,6 +288,8 @@ def main() -> int:
     parser.add_argument("--signer-directory", type=Path, required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--trusted-publisher-sha", required=True)
+    parser.add_argument("--publisher-root", type=Path, required=True)
+    parser.add_argument("--executing-workflow", type=Path, required=True)
     arguments = parser.parse_args()
     try:
         result = verify_attestation(
@@ -261,9 +299,16 @@ def main() -> int:
             signer_directory=arguments.signer_directory,
             repository=arguments.repository,
             trusted_publisher_sha=arguments.trusted_publisher_sha,
+            publisher_root=arguments.publisher_root,
+            executing_workflow=arguments.executing_workflow,
         )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    except (AttestationError, OSError, subprocess.SubprocessError) as exc:
+    except (
+        AttestationError,
+        OSError,
+        PublisherTrustError,
+        subprocess.SubprocessError,
+    ) as exc:
         parser.error(str(exc))
     return 0
 

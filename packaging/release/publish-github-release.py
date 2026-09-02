@@ -23,8 +23,6 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_API_BYTES = 2 * 1024 * 1024
-LEGACY_TAG = "v0.1.120"
-LEGACY_SHA = "b354026f73d63a82ad4c64923f46dc400a73efcb"
 
 
 class GitHubReleaseError(RuntimeError):
@@ -266,14 +264,11 @@ def publish_release(
     component_sha: str,
     phase: str,
     asset_paths: list[Path],
-    allow_legacy_mutable: bool,
 ) -> dict[str, Any]:
     if not TAG.fullmatch(tag) or not SHA.fullmatch(component_sha):
         raise GitHubReleaseError("release tag or component SHA is invalid")
     if phase not in {"stage", "finalize"}:
         raise GitHubReleaseError("release publication phase is invalid")
-    if allow_legacy_mutable and (tag != LEGACY_TAG or component_sha != LEGACY_SHA):
-        raise GitHubReleaseError("mutable legacy exception is restricted to exact v0.1.120")
     local_assets = [_artifact(path) for path in asset_paths]
     local_by_name = {asset["name"]: asset for asset in local_assets}
     if len(local_by_name) != len(local_assets):
@@ -283,7 +278,7 @@ def publish_release(
     if release is None:
         release = _create_draft(api, tag=tag, component_sha=component_sha)
     _validate_release(release, tag=tag)
-    if not release["draft"] and not release["immutable"] and not allow_legacy_mutable:
+    if not release["draft"] and not release["immutable"]:
         raise GitHubReleaseError("existing published release is mutable")
 
     remote_by_name = _remote_assets(release)
@@ -307,7 +302,6 @@ def publish_release(
         _verify_asset(remote_by_name[name], local)
     if (
         phase == "finalize"
-        and not allow_legacy_mutable
         and set(remote_by_name) != set(local_by_name)
     ):
         raise GitHubReleaseError("draft GitHub release has an unexpected asset set")
@@ -325,9 +319,9 @@ def publish_release(
     if phase == "finalize":
         if release["draft"]:
             raise GitHubReleaseError("GitHub release remained a draft after finalization")
-        if not release["immutable"] and not allow_legacy_mutable:
+        if not release["immutable"]:
             raise GitHubReleaseError("published GitHub release is not immutable")
-        if not allow_legacy_mutable and set(_remote_assets(release)) != set(local_by_name):
+        if set(_remote_assets(release)) != set(local_by_name):
             raise GitHubReleaseError("immutable GitHub release has an unexpected asset set")
 
     return {
@@ -336,7 +330,6 @@ def publish_release(
         "phase": phase,
         "draft": release["draft"],
         "immutable": release["immutable"],
-        "legacyMutable": allow_legacy_mutable,
         "assets": {name: local_by_name[name]["digest"] for name in sorted(local_by_name)},
         "status": "VERIFIED",
     }
@@ -350,7 +343,6 @@ def main() -> int:
     parser.add_argument("--phase", choices=("stage", "finalize"), required=True)
     parser.add_argument("--asset", action="append", type=Path, required=True)
     parser.add_argument("--token-env", default="GITHUB_TOKEN")
-    parser.add_argument("--allow-legacy-mutable", action="store_true")
     arguments = parser.parse_args()
     try:
         result = publish_release(
@@ -361,7 +353,6 @@ def main() -> int:
             component_sha=arguments.component_sha,
             phase=arguments.phase,
             asset_paths=arguments.asset,
-            allow_legacy_mutable=arguments.allow_legacy_mutable,
         )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     except (GitHubReleaseError, OSError, subprocess.SubprocessError) as exc:

@@ -13,7 +13,8 @@ object_name="$3"
 [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,221}[a-z0-9]$ ]] \
   || { echo "invalid GCS bucket" >&2; exit 2; }
 if [[ ! "$object_name" =~ ^releases/reservations/iq9075/[1-9][0-9]*\.json$ ]] \
-  && [[ ! "$object_name" =~ ^releases/promotions/iq9075/[0-9]+\.[0-9]+\.[0-9]+\.json$ ]]; then
+  && [[ ! "$object_name" =~ ^releases/promotions/iq9075/[0-9]+\.[0-9]+\.[0-9]+\.json$ ]] \
+  && [[ ! "$object_name" =~ ^releases/promotions/distribution/[0-9]+\.[0-9]+\.[0-9]+\.json$ ]]; then
   echo "GCS object is outside the fixed release reservation/promotion prefixes" >&2
   exit 2
 fi

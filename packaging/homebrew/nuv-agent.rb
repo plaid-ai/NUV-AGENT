@@ -252,6 +252,11 @@ class NuvAgent < Formula
     sha256 "3413c2ae377550f5487991d444428f1a8ae92784aac79caa8b1e3b89b175f77e"
   end
 
+  resource "protobuf" do
+    url "https://files.pythonhosted.org/packages/39/ca/c47f91d3cab175b01fd8c4f0d80fdf8613be876cc616e66ad281a59c5ddf/protobuf-7.36.1-py3-none-any.whl"
+    sha256 "7d951e46b3f963d6c264c367c437921de9d5aedd9c3f9612b9077736b4e3ad5c"
+  end
+
   resource "opencv-python" do
     url "https://files.pythonhosted.org/packages/fc/6f/5a28fef4c4a382be06afe3938c64cc168223016fa520c5abaf37e8862aa5/opencv_python-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl"
     sha256 "caf60c071ec391ba51ed00a4a920f996d0b64e3e46068aac1f646b5de0326a19"
@@ -290,6 +295,11 @@ class NuvAgent < Formula
   resource "setuptools" do
     url "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl"
     sha256 "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3"
+  end
+
+  resource "sentencepiece" do
+    url "https://files.pythonhosted.org/packages/d1/18/823954c9c90e74eba09fb96752dc37a5555df00d69866cb9406d1725dc7e/sentencepiece-0.2.2-cp314-cp314-macosx_11_0_arm64.whl"
+    sha256 "79bac5a251f23a7341e28fda9ce0d5319edf45328239ce037c0682936f137906"
   end
 
   resource "wheel" do

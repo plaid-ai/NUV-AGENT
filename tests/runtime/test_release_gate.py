@@ -21,7 +21,9 @@ class ReleaseGateTest(unittest.TestCase):
         source_test = workflow.index("- name: Test source in clean environment")
         build = workflow.index("- name: Build normalized sdist and BOM")
         smoke = workflow.index("- name: Install and smoke-test built sdist")
-        publish = workflow.index("- name: Stage exact assets without publishing the release")
+        publish = workflow.index(
+            "- name: Finalize exact immutable GitHub release before live channels"
+        )
 
         self.assertLess(source_test, build)
         self.assertLess(build, smoke)
@@ -49,7 +51,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('path: publisher', workflow)
         self.assertIn('path: release-source', workflow)
         self.assertIn("publish-github-release.py", workflow)
-        self.assertIn("--phase stage", workflow)
+        self.assertNotIn("--phase stage", workflow)
         self.assertIn("--phase finalize", workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertIn("if git diff --cached --quiet; then", workflow)
@@ -105,7 +107,7 @@ class ReleaseGateTest(unittest.TestCase):
             "  github-release-publish:", maxsplit=1
         )[0]
         apt_publish = workflow.split("  apt-publish:", maxsplit=1)[1].split(
-            "  finalize-distribution:", maxsplit=1
+            "  iq9075-ota-publish:", maxsplit=1
         )[0]
         ota_publish = workflow.split("  iq9075-ota-publish:", maxsplit=1)[1]
         self.assertIn("APT_GPG_PRIVATE_KEY", apt_publish)
@@ -149,7 +151,15 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('$(basename "$BOM_ARTIFACT_PATH")', apt_script)
         self.assertIn('gcloud storage cat "gs://$BUCKET/$relative_path" | cmp -s', apt_script)
         self.assertIn("--if-generation-match=0", apt_script)
-        self.assertIn("-x '^(releases/|pool/)'", apt_script)
+        self.assertNotIn("gsutil", apt_script)
+        self.assertIn("-acquire-by-hash", apt_script)
+        self.assertIn("Acquire-By-Hash: yes", apt_script)
+        self.assertIn("APT_BY_HASH_PATHS", apt_script)
+        self.assertIn("APT_DISCOVERY_PATH", apt_script)
+        self.assertLess(
+            apt_script.index('for apt_metadata in "${APT_MUTABLE_METADATA_PATHS[@]}"'),
+            apt_script.index('upload_mutable_metadata "$APT_DISCOVERY_PATH"'),
+        )
         self.assertNotIn("setmeta", apt_script)
         self.assertIn("RELEASE_TRUST_DOMAIN is required", apt_script)
         self.assertIn('aptly -config="$APTLY_CONFIG" repo add "$REPO_NAME" "$ROLLBACK_DEB_PATH"', apt_script)
@@ -244,11 +254,16 @@ class ReleaseGateTest(unittest.TestCase):
             encoding="utf-8"
         )
         for requirement in (
+            "torch==2.10.0",
+            "numpy==2.4.2",
             "transformers==5.16.1",
             "huggingface-hub==1.29.0",
             "hf-xet==1.6.0",
             "tokenizers==0.23.1",
             "safetensors==0.8.0",
+            "Pillow==12.1.0",
+            "sentencepiece==0.2.2",
+            "protobuf==7.36.1",
         ):
             self.assertIn(requirement, pyproject)
             self.assertIn(requirement, zsad)
@@ -257,6 +272,40 @@ class ReleaseGateTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("transformers", iq_lock)
         self.assertNotIn("torch", iq_lock)
+
+    def test_macos_arm64_formula_and_fixed_revision_mps_gate_is_fail_closed(self) -> None:
+        gate = (ROOT / ".github/workflows/agent-release-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        macos = gate.split(
+            "  macos-arm64-release-prerequisite:", maxsplit=1
+        )[1].split("  agent-release-gate:", maxsplit=1)[0]
+        self.assertIn("runs-on: macos-14", macos)
+        self.assertIn("brew install --formula --build-from-source", macos)
+        self.assertIn('platform.machine() == "arm64"', macos)
+        self.assertIn("torch.backends.mps.is_available()", macos)
+        self.assertIn(
+            "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
+        )
+        self.assertIn("local_files_only=True", macos)
+        self.assertIn("HF_HUB_OFFLINE", macos)
+        self.assertIn("ZeroShotAnomalyDetector", macos)
+        for identity in (
+            '"torch": "2.10.0"',
+            '"numpy": "2.4.2"',
+            '"transformers": "5.16.1"',
+            '"huggingface-hub": "1.29.0"',
+            '"hf-xet": "1.6.0"',
+            '"tokenizers": "0.23.1"',
+            '"safetensors": "0.8.0"',
+            '"Pillow": "12.1.0"',
+            '"sentencepiece": "0.2.2"',
+            '"protobuf": "7.36.1"',
+        ):
+            self.assertIn(identity, macos)
+        aggregator = gate.split("  agent-release-gate:", maxsplit=1)[1]
+        self.assertIn("macos-arm64-release-prerequisite", aggregator)
+        self.assertIn("needs.macos-arm64-release-prerequisite.result", aggregator)
 
     def test_debian_bootstrap_is_prebuilt_and_excludes_checkout_source(self) -> None:
         deb = (ROOT / "packaging" / "deb" / "build-deb.sh").read_text(encoding="utf-8")

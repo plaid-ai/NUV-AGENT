@@ -28,6 +28,9 @@ def load_script(name: str, relative: str):
     return module
 
 
+PUBLISHER_TRUST = load_script(
+    "publisher_trust", "packaging/release/publisher_trust.py"
+)
 VERIFY_SOURCE = load_script(
     "verify_release_source", "packaging/release/verify-release-source.py"
 )
@@ -44,6 +47,10 @@ SETTINGS = load_script(
 )
 GITHUB_RELEASE = load_script(
     "publish_github_release", "packaging/release/publish-github-release.py"
+)
+HOMEBREW_PROMOTION = load_script(
+    "verify_homebrew_promotion",
+    "packaging/release/verify-homebrew-promotion.py",
 )
 READINESS = load_script(
     "verify_release_readiness", "packaging/release/verify-release-readiness.py"
@@ -63,6 +70,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ROOT / ".github/workflows/release-request.yml"
         ).read_text(encoding="utf-8")
 
+    def _job(self, name: str) -> str:
+        start = self.publish.index(f"  {name}:")
+        following = re.search(r"^  [a-z0-9-]+:\s*$", self.publish[start + 1 :], re.MULTILINE)
+        return self.publish[start:] if following is None else self.publish[
+            start : start + 1 + following.start()
+        ]
+
     def test_tag_push_is_secret_zero_and_default_branch_starts_publisher(self) -> None:
         self.assertIn("on:\n  push:\n    tags:", self.request)
         self.assertNotIn("${{ secrets.", self.request)
@@ -70,40 +84,37 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertNotIn("environment:", self.request)
         self.assertIn('workflows: ["release-request"]', self.publish)
         self.assertIn("group: release-publisher-global", self.publish)
+        self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', self.publish.split("jobs:", 1)[0])
         trigger = self.publish.split("jobs:", maxsplit=1)[0]
         self.assertNotIn("  push:\n", trigger)
         self.assertIn('publisher workflow_dispatch must run from main', self.publish)
         self.assertIn("github.event.workflow_run.head_sha", self.publish)
         self.assertIn("ref: ${{ github.workflow_sha }}", self.publish)
+        self.assertIn('[ "$WORKFLOW_SHA" = "$DEFAULT_BRANCH_SHA" ]', self.publish)
         self.assertIn("path: settings-evidence", self.publish)
         self.assertIn('--trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA"', self.publish)
 
     def test_every_credential_job_uses_environment_and_trusted_checkout(self) -> None:
-        sections = {}
         job_names = [
             "github-release-publish",
             "homebrew-publish",
             "apt-publish",
-            "finalize-distribution",
             "iq9075-ota-publish",
         ]
-        for index, name in enumerate(job_names):
-            start = self.publish.index(f"  {name}:")
-            following = [
-                self.publish.find(f"  {candidate}:", start + 1)
-                for candidate in job_names[index + 1 :]
-            ]
-            following = [value for value in following if value >= 0]
-            end = min(following) if following else len(self.publish)
-            sections[name] = self.publish[start:end]
         expected_environment = {
             "github-release-publish": "homebrew-release",
             "homebrew-publish": "homebrew-release",
             "apt-publish": "apt-release",
-            "finalize-distribution": "homebrew-release",
             "iq9075-ota-publish": "iq9075-release",
         }
-        for name, section in sections.items():
+        credential_reference = {
+            "github-release-publish": "${{ github.token }}",
+            "homebrew-publish": "${{ secrets.",
+            "apt-publish": "${{ secrets.",
+            "iq9075-ota-publish": "${{ secrets.",
+        }
+        for name in job_names:
+            section = self._job(name)
             with self.subTest(job=name):
                 self.assertIn(
                     f"environment: {expected_environment[name]}", section
@@ -114,22 +125,50 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     section,
                 )
                 self.assertIn("path: publisher", section)
+                self.assertIn("path: settings-evidence", section)
+                self.assertEqual(
+                    section.count("verify-release-settings-attestation.py"), 2
+                )
+                self.assertEqual(section.count("--publisher-root publisher"), 2)
+                self.assertEqual(
+                    section.count(
+                        "--executing-workflow settings-evidence/.github/workflows/release-publish.yml"
+                    ),
+                    2,
+                )
+                self.assertLess(
+                    section.rindex("verify-release-settings-attestation.py"),
+                    section.index(credential_reference[name]),
+                )
+                if name == "github-release-publish":
+                    self.assertIn("permissions:\n      contents: write", section)
+                    self.assertNotIn("GITHUB_RELEASE_TOKEN", section)
+                else:
+                    self.assertNotIn("contents: write", section)
                 self.assertNotIn("ref: ${{ needs.release-preflight.outputs.release_tag }}", section)
                 self.assertNotIn("build-agent-bundle.sh", section)
 
-    def test_github_release_is_draft_until_final_promotion_then_immutable(self) -> None:
-        stage = self.publish.split("  github-release-publish:", maxsplit=1)[1].split(
-            "  homebrew-publish:", maxsplit=1
-        )[0]
-        finalize = self.publish.split("  finalize-distribution:", maxsplit=1)[1].split(
-            "  iq9075-ota-publish:", maxsplit=1
-        )[0]
-        self.assertIn("--phase stage", stage)
-        self.assertNotIn("--phase finalize", stage)
-        self.assertIn("--phase finalize", finalize)
-        self.assertIn('NAME="nuv_agent-${VERSION}-distribution-promotion.json"', finalize)
-        self.assertIn('publisher/packaging/release/publish-github-release.py', stage)
-        self.assertIn('publisher/packaging/release/publish-github-release.py', finalize)
+    def test_github_is_immutable_before_rerunnable_live_channel_promotion(self) -> None:
+        github = self._job("github-release-publish")
+        homebrew = self._job("homebrew-publish")
+        apt = self._job("apt-publish")
+        self.assertIn("--phase finalize", github)
+        self.assertNotIn("--phase stage", self.publish)
+        self.assertIn("distribution-source-plan", github)
+        self.assertIn("needs: [release-preflight, github-release-publish]", homebrew)
+        self.assertIn("homebrewFormula", (
+            ROOT / "packaging/release/generate-release-promotion.py"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("github-release-publish, homebrew-publish", apt)
+        self.assertIn('NAME="nuv_agent-${VERSION}-distribution-promotion.json"', apt)
+        self.assertIn("releases/promotions/distribution/${VERSION}.json", apt)
+        self.assertLess(
+            self.publish.index("  github-release-publish:"),
+            self.publish.index("  homebrew-publish:"),
+        )
+        self.assertLess(
+            self.publish.index("  homebrew-publish:"), self.publish.index("  apt-publish:")
+        )
         self.assertNotIn("softprops/action-gh-release", self.publish)
 
     def test_v121_dependency_readiness_is_enforced_before_build(self) -> None:
@@ -145,7 +184,6 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         READINESS.verify_readiness(
             ROOT / "packaging/release/release-readiness.json",
             version="0.1.121",
-            allow_legacy=False,
         )
         with tempfile.TemporaryDirectory() as raw_root:
             blocked = Path(raw_root) / "readiness.json"
@@ -167,13 +205,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 READINESS.verify_readiness(
                     blocked,
                     version="0.1.121",
-                    allow_legacy=False,
                 )
-        READINESS.verify_readiness(
-            ROOT / "packaging/release/release-readiness.json",
-            version="0.1.120",
-            allow_legacy=True,
-        )
+        with self.assertRaises(READINESS.ReadinessError):
+            READINESS.verify_readiness(
+                ROOT / "packaging/release/release-readiness.json",
+                version="0.1.120",
+            )
 
     def test_ota_sequence_failure_precedes_private_key_and_uses_global_cas(self) -> None:
         ota = self.publish.split("  iq9075-ota-publish:", maxsplit=1)[1]
@@ -246,9 +283,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("name: agent-release-gate", gate)
         self.assertIn("  agent-release-gate:\n    name: agent-release-gate", gate)
         self.assertIn("runs-on: ubuntu-24.04-arm", gate)
-        self.assertIn("needs: arm64-release-prerequisite", gate)
+        self.assertIn(
+            "needs: [arm64-release-prerequisite, macos-arm64-release-prerequisite]",
+            gate,
+        )
         self.assertIn("if: always()", gate)
         self.assertIn("needs.arm64-release-prerequisite.result", gate)
+        self.assertIn("needs.macos-arm64-release-prerequisite.result", gate)
         self.assertIn("requirements-agent-bundle-arm64.txt", gate)
         self.assertIn("packaging/release/run-isolated-tests.py", gate)
         self.assertIn("actionlint", gate)
@@ -291,38 +332,34 @@ class ReleaseSourceVerificationTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def test_exact_legacy_tag_is_manual_rerun_only(self) -> None:
+    def test_unsigned_legacy_tag_and_nonempty_fallback_policy_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             repository, commit = self._repository(root)
             self._git(repository, "tag", "-a", "v1.2.3", "-m", "legacy")
-            policy = self._policy(
-                root,
-                fingerprint="A" * 40,
-                legacy={"v1.2.3": commit},
-            )
             signers = root / "signers"
             signers.mkdir()
-            verified = VERIFY_SOURCE.verify_release_source(
-                repository=repository,
-                tag="v1.2.3",
-                origin_main_ref="refs/heads/main",
-                trusted_publisher_sha=commit,
-                event_name="workflow_dispatch",
-                policy_path=policy,
-                signer_directory=signers,
-            )
-            self.assertEqual(verified["legacy_rerun"], "true")
-            with self.assertRaises(VERIFY_SOURCE.VerificationError):
-                VERIFY_SOURCE.verify_release_source(
-                    repository=repository,
-                    tag="v1.2.3",
-                    origin_main_ref="refs/heads/main",
-                    trusted_publisher_sha=commit,
-                    event_name="workflow_run",
-                    policy_path=policy,
-                    signer_directory=signers,
+            for legacy, event_name in (
+                ({"v1.2.3": commit}, "workflow_dispatch"),
+                ({}, "workflow_dispatch"),
+                ({}, "workflow_run"),
+            ):
+                policy = self._policy(
+                    root,
+                    fingerprint="A" * 40,
+                    legacy=legacy,
                 )
+                with self.subTest(legacy=bool(legacy), event_name=event_name):
+                    with self.assertRaises(VERIFY_SOURCE.VerificationError):
+                        VERIFY_SOURCE.verify_release_source(
+                            repository=repository,
+                            tag="v1.2.3",
+                            origin_main_ref="refs/heads/main",
+                            trusted_publisher_sha=commit,
+                            event_name=event_name,
+                            policy_path=policy,
+                            signer_directory=signers,
+                        )
 
     @unittest.skipUnless(shutil.which("gpg"), "gpg is required")
     def test_signed_tag_requires_exact_allowlisted_primary_fingerprint(self) -> None:
@@ -462,7 +499,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             paths = {}
-            for name in ("sdist", "bom", "bundle", "deb"):
+            for name in ("sdist", "bom", "formula", "bundle", "deb"):
                 path = root / name
                 path.write_bytes(name.encode())
                 paths[name] = path
@@ -471,21 +508,49 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 tag="v0.1.121",
                 component_sha="a" * 40,
                 trusted_publisher_sha="b" * 40,
+                security_policy=ROOT / "packaging/release/release-security-policy.json",
                 sdist=paths["sdist"],
                 sdist_bom=paths["bom"],
+                formula=paths["formula"],
                 bundle=paths["bundle"],
                 deb=paths["deb"],
+                source_plan=None,
                 rollback_version="0.1.120",
                 rollback_sha256="c" * 64,
             )
+            source_plan = root / "source-plan.json"
+            source_plan.write_text(
+                json.dumps(
+                    PROMOTION.build_distribution_plan(arguments),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            arguments.source_plan = source_plan
             first = PROMOTION.build_distribution(arguments)
             second = PROMOTION.build_distribution(arguments)
             self.assertEqual(first, second)
             self.assertEqual(first["status"], "PROMOTED")
+            self.assertEqual(first["governance"]["pullRequestApprovals"], 0)
+            self.assertEqual(first["governance"]["environmentReviewers"], 0)
+            self.assertEqual(
+                first["artifacts"]["homebrewFormula"]["name"], "formula"
+            )
+            self.assertRegex(first["sourcePlanDigest"], r"^sha256:[0-9a-f]{64}$")
             self.assertEqual(
                 first["rollbackPackage"],
                 {"agentVersion": "0.1.120", "sha256": "c" * 64},
             )
+            altered = json.loads(source_plan.read_text(encoding="utf-8"))
+            altered["channels"]["homebrew"] = "PUBLISHED"
+            source_plan.write_text(
+                json.dumps(altered, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(PROMOTION.PromotionError):
+                PROMOTION.build_distribution(arguments)
 
     def test_ota_promotion_binds_distribution_bundle_to_signed_bom(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -494,6 +559,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
             names = {
                 "sdist": "nuv_agent-0.1.121.tar.gz",
                 "sdist_bom": "nuv_agent-0.1.121-sdist.release-bom.json",
+                "formula": "nuv-agent-0.1.121.rb",
                 "bundle": "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz",
                 "deb": "nuv-agent_0.1.121_arm64.deb",
             }
@@ -506,13 +572,27 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 tag="v0.1.121",
                 component_sha="a" * 40,
                 trusted_publisher_sha="b" * 40,
+                security_policy=ROOT / "packaging/release/release-security-policy.json",
                 sdist=artifacts["sdist"],
                 sdist_bom=artifacts["sdist_bom"],
+                formula=artifacts["formula"],
                 bundle=artifacts["bundle"],
                 deb=artifacts["deb"],
+                source_plan=None,
                 rollback_version="0.1.120",
                 rollback_sha256="c" * 64,
             )
+            source_plan = root / "source-plan.json"
+            source_plan.write_text(
+                json.dumps(
+                    PROMOTION.build_distribution_plan(distribution_arguments),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            distribution_arguments.source_plan = source_plan
             manifest = PROMOTION.build_distribution(distribution_arguments)
             manifest_path = root / "nuv_agent-0.1.121-distribution-promotion.json"
             manifest_path.write_text(
@@ -640,14 +720,358 @@ esac
             failed = subprocess.run(command, check=False, capture_output=True, env=environment)
             self.assertNotEqual(failed.returncode, 0)
 
+    def test_ota_discovery_is_last_and_every_partial_stage_is_rerunnable(self) -> None:
+        from base64 import b64encode
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            artifact = root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+            artifact.write_bytes(b"exact ota bundle")
+            private_key = Ed25519PrivateKey.generate()
+            private_raw = private_key.private_bytes(
+                serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw,
+                serialization.NoEncryption(),
+            )
+            public_der = private_key.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            keyring = root / "keyring.json"
+            keyring.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "trustDomain": "test-ota",
+                        "keys": {"test-release": b64encode(public_der).decode("ascii")},
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            bom = root / "release-bom.json"
+            signature = root / "release-bom.json.sig"
+            generation_environment = {
+                **os.environ,
+                "TEST_RELEASE_PRIVATE_KEY": b64encode(private_raw).decode("ascii"),
+            }
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "packaging/release/generate-release-bom.py"),
+                    "--schema-version", "2",
+                    "--bom-id", "nuv-agent-0.1.121-iq9075-aarch64",
+                    "--version", "0.1.121",
+                    "--component-sha", "a" * 40,
+                    "--config-schema", "12",
+                    "--release-sequence", "2",
+                    "--min-updater-version", "0.1.0",
+                    "--target", "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64",
+                    "--artifact", str(artifact),
+                    "--artifact-kind", "agent-bundle",
+                    "--built-at", "2026-09-02T00:00:00Z",
+                    "--output", str(bom),
+                    "--signature-output", str(signature),
+                    "--signing-key-id", "test-release",
+                    "--signing-private-key-env", "TEST_RELEASE_PRIVATE_KEY",
+                ],
+                check=True,
+                capture_output=True,
+                env=generation_environment,
+            )
+
+            for failed_stage in range(1, 7):
+                with self.subTest(failed_stage=failed_stage):
+                    stage = root / f"stage-{failed_stage}"
+                    binary = stage / "bin"
+                    remote = stage / "remote"
+                    public = stage / "public"
+                    log = stage / "gcloud.log"
+                    counter = stage / "counter"
+                    binary.mkdir(parents=True)
+                    remote.mkdir()
+                    fake = binary / "gcloud"
+                    fake.write_text(
+                        """#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "$FAKE_GCLOUD_LOG"
+[ "$1" = storage ]
+args=("$@")
+remote_arg="${args[${#args[@]}-1]}"
+relative="${remote_arg#gs://test-bucket/}"
+target="$FAKE_GCLOUD_REMOTE/$relative"
+case "$2" in
+  cp)
+    count=0
+    [ ! -f "$FAKE_GCLOUD_COUNTER" ] || count=$(cat "$FAKE_GCLOUD_COUNTER")
+    count=$((count + 1))
+    echo "$count" > "$FAKE_GCLOUD_COUNTER"
+    if [ "$count" = "$FAKE_FAIL_STAGE" ]; then
+      exit 75
+    fi
+    [ ! -e "$target" ] || exit 1
+    mkdir -p "$(dirname "$target")"
+    cp "${args[${#args[@]}-2]}" "$target"
+    ;;
+  cat) cat "$target" ;;
+  *) exit 2 ;;
+esac
+""",
+                        encoding="utf-8",
+                    )
+                    fake.chmod(0o755)
+                    environment = {
+                        **os.environ,
+                        "PATH": f"{binary}:{Path(sys.executable).parent}:{os.environ['PATH']}",
+                        "VERSION": "0.1.121",
+                        "BUCKET": "test-bucket",
+                        "SKIP_APT_PUBLISH": "true",
+                        "APT_PUBLIC_DIR": str(public),
+                        "RELEASE_KEYRING_PATH": str(keyring),
+                        "RELEASE_TRUST_DOMAIN": "test-ota",
+                        "FAKE_GCLOUD_LOG": str(log),
+                        "FAKE_GCLOUD_REMOTE": str(remote),
+                        "FAKE_GCLOUD_COUNTER": str(counter),
+                        "FAKE_FAIL_STAGE": str(failed_stage),
+                    }
+                    command = [
+                        str(ROOT / "packaging/apt/publish-gcs.sh"),
+                        str(artifact),
+                        str(bom),
+                        str(signature),
+                        str(artifact),
+                    ]
+                    first = subprocess.run(
+                        command, check=False, capture_output=True, text=True, env=environment
+                    )
+                    self.assertNotEqual(first.returncode, 0)
+                    environment["FAKE_FAIL_STAGE"] = "0"
+                    second = subprocess.run(
+                        command, check=False, capture_output=True, text=True, env=environment
+                    )
+                    self.assertEqual(second.returncode, 0, second.stderr)
+                    third = subprocess.run(
+                        command, check=False, capture_output=True, text=True, env=environment
+                    )
+                    self.assertEqual(third.returncode, 0, third.stderr)
+                    objects = sorted(path for path in remote.rglob("*") if path.is_file())
+                    self.assertEqual(len(objects), 6)
+                    cp_lines = [
+                        line for line in log.read_text(encoding="utf-8").splitlines()
+                        if line.startswith("storage cp ")
+                    ]
+                    self.assertTrue(cp_lines)
+                    self.assertTrue(
+                        cp_lines[-1].endswith(
+                            "gs://test-bucket/releases/0.1.121/release-bom.json"
+                        )
+                    )
+
 
 class SettingsPolicyTest(unittest.TestCase):
+    def test_approved_governance_is_zero_approval_but_status_gate_remains_strict(self) -> None:
+        policy = json.loads(
+            (ROOT / "packaging/release/release-security-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            policy["governance"],
+            {
+                "pullRequestApprovals": 0,
+                "environmentReviewers": 0,
+                "requiredStatusContext": "agent-release-gate",
+                "requiredStatusIntegrationId": 15368,
+            },
+        )
+        for environment in policy["requiredEnvironments"].values():
+            self.assertFalse(environment["requireReviewers"])
+            self.assertFalse(environment["preventSelfReview"])
+            self.assertIsNone(environment["reviewerTeamId"])
+        self.assertNotIn("GITHUB_RELEASE_TOKEN", json.dumps(policy))
+
+    def test_settings_audit_accepts_no_environment_wait_and_rejects_reviewer_rule(self) -> None:
+        branch_ruleset = {
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/heads/main"], "exclude": []}
+            },
+            "bypass_actors": [
+                {
+                    "actor_id": 16128529,
+                    "actor_type": "Team",
+                    "bypass_mode": "pull_request",
+                }
+            ],
+            "rules": [
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_approving_review_count": 0,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_code_owner_review": False,
+                        "require_last_push_approval": False,
+                        "required_review_thread_resolution": True,
+                    },
+                },
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "do_not_enforce_on_create": False,
+                        "required_status_checks": [
+                            {
+                                "context": "agent-release-gate",
+                                "integration_id": 15368,
+                            }
+                        ],
+                    },
+                },
+            ],
+        }
+        tag_ruleset = {
+            "target": "tag",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+            },
+            "bypass_actors": [
+                {
+                    "actor_id": 16128529,
+                    "actor_type": "Team",
+                    "bypass_mode": "always",
+                }
+            ],
+            "rules": [
+                {"type": "creation"},
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+            ],
+        }
+        responses: dict[str, object] = {
+            "/repos/plaid-ai/NUV-AGENT": {"default_branch": "main"},
+            "/repos/plaid-ai/NUV-AGENT/immutable-releases": {"enabled": True},
+            "/repos/plaid-ai/NUV-AGENT/branches/main": {"protected": True},
+            "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true": [
+                {"id": 1},
+                {"id": 2},
+            ],
+            "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
+            "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
+            "/repos/plaid-ai/NUV-AGENT/actions/permissions/workflow": {
+                "default_workflow_permissions": "read",
+                "can_approve_pull_request_reviews": False,
+            },
+        }
+        for name in ("homebrew-release", "apt-release", "iq9075-release"):
+            responses[f"/repos/plaid-ai/NUV-AGENT/environments/{name}"] = {
+                "name": name,
+                "deployment_branch_policy": {
+                    "protected_branches": True,
+                    "custom_branch_policies": False,
+                },
+                "protection_rules": [],
+            }
+
+        fake_api = mock.Mock()
+        fake_api.get.side_effect = lambda path: responses[path]
+        with mock.patch.object(SETTINGS, "GitHubApi", return_value=fake_api):
+            result = SETTINGS.verify_settings(
+                repository="plaid-ai/NUV-AGENT",
+                token="metadata-only",
+                policy_path=ROOT / "packaging/release/release-security-policy.json",
+                trusted_publisher_sha="a" * 40,
+                include_secret_scopes=False,
+            )
+            self.assertEqual(result["governance"]["pullRequestApprovals"], 0)
+            responses[
+                "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
+            ]["protection_rules"] = [{"type": "required_reviewers"}]
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+
+    def test_publisher_surface_binds_every_tracked_helper_and_workflow_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            repository = root / "publisher"
+            workflow = repository / ".github/workflows/release-publish.yml"
+            helper = repository / "packaging/release/helper.sh"
+            workflow.parent.mkdir(parents=True)
+            helper.parent.mkdir(parents=True)
+            workflow.write_text("name: trusted\n", encoding="utf-8")
+            helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+            subprocess.run(["git", "init", "-b", "main", repository], check=True, capture_output=True)
+            subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "-C", repository, "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", repository, "add", "."], check=True)
+            subprocess.run(["git", "-C", repository, "commit", "-m", "publisher"], check=True, capture_output=True)
+            commit = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+            ).strip()
+            surface = PUBLISHER_TRUST.publisher_surface(repository, expected_sha=commit)
+            executing = root / "executing.yml"
+            executing.write_bytes(workflow.read_bytes())
+            PUBLISHER_TRUST.verify_executing_workflow(
+                repository,
+                executing,
+                expected_workflow_sha256=surface["workflowSha256"],
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "update-index",
+                    "--assume-unchanged",
+                    "packaging/release/helper.sh",
+                ],
+                check=True,
+            )
+            helper.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            with self.assertRaises(PUBLISHER_TRUST.PublisherTrustError):
+                PUBLISHER_TRUST.publisher_surface(repository, expected_sha=commit)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "update-index",
+                    "--no-assume-unchanged",
+                    "packaging/release/helper.sh",
+                ],
+                check=True,
+            )
+            helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executing.write_text("name: attacker\n", encoding="utf-8")
+            with self.assertRaises(PUBLISHER_TRUST.PublisherTrustError):
+                PUBLISHER_TRUST.verify_executing_workflow(
+                    repository,
+                    executing,
+                    expected_workflow_sha256=surface["workflowSha256"],
+                )
+
     def test_required_ruleset_matching_is_exact(self) -> None:
         rulesets = [
             {
                 "target": "tag",
                 "enforcement": "active",
-                "conditions": {"ref_name": {"include": ["refs/tags/v*"]}},
+                "conditions": {
+                    "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+                },
                 "rules": [
                     {"type": "creation"},
                     {"type": "deletion"},
@@ -678,16 +1102,32 @@ class SettingsPolicyTest(unittest.TestCase):
             {
                 "target": "branch",
                 "enforcement": "active",
-                "conditions": {"ref_name": {"include": ["refs/heads/main"]}},
+                "conditions": {
+                    "ref_name": {"include": ["refs/heads/main"], "exclude": []}
+                },
                 "rules": [
                     {"type": "deletion"},
                     {"type": "non_fast_forward"},
-                    {"type": "pull_request"},
+                    {
+                        "type": "pull_request",
+                        "parameters": {
+                            "required_approving_review_count": 0,
+                            "dismiss_stale_reviews_on_push": False,
+                            "require_code_owner_review": False,
+                            "require_last_push_approval": False,
+                            "required_review_thread_resolution": True,
+                        },
+                    },
                     {
                         "type": "required_status_checks",
                         "parameters": {
+                            "strict_required_status_checks_policy": True,
+                            "do_not_enforce_on_create": False,
                             "required_status_checks": [
-                                {"context": "agent-release-gate"}
+                                {
+                                    "context": "agent-release-gate",
+                                    "integration_id": 15368,
+                                }
                             ]
                         },
                     },
@@ -704,12 +1144,28 @@ class SettingsPolicyTest(unittest.TestCase):
                 "required_status_checks",
             },
             "required_status_context": "agent-release-gate",
+            "required_status_integration_id": 15368,
+            "require_pull_request_hardening": True,
         }
         self.assertTrue(SETTINGS._ruleset_covers(rulesets, **arguments))
-        rulesets[0]["rules"][-1]["parameters"]["required_status_checks"][0][
-            "context"
-        ] = "nonexistent-check"
-        self.assertFalse(SETTINGS._ruleset_covers(rulesets, **arguments))
+        mutations = [
+            ("exclude", lambda value: value[0]["conditions"]["ref_name"].update(exclude=["refs/heads/main-hotfix"])),
+            ("approval-count", lambda value: value[0]["rules"][2]["parameters"].update(required_approving_review_count=1)),
+            ("dismiss-stale", lambda value: value[0]["rules"][2]["parameters"].update(dismiss_stale_reviews_on_push=True)),
+            ("code-owner", lambda value: value[0]["rules"][2]["parameters"].update(require_code_owner_review=True)),
+            ("last-push", lambda value: value[0]["rules"][2]["parameters"].update(require_last_push_approval=True)),
+            ("resolve-threads", lambda value: value[0]["rules"][2]["parameters"].update(required_review_thread_resolution=False)),
+            ("strict", lambda value: value[0]["rules"][3]["parameters"].update(strict_required_status_checks_policy=False)),
+            ("create", lambda value: value[0]["rules"][3]["parameters"].update(do_not_enforce_on_create=True)),
+            ("integration", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"][0].update(integration_id=1)),
+            ("context", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"][0].update(context="nonexistent-check")),
+            ("extra-check", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"].append({"context": "extra", "integration_id": 15368})),
+        ]
+        for label, mutate in mutations:
+            candidate = json.loads(json.dumps(rulesets))
+            mutate(candidate)
+            with self.subTest(label=label):
+                self.assertFalse(SETTINGS._ruleset_covers(candidate, **arguments))
 
     def test_short_lived_settings_attestation_binds_policy_and_expiry(self) -> None:
         settings_verifier = (
@@ -728,11 +1184,19 @@ class SettingsPolicyTest(unittest.TestCase):
                 "kind": "nuvion-release-settings-attestation",
                 "repository": "plaid-ai/NUV-AGENT",
                 "trustedPublisherSha": "a" * 40,
+                "publisherTreeSha256": "b" * 64,
+                "workflowSha256": "c" * 64,
                 "policySha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
                 "verifiedAt": "2026-09-02T00:00:00Z",
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "defaultBranch": "main",
+                    "governance": {
+                        "pullRequestApprovals": 0,
+                        "environmentReviewers": 0,
+                        "requiredStatusContext": "agent-release-gate",
+                        "requiredStatusIntegrationId": 15368,
+                    },
                     "secretScopesChecked": True,
                     "status": "VERIFIED",
                 },
@@ -748,6 +1212,15 @@ class SettingsPolicyTest(unittest.TestCase):
                 SETTINGS_ATTESTATION,
                 "_verify_signature",
                 return_value="9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+            ), mock.patch.object(
+                SETTINGS_ATTESTATION,
+                "publisher_surface",
+                return_value={
+                    "publisherTreeSha256": "b" * 64,
+                    "workflowSha256": "c" * 64,
+                },
+            ), mock.patch.object(
+                SETTINGS_ATTESTATION, "verify_executing_workflow"
             ):
                 result = SETTINGS_ATTESTATION.verify_attestation(
                     attestation_path=path,
@@ -756,6 +1229,8 @@ class SettingsPolicyTest(unittest.TestCase):
                     signer_directory=ROOT / "packaging/release/trusted-tag-signers",
                     repository="plaid-ai/NUV-AGENT",
                     trusted_publisher_sha="a" * 40,
+                    publisher_root=ROOT,
+                    executing_workflow=ROOT / ".github/workflows/release-publish.yml",
                     now=now,
                 )
                 self.assertEqual(result["status"], "VERIFIED")
@@ -768,6 +1243,8 @@ class SettingsPolicyTest(unittest.TestCase):
                         signer_directory=ROOT / "packaging/release/trusted-tag-signers",
                         repository="plaid-ai/NUV-AGENT",
                         trusted_publisher_sha="b" * 40,
+                        publisher_root=ROOT,
+                        executing_workflow=ROOT / ".github/workflows/release-publish.yml",
                         now=now,
                     )
                 with self.assertRaises(SETTINGS_ATTESTATION.AttestationError):
@@ -778,6 +1255,8 @@ class SettingsPolicyTest(unittest.TestCase):
                         signer_directory=ROOT / "packaging/release/trusted-tag-signers",
                         repository="plaid-ai/NUV-AGENT",
                         trusted_publisher_sha="a" * 40,
+                        publisher_root=ROOT,
+                        executing_workflow=ROOT / ".github/workflows/release-publish.yml",
                         now=now + dt.timedelta(days=1),
                     )
 
@@ -846,11 +1325,19 @@ class SettingsPolicyTest(unittest.TestCase):
                 "kind": "nuvion-release-settings-attestation",
                 "repository": "plaid-ai/NUV-AGENT",
                 "trustedPublisherSha": "a" * 40,
+                "publisherTreeSha256": "b" * 64,
+                "workflowSha256": "c" * 64,
                 "policySha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
                 "verifiedAt": "2026-09-02T00:00:00Z",
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "defaultBranch": "main",
+                    "governance": {
+                        "pullRequestApprovals": 0,
+                        "environmentReviewers": 0,
+                        "requiredStatusContext": "agent-release-gate",
+                        "requiredStatusIntegrationId": 15368,
+                    },
                     "secretScopesChecked": True,
                     "status": "VERIFIED",
                 },
@@ -886,15 +1373,27 @@ class SettingsPolicyTest(unittest.TestCase):
                     env=environment,
                 )
             )
-            result = SETTINGS_ATTESTATION.verify_attestation(
-                attestation_path=attestation,
-                signature_path=signature,
-                policy_path=policy,
-                signer_directory=signers,
-                repository="plaid-ai/NUV-AGENT",
-                trusted_publisher_sha="a" * 40,
-                now=dt.datetime(2026, 9, 2, 1, 0, tzinfo=dt.timezone.utc),
-            )
+            with mock.patch.object(
+                SETTINGS_ATTESTATION,
+                "publisher_surface",
+                return_value={
+                    "publisherTreeSha256": "b" * 64,
+                    "workflowSha256": "c" * 64,
+                },
+            ), mock.patch.object(
+                SETTINGS_ATTESTATION, "verify_executing_workflow"
+            ):
+                result = SETTINGS_ATTESTATION.verify_attestation(
+                    attestation_path=attestation,
+                    signature_path=signature,
+                    policy_path=policy,
+                    signer_directory=signers,
+                    repository="plaid-ai/NUV-AGENT",
+                    trusted_publisher_sha="a" * 40,
+                    publisher_root=ROOT,
+                    executing_workflow=ROOT / ".github/workflows/release-publish.yml",
+                    now=dt.datetime(2026, 9, 2, 1, 0, tzinfo=dt.timezone.utc),
+                )
             self.assertEqual(result["signerFingerprint"], fingerprint)
 
     def test_ruleset_bypass_is_exact_release_admin_team(self) -> None:
@@ -902,7 +1401,9 @@ class SettingsPolicyTest(unittest.TestCase):
             {
                 "target": "tag",
                 "enforcement": "active",
-                "conditions": {"ref_name": {"include": ["refs/tags/v*"]}},
+                "conditions": {
+                    "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+                },
                 "rules": [
                     {"type": "creation"},
                     {"type": "deletion"},
@@ -965,11 +1466,24 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             paths = []
-            for name in ("nuv_agent-0.1.121.tar.gz", "release-bom.json", "promotion.json"):
+            for name in (
+                "nuv_agent-0.1.121.tar.gz",
+                "release-bom.json",
+                "nuv-agent-0.1.121.rb",
+                "source-plan.json",
+            ):
                 path = root / name
                 path.write_bytes(name.encode("ascii"))
                 paths.append(path)
             api = self.FakeApi(self._release(draft=True, immutable=False))
+            api.value["assets"].append(
+                {
+                    "name": paths[0].name,
+                    "size": paths[0].stat().st_size,
+                    "digest": f"sha256:{hashlib.sha256(paths[0].read_bytes()).hexdigest()}",
+                    "state": "uploaded",
+                }
+            )
 
             def upload(fake_api, *, tag, local):
                 fake_api.value["assets"].append(
@@ -988,11 +1502,18 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
                     component_sha="a" * 40,
                     phase="finalize",
                     asset_paths=paths,
-                    allow_legacy_mutable=False,
                 )
             self.assertFalse(result["draft"])
             self.assertTrue(result["immutable"])
-            self.assertEqual(len(result["assets"]), 3)
+            self.assertEqual(len(result["assets"]), 4)
+            rerun = GITHUB_RELEASE.publish_release(
+                api=api,
+                tag="v0.1.121",
+                component_sha="a" * 40,
+                phase="finalize",
+                asset_paths=paths,
+            )
+            self.assertTrue(rerun["immutable"])
 
     def test_mutable_published_release_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -1006,7 +1527,74 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
                     component_sha="a" * 40,
                     phase="stage",
                     asset_paths=[asset],
-                    allow_legacy_mutable=False,
+                )
+
+
+class HomebrewPromotionTest(unittest.TestCase):
+    def test_formula_updater_treats_identity_values_as_data(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            formula = root / "nuv-agent.rb"
+            formula.write_text(
+                'class NuvAgent < Formula\n  url "__URL__"\n  sha256 "__SHA256__"\n  version "0.1.120"\nend\n',
+                encoding="utf-8",
+            )
+            environment = {
+                **os.environ,
+                "FORMULA_PATH": str(formula),
+                "URL": "https://github.com/plaid-ai/NUV-agent/release.tar.gz",
+                "SHA256": "a" * 64,
+                "VERSION": "0.1.121",
+            }
+            subprocess.run(
+                [str(ROOT / "packaging/release/update-homebrew-formula.sh")],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertIn('version "0.1.121"', formula.read_text(encoding="utf-8"))
+            environment["URL"] = 'https://example.invalid/"; system("touch pwn")'
+            failed = subprocess.run(
+                [str(ROOT / "packaging/release/update-homebrew-formula.sh")],
+                check=False,
+                capture_output=True,
+                env=environment,
+                cwd=root,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse((root / "pwn").exists())
+
+    def test_update_exact_rerun_drift_and_downgrade_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            current = root / "current.rb"
+            candidate = root / "candidate.rb"
+            current.write_text('class Nuv < Formula\n  version "0.1.120"\nend\n', encoding="utf-8")
+            candidate.write_text('class Nuv < Formula\n  version "0.1.121"\nend\n', encoding="utf-8")
+            result = HOMEBREW_PROMOTION.verify_promotion(
+                current, candidate, requested_version="0.1.121"
+            )
+            self.assertEqual(result["status"], "UPDATE")
+            current.write_bytes(candidate.read_bytes())
+            result = HOMEBREW_PROMOTION.verify_promotion(
+                current, candidate, requested_version="0.1.121"
+            )
+            self.assertEqual(result["status"], "NOOP")
+            candidate.write_text(
+                'class Nuv < Formula\n  version "0.1.121"\n  # drift\nend\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(HOMEBREW_PROMOTION.HomebrewPromotionError):
+                HOMEBREW_PROMOTION.verify_promotion(
+                    current, candidate, requested_version="0.1.121"
+                )
+            candidate.write_text(
+                'class Nuv < Formula\n  version "0.1.119"\nend\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(HOMEBREW_PROMOTION.HomebrewPromotionError):
+                HOMEBREW_PROMOTION.verify_promotion(
+                    current, candidate, requested_version="0.1.119"
                 )
 
 
