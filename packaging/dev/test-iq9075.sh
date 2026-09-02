@@ -40,7 +40,8 @@ die() {
   exit 1
 }
 
-for command in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl timeout python3 readlink; do
+for command in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl timeout python3 readlink \
+  mktemp install id; do
   command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 [ -x /usr/bin/python3 ] || die "/usr/bin/python3 is required"
@@ -118,14 +119,55 @@ if [ "$agent_python" != "$default_agent_python" ] || [ -n "${PYTHONPATH:-}" ]; t
   echo "[iq9075-e2e] candidate Python/source override: pre-release hardware evidence only"
 fi
 
-webrtc_python=("$agent_python")
+probe_user="$(id -un)"
+if [ "$(id -u)" -eq 0 ]; then
+  probe_user=nuvion
+fi
+probe_group="$(id -gn "$probe_user")"
+probe_runtime_dir="$(mktemp -d /tmp/nuvion-iq9075-e2e.XXXXXX)"
+case "$probe_runtime_dir" in
+  /tmp/nuvion-iq9075-e2e.*) ;;
+  *) die "unsafe probe runtime directory" ;;
+esac
+cleanup_probe_runtime() {
+  case "$probe_runtime_dir" in
+    /tmp/nuvion-iq9075-e2e.*)
+      [ ! -L "$probe_runtime_dir" ] && rm -rf -- "$probe_runtime_dir"
+      ;;
+  esac
+}
+trap cleanup_probe_runtime EXIT
+if [ "$(id -u)" -eq 0 ]; then
+  chown "$probe_user:$probe_group" "$probe_runtime_dir"
+  for directory in home cache config runtime; do
+    install -d -m 0700 -o "$probe_user" -g "$probe_group" \
+      "$probe_runtime_dir/$directory"
+  done
+else
+  chmod 0700 "$probe_runtime_dir"
+  for directory in home cache config runtime; do
+    install -d -m 0700 "$probe_runtime_dir/$directory"
+  done
+fi
+probe_environment=(
+  "HOME=$probe_runtime_dir/home"
+  "XDG_CACHE_HOME=$probe_runtime_dir/cache"
+  "XDG_CONFIG_HOME=$probe_runtime_dir/config"
+  "XDG_RUNTIME_DIR=$probe_runtime_dir/runtime"
+)
+
+webrtc_python=(
+  /usr/bin/env
+  "${probe_environment[@]}"
+  "PYTHONPATH=${PYTHONPATH:-}"
+  "G_DEBUG=fatal-criticals"
+  "$agent_python"
+)
 if [ "$(id -u)" -eq 0 ]; then
   command -v runuser >/dev/null 2>&1 || die "runuser is required for non-root Agent probes"
   webrtc_python=(
-    runuser -u nuvion -- /usr/bin/env
-    "PYTHONPATH=${PYTHONPATH:-}"
-    "G_DEBUG=fatal-criticals"
-    "$agent_python"
+    runuser -u nuvion --
+    "${webrtc_python[@]}"
   )
 fi
 
@@ -239,15 +281,19 @@ print("[iq9075-e2e] disposable WebRTC reset/re-offer: PASS")
 PY
 
 if [ "$camera_mode" = "oak" ]; then
-  oak_python=("$agent_python")
+  oak_python=(
+    /usr/bin/env
+    "${probe_environment[@]}"
+    "PYTHONPATH=${PYTHONPATH:-}"
+    "NUVION_IQ9075_OAK_SOAK_SECONDS=${NUVION_IQ9075_OAK_SOAK_SECONDS:-120}"
+    "NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB=${NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB:-96}"
+    "$agent_python"
+  )
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
     oak_python=(
-      runuser -u nuvion -- /usr/bin/env
-      "PYTHONPATH=${PYTHONPATH:-}"
-      "NUVION_IQ9075_OAK_SOAK_SECONDS=${NUVION_IQ9075_OAK_SOAK_SECONDS:-120}"
-      "NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB=${NUVION_IQ9075_OAK_MAX_RSS_GROWTH_MIB:-96}"
-      "$agent_python"
+      runuser -u nuvion --
+      "${oak_python[@]}"
     )
   elif [ "$(id -un)" != "nuvion" ]; then
     die "run the OAK test with sudo so capture can be verified as the nuvion service user"
