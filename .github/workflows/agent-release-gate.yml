@@ -91,7 +91,17 @@ jobs:
       - name: Install the exact shipped Homebrew tuple
         run: |
           set -euo pipefail
-          brew install --formula --build-from-source "${RUNNER_TEMP}/nuv-agent.rb"
+          TAP_NAME="nuvion/release-gate"
+          FORMULA_NAME="$TAP_NAME/nuv-agent"
+          brew tap-new --no-git "$TAP_NAME"
+          TAP_ROOT="$(brew --repository "$TAP_NAME")"
+          install -m 0644 \
+            "${RUNNER_TEMP}/nuv-agent.rb" \
+            "$TAP_ROOT/Formula/nuv-agent.rb"
+          # Homebrew 6 rejects path formulae and requires explicit trust for
+          # non-official taps. Trust only this exact candidate formula.
+          brew trust --formula "$FORMULA_NAME"
+          brew install --formula --build-from-source "$FORMULA_NAME"
           FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
           [ -x "$FORMULA_PYTHON" ]
           "$FORMULA_PYTHON" -m pip check
@@ -178,6 +188,13 @@ jobs:
           result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
           assert result is not None and len(result["scores"]) == 2
           PY
+
+      - name: Remove the ephemeral candidate tap
+        if: always()
+        run: |
+          brew uninstall --force nuvion/release-gate/nuv-agent >/dev/null 2>&1 || true
+          brew untrust --formula nuvion/release-gate/nuv-agent >/dev/null 2>&1 || true
+          brew untap nuvion/release-gate >/dev/null 2>&1 || true
 
   agent-release-gate:
     name: agent-release-gate

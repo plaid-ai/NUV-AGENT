@@ -281,6 +281,16 @@ class ReleaseGateTest(unittest.TestCase):
             "  macos-arm64-release-prerequisite:", maxsplit=1
         )[1].split("  agent-release-gate:", maxsplit=1)[0]
         self.assertIn("runs-on: macos-14", macos)
+        self.assertIn('brew tap-new --no-git "$TAP_NAME"', macos)
+        self.assertIn('brew trust --formula "$FORMULA_NAME"', macos)
+        self.assertIn(
+            "brew untrust --formula nuvion/release-gate/nuv-agent", macos
+        )
+        self.assertIn('$TAP_ROOT/Formula/nuv-agent.rb', macos)
+        self.assertNotIn(
+            'brew install --formula --build-from-source "${RUNNER_TEMP}/nuv-agent.rb"',
+            macos,
+        )
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
