@@ -155,7 +155,7 @@ jobs:
           HF_HOME: ${{ runner.temp }}/huggingface
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-          # GitHub's 14 GB macOS runner trips the MPS recommended-set limit
+          # GitHub's standard arm64 runner can trip the MPS allocation limit
           # even for this exact FP16 model. Disable only PyTorch's allocator
           # watermark for this bounded one-shot probe; assert actual usage below.
           PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
@@ -163,6 +163,10 @@ jobs:
           MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
         run: |
           set -euo pipefail
+          # Reclaim the large filesystem cache left by the Formula install
+          # before allocating from the same unified-memory pool.
+          sync
+          sudo purge
           FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
           "$FORMULA_PYTHON" - <<'PY'
           import os
