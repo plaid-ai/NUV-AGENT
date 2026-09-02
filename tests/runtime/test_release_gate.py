@@ -294,14 +294,15 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
-        self.assertEqual(
-            macos.count("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"), 1
-        )
-        self.assertIn(
-            'os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"', macos
-        )
+        self.assertNotIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO", macos)
         self.assertIn("detector._inference_dtype == torch.float16", macos)
-        self.assertIn("detector._model.text_model is None", macos)
+        self.assertIn(
+            'detector._model.__class__.__name__ == "SiglipVisionModel"', macos
+        )
+        self.assertIn('not hasattr(detector._model, "text_model")', macos)
+        self.assertIn(
+            'getattr(detector._model, "vision_model", detector._model)', macos
+        )
         self.assertIn(
             "torch.mps.current_allocated_memory() < 512 * 1024**2", macos
         )
@@ -328,8 +329,17 @@ class ReleaseGateTest(unittest.TestCase):
         zero_shot = (
             ROOT / "nuvion_app" / "inference" / "zero_shot.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("low_cpu_mem_usage=True", zero_shot)
-        self.assertIn("dtype=self._inference_dtype", zero_shot)
+        text_worker = (
+            ROOT / "nuvion_app" / "inference" / "_siglip_text_features.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("dtype=torch.float16", text_worker)
+        self.assertIn('with torch.device("meta"):', text_worker)
+        self.assertIn('model.to_empty(device="cpu")', text_worker)
+        self.assertIn('from safetensors import safe_open', text_worker)
+        self.assertIn('with torch.device("meta"):', zero_shot)
+        self.assertIn('vision_model.to_empty(device=self._device)', zero_shot)
+        self.assertIn('from safetensors import safe_open', zero_shot)
+        self.assertIn('[sys.executable, "-I", str(worker_path)]', zero_shot)
         self.assertIn(
             "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
         )

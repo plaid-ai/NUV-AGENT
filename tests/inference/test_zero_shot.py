@@ -74,6 +74,32 @@ class ZeroShotDeviceResolveTest(unittest.TestCase):
         device = ZeroShotAnomalyDetector._resolve_device(fake_torch, "mps")
         self.assertEqual(device, "cpu")
 
+    def test_text_worker_payload_is_strict_and_finite(self) -> None:
+        labels = ["normal", "anomalous"]
+        valid = {
+            "schemaVersion": 1,
+            "labels": labels,
+            "features": [[0.25, -0.5], [0.75, 0.125]],
+        }
+        self.assertEqual(
+            ZeroShotAnomalyDetector._validate_text_worker_payload(valid, labels),
+            valid["features"],
+        )
+        invalid_payloads = (
+            {**valid, "schemaVersion": True},
+            {**valid, "labels": ["normal", "other"]},
+            {**valid, "features": [[0.25], [0.75, 0.125]]},
+            {**valid, "features": [[0.25, float("nan")], [0.75, 0.125]]},
+            {**valid, "features": [[0.25, False], [0.75, 0.125]]},
+            {**valid, "unexpected": "field"},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    ZeroShotAnomalyDetector._validate_text_worker_payload(
+                        payload, labels
+                    )
+
 
 @unittest.skipUnless(
     os.environ.get("NUVION_ZSAD_REGRESSION_MODEL"),
@@ -104,9 +130,11 @@ class MacMpsZeroShotRegressionTest(unittest.TestCase):
             self.assertEqual(detector._device, "mps")
             self.assertEqual(detector._inference_dtype, torch.float16)
             self.assertEqual(next(detector._model.parameters()).dtype, torch.float16)
-            self.assertIsNone(detector._model.text_model)
+            self.assertEqual(detector._model.__class__.__name__, "SiglipVisionModel")
+            self.assertFalse(hasattr(detector._model, "text_model"))
+            vision_root = getattr(detector._model, "vision_model", detector._model)
             self.assertEqual(
-                next(detector._model.vision_model.parameters()).device.type, "mps"
+                next(vision_root.parameters()).device.type, "mps"
             )
             self.assertEqual(detector._mps_text_features.device.type, "mps")
             self.assertEqual(detector._mps_logit_scale.device.type, "mps")
