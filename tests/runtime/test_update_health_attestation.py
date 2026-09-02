@@ -10,6 +10,7 @@ from nuvion_app.runtime.update_health_attestation import (
     parse_health_attestation_response,
     request_health_attestation,
 )
+from nuvion_updater.store import CommitGate
 
 
 class UpdateHealthAttestationTest(unittest.TestCase):
@@ -23,6 +24,7 @@ class UpdateHealthAttestationTest(unittest.TestCase):
             "gateId": self.gate_id,
             "challenge": "A" * 43,
             "commandId": self.command_id,
+            "commandExpiresAt": "2026-09-02T10:05:00Z",
             "bomDigest": self.bom_digest,
             "componentSha": self.component_sha,
             "releaseSequence": 2,
@@ -73,6 +75,31 @@ class UpdateHealthAttestationTest(unittest.TestCase):
         )
         self.assertEqual(request["gateId"], self.gate_id)
         self.assertEqual(request["productModel"], "IQ9075_DEV")
+
+    def test_real_updater_public_commit_gate_is_accepted(self) -> None:
+        gate = CommitGate(
+            command_id=self.command_id,
+            command_expires_at="2026-09-02T10:05:00Z",
+            gate_id=self.gate_id,
+            challenge="A" * 43,
+            peer_pid=412,
+            agent_start_ticks=123456,
+            boot_id=self.gate["bootId"],
+            candidate_slot="releases/" + "a" * 64,
+            bom_digest=self.bom_digest,
+            component_sha=self.component_sha,
+            release_sequence=2,
+            health_deadline="2026-09-02T10:01:00Z",
+            created_at="2026-09-02T10:00:00Z",
+            attestation_id=None,
+            attestation_jws_sha256=None,
+            consumed_at=None,
+        )
+
+        request = self._request(gate=gate.public_dict())
+
+        self.assertEqual(request["commandId"], self.command_id)
+        self.assertEqual(request["gateId"], self.gate_id)
 
     def test_gate_unknown_field_and_release_identity_mismatch_fail_closed(self) -> None:
         unknown = {**self.gate, "callerHealth": "HEALTHY"}

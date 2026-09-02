@@ -10,6 +10,8 @@ from unittest import mock
 
 class _FakeGLib:
     calls: ClassVar[list[tuple[Any, tuple[Any, ...]]]] = []
+    timeouts: ClassVar[dict[int, tuple[Any, tuple[Any, ...]]]] = {}
+    next_source_id: ClassVar[int] = 100
 
     @classmethod
     def idle_add(cls, func: Any, *args: Any) -> int:
@@ -21,6 +23,22 @@ class _FakeGLib:
         while cls.calls:
             func, args = cls.calls.pop(0)
             func(*args)
+
+    @classmethod
+    def timeout_add(cls, _milliseconds: int, func: Any, *args: Any) -> int:
+        source_id = cls.next_source_id
+        cls.next_source_id += 1
+        cls.timeouts[source_id] = (func, args)
+        return source_id
+
+    @classmethod
+    def source_remove(cls, source_id: int) -> bool:
+        return cls.timeouts.pop(source_id, None) is not None
+
+    @classmethod
+    def fire_timeout(cls, source_id: int) -> None:
+        func, args = cls.timeouts.pop(source_id)
+        func(*args)
 
 
 class _FakePromise:
@@ -241,6 +259,8 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
     def setUp(self) -> None:
         _FakeGLib.calls.clear()
+        _FakeGLib.timeouts.clear()
+        _FakeGLib.next_source_id = 100
         _FakeElementFactory.created.clear()
         _FakeElementFactory.trace.clear()
 
@@ -365,6 +385,96 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         ]
         self.assertEqual(len(local_descriptions), 1)
         self.assertIs(local_descriptions[0][0], local_offer)
+
+    def test_offer_enqueue_failure_disposes_exact_branch_and_sends_stop(self) -> None:
+        sent: list[tuple[str, object]] = []
+
+        def send_message(
+            destination: str,
+            _payload: dict[str, object],
+            _remember: bool,
+            token: object,
+        ) -> bool:
+            sent.append((destination, token))
+            return destination != self.module.WEBRTC_UPLINK_OFFER_DEST
+
+        controller, pipeline = self._controller(send_message)
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertIsNone(branch.queue.get_parent())
+        self.assertIsNone(branch.webrtcbin.get_parent())
+        self.assertNotIn(branch.queue, pipeline.elements)
+        self.assertEqual(
+            [destination for destination, _token in sent],
+            [
+                self.module.WEBRTC_UPLINK_OFFER_DEST,
+                self.module.WEBRTC_UPLINK_STOP_DEST,
+            ],
+        )
+        self.assertTrue(sent[-1][1].terminal)
+
+    def test_offer_answer_timeout_disposes_branch_and_sends_terminal_stop(self) -> None:
+        sent: list[tuple[str, object]] = []
+        controller, _pipeline = self._controller(
+            lambda destination, _payload, _remember, token: (
+                sent.append((destination, token)) or True
+            )
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
+        _FakeGLib.drain()
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+
+        _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertEqual(sent[-1][0], self.module.WEBRTC_UPLINK_STOP_DEST)
+        self.assertTrue(sent[-1][1].terminal)
+
+    def test_valid_answer_cancels_watchdog_before_it_can_dispose_branch(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
+        _FakeGLib.drain()
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+
+        controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
+        _FakeGLib.drain()
+
+        self.assertEqual(_FakeGLib.timeouts, {})
+        self.assertIs(controller._branch, branch)
+        self.assertTrue(branch.answer_applied)
+
+    def test_stale_offer_rejection_cannot_dispose_replacement_session(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        stale = self.module.WebRTCSignalingToken(
+            controller._stats_generation,
+            "session-1",
+        )
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self._start(controller, "session-2")
+        replacement = controller._branch
+
+        self.assertFalse(
+            controller.reject_signaling(stale, reason="late server rejection")
+        )
+        _FakeGLib.drain()
+
+        self.assertIs(controller._branch, replacement)
+        self.assertEqual(controller._session.session_id, "session-2")
 
     def test_repeated_stop_keeps_the_queued_terminal_token_current(self) -> None:
         sent: list[object] = []

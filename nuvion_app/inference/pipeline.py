@@ -994,6 +994,44 @@ def _reset_webrtc_signaling_transport() -> None:
         log.info("[WEBRTC-UPLINK] discarded stale queued signaling frames=%d", dropped)
 
 
+def _reject_current_webrtc_offer(payload: dict, *, reason: str) -> bool:
+    """Bind a server rejection to the current cached offer generation."""
+
+    path = str(payload.get("path") or "")
+    if path != WEBRTC_UPLINK_OFFER_DEST:
+        return False
+    cached = _get_last_payload(path)
+    if cached is None or cached.signaling_token is None:
+        return False
+    rejected_session_id = str(payload.get("sessionId") or "").strip()
+    cached_session_id = str(cached.payload.get("sessionId") or "").strip()
+    if not rejected_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] uncorrelated offer rejection deferred to answer watchdog"
+        )
+        return False
+    if rejected_session_id != cached_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] ignored stale correlated offer rejection "
+            "rejectedSessionId=%s currentSessionId=%s",
+            rejected_session_id,
+            cached_session_id,
+        )
+        return False
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    reject = getattr(controller, "reject_signaling", None)
+    if not callable(reject) or not reject(cached.signaling_token, reason=reason):
+        return False
+    with last_sent_payloads_lock:
+        current = last_sent_payloads.get(path)
+        if current is not None and current.signaling_token == cached.signaling_token:
+            last_sent_payloads.pop(path, None)
+    for task in tuple(webrtc_retry_tasks):
+        task.cancel()
+    webrtc_retry_tasks.clear()
+    return True
+
+
 def _set_agent_uplink_blocked(blocked: bool, reason: str = "") -> None:
     global agent_uplink_blocked, agent_uplink_block_reason
     with agent_uplink_lock:
@@ -1919,6 +1957,10 @@ async def handle_agent_error(body: str) -> None:
                 AGENT_ERROR_MAX_RETRIES,
                 detail,
             )
+            _reject_current_webrtc_offer(
+                payload,
+                reason=f"offer retry exhausted: {code}",
+            )
             return
 
         delay_sec = min(AGENT_ERROR_BACKOFF_BASE_SEC * (2 ** (attempt - 1)), AGENT_ERROR_BACKOFF_MAX_SEC)
@@ -1950,6 +1992,17 @@ async def handle_agent_error(body: str) -> None:
         return
 
     _reset_agent_retry_attempt(path)
+    offer_rejected = _reject_current_webrtc_offer(
+        payload,
+        reason=f"non-retryable server rejection: {code} status={status_int}",
+    )
+    if offer_rejected:
+        log.warning(
+            "[WEBRTC-UPLINK] disposed locally rejected offer path=%s code=%s status=%s",
+            path,
+            code,
+            status_int,
+        )
     if status_int in (401, 403):
         reason = f"{code} {message}".strip()
         _set_agent_uplink_blocked(True, reason)

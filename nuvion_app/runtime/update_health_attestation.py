@@ -28,6 +28,7 @@ _GATE_FIELDS = frozenset(
         "gateId",
         "challenge",
         "commandId",
+        "commandExpiresAt",
         "bomDigest",
         "componentSha",
         "releaseSequence",
@@ -128,6 +129,7 @@ def build_health_attestation_request(
             "COMMIT_GATE_MISMATCH",
             "root commit gate commandId does not match desired command",
         )
+    _timestamp(gate.get("commandExpiresAt"), "commandExpiresAt")
     gate_id = _canonical_uuid(gate.get("gateId"), "gateId")
     _canonical_uuid(gate.get("bootId"), "bootId")
     challenge = gate.get("challenge")

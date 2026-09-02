@@ -208,6 +208,80 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             )
         )
 
+    def test_correlated_terminal_offer_rejection_disposes_exact_session(self) -> None:
+        token = pipeline.WebRTCSignalingToken(7, "session-current")
+        controller = mock.Mock()
+        controller.reject_signaling.return_value = True
+        cached = {
+            pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
+                {"sessionId": "session-current"},
+                token,
+            )
+        }
+        body = json.dumps(
+            {
+                "path": pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                "sessionId": "session-current",
+                "status": 400,
+                "retryable": False,
+                "code": "WEBRTC_OFFER_REJECTED",
+            }
+        )
+
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", cached),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", set()),
+        ):
+            asyncio.run(pipeline.handle_agent_error(body))
+
+        controller.reject_signaling.assert_called_once_with(
+            token,
+            reason="non-retryable server rejection: WEBRTC_OFFER_REJECTED status=400",
+        )
+        self.assertEqual(cached, {})
+
+    def test_uncorrelated_or_stale_offer_rejection_waits_for_exact_watchdog(self) -> None:
+        token = pipeline.WebRTCSignalingToken(9, "session-current")
+        controller = mock.Mock()
+        cached = {
+            pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
+                {"sessionId": "session-current"},
+                token,
+            )
+        }
+        base = {
+            "path": pipeline.WEBRTC_UPLINK_OFFER_DEST,
+            "status": 400,
+            "retryable": False,
+            "code": "WEBRTC_OFFER_REJECTED",
+        }
+
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", cached),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", set()),
+        ):
+            asyncio.run(pipeline.handle_agent_error(json.dumps(base)))
+            asyncio.run(
+                pipeline.handle_agent_error(
+                    json.dumps({**base, "sessionId": "session-stale"})
+                )
+            )
+
+        controller.reject_signaling.assert_not_called()
+        self.assertIn(pipeline.WEBRTC_UPLINK_OFFER_DEST, cached)
+
     def test_outbound_sender_revalidates_token_without_dropping_durable_event(self) -> None:
         async def scenario() -> None:
             stale = pipeline.WebRTCSignalingToken(3, "session-old")
