@@ -97,14 +97,18 @@ STOMP heartbeat, live WebRTC connectivity with increasing outbound samples,
 pipeline progress, and healthy event/command outboxes. The BE MUST NOT accept a
 caller-supplied health verdict.
 
-The response is:
+The response uses the standard API envelope and contains no unsigned health
+claims:
 
 ```json
 {
-  "keyId": "health-2026-01",
-  "issuedAt": "2026-09-02T10:00:00Z",
-  "expiresAt": "2026-09-02T10:00:30Z",
-  "compactJws": "<protected>.<claims>.<signature>"
+  "message": "Agent update health attestation issued",
+  "data": {
+    "keyId": "health-2026-01",
+    "issuedAt": "2026-09-02T10:00:00Z",
+    "expiresAt": "2026-09-02T10:00:30Z",
+    "compactJws": "<protected>.<claims>.<signature>"
+  }
 }
 ```
 
