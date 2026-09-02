@@ -248,7 +248,12 @@ jobs:
           # after the CPU oracle process has released every model allocation.
           sync
           sudo purge
-          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
+          # GitHub's 8 GiB image is already at the default MPS high-watermark
+          # after Formula/model loading. Disable only that conservative guard in
+          # this ephemeral process; hard active/driver/delta bounds below still
+          # fail closed on real MPS residency or growth. Production is unchanged.
+          PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 \
+            PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
           import json
           import math
           import os
@@ -264,6 +269,7 @@ jobs:
           formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
           reference_path = Path(os.environ["REFERENCE_PATH"])
           package_path = Path(nuvion_app.__file__).resolve()
+          assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"
           assert package_path.is_relative_to(formula_prefix / "libexec")
           assert path.name == revision
           assert Path(snapshot_download(
