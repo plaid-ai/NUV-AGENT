@@ -12,6 +12,7 @@ from nuvion_app.runtime.release_bom import (
     build_release_bom_v2_payload,
     canonical_release_bom_json,
 )
+from nuvion_updater.health_attestation import CommitProcessIdentity
 from nuvion_updater.slots import ReleaseSlotManager
 from nuvion_updater.store import UpdatePhase, UpdateState
 from nuvion_updater.systemd_runtime import SystemdRuntime
@@ -286,6 +287,72 @@ class SystemdRuntimeTest(unittest.TestCase):
             run.call_args_list[-1].args[0],
             ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
         )
+
+    def test_commit_gate_binds_peer_main_pid_start_ticks_boot_and_slot(self) -> None:
+        proc_root = self.root / "proc"
+        process = proc_root / "412"
+        process.mkdir(parents=True)
+        expected_slot = self.slots.current_slot()
+        assert expected_slot is not None
+        (process / "environ").write_bytes(
+            b"NUVION_ACTIVE_SLOT=" + expected_slot.encode("utf-8") + b"\0"
+        )
+        stat_suffix = ["S", *(["1"] * 18), "987654", "0", "0"]
+        (process / "stat").write_text(
+            f"412 (nuv-agent worker) {' '.join(stat_suffix)}\n",
+            encoding="ascii",
+        )
+        boot_id = "00000000-0000-4000-8000-000000000123"
+        boot_path = proc_root / "sys" / "kernel" / "random"
+        boot_path.mkdir(parents=True)
+        (boot_path / "boot_id").write_text(boot_id + "\n", encoding="ascii")
+        completed = self._completed((), stdout="412\n")
+        with (
+            mock.patch("nuvion_updater.systemd_runtime.PROC_ROOT", proc_root),
+            mock.patch(
+                "nuvion_updater.systemd_runtime.subprocess.run",
+                side_effect=[completed, completed],
+            ),
+        ):
+            identity = self.runtime.commit_process_identity(self.state, 412)
+        self.assertEqual(
+            identity,
+            CommitProcessIdentity(
+                pid=412,
+                start_ticks=987654,
+                boot_id=boot_id,
+                active_slot=expected_slot,
+            ),
+        )
+
+    def test_commit_gate_rejects_non_main_peer_and_pid_reuse(self) -> None:
+        completed = self._completed((), stdout="412\n")
+        with mock.patch(
+            "nuvion_updater.systemd_runtime.subprocess.run",
+            return_value=completed,
+        ), self.assertRaisesRegex(RuntimeError, "COMMIT_PEER_MAIN_PID_MISMATCH"):
+            self.runtime.commit_process_identity(self.state, 999)
+
+        expected_slot = self.slots.current_slot()
+        assert expected_slot is not None
+        with (
+            mock.patch.object(self.runtime, "_main_pid", return_value=412),
+            mock.patch.object(
+                self.runtime, "_process_start_ticks", side_effect=[100, 101]
+            ),
+            mock.patch.object(
+                self.runtime,
+                "_active_slot_from_environ",
+                return_value=expected_slot,
+            ),
+            mock.patch.object(
+                self.runtime,
+                "_boot_id",
+                return_value="00000000-0000-4000-8000-000000000123",
+            ),
+            self.assertRaisesRegex(RuntimeError, "COMMIT_PROCESS_INSTANCE_CHANGED"),
+        ):
+            self.runtime.commit_process_identity(self.state, 412)
 
     def test_rollback_boot_check_requires_exact_running_restored_slot(self) -> None:
         proc_root = self.root / "proc"

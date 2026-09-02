@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from nuvion_app.runtime.release_bom import (
     ReleaseBomValidationError,
     load_release_bom,
 )
+from nuvion_updater.health_attestation import CommitProcessIdentity
 from nuvion_updater.secure_io import read_fixed_regular_file
 from nuvion_updater.slots import SLOT_MARKER, ReleaseSlotManager
 from nuvion_updater.store import UpdateState
@@ -29,6 +31,8 @@ DOCTOR_TIMEOUT_SECONDS = 120
 IQ9075_PROBE_TIMEOUT_SECONDS = 300
 MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 64 * 1024
+MAX_PROC_STAT_BYTES = 16 * 1024
+MAX_BOOT_ID_BYTES = 128
 
 _COMMAND_ENV = {
     "LANG": "C",
@@ -149,6 +153,37 @@ class SystemdRuntime:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             return self._failed_check(self._reason(exc, "FUNCTIONAL_HEALTH_FAILED"))
         return True, "FUNCTIONAL_HEALTHY"
+
+    def commit_process_identity(
+        self,
+        state: UpdateState,
+        peer_pid: int,
+    ) -> CommitProcessIdentity:
+        """Bind the Unix peer to the exact systemd candidate process instance."""
+
+        if isinstance(peer_pid, bool) or not isinstance(peer_pid, int) or peer_pid < 1:
+            raise RuntimeError("COMMIT_PEER_PID_UNAVAILABLE")
+        expected_slot = self._validate_staged_state(state)
+        first_main_pid = self._main_pid()
+        if first_main_pid != peer_pid:
+            raise RuntimeError("COMMIT_PEER_MAIN_PID_MISMATCH")
+        first_start_ticks = self._process_start_ticks(peer_pid)
+        active_slot = self._active_slot_from_environ(peer_pid)
+        boot_id = self._boot_id()
+        second_start_ticks = self._process_start_ticks(peer_pid)
+        second_main_pid = self._main_pid()
+        if second_main_pid != first_main_pid:
+            raise RuntimeError("COMMIT_MAIN_PID_CHANGED")
+        if second_start_ticks != first_start_ticks:
+            raise RuntimeError("COMMIT_PROCESS_INSTANCE_CHANGED")
+        if self.slots.current_slot() != expected_slot or active_slot != expected_slot:
+            raise RuntimeError("COMMIT_ACTIVE_SLOT_MISMATCH")
+        return CommitProcessIdentity(
+            pid=peer_pid,
+            start_ticks=first_start_ticks,
+            boot_id=boot_id,
+            active_slot=expected_slot,
+        )
 
     def _iq9075_functional_check(self) -> tuple[bool, str]:
         try:
@@ -288,6 +323,78 @@ class SystemdRuntime:
         if not value or value != value.strip():
             raise RuntimeError("BOOT_ACTIVE_SLOT_ENV_MISMATCH")
         return value
+
+    @staticmethod
+    def _process_start_ticks(pid: int) -> int:
+        raw = SystemdRuntime._read_proc_file(
+            PROC_ROOT / str(pid) / "stat",
+            max_bytes=MAX_PROC_STAT_BYTES,
+            error="COMMIT_PROCESS_STAT_INVALID",
+        )
+        try:
+            text = raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID") from exc
+        prefix = f"{pid} ("
+        closing = text.rfind(") ")
+        if not text.startswith(prefix) or closing < len(prefix):
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        fields_from_state = text[closing + 2 :].split()
+        # /proc/<pid>/stat field 3 is the first token after comm; starttime is
+        # field 22, therefore token index 19 in this suffix.
+        if len(fields_from_state) <= 19:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        raw_ticks = fields_from_state[19]
+        if not raw_ticks.isascii() or not raw_ticks.isdecimal():
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        ticks = int(raw_ticks, 10)
+        if ticks < 1:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        return ticks
+
+    @staticmethod
+    def _boot_id() -> str:
+        raw = SystemdRuntime._read_proc_file(
+            PROC_ROOT / "sys" / "kernel" / "random" / "boot_id",
+            max_bytes=MAX_BOOT_ID_BYTES,
+            error="COMMIT_BOOT_ID_INVALID",
+        )
+        try:
+            value = raw.decode("ascii").strip()
+            normalized = str(uuid.UUID(value))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("COMMIT_BOOT_ID_INVALID") from exc
+        if normalized != value:
+            raise RuntimeError("COMMIT_BOOT_ID_INVALID")
+        return value
+
+    @staticmethod
+    def _read_proc_file(path: Path, *, max_bytes: int, error: str) -> bytes:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise RuntimeError(error) from exc
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(4096, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(error)
+            return b"".join(chunks)
+        except OSError as exc:
+            raise RuntimeError(error) from exc
+        finally:
+            os.close(descriptor)
 
     def _validate_fixed_probe(self) -> None:
         probe = Path(IQ9075_PROBE)

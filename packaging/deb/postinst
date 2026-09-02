@@ -301,7 +301,8 @@ fi
 
 if [ -f /etc/nuvion-updater/device-binding.json ] \
   && [ -f /etc/nuvion-updater/command-keyring.json ] \
-  && [ -f /etc/nuvion-updater/release-keyring.json ]; then
+  && [ -f /etc/nuvion-updater/release-keyring.json ] \
+  && [ -f /etc/nuvion-updater/health-attestation-keyring.json ]; then
   systemctl enable --now nuv-agent-updater.socket
   systemctl try-restart nuv-agent-updater.service || true
 else

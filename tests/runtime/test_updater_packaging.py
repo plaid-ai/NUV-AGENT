@@ -73,6 +73,7 @@ class UpdaterPackagingTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         build = (ROOT / "packaging/deb/build-deb.sh").read_text(encoding="utf-8")
         protocol = (ROOT / "nuvion_updater/protocol.py").read_text(encoding="utf-8")
+        postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
 
         self.assertIn("User=root", service)
         self.assertIn("ProtectSystem=strict", service)
@@ -89,6 +90,7 @@ class UpdaterPackagingTest(unittest.TestCase):
         self.assertIn("dpkg-deb --root-owner-group --build", build)
         self.assertIn("bootstrap-agent-bundle.tar.gz", build)
         self.assertIn("requirements-agent-bundle-arm64.txt", build)
+        self.assertIn("health-attestation-keyring.json", postinst)
 
     def test_dpkg_root_owner_group_normalizes_unprivileged_builder_ids(self) -> None:
         dpkg_deb = shutil.which("dpkg-deb")

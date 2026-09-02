@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from nuvion_updater.controller import UpdaterController
+from nuvion_updater.health_attestation import HealthAttestationVerifier
 from nuvion_updater.protocol import UpdaterProtocol, UpdaterUnixServer, systemd_listener
 from nuvion_updater.repository import ContentAddressedReleaseRepository
 from nuvion_updater.secure_io import read_fixed_regular_file
@@ -17,6 +18,7 @@ from nuvion_updater.trust import (
     DeviceBinding,
     build_root_command_verifier,
     load_device_binding,
+    load_health_attestation_keyring,
     load_release_keyring,
 )
 from nuvion_updater.version import UPDATER_VERSION
@@ -24,6 +26,9 @@ from nuvion_updater.version import UPDATER_VERSION
 DEFAULT_BINDING = Path("/etc/nuvion-updater/device-binding.json")
 DEFAULT_COMMAND_KEYRING = Path("/etc/nuvion-updater/command-keyring.json")
 DEFAULT_RELEASE_KEYRING = Path("/etc/nuvion-updater/release-keyring.json")
+DEFAULT_HEALTH_ATTESTATION_KEYRING = Path(
+    "/etc/nuvion-updater/health-attestation-keyring.json"
+)
 DEFAULT_STATE_DB = Path("/var/lib/nuvion-updater/updater.sqlite3")
 DEFAULT_DOWNLOADS = Path("/var/lib/nuvion-updater/downloads")
 DEFAULT_INSTALL_ROOT = Path("/opt/nuv-agent")
@@ -70,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-binding", type=Path, default=DEFAULT_BINDING)
     parser.add_argument("--command-keyring", type=Path, default=DEFAULT_COMMAND_KEYRING)
     parser.add_argument("--release-keyring", type=Path, default=DEFAULT_RELEASE_KEYRING)
+    parser.add_argument(
+        "--health-attestation-keyring",
+        type=Path,
+        default=DEFAULT_HEALTH_ATTESTATION_KEYRING,
+    )
     parser.add_argument("--state-db", type=Path, default=DEFAULT_STATE_DB)
     parser.add_argument("--downloads", type=Path, default=DEFAULT_DOWNLOADS)
     parser.add_argument("--install-root", type=Path, default=DEFAULT_INSTALL_ROOT)
@@ -88,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     release_keyring = load_release_keyring(
         args.release_keyring,
+        expected_trust_domain=binding.trust_domain,
+    )
+    health_attestation_keyring = load_health_attestation_keyring(
+        args.health_attestation_keyring,
         expected_trust_domain=binding.trust_domain,
     )
     slots = ReleaseSlotManager(args.install_root)
@@ -120,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
         activation_callback=systemd_runtime.restart_agent,
         boot_health_check=systemd_runtime.boot_health_check,
         functional_health_check=systemd_runtime.functional_health_check,
+        commit_process_check=systemd_runtime.commit_process_identity,
+        health_attestation_verifier=HealthAttestationVerifier(
+            keyring=health_attestation_keyring
+        ),
         rollback_boot_health_check=systemd_runtime.rollback_boot_health_check,
         safe_stop_callback=systemd_runtime.safe_stop,
     )

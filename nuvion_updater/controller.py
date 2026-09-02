@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import secrets
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,9 +21,14 @@ from nuvion_app.runtime.release_bom import (
     verify_release_artifact,
 )
 from nuvion_updater.errors import UpdaterError, UpdaterSecurityError
+from nuvion_updater.health_attestation import (
+    CommitProcessIdentity,
+    ExpectedHealthAttestation,
+    HealthAttestationVerifier,
+)
 from nuvion_updater.repository import ContentAddressedReleaseRepository
 from nuvion_updater.slots import ReleaseSlotManager
-from nuvion_updater.store import UpdatePhase, UpdaterStore, UpdateState
+from nuvion_updater.store import CommitGate, UpdatePhase, UpdaterStore, UpdateState
 from nuvion_updater.trust import DeviceBinding
 from nuvion_updater.util import parse_digest
 
@@ -46,6 +54,10 @@ class UpdaterController:
         activation_callback: Callable[[str], None] | None = None,
         boot_health_check: Callable[[UpdateState], tuple[bool, str]] | None = None,
         functional_health_check: Callable[[UpdateState], tuple[bool, str]] | None = None,
+        commit_process_check: (
+            Callable[[UpdateState, int], CommitProcessIdentity] | None
+        ) = None,
+        health_attestation_verifier: HealthAttestationVerifier | None = None,
         rollback_boot_health_check: Callable[[str], tuple[bool, str]] | None = None,
         safe_stop_callback: Callable[[], None] | None = None,
         activation_timeout_seconds: int = 300,
@@ -75,6 +87,8 @@ class UpdaterController:
         self.activation_callback = activation_callback
         self.boot_health_check = boot_health_check
         self.functional_health_check = functional_health_check
+        self.commit_process_check = commit_process_check
+        self.health_attestation_verifier = health_attestation_verifier
         self.rollback_boot_health_check = rollback_boot_health_check
         self.safe_stop_callback = safe_stop_callback
         self.activation_timeout_seconds = activation_timeout_seconds
@@ -93,6 +107,8 @@ class UpdaterController:
             and self.activation_callback is not None
             and self.boot_health_check is not None
             and self.functional_health_check is not None
+            and self.commit_process_check is not None
+            and self.health_attestation_verifier is not None
             and self.rollback_boot_health_check is not None
             and self.safe_stop_callback is not None
         )
@@ -259,19 +275,87 @@ class UpdaterController:
             health_deadline=self._deadline(self.commit_timeout_seconds),
         )
 
-    def commit(self, command_id: str) -> UpdateState:
+    def begin_commit_gate(self, command_id: str, *, peer_pid: int) -> CommitGate:
         state = self._require_state(command_id)
-        if state.phase == UpdatePhase.COMMITTED:
-            return state
         if state.phase != UpdatePhase.FUNCTIONAL_HEALTHY:
+            raise UpdaterError(
+                "INVALID_PHASE", "FUNCTIONAL_HEALTHY is required before commit gate"
+            )
+        if (
+            state.candidate_slot is None
+            or state.component_sha is None
+            or state.release_sequence is None
+            or state.health_deadline is None
+        ):
+            raise UpdaterError(
+                "INVALID_JOURNAL", "commit gate release identity is incomplete"
+            )
+        process = self._capture_commit_process(state, peer_pid)
+        return self.store.begin_commit_gate(
+            command_id=command_id,
+            gate_id=str(uuid.uuid4()),
+            challenge=base64.urlsafe_b64encode(secrets.token_bytes(32))
+            .decode("ascii")
+            .rstrip("="),
+            process=process,
+            bom_digest=state.bom_digest,
+            component_sha=state.component_sha,
+            release_sequence=state.release_sequence,
+            health_deadline=state.health_deadline,
+        )
+
+    def commit(
+        self,
+        command_id: str,
+        *,
+        gate_id: str,
+        health_attestation_jws: str,
+        peer_pid: int,
+    ) -> UpdateState:
+        state = self._require_state(command_id)
+        if state.phase not in {UpdatePhase.FUNCTIONAL_HEALTHY, UpdatePhase.COMMITTED}:
             raise UpdaterError(
                 "INVALID_PHASE", "FUNCTIONAL_HEALTHY is required before commit"
             )
-        if state.release_sequence is None:
-            raise UpdaterError("INVALID_JOURNAL", "release sequence is missing")
-        if state.candidate_slot is None or not self.slots.is_active(state.candidate_slot):
-            return self.rollback(command_id, reason="ACTIVE_SLOT_MISMATCH")
-        return self.store.commit_command(command_id)
+        gate = self.store.commit_gate(command_id)
+        if gate is None:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_REQUIRED", "BEGIN_COMMIT_GATE is required before commit"
+            )
+        if gate.gate_id != gate_id:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_MISMATCH", "gateId does not match the durable commit gate"
+            )
+        process = self._capture_commit_process(state, peer_pid)
+        if process != gate.process:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_MISMATCH",
+                "live Agent process does not match the durable commit gate",
+            )
+        assert self.health_attestation_verifier is not None
+        verified = self.health_attestation_verifier.verify(
+            health_attestation_jws,
+            expected=self._expected_health_attestation(gate),
+        )
+        # Signature verification and local process inspection must not extend
+        # the persisted absolute deadline. Timeout follows the existing
+        # watchdog rollback path.
+        state = self._enforce_health_deadline(state)
+        if state.phase not in {UpdatePhase.FUNCTIONAL_HEALTHY, UpdatePhase.COMMITTED}:
+            return state
+        second_process = self._capture_commit_process(state, peer_pid)
+        if second_process != gate.process:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_MISMATCH",
+                "Agent process changed while validating the health attestation",
+            )
+        return self.store.commit_command_attested(
+            command_id,
+            gate_id=gate.gate_id,
+            process=second_process,
+            attestation_id=verified.attestation_id,
+            attestation_jws_sha256=verified.compact_jws_sha256,
+        )
 
     def rollback(self, command_id: str, *, reason: str = "OPERATOR_REQUEST") -> UpdateState:
         # Do not call _require_state here: deadline enforcement itself enters
@@ -565,6 +649,47 @@ class UpdaterController:
                 "ROLLBACK_UNAVAILABLE", "no previous slot exists for rollback"
             )
         return previous
+
+    def _capture_commit_process(
+        self,
+        state: UpdateState,
+        peer_pid: int,
+    ) -> CommitProcessIdentity:
+        if self.commit_process_check is None:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNAVAILABLE", "commit process verifier is unavailable"
+            )
+        try:
+            process = self.commit_process_check(state, peer_pid)
+        except Exception as exc:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNVERIFIED",
+                f"candidate process identity could not be verified: {type(exc).__name__}",
+            ) from exc
+        if not isinstance(process, CommitProcessIdentity) or process.pid != peer_pid:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNVERIFIED", "candidate process identity is invalid"
+            )
+        return process
+
+    def _expected_health_attestation(
+        self,
+        gate: CommitGate,
+    ) -> ExpectedHealthAttestation:
+        return ExpectedHealthAttestation(
+            gate_id=gate.gate_id,
+            challenge=gate.challenge,
+            trust_domain=self.binding.trust_domain,
+            device_id=self.binding.device_id,
+            command_id=gate.command_id,
+            bom_digest=gate.bom_digest,
+            component_sha=gate.component_sha,
+            release_sequence=gate.release_sequence,
+            product_model=self.binding.product_model,
+            platform_profile=self.binding.platform_profile,
+            hardware_revision=self.binding.hardware_revision,
+            architecture=self.binding.architecture,
+        )
 
     def _rollback_failed(self, command_id: str, exc: Exception) -> UpdateState:
         stop_detail = ""

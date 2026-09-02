@@ -184,8 +184,25 @@ class UpdaterClient:
     ) -> dict[str, Any]:
         return self._health("REPORT_FUNCTIONAL_HEALTH", command_id, healthy, detail)
 
-    def commit(self, command_id: str) -> dict[str, Any]:
-        return self._operation("COMMIT", command_id)
+    def begin_commit_gate(self, command_id: str) -> dict[str, Any]:
+        return self._operation("BEGIN_COMMIT_GATE", command_id)
+
+    def commit(
+        self,
+        command_id: str,
+        *,
+        gate_id: str,
+        health_attestation_jws: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            {
+                "schemaVersion": 1,
+                "operation": "COMMIT",
+                "commandId": command_id,
+                "gateId": gate_id,
+                "healthAttestationJws": health_attestation_jws,
+            }
+        )
 
     def rollback(self, command_id: str, *, reason: str | None = None) -> dict[str, Any]:
         request: dict[str, Any] = {

@@ -55,6 +55,9 @@ This script:
   The `nuvion` account is explicitly removed from the root-equivalent Docker
   group. Docker/Triton profiles remain OTA fail-closed until their separate
   privileged runtime helper and product health adapter are installed.
+- Requires a separate root-owned health-attestation keyring and a short-lived,
+  BE-signed commit proof before an OTA candidate can become permanent. See
+  [`agent-update-health-attestation-v1.md`](agent-update-health-attestation-v1.md).
 - Demo mode uses the public MVTec dataset bucket and local cache at runtime.
 
 Python requirement: Ubuntu 24.04 system CPython 3.12.

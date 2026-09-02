@@ -171,6 +171,72 @@ def load_release_keyring(
         raise UpdaterSecurityError("INVALID_RELEASE_KEYRING", str(exc)) from exc
 
 
+def load_health_attestation_keyring(
+    path: str | Path,
+    *,
+    expected_trust_domain: str,
+    require_root_owner: bool = True,
+) -> Ed25519Keyring:
+    payload = _load_json(path, require_root_owner=require_root_owner)
+    if set(payload) != {"schemaVersion", "trustDomain", "purpose", "keys"}:
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING",
+            "health attestation keyring fields do not match schema v1",
+        )
+    if payload.get("schemaVersion") != 1:
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING",
+            "unsupported health attestation keyring schemaVersion",
+        )
+    if payload.get("trustDomain") != expected_trust_domain:
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING",
+            "health attestation keyring trust domain mismatch",
+        )
+    if payload.get("purpose") != "agent-update-health-attestation":
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING",
+            "health attestation keyring purpose mismatch",
+        )
+    raw_keys = payload.get("keys")
+    if not isinstance(raw_keys, dict) or not raw_keys or len(raw_keys) > 32:
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING",
+            "health attestation keyring must contain 1..32 keys",
+        )
+    decoded: dict[str, bytes] = {}
+    for kid, encoded in raw_keys.items():
+        if not isinstance(kid, str) or not kid or len(kid) > 128:
+            raise UpdaterSecurityError(
+                "INVALID_HEALTH_ATTESTATION_KEYRING",
+                "health attestation key id is invalid",
+            )
+        if not isinstance(encoded, str) or not encoded:
+            raise UpdaterSecurityError(
+                "INVALID_HEALTH_ATTESTATION_KEYRING",
+                f"health attestation key {kid} must be base64",
+            )
+        try:
+            material = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise UpdaterSecurityError(
+                "INVALID_HEALTH_ATTESTATION_KEYRING",
+                f"health attestation key {kid} is invalid base64",
+            ) from exc
+        if base64.b64encode(material).decode("ascii") != encoded:
+            raise UpdaterSecurityError(
+                "INVALID_HEALTH_ATTESTATION_KEYRING",
+                f"health attestation key {kid} is not canonical base64",
+            )
+        decoded[kid] = material
+    try:
+        return Ed25519Keyring(decoded)
+    except (TypeError, ValueError) as exc:
+        raise UpdaterSecurityError(
+            "INVALID_HEALTH_ATTESTATION_KEYRING", str(exc)
+        ) from exc
+
+
 def build_root_command_verifier(
     *,
     binding: DeviceBinding,
