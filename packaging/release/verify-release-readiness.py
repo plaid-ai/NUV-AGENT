@@ -442,6 +442,7 @@ def _validate_physical_documents(
         "schemaVersion",
         "kind",
         "startedAt",
+        "outcome",
         "board",
         "oakMxidSha256",
         "deviceIdentity",
@@ -453,10 +454,16 @@ def _validate_physical_documents(
         raise ReadinessError("IQ9075 OAK soak source fields are invalid")
     runtime_identity = oak_soak.get("runtimeIdentity")
     device_identity = oak_soak.get("deviceIdentity")
+    outcome = oak_soak.get("outcome")
     if (
         type(oak_soak.get("schemaVersion")) is not int
-        or oak_soak.get("schemaVersion") != 1
+        or oak_soak.get("schemaVersion") != 2
         or oak_soak.get("kind") != "nuvion-iq9075-oak-soak-result"
+        or not isinstance(outcome, dict)
+        or set(outcome) != {"status", "error", "cleanupErrors"}
+        or outcome.get("status") != "passed"
+        or outcome.get("error") is not None
+        or outcome.get("cleanupErrors") != []
         or oak_soak.get("startedAt") != manifest.get("startedAt")
         or oak_soak.get("board") != board
         or oak_soak.get("oakMxidSha256") != manifest.get("oakMxidSha256")
@@ -678,13 +685,14 @@ def _validate_physical_documents(
         "artifactSha256",
         "bomSha256",
         "exitCode",
+        "outcome",
         "soak",
         "webrtc",
         "splitmux",
         "rollback",
     } or (
         type(result.get("schemaVersion")) is not int
-        or result.get("schemaVersion") != 1
+        or result.get("schemaVersion") != 2
         or result.get("kind") != "nuvion-iq9075-physical-result"
         or result.get("runId") != run_id
         or result.get("agentVersion") != version
@@ -694,6 +702,7 @@ def _validate_physical_documents(
         or result.get("bomSha256") != tested_bom_sha256
         or result.get("exitCode") != 0
         or isinstance(result.get("exitCode"), bool)
+        or result.get("outcome") != outcome
     ):
         raise ReadinessError("IQ9075 harness result identity is invalid")
 
@@ -703,7 +712,10 @@ def _validate_physical_documents(
         "targetFps",
         "rawSamples",
         "rssAnonSamples",
+        "rssAnonSlopeMiBPerMin",
+        "rssAnonRangeMiB",
         "gstreamerErrors",
+        "gstreamerWarnings",
         "maxAppsrcBuffers",
         "maxAppsrcBytes",
         "queueHighWatermarks",
@@ -743,6 +755,16 @@ def _validate_physical_documents(
     errors = soak.get("gstreamerErrors")
     if not isinstance(errors, list) or errors:
         raise ReadinessError("IQ9075 GStreamer errors were observed")
+    warnings = soak.get("gstreamerWarnings")
+    if (
+        not isinstance(warnings, list)
+        or len(warnings) > 256
+        or any(
+            not isinstance(item, str) or not item or len(item) > 2000
+            for item in warnings
+        )
+    ):
+        raise ReadinessError("IQ9075 GStreamer warnings are invalid")
     queue_levels = soak.get("queueHighWatermarks")
     expected_queues = {
         "physical_raw_queue",
@@ -801,6 +823,20 @@ def _validate_physical_documents(
     ) / denominator
     rss_values = [value for _elapsed, value in rss_samples]
     rss_range = max(rss_values) - min(rss_values)
+    reported_rss_slope = _number(
+        soak.get("rssAnonSlopeMiBPerMin"),
+        label="IQ9075 reported RSS slope",
+    )
+    reported_rss_range = _number(
+        soak.get("rssAnonRangeMiB"),
+        label="IQ9075 reported RSS range",
+        minimum=0.0,
+    )
+    if (
+        not math.isclose(reported_rss_slope, rss_slope, rel_tol=0.0, abs_tol=0.001)
+        or not math.isclose(reported_rss_range, rss_range, rel_tol=0.0, abs_tol=0.001)
+    ):
+        raise ReadinessError("IQ9075 reported RSS metrics differ from samples")
     if abs(rss_slope) > 2.0 or rss_range > 32.0:
         raise ReadinessError("IQ9075 RSS growth exceeds the release bound")
 
@@ -815,6 +851,7 @@ def _validate_physical_documents(
         "teeRequestPadCount",
         "queueState",
         "webrtcState",
+        "branchObjectsFinalized",
         "hasPipeline",
     } or (
         webrtc.get("offerCount") != 1
@@ -829,6 +866,7 @@ def _validate_physical_documents(
         or isinstance(webrtc.get("teeRequestPadCount"), bool)
         or webrtc.get("queueState") != "NULL"
         or webrtc.get("webrtcState") != "NULL"
+        or webrtc.get("branchObjectsFinalized") is not True
         or webrtc.get("hasPipeline") is not False
     ):
         raise ReadinessError("IQ9075 WebRTC teardown proof is invalid")

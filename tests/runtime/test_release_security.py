@@ -385,7 +385,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             for second in range(0, 121, 5)
         ]
         result = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "kind": "nuvion-iq9075-physical-result",
             "runId": run_id,
             "agentVersion": "0.1.121",
@@ -394,12 +394,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "artifactSha256": artifact_sha256,
             "bomSha256": bom_file_sha256,
             "exitCode": 0,
+            "outcome": {
+                "status": "passed",
+                "error": None,
+                "cleanupErrors": [],
+            },
             "soak": {
                 "durationSeconds": 120.0,
                 "targetFps": 30.0,
                 "rawSamples": 3600,
                 "rssAnonSamples": rss_samples,
+                "rssAnonSlopeMiBPerMin": 0.0,
+                "rssAnonRangeMiB": 0.0,
                 "gstreamerErrors": [],
+                "gstreamerWarnings": [],
                 "maxAppsrcBuffers": 2,
                 "maxAppsrcBytes": 1843200,
                 "queueHighWatermarks": {
@@ -419,6 +427,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "teeRequestPadCount": 0,
                 "queueState": "NULL",
                 "webrtcState": "NULL",
+                "branchObjectsFinalized": True,
                 "hasPipeline": False,
             },
             "splitmux": {
@@ -449,9 +458,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             encoding="utf-8",
         )
         oak_soak = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "kind": "nuvion-iq9075-oak-soak-result",
             "startedAt": manifest["startedAt"],
+            "outcome": result["outcome"],
             "board": manifest["board"],
             "oakMxidSha256": manifest["oakMxidSha256"],
             "deviceIdentity": {
@@ -1076,6 +1086,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
 
         mutations = {
+            "failed-outcome": lambda result: result["outcome"].update(
+                status="failed", error="RSS gate failed"
+            ),
             "raw-frame-shortfall": lambda result: result["soak"].update(
                 rawSamples=100
             ),
@@ -1225,7 +1238,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
             raw = result_path.read_text(encoding="utf-8")
             result_path.write_text(
-                raw.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+                raw.replace('"schemaVersion":2', '"schemaVersion":2,"schemaVersion":2'),
                 encoding="utf-8",
             )
             summary["harnessResult"]["sha256"] = hashlib.sha256(
@@ -1561,6 +1574,24 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(len(list(output.iterdir())), 7)
             summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            assembled_manifest = json.loads(
+                Path(result["manifest"]).read_text(encoding="utf-8")
+            )
+            assembled_oak = json.loads(
+                (output / assembled_manifest["oakSoak"]["file"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assembled_result = json.loads(
+                Path(result["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(assembled_oak["schemaVersion"], 2)
+            self.assertEqual(
+                assembled_oak["outcome"],
+                {"status": "passed", "error": None, "cleanupErrors": []},
+            )
+            self.assertEqual(assembled_result["schemaVersion"], 2)
+            self.assertEqual(assembled_result["outcome"], assembled_oak["outcome"])
             security = json.loads(
                 arguments["security_policy_path"].read_text(encoding="utf-8")
             )
@@ -1592,7 +1623,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             path = arguments["soak_result_path"]
             raw = path.read_text(encoding="utf-8")
             path.write_text(
-                raw.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+                raw.replace('"schemaVersion":2', '"schemaVersion":2,"schemaVersion":2'),
                 encoding="utf-8",
             )
 
@@ -1613,6 +1644,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
+        def failed_soak(arguments: dict[str, object]) -> None:
+            path = arguments["soak_result_path"]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["outcome"] = {
+                "status": "failed",
+                "error": "RuntimeError: RSS gate failed",
+                "cleanupErrors": [],
+            }
+            path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
         def bool_schema(arguments: dict[str, object]) -> None:
             path = arguments["soak_result_path"]
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1626,6 +1670,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "duplicate": duplicate_soak_member,
             "nan": nan_soak_metric,
             "validator": validation_failure,
+            "failed-soak": failed_soak,
             "bool-schema": bool_schema,
         }.items():
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
@@ -1636,10 +1681,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 output.mkdir(mode=0o700)
                 arguments = inputs(source)
                 corrupt(arguments)
-                with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError) as caught:
                     PHYSICAL_EVIDENCE.assemble(
                         **arguments, output_directory=output
                     )
+                if label == "failed-soak":
+                    self.assertIn("cannot be promoted", str(caught.exception))
                 self.assertEqual(list(output.iterdir()), [])
 
         with tempfile.TemporaryDirectory() as raw_root:

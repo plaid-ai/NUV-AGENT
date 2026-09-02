@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import importlib
 import sys
 import types
 import unittest
+import weakref
 from typing import Any, ClassVar
 from unittest import mock
 
@@ -392,8 +394,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             )
         )
         self._start(controller, "session-1")
-        branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
 
         controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
 
@@ -433,7 +434,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
         self._start(controller, "session-1")
         branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
         local_offer = object()
 
         with mock.patch.object(
@@ -471,7 +472,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller, pipeline = self._controller(send_message)
         self._start(controller, "session-1")
         branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
 
         controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
         _FakeGLib.drain()
@@ -497,8 +498,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             )
         )
         self._start(controller, "session-1")
-        branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
         _FakeGLib.drain()
         self.assertEqual(len(_FakeGLib.timeouts), 1)
@@ -510,11 +510,54 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertEqual(sent[-1][0], self.module.WEBRTC_UPLINK_STOP_DEST)
         self.assertTrue(sent[-1][1].terminal)
 
+    def test_retained_gst_promises_do_not_retain_disposed_branch(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        queue_ref = weakref.ref(branch.queue)
+        webrtc_ref = weakref.ref(branch.webrtcbin)
+
+        create_promise = next(
+            args[1]
+            for signal, args in branch.webrtcbin.emitted
+            if signal == "create-offer"
+        )
+        create_promise.complete(reply=_OfferReply())
+        _FakeGLib.drain()
+        self.assertTrue(controller.request_outbound_stats())
+        _FakeGLib.drain()
+        stats_promise = next(
+            args[1]
+            for signal, args in branch.webrtcbin.emitted
+            if signal == "get-stats"
+        )
+        retained_promises = [
+            create_promise,
+            *branch.webrtcbin.description_promises,
+            stats_promise,
+        ]
+
+        # Model native GStreamer retaining replied/in-flight promises beyond
+        # teardown. Their Python user-data must not strongly own webrtcbin.
+        for promise in retained_promises:
+            self.assertNotIn(branch.webrtcbin, promise.token)
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self.assertIsNone(controller._branch)
+        branch = None
+        _FakeElementFactory.created.clear()
+        gc.collect()
+
+        self.assertIsNone(queue_ref())
+        self.assertIsNone(webrtc_ref())
+        self.assertGreaterEqual(len(retained_promises), 3)
+
     def test_valid_answer_requires_connection_before_watchdog_is_cancelled(self) -> None:
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
         branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), token)
         _FakeGLib.drain()
         self.assertEqual(len(_FakeGLib.timeouts), 1)
@@ -554,8 +597,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             )
         )
         self._start(controller, "session-1")
-        branch = controller._branch
-        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        offer_token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
         _FakeGLib.drain()
         controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
@@ -577,7 +619,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self._start(controller, "session-1")
         branch = controller._branch
         branch.webrtcbin.auto_complete_descriptions = False
-        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        offer_token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
         local_promise = branch.webrtcbin.description_promises[-1]
         self.assertNotIn(self.module.WEBRTC_UPLINK_OFFER_DEST, sent)
@@ -595,7 +637,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
         branch = controller._branch
-        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        offer_token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
         _FakeGLib.drain()
         branch.webrtcbin.auto_complete_descriptions = False
@@ -613,7 +655,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
         branch = controller._branch
-        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        offer_token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
         _FakeGLib.drain()
         branch.webrtcbin.auto_complete_descriptions = False
@@ -631,7 +673,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
         first = controller._branch
-        offer_token = (controller._stats_generation, "session-1", first.webrtcbin)
+        offer_token = (controller._stats_generation, "session-1")
         controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
         _FakeGLib.drain()
         first.webrtcbin.auto_complete_descriptions = False
@@ -809,7 +851,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             generation,
             "session-1",
         )
-        token = (generation, "session-1", branch.webrtcbin)
+        token = (generation, "session-1")
         for index in range(3):
             controller._on_stats_created(
                 _ReplyPromise(
@@ -847,19 +889,9 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
     def test_late_stats_callback_from_replaced_session_is_ignored(self) -> None:
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
-        old_branch = controller._branch
-        old_token = (
-            controller._stats_generation,
-            "session-1",
-            old_branch.webrtcbin,
-        )
+        old_token = (controller._stats_generation, "session-1")
         self._start(controller, "session-2")
-        new_branch = controller._branch
-        new_token = (
-            controller._stats_generation,
-            "session-2",
-            new_branch.webrtcbin,
-        )
+        new_token = (controller._stats_generation, "session-2")
         stats = {
             "type": "remote-inbound-rtp",
             "round-trip-time": 0.05,
@@ -877,8 +909,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
     def test_stop_invalidates_inflight_stats_before_glib_callback(self) -> None:
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
-        branch = controller._branch
-        token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        token = (controller._stats_generation, "session-1")
 
         controller.stop(send_signal=False)
         controller._on_stats_created(
@@ -952,7 +983,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self._start(controller, "session-1")
         first = controller._branch
         first_generation = controller._stats_generation
-        old_offer_token = (first_generation, "session-1", first.webrtcbin)
+        old_offer_token = (first_generation, "session-1")
 
         controller.on_signaling_reset()
         _FakeGLib.drain()

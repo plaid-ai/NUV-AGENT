@@ -453,6 +453,7 @@ if [ "$camera_mode" = "oak" ]; then
 from importlib.metadata import version
 from pathlib import Path
 from datetime import datetime, timezone
+import gc
 import hashlib
 import json
 import math
@@ -461,6 +462,7 @@ import platform
 import re
 import threading
 import time
+import weakref
 
 import depthai
 import numpy as np
@@ -1004,7 +1006,23 @@ if state_result == Gst.StateChangeReturn.FAILURE:
     pipeline.set_state(Gst.State.NULL)
     raise SystemExit("OAK GStreamer pipeline failed to enter PLAYING")
 
-
+runtime_usb_path = initial_usb_path
+webrtc_evidence = {}
+soak_start_samples = 0
+soak_started = time.monotonic()
+soak_elapsed = 0.0
+soak_raw_samples = 0
+raw_fps = 0.0
+rss_samples = []
+rss_slope = None
+rss_range = None
+fragments_at_soak_start = 0
+segments = []
+fragment_delta = 0
+newest_segment_age = None
+bridge_stats = bridge.stats_snapshot()
+run_failure = None
+cleanup_errors = []
 try:
     bridge.start()
     runtime_usb_path = require_runtime_oak(startup_timeout)
@@ -1045,6 +1063,8 @@ try:
         raise RuntimeError("physical WebRTC offer has no owned disposable branch")
     old_queue = rejected_branch.queue
     old_webrtc = rejected_branch.webrtcbin
+    old_queue_ref = weakref.ref(old_queue)
+    old_webrtc_ref = weakref.ref(old_webrtc)
     wait_until(
         lambda: controller._branch is None,
         10.0,
@@ -1071,16 +1091,25 @@ try:
         raise RuntimeError("rejected WebRTC tee request pad was not released")
     if controller.runtime_health_snapshot()["hasPipeline"]:
         raise RuntimeError("rejected WebRTC runtime still reports an active pipeline")
+    del rejected_branch, old_queue, old_webrtc
+    gc.collect()
+    wait_until(
+        lambda: old_queue_ref() is None and old_webrtc_ref() is None,
+        5.0,
+        "rejected WebRTC branch object finalization",
+        static_queues,
+    )
     webrtc_evidence = {
         "offerCount": len(offer_snapshot()),
         "terminalStopCount": len(terminal_stops),
         "offerSdpHadPinnedProfile": "profile-level-id=42e01f" in offer_sdp,
         "branchParentDetached": True,
-        "queueParentDetached": old_queue.get_parent() is None,
-        "webrtcParentDetached": old_webrtc.get_parent() is None,
+        "queueParentDetached": True,
+        "webrtcParentDetached": True,
         "teeRequestPadCount": request_pad_count(uplink_tee),
         "queueState": "NULL",
         "webrtcState": "NULL",
+        "branchObjectsFinalized": True,
         "hasPipeline": False,
     }
 
@@ -1153,22 +1182,51 @@ try:
     if gst_errors:
         raise RuntimeError(f"GStreamer errors were observed: {gst_errors}")
     bridge_stats = bridge.stats_snapshot()
+except BaseException as exc:  # Persist bounded diagnostics before failing the gate.
+    run_failure = f"{type(exc).__name__}: {exc}"[:2000]
 finally:
-    controller.stop(send_signal=False)
-    teardown_deadline = time.monotonic() + 5.0
-    while context.pending() and time.monotonic() < teardown_deadline:
-        context.iteration(False)
-    bridge.close()
-    pipeline.set_state(Gst.State.NULL)
-    pipeline.get_state(5 * Gst.SECOND)
+    try:
+        bridge_stats = bridge.stats_snapshot()
+    except Exception as exc:
+        cleanup_errors.append(f"bridge stats: {type(exc).__name__}: {exc}"[:1000])
+    try:
+        segments = sorted(segment_dir.glob("segment_*.mp4"))
+        fragment_delta = fragment_opened - fragments_at_soak_start
+        if segments:
+            newest_segment_age = min(
+                time.time() - item.stat().st_mtime for item in segments
+            )
+    except Exception as exc:
+        cleanup_errors.append(f"splitmux snapshot: {type(exc).__name__}: {exc}"[:1000])
+    try:
+        controller.stop(send_signal=False)
+        teardown_deadline = time.monotonic() + 5.0
+        while context.pending() and time.monotonic() < teardown_deadline:
+            context.iteration(False)
+    except Exception as exc:
+        cleanup_errors.append(f"WebRTC teardown: {type(exc).__name__}: {exc}"[:1000])
+    try:
+        bridge.close()
+    except Exception as exc:
+        cleanup_errors.append(f"DepthAI teardown: {type(exc).__name__}: {exc}"[:1000])
+    try:
+        pipeline.set_state(Gst.State.NULL)
+        pipeline.get_state(5 * Gst.SECOND)
+    except Exception as exc:
+        cleanup_errors.append(f"GStreamer teardown: {type(exc).__name__}: {exc}"[:1000])
 
 evidence_path = Path(os.environ["NUVION_IQ9075_OAK_EVIDENCE_OUTPUT"])
 if evidence_path.parent.resolve(strict=True) != runtime_root or evidence_path.name != "oak-soak-result.json":
     raise SystemExit("OAK evidence output escaped the private runtime root")
 evidence = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "kind": "nuvion-iq9075-oak-soak-result",
     "startedAt": started_at,
+    "outcome": {
+        "status": "failed" if run_failure is not None or cleanup_errors else "passed",
+        "error": run_failure,
+        "cleanupErrors": cleanup_errors,
+    },
     "board": {
         "productModel": "IQ9075_DEV",
         "platformProfile": "iq9075_dev",
@@ -1203,7 +1261,12 @@ evidence = {
             }
             for timestamp, rss_kib in rss_samples
         ],
+        "rssAnonSlopeMiBPerMin": (
+            round(rss_slope, 6) if rss_slope is not None else None
+        ),
+        "rssAnonRangeMiB": round(rss_range, 6) if rss_range is not None else None,
         "gstreamerErrors": list(gst_errors),
+        "gstreamerWarnings": list(gst_warnings),
         "maxAppsrcBuffers": max_appsrc_buffers,
         "maxAppsrcBytes": max_appsrc_bytes,
         "queueHighWatermarks": dict(sorted(queue_high_watermarks.items())),
@@ -1214,22 +1277,56 @@ evidence = {
         "retentionLimit": MAX_SEGMENTS,
         "segmentsAtEnd": len(segments),
         "fragmentsOpenedDuringSoak": fragment_delta,
-        "newestSegmentAgeSeconds": round(newest_segment_age, 6),
+        "newestSegmentAgeSeconds": (
+            round(newest_segment_age, 6)
+            if newest_segment_age is not None
+            else None
+        ),
     },
 }
 serialized = (json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
-descriptor = os.open(
-    evidence_path,
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-    0o600,
+temporary_evidence_path = evidence_path.with_name(
+    f".{evidence_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
 )
 try:
-    with os.fdopen(descriptor, "wb", closefd=False) as output:
-        output.write(serialized)
-        output.flush()
-        os.fsync(output.fileno())
+    descriptor = os.open(
+        temporary_evidence_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
+            output.write(serialized)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(descriptor)
+    os.link(
+        temporary_evidence_path,
+        evidence_path,
+        follow_symlinks=False,
+    )
+    directory_descriptor = os.open(runtime_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 finally:
-    os.close(descriptor)
+    temporary_evidence_path.unlink(missing_ok=True)
+
+if run_failure is not None or cleanup_errors:
+    detail = run_failure or cleanup_errors[0]
+    print(
+        "[iq9075-e2e] preserved failure evidence: "
+        f"{serialized.decode('utf-8').strip()}",
+        flush=True,
+    )
+    print(
+        "[iq9075-e2e] OAK production offer/watchdog/teardown RSS soak: FAIL "
+        f"({detail}; evidence={evidence_path})",
+        flush=True,
+    )
+    raise SystemExit(detail)
 
 print(
     "[iq9075-e2e] OAK production offer/watchdog/teardown RSS soak: PASS "
@@ -1243,23 +1340,18 @@ print(
 PY
   oak_status=$?
   set -e
-  if [ "$oak_status" -ne 0 ]; then
-    if [ "$allow_no_camera" = true ] && [ "$oak_status" -eq 3 ]; then
-      echo "[iq9075-e2e] OAK-D camera: SKIP (no device; --allow-no-camera)"
-      exit 0
-    fi
-    die "OAK-D RGB/appsrc/H264/RTP test failed (status=$oak_status); check runtime, USB permissions, configured MXID, and camera health"
-  fi
-  if [ -n "$evidence_output" ]; then
+  if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/oak-soak-result.json" ]; then
     post_release_marker_sha="$(validate_release_identity)" || \
       die "candidate release identity changed after OAK soak"
     [ "$post_release_marker_sha" = "$release_marker_sha" ] || \
       die "candidate release marker changed during OAK soak"
     /usr/bin/python3 -I - \
       "$probe_runtime_dir/oak-soak-result.json" "$evidence_output" "$(id -u)" <<'PY'
+import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 source = Path(sys.argv[1])
@@ -1282,20 +1374,173 @@ if (
     or metadata.st_mode & 0o022
 ):
     raise SystemExit("IQ9075 evidence destination directory is not private")
+source_metadata = source.stat(follow_symlinks=False)
+if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+    raise SystemExit("IQ9075 evidence source must be one regular private file")
 raw = source.read_bytes()
 if not raw or len(raw) > 1024 * 1024:
     raise SystemExit("IQ9075 evidence payload size is invalid")
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-descriptor = os.open(destination, flags, 0o600)
+
+
+def reject_duplicate(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member: {key}")
+        result[key] = value
+    return result
+
+
 try:
-    with os.fdopen(descriptor, "wb", closefd=False) as output:
-        output.write(raw)
-        output.flush()
-        os.fsync(output.fileno())
+    payload = json.loads(
+        raw,
+        object_pairs_hook=reject_duplicate,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"invalid JSON constant: {value}")
+        ),
+    )
+except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    raise SystemExit(f"IQ9075 evidence source is not strict JSON: {exc}") from exc
+
+root_keys = {
+    "schemaVersion", "kind", "startedAt", "outcome", "board",
+    "oakMxidSha256", "deviceIdentity", "runtimeIdentity", "soak",
+    "webrtc", "splitmux",
+}
+outcome_keys = {"status", "error", "cleanupErrors"}
+board_keys = {
+    "productModel", "platformProfile", "hardwareRevision", "architecture",
+    "kernel", "depthaiVersion", "gstreamerVersion",
+}
+runtime_keys = {
+    "agentVersion", "componentSha", "bomDigest", "pythonPath",
+    "releaseMarkerSha256",
+}
+soak_keys = {
+    "durationSeconds", "targetFps", "rawSamples", "rssAnonSamples",
+    "rssAnonSlopeMiBPerMin", "rssAnonRangeMiB", "gstreamerErrors",
+    "gstreamerWarnings", "maxAppsrcBuffers", "maxAppsrcBytes",
+    "queueHighWatermarks",
+}
+webrtc_keys = {
+    "offerCount", "terminalStopCount", "offerSdpHadPinnedProfile",
+    "branchParentDetached", "queueParentDetached", "webrtcParentDetached",
+    "teeRequestPadCount", "queueState", "webrtcState",
+    "branchObjectsFinalized", "hasPipeline",
+}
+splitmux_keys = {
+    "segmentSeconds", "retentionLimit", "segmentsAtEnd",
+    "fragmentsOpenedDuringSoak", "newestSegmentAgeSeconds",
+}
+if (
+    not isinstance(payload, dict)
+    or set(payload) != root_keys
+    or type(payload.get("schemaVersion")) is not int
+    or payload.get("schemaVersion") != 2
+    or payload.get("kind") != "nuvion-iq9075-oak-soak-result"
+):
+    raise SystemExit("IQ9075 evidence source root schema is invalid")
+
+outcome = payload.get("outcome")
+cleanup_errors = outcome.get("cleanupErrors") if isinstance(outcome, dict) else None
+if (
+    not isinstance(outcome, dict)
+    or set(outcome) != outcome_keys
+    or outcome.get("status") not in {"passed", "failed"}
+    or not isinstance(cleanup_errors, list)
+    or len(cleanup_errors) > 16
+    or any(
+        not isinstance(item, str) or not item or len(item) > 1000
+        for item in cleanup_errors
+    )
+):
+    raise SystemExit("IQ9075 evidence outcome schema is invalid")
+if outcome["status"] == "passed":
+    if outcome.get("error") is not None or cleanup_errors:
+        raise SystemExit("passed IQ9075 evidence contains failure details")
+elif (
+    outcome.get("error") is not None
+    and (
+        not isinstance(outcome.get("error"), str)
+        or not outcome["error"]
+        or len(outcome["error"]) > 2000
+    )
+) or (outcome.get("error") is None and not cleanup_errors):
+    raise SystemExit("failed IQ9075 evidence lacks bounded failure details")
+
+board = payload.get("board")
+device_identity = payload.get("deviceIdentity")
+runtime_identity = payload.get("runtimeIdentity")
+soak = payload.get("soak")
+webrtc = payload.get("webrtc")
+splitmux = payload.get("splitmux")
+if (
+    not isinstance(board, dict)
+    or set(board) != board_keys
+    or not isinstance(device_identity, dict)
+    or set(device_identity) != {"deviceId", "spaceId"}
+    or not isinstance(runtime_identity, dict)
+    or set(runtime_identity) != runtime_keys
+    or not isinstance(soak, dict)
+    or set(soak) != soak_keys
+    or not isinstance(webrtc, dict)
+    or (
+        set(webrtc) != webrtc_keys
+        and not (outcome["status"] == "failed" and not webrtc)
+    )
+    or not isinstance(splitmux, dict)
+    or set(splitmux) != splitmux_keys
+):
+    raise SystemExit("IQ9075 evidence nested object fields are invalid")
+
+rss_samples = soak.get("rssAnonSamples")
+errors = soak.get("gstreamerErrors")
+warnings = soak.get("gstreamerWarnings")
+queue_levels = soak.get("queueHighWatermarks")
+if (
+    not isinstance(rss_samples, list)
+    or len(rss_samples) > 256
+    or any(
+        not isinstance(item, dict)
+        or set(item) != {"elapsedSec", "rssAnonKiB"}
+        for item in rss_samples
+    )
+    or not isinstance(errors, list)
+    or not isinstance(warnings, list)
+    or not isinstance(queue_levels, dict)
+):
+    raise SystemExit("IQ9075 evidence collection fields are invalid")
+
+temporary = destination.with_name(
+    f".{destination.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(descriptor)
+    os.link(temporary, destination, follow_symlinks=False)
+    directory_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 finally:
-    os.close(descriptor)
+    temporary.unlink(missing_ok=True)
 PY
     echo "[iq9075-e2e] canonical OAK evidence: $evidence_output"
+  fi
+  if [ "$oak_status" -ne 0 ]; then
+    if [ "$allow_no_camera" = true ] && [ "$oak_status" -eq 3 ]; then
+      echo "[iq9075-e2e] OAK-D camera: SKIP (no device; --allow-no-camera)"
+      exit 0
+    fi
+    die "OAK-D RGB/appsrc/H264/RTP test failed (status=$oak_status); check runtime, USB permissions, configured MXID, camera health, and preserved evidence"
   fi
   echo "[iq9075-e2e] local OAK-D/GStreamer/WebRTC path: PASS"
   exit 0

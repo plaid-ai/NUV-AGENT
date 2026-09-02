@@ -464,7 +464,7 @@ class WebRTCUplinkController:
         try:
             promise = Gst.Promise.new_with_change_func(
                 self._on_stats_created,
-                (generation, session_id, branch.webrtcbin),
+                (generation, session_id),
                 None,
             )
             branch.webrtcbin.emit("get-stats", None, promise)
@@ -485,12 +485,11 @@ class WebRTCUplinkController:
             with self._stats_lock:
                 if (
                     not isinstance(token, tuple)
-                    or len(token) != 3
+                    or len(token) != 2
                     or token[0] != self._stats_generation
                     or self._session is None
                     or token[1] != self._session.session_id
                     or self._branch is None
-                    or token[2] is not self._branch.webrtcbin
                     or self._branch_cleanup_failed
                 ):
                     return
@@ -985,7 +984,12 @@ class WebRTCUplinkController:
                 self._teardown_branch_on_main_loop(generation)
                 return False
 
-        token = (generation, session_id, branch.webrtcbin)
+        # Promise user-data must never own the element that owns the promise.
+        # Some GStreamer/WebRTC code paths retain a replied promise until the
+        # element is finalized. Putting ``webrtcbin`` in the token therefore
+        # creates a native/Python reference cycle that survives parent removal
+        # and keeps its internal media graph alive after a rejected offer.
+        token = (generation, session_id)
         self._arm_offer_watchdog_on_main_loop(generation, session_id)
         promise = Gst.Promise.new_with_change_func(
             self._on_offer_created,
@@ -1404,7 +1408,7 @@ class WebRTCUplinkController:
             branch.answer_pending = True
         promise = Gst.Promise.new_with_change_func(
             self._on_remote_description_set,
-            (generation, session_id, branch.webrtcbin),
+            (generation, session_id),
             None,
         )
         try:
@@ -1427,12 +1431,12 @@ class WebRTCUplinkController:
         token: object = None,
         *_args: object,
     ) -> None:
-        if not isinstance(token, tuple) or len(token) != 3:
+        if not isinstance(token, tuple) or len(token) != 2:
             return
-        generation, session_id, element = token
+        generation, session_id = token
         if not isinstance(generation, int) or not isinstance(session_id, str):
             return
-        branch = self._active_branch_for_token(generation, session_id, element)
+        branch = self._active_branch_for_token(generation, session_id)
         if branch is None:
             return
         failure = self._promise_failure_reason(promise)
@@ -1444,7 +1448,7 @@ class WebRTCUplinkController:
             )
             return
         with self._stats_lock:
-            if self._active_branch_for_token(generation, session_id, element) is not branch:
+            if self._active_branch_for_token(generation, session_id) is not branch:
                 return
             if not branch.answer_pending:
                 return
@@ -1492,12 +1496,12 @@ class WebRTCUplinkController:
         token: object = None,
         *_args: object,
     ) -> None:
-        if not isinstance(token, tuple) or len(token) != 3:
+        if not isinstance(token, tuple) or len(token) != 2:
             return
-        generation, session_id, element = token
+        generation, session_id = token
         if not isinstance(generation, int) or not isinstance(session_id, str):
             return
-        branch = self._active_branch_for_token(generation, session_id, element)
+        branch = self._active_branch_for_token(generation, session_id)
         if branch is None:
             return
 
@@ -1582,7 +1586,6 @@ class WebRTCUplinkController:
             (
                 generation,
                 session_id,
-                branch.webrtcbin,
                 payload,
                 signaling_token,
             ),
@@ -1608,9 +1611,9 @@ class WebRTCUplinkController:
         token: object = None,
         *_args: object,
     ) -> None:
-        if not isinstance(token, tuple) or len(token) != 5:
+        if not isinstance(token, tuple) or len(token) != 4:
             return
-        generation, session_id, element, payload, signaling_token = token
+        generation, session_id, payload, signaling_token = token
         if (
             not isinstance(generation, int)
             or not isinstance(session_id, str)
@@ -1618,7 +1621,7 @@ class WebRTCUplinkController:
             or not isinstance(signaling_token, WebRTCSignalingToken)
         ):
             return
-        branch = self._active_branch_for_token(generation, session_id, element)
+        branch = self._active_branch_for_token(generation, session_id)
         if branch is None:
             return
         failure = self._promise_failure_reason(promise)

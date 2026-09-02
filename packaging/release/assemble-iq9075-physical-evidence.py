@@ -230,6 +230,7 @@ def _assemble_into(
         "schemaVersion",
         "kind",
         "startedAt",
+        "outcome",
         "board",
         "oakMxidSha256",
         "deviceIdentity",
@@ -241,10 +242,19 @@ def _assemble_into(
     if (
         set(soak) != expected_soak_keys
         or type(soak.get("schemaVersion")) is not int
-        or soak.get("schemaVersion") != 1
+        or soak.get("schemaVersion") != 2
         or soak.get("kind") != "nuvion-iq9075-oak-soak-result"
     ):
         raise AssemblyError("OAK soak result schema is invalid")
+    outcome = soak.get("outcome")
+    if (
+        not isinstance(outcome, dict)
+        or set(outcome) != {"status", "error", "cleanupErrors"}
+        or outcome.get("status") != "passed"
+        or outcome.get("error") is not None
+        or outcome.get("cleanupErrors") != []
+    ):
+        raise AssemblyError("failed OAK soak result cannot be promoted")
 
     output_directory = _private_output_directory(output_directory)
     names = {
@@ -314,7 +324,7 @@ def _assemble_into(
     _write_new(paths["manifest"], manifest_raw)
 
     result = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "nuvion-iq9075-physical-result",
         "runId": run_id,
         "agentVersion": version,
@@ -323,6 +333,7 @@ def _assemble_into(
         "artifactSha256": artifact_sha,
         "bomSha256": _digest(bom_raw),
         "exitCode": 0,
+        "outcome": soak.get("outcome"),
         "soak": soak.get("soak"),
         "webrtc": soak.get("webrtc"),
         "splitmux": soak.get("splitmux"),

@@ -348,9 +348,26 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('"profile-level-id=42e01f"', e2e)
         self.assertIn("old_queue.get_parent() is not None", e2e)
         self.assertIn("old_webrtc.get_state(0)[1] != Gst.State.NULL", e2e)
+        self.assertIn("old_webrtc_ref = weakref.ref(old_webrtc)", e2e)
+        self.assertIn("rejected WebRTC branch object finalization", e2e)
+        self.assertIn('"branchObjectsFinalized": True', e2e)
         self.assertIn("request_pad_count(uplink_tee) != 0", e2e)
         self.assertIn("controller._branch is not None", e2e)
         self.assertIn("bridge.stats_snapshot()", e2e)
+        self.assertIn('"status": "failed" if run_failure', e2e)
+        self.assertIn('"schemaVersion": 2', e2e)
+        self.assertIn('"rssAnonSlopeMiBPerMin"', e2e)
+        self.assertIn('cleanup_errors.append(f"DepthAI teardown:', e2e)
+        self.assertIn("[iq9075-e2e] preserved failure evidence:", e2e)
+        self.assertGreaterEqual(e2e.count("os.link("), 2)
+        self.assertGreaterEqual(e2e.count("time.monotonic_ns()"), 2)
+        self.assertIn("IQ9075 evidence source root schema is invalid", e2e)
+        self.assertIn("failed IQ9075 evidence lacks bounded failure details", e2e)
+        evidence_copy = e2e.index(
+            'if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/oak-soak-result.json" ]'
+        )
+        oak_failure = e2e.index('if [ "$oak_status" -ne 0 ]', evidence_copy)
+        self.assertLess(evidence_copy, oak_failure)
         self.assertIn("Gst.MessageType.ERROR", e2e)
         self.assertIn('oak_status" -eq 3', e2e)
         self.assertIn('NUVION_GST_SOURCE must be empty', e2e)
@@ -378,6 +395,188 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("Gst.MessageType.ERROR | Gst.MessageType.WARNING", e2e)
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)
         self.assertNotIn("curl ", e2e)
+
+    def test_oak_evidence_export_is_atomic_strict_and_preserves_failures(
+        self,
+    ) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        marker = (
+            '"$probe_runtime_dir/oak-soak-result.json" "$evidence_output" '
+            '"$(id -u)" <<\'PY\'\n'
+        )
+        start = e2e.index(marker) + len(marker)
+        end = e2e.index(
+            "\nPY\n    echo \"[iq9075-e2e] canonical OAK evidence",
+            start,
+        )
+        exporter = e2e[start:end]
+
+        def payload(status: str) -> dict[str, object]:
+            passed = status == "passed"
+            return {
+                "schemaVersion": 2,
+                "kind": "nuvion-iq9075-oak-soak-result",
+                "startedAt": "2026-09-03T00:00:00Z",
+                "outcome": {
+                    "status": status,
+                    "error": None if passed else "RuntimeError: RSS gate failed",
+                    "cleanupErrors": [],
+                },
+                "board": {
+                    "productModel": "IQ9075_DEV",
+                    "platformProfile": "iq9075_dev",
+                    "hardwareRevision": "QCS9075-EVK",
+                    "architecture": "aarch64",
+                    "kernel": "6.8.0",
+                    "depthaiVersion": "2.32.0.0",
+                    "gstreamerVersion": "1.24.2",
+                },
+                "oakMxidSha256": "a" * 64,
+                "deviceIdentity": {"deviceId": "sp-3-nuvion-test", "spaceId": 3},
+                "runtimeIdentity": {
+                    "agentVersion": "0.1.121",
+                    "componentSha": "b" * 40,
+                    "bomDigest": "sha256:" + "c" * 64,
+                    "pythonPath": "/opt/nuv-agent/test/venv/bin/python",
+                    "releaseMarkerSha256": "d" * 64,
+                },
+                "soak": {
+                    "durationSeconds": 120.0 if passed else 0.0,
+                    "targetFps": 30.0,
+                    "rawSamples": 3600 if passed else 0,
+                    "rssAnonSamples": [],
+                    "rssAnonSlopeMiBPerMin": 0.0 if passed else None,
+                    "rssAnonRangeMiB": 0.0 if passed else None,
+                    "gstreamerErrors": [],
+                    "gstreamerWarnings": [],
+                    "maxAppsrcBuffers": 1,
+                    "maxAppsrcBytes": 921600,
+                    "queueHighWatermarks": {},
+                },
+                "webrtc": {
+                    "offerCount": 1,
+                    "terminalStopCount": 1,
+                    "offerSdpHadPinnedProfile": True,
+                    "branchParentDetached": True,
+                    "queueParentDetached": True,
+                    "webrtcParentDetached": True,
+                    "teeRequestPadCount": 0,
+                    "queueState": "NULL",
+                    "webrtcState": "NULL",
+                    "branchObjectsFinalized": True,
+                    "hasPipeline": False,
+                }
+                if passed
+                else {},
+                "splitmux": {
+                    "segmentSeconds": 4.0,
+                    "retentionLimit": 30,
+                    "segmentsAtEnd": 0,
+                    "fragmentsOpenedDuringSoak": 0,
+                    "newestSegmentAgeSeconds": None,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for status in ("passed", "failed"):
+                with self.subTest(status=status):
+                    source = root / f"{status}-source.json"
+                    destination = root / f"{status}-evidence.json"
+                    raw = (
+                        json.dumps(
+                            payload(status),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode()
+                    source.write_bytes(raw)
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-",
+                            str(source),
+                            str(destination),
+                            str(os.getuid()),
+                        ],
+                        input=exporter,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(destination.read_bytes(), raw)
+                    self.assertEqual(
+                        list(root.glob(f".{destination.name}.*.tmp")),
+                        [],
+                    )
+
+                    repeated = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-",
+                            str(source),
+                            str(destination),
+                            str(os.getuid()),
+                        ],
+                        input=exporter,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(repeated.returncode, 0)
+                    self.assertEqual(destination.read_bytes(), raw)
+
+            invalid = payload("failed")
+            invalid["unexpected"] = True
+            source = root / "invalid-source.json"
+            destination = root / "invalid-evidence.json"
+            source.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(destination.exists())
+
+            malformed_failure = payload("failed")
+            malformed_failure["outcome"]["error"] = None
+            source = root / "malformed-failure-source.json"
+            destination = root / "malformed-failure-evidence.json"
+            source.write_text(
+                json.dumps(malformed_failure) + "\n",
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("lacks bounded failure details", rejected.stderr)
+            self.assertFalse(destination.exists())
 
     def test_packaging_shell_scripts_parse(self) -> None:
         scripts = sorted((ROOT / "packaging").rglob("*.sh"))
