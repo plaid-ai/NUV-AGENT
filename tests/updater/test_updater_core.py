@@ -874,6 +874,93 @@ class UpdaterCoreTest(unittest.TestCase):
         assert persisted_gate is not None
         self.assertIsNone(persisted_gate.consumed_at)
 
+    def test_atomic_commit_rechecks_all_deadlines_after_process_inspection(self) -> None:
+        cases = (
+            ("command", 5, 120, 5, "COMMAND_EXPIRED"),
+            ("health", 300, 5, 30, "COMMIT_TIMEOUT"),
+            ("attestation", 300, 120, 5, "HEALTH_ATTESTATION_EXPIRED"),
+        )
+        for index, (
+            name,
+            command_ttl,
+            commit_ttl,
+            attestation_ttl,
+            expected_code,
+        ) in enumerate(cases, start=1):
+            with self.subTest(deadline=name):
+                now = [datetime.now(timezone.utc)]
+                atomic_store = UpdaterStore(
+                    self.state_path,
+                    require_root_owner=False,
+                    clock=lambda: now[0]
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                )
+                self.health_verifier.clock = lambda: now[0]
+                payload, _ = self._publish(
+                    version=f"0.1.{140 + index}",
+                    release_sequence=20 + index,
+                )
+                command_id, command = self._command(
+                    payload,
+                    sequence=60 + index,
+                    expires_at=now[0] + timedelta(seconds=command_ttl),
+                )
+                controller = self._controller(
+                    store=atomic_store,
+                    clock=lambda: now[0],
+                    commit_timeout_seconds=commit_ttl,
+                )
+                controller.authorize_and_stage(command)
+                controller.activate(command_id)
+                controller.report_boot_health(command_id, healthy=True)
+                controller.report_functional_health(command_id, healthy=True)
+                gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+                attestation = self._health_attestation(
+                    gate,
+                    issued_at=now[0],
+                    expires_at=now[0] + timedelta(seconds=attestation_ttl),
+                )
+
+                process_checks = 0
+
+                def process_after_delay(state, pid):
+                    nonlocal process_checks
+                    process_checks += 1
+                    identity = CommitProcessIdentity(
+                        pid=pid,
+                        start_ticks=123456,
+                        boot_id="00000000-0000-4000-8000-000000000123",
+                        active_slot=self.slots.relative_target(state.candidate_slot),
+                    )
+                    # The first call in commit validates the peer before JWS
+                    # verification. Advance only in the second inspection so
+                    # the signed proof is initially valid but stale at the
+                    # atomic journal boundary.
+                    if process_checks == 2:
+                        now[0] += timedelta(seconds=10)
+                    return identity
+
+                controller.commit_process_check = process_after_delay
+                with self.assertRaises(UpdaterError) as raised:
+                    controller.commit(
+                        command_id,
+                        gate_id=gate.gate_id,
+                        health_attestation_jws=attestation,
+                        peer_pid=4242,
+                    )
+
+                self.assertEqual(raised.exception.code, expected_code)
+                rolled_back = atomic_store.get(command_id)
+                assert rolled_back is not None
+                self.assertEqual(rolled_back.phase, UpdatePhase.ROLLED_BACK)
+                self.assertEqual(rolled_back.message, expected_code)
+                persisted_gate = atomic_store.commit_gate(command_id)
+                assert persisted_gate is not None
+                self.assertIsNone(persisted_gate.attestation_id)
+                self.assertIsNone(persisted_gate.consumed_at)
+                self.assertEqual(atomic_store.current_release_sequence(), 1)
+
     def test_recovery_cleans_cache_left_after_verified_transition_crash(self) -> None:
         payload, _ = self._publish(version="0.1.134", release_sequence=14)
         command_id, command = self._command(payload, sequence=50)

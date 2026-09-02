@@ -829,10 +829,10 @@ class UpdaterStore:
         process: CommitProcessIdentity,
         attestation_id: str,
         attestation_jws_sha256: str,
+        attestation_expires_at: datetime,
     ) -> UpdateState:
         """Atomically consume one attestation and commit installed identity."""
 
-        now = self._clock()
         with self._lock, self._transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT * FROM updater_command WHERE command_id = ?", (command_id,)
@@ -884,6 +884,39 @@ class UpdaterStore:
                 )
             if current.release_sequence is None:
                 raise UpdaterError("INVALID_JOURNAL", "release sequence is missing")
+            if (
+                current.command_expires_at != gate.command_expires_at
+                or current.health_deadline != gate.health_deadline
+            ):
+                raise UpdaterSecurityError(
+                    "COMMIT_GATE_BINDING_MISMATCH",
+                    "commit gate deadlines no longer match the update journal",
+                )
+
+            command_expires_at = self._parse_timestamp(
+                gate.command_expires_at,
+                code="COMMIT_GATE_BINDING_MISMATCH",
+                field="command expiry",
+            )
+            health_deadline = self._parse_timestamp(
+                gate.health_deadline,
+                code="COMMIT_GATE_BINDING_MISMATCH",
+                field="health deadline",
+            )
+            if (
+                attestation_expires_at.tzinfo is None
+                or attestation_expires_at.utcoffset() is None
+            ):
+                raise UpdaterSecurityError(
+                    "INVALID_HEALTH_ATTESTATION",
+                    "health attestation expiry must be timezone-aware",
+                )
+            attestation_deadline = attestation_expires_at.astimezone(timezone.utc)
+            if attestation_deadline > command_expires_at:
+                raise UpdaterSecurityError(
+                    "INVALID_HEALTH_ATTESTATION_TTL",
+                    "health attestation expires after the accepted command",
+                )
 
             committed_sequence = connection.execute(
                 "SELECT meta_value FROM updater_meta "
@@ -909,6 +942,32 @@ class UpdaterStore:
                 raise UpdaterSecurityError(
                     "RELEASE_SEQUENCE_COLLISION",
                     "release sequence is already bound to another BOM",
+                )
+
+            # Read the authoritative wall clock only after all potentially
+            # slow validation and immediately before the durable writes. The
+            # strict boundary deliberately does not apply verifier clock skew:
+            # no proof or lease may be consumed at or after its signed expiry.
+            now = self._clock()
+            observed_at = self._parse_timestamp(
+                now,
+                code="INVALID_JOURNAL_CLOCK",
+                field="journal clock",
+            )
+            if observed_at >= command_expires_at:
+                raise UpdaterError(
+                    "COMMAND_EXPIRED",
+                    "accepted command expired before atomic commit",
+                )
+            if observed_at >= health_deadline:
+                raise UpdaterError(
+                    "COMMIT_TIMEOUT",
+                    "commit health deadline expired before atomic commit",
+                )
+            if observed_at >= attestation_deadline:
+                raise UpdaterSecurityError(
+                    "HEALTH_ATTESTATION_EXPIRED",
+                    "health attestation expired before atomic commit",
                 )
 
             connection.executemany(
@@ -959,6 +1018,16 @@ class UpdaterStore:
                 "SELECT * FROM updater_command WHERE command_id = ?", (command_id,)
             ).fetchone()
             return self._row(updated)
+
+    @staticmethod
+    def _parse_timestamp(value: str, *, code: str, field: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise UpdaterSecurityError(code, f"{field} is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise UpdaterSecurityError(code, f"{field} must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
 
     def transitions(self, command_id: str) -> list[tuple[str | None, str]]:
         with self._transaction() as connection:

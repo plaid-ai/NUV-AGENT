@@ -55,6 +55,10 @@ HOMEBREW_PROMOTION = load_script(
 READINESS = load_script(
     "verify_release_readiness", "packaging/release/verify-release-readiness.py"
 )
+RELEASE_GATE = load_script(
+    "verify_agent_release_gate",
+    "packaging/release/verify-agent-release-gate.py",
+)
 SETTINGS_ATTESTATION = load_script(
     "verify_release_settings_attestation",
     "packaging/release/verify-release-settings-attestation.py",
@@ -334,30 +338,43 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("softprops/action-gh-release", self.publish)
 
-    def test_v121_dependency_readiness_is_enforced_before_build(self) -> None:
+    def test_v121_release_is_blocked_until_live_release_gates_succeed(self) -> None:
         preflight = self.publish.split("  release-preflight:", maxsplit=1)[1].split(
             "  release-build:", maxsplit=1
         )[0]
         self.assertIn("verify-release-readiness.py", preflight)
         self.assertIn("release-readiness.json", preflight)
+        self.assertIn("verify-agent-release-gate.py", preflight)
+        self.assertIn("--component-sha \"$COMPONENT_SHA\"", preflight)
+        self.assertIn("checks: read", preflight)
+        self.assertIn("--candidate-workflow release-source/", preflight)
+        self.assertIn("--trusted-workflow publisher/", preflight)
+        self.assertIn("--gate-workflow-sha256 \"$GATE_WORKFLOW_SHA256\"", preflight)
+        self.assertIn("--signer-directory publisher/packaging/release/", preflight)
+        self.assertLess(
+            preflight.index("verify-agent-release-gate.py"),
+            preflight.index("verify-release-readiness.py"),
+        )
         self.assertLess(
             self.publish.index("verify-release-readiness.py"),
             self.publish.index("  release-build:"),
         )
-        READINESS.verify_readiness(
-            ROOT / "packaging/release/release-readiness.json",
-            version="0.1.121",
-        )
+        with self.assertRaises(READINESS.ReadinessError):
+            READINESS.verify_readiness(
+                ROOT / "packaging/release/release-readiness.json",
+                version="0.1.121",
+            )
         with tempfile.TemporaryDirectory() as raw_root:
             blocked = Path(raw_root) / "readiness.json"
             blocked.write_text(
                 json.dumps(
                     {
-                        "schemaVersion": 1,
+                        "schemaVersion": 2,
                         "releases": {
                             "0.1.121": {
                                 "status": "BLOCKED",
                                 "blockers": [{"id": "TRANSFORMERS-REGRESSION"}],
+                                "evidence": None,
                             }
                         },
                     }
@@ -374,6 +391,260 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 ROOT / "packaging/release/release-readiness.json",
                 version="0.1.120",
             )
+
+    def test_exact_sha_release_gate_binds_check_app_workflow_and_run(self) -> None:
+        component_sha = "a" * 40
+        repository = "plaid-ai/NUV-AGENT"
+        check = {
+            "id": 7002,
+            "name": "agent-release-gate",
+            "head_sha": component_sha,
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": (
+                "https://github.com/plaid-ai/NUV-AGENT/actions/runs/8003/job/9004"
+            ),
+            "app": {"id": 15368, "slug": "github-actions"},
+            "check_suite": {"id": 6001},
+        }
+        run = {
+            "id": 8003,
+            "check_suite_id": 6001,
+            "head_sha": component_sha,
+            "name": "agent-release-gate",
+            "path": ".github/workflows/agent-release-gate.yml",
+            "status": "completed",
+            "conclusion": "success",
+            "event": "pull_request",
+            "repository": {"full_name": repository},
+        }
+
+        evidence = RELEASE_GATE.verify_release_gate(
+            repository=repository,
+            component_sha=component_sha,
+            required_context="agent-release-gate",
+            required_integration_id=15368,
+            workflow_sha256="b" * 64,
+            check_runs=[check],
+            workflow_run=lambda run_id: run if run_id == 8003 else {},
+        )
+
+        self.assertEqual(evidence["componentSha"], component_sha)
+        self.assertEqual(evidence["workflowRunId"], 8003)
+        self.assertEqual(evidence["checkRunId"], 7002)
+        self.assertEqual(evidence["checkSuiteId"], 6001)
+
+    def test_ready_decision_requires_signed_physical_and_live_gate_evidence(self) -> None:
+        component_sha = "a" * 40
+        fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+        gate_evidence = {
+            "componentSha": component_sha,
+            "workflow": ".github/workflows/agent-release-gate.yml",
+            "workflowSha256": "b" * 64,
+            "workflowRunId": 101,
+            "checkRunId": 102,
+            "checkSuiteId": 103,
+            "context": "agent-release-gate",
+            "integrationId": 15368,
+        }
+        physical_document = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-physical-release-evidence",
+            "agentVersion": "0.1.121",
+            "componentSha": component_sha,
+            "harnessManifestSha256": "c" * 64,
+            "harnessEvidenceSha256": "d" * 64,
+            "physicalGate": {
+                "oakSoakSeconds": 120,
+                "rawFps": 29.9,
+                "rssSlopeMiBPerMinute": 0.05,
+                "rssRangeMiB": 9.6,
+                "gstreamerErrors": 0,
+                "webrtcBranchDisposed": True,
+                "splitmuxRotated": True,
+                "rollbackOakReady": True,
+            },
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            evidence = root / "iq9075-v0.1.121-physical-evidence.json"
+            signature = root / "iq9075-v0.1.121-physical-evidence.json.asc"
+            evidence.write_text(
+                json.dumps(physical_document, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            signature.write_text("detached-signature\n", encoding="utf-8")
+            readiness = root / "release-readiness.json"
+            readiness.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 2,
+                        "releases": {
+                            "0.1.121": {
+                                "status": "READY",
+                                "blockers": [],
+                                "evidence": {
+                                    "componentSha": component_sha,
+                                    "agentReleaseGate": gate_evidence,
+                                    "iq9075Physical": {
+                                        "evidenceFile": evidence.name,
+                                        "evidenceSha256": hashlib.sha256(
+                                            evidence.read_bytes()
+                                        ).hexdigest(),
+                                        "signatureFile": signature.name,
+                                        "signatureSha256": hashlib.sha256(
+                                            signature.read_bytes()
+                                        ).hexdigest(),
+                                        "signerFingerprint": fingerprint,
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                READINESS,
+                "_verify_detached_signature",
+                return_value=fingerprint,
+            ) as verify_signature:
+                READINESS.verify_readiness(
+                    readiness,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    gate_evidence=gate_evidence,
+                    security_policy=(
+                        ROOT / "packaging/release/release-security-policy.json"
+                    ),
+                    signer_directory=(
+                        ROOT / "packaging/release/trusted-tag-signers"
+                    ),
+                )
+            verify_signature.assert_called_once()
+
+            mismatched_gate = {**gate_evidence, "workflowRunId": 999}
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError,
+                "does not match live GitHub proof",
+            ):
+                READINESS.verify_readiness(
+                    readiness,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    gate_evidence=mismatched_gate,
+                    security_policy=(
+                        ROOT / "packaging/release/release-security-policy.json"
+                    ),
+                    signer_directory=(
+                        ROOT / "packaging/release/trusted-tag-signers"
+                    ),
+                )
+
+    def test_latest_failed_gate_supersedes_older_success(self) -> None:
+        component_sha = "a" * 40
+        base = {
+            "name": "agent-release-gate",
+            "head_sha": component_sha,
+            "status": "completed",
+            "details_url": (
+                "https://github.com/plaid-ai/NUV-AGENT/actions/runs/8003/job/9004"
+            ),
+            "app": {"id": 15368, "slug": "github-actions"},
+            "check_suite": {"id": 6001},
+        }
+        with self.assertRaisesRegex(
+            RELEASE_GATE.ReleaseGateError,
+            "latest trusted release gate check did not succeed",
+        ):
+            RELEASE_GATE.verify_release_gate(
+                repository="plaid-ai/NUV-AGENT",
+                component_sha=component_sha,
+                required_context="agent-release-gate",
+                required_integration_id=15368,
+                workflow_sha256="b" * 64,
+                check_runs=[
+                    {**base, "id": 7001, "conclusion": "success"},
+                    {**base, "id": 7002, "conclusion": "failure"},
+                ],
+                workflow_run=lambda _run_id: {},
+            )
+
+    def test_gate_rejects_wrong_actions_app_or_workflow_path(self) -> None:
+        component_sha = "a" * 40
+        repository = "plaid-ai/NUV-AGENT"
+        check = {
+            "id": 7002,
+            "name": "agent-release-gate",
+            "head_sha": component_sha,
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": (
+                "https://github.com/plaid-ai/NUV-AGENT/actions/runs/8003/job/9004"
+            ),
+            "app": {"id": 15368, "slug": "github-actions"},
+            "check_suite": {"id": 6001},
+        }
+        run = {
+            "id": 8003,
+            "check_suite_id": 6001,
+            "head_sha": component_sha,
+            "name": "agent-release-gate",
+            "path": ".github/workflows/not-the-release-gate.yml",
+            "status": "completed",
+            "conclusion": "success",
+            "event": "pull_request",
+            "repository": {"full_name": repository},
+        }
+        with self.assertRaisesRegex(
+            RELEASE_GATE.ReleaseGateError,
+            "exact release workflow run",
+        ):
+            RELEASE_GATE.verify_release_gate(
+                repository=repository,
+                component_sha=component_sha,
+                required_context="agent-release-gate",
+                required_integration_id=15368,
+                workflow_sha256="b" * 64,
+                check_runs=[check],
+                workflow_run=lambda _run_id: run,
+            )
+
+        check["app"] = {"id": 999, "slug": "third-party"}
+        with self.assertRaisesRegex(
+            RELEASE_GATE.ReleaseGateError,
+            "no trusted release gate check",
+        ):
+            RELEASE_GATE.verify_release_gate(
+                repository=repository,
+                component_sha=component_sha,
+                required_context="agent-release-gate",
+                required_integration_id=15368,
+                workflow_sha256="b" * 64,
+                check_runs=[check],
+                workflow_run=lambda _run_id: {},
+            )
+
+    def test_release_gate_workflow_bytes_must_match_trusted_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            candidate = root / "candidate.yml"
+            trusted = root / "trusted.yml"
+            candidate.write_text("name: agent-release-gate\n", encoding="utf-8")
+            trusted.write_bytes(candidate.read_bytes())
+            digest = RELEASE_GATE.verify_workflow_identity(candidate, trusted)
+            self.assertEqual(digest, hashlib.sha256(candidate.read_bytes()).hexdigest())
+
+            candidate.write_text("name: weakened-gate\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                RELEASE_GATE.ReleaseGateError,
+                "differs from trusted publisher bytes",
+            ):
+                RELEASE_GATE.verify_workflow_identity(candidate, trusted)
 
     def test_ota_sequence_failure_precedes_private_key_and_uses_global_cas(self) -> None:
         ota = self.publish.split("  iq9075-ota-publish:", maxsplit=1)[1]
@@ -672,6 +943,10 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 tag="v0.1.121",
                 component_sha="a" * 40,
                 trusted_publisher_sha="b" * 40,
+                gate_run_id=101,
+                gate_check_id=102,
+                gate_check_suite_id=103,
+                gate_workflow_sha256="d" * 64,
                 security_policy=ROOT / "packaging/release/release-security-policy.json",
                 sdist=paths["sdist"],
                 sdist_bom=paths["bom"],
@@ -699,6 +974,9 @@ class SequenceAndPromotionTest(unittest.TestCase):
             self.assertEqual(first["status"], "PROMOTED")
             self.assertEqual(first["governance"]["pullRequestApprovals"], 1)
             self.assertEqual(first["governance"]["environmentReviewers"], 0)
+            self.assertEqual(first["releaseGate"]["workflowRunId"], 101)
+            self.assertEqual(first["releaseGate"]["checkRunId"], 102)
+            self.assertEqual(first["releaseGate"]["workflowSha256"], "d" * 64)
             self.assertEqual(
                 first["artifacts"]["homebrewFormula"]["name"], "formula"
             )
@@ -736,6 +1014,10 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 tag="v0.1.121",
                 component_sha="a" * 40,
                 trusted_publisher_sha="b" * 40,
+                gate_run_id=101,
+                gate_check_id=102,
+                gate_check_suite_id=103,
+                gate_workflow_sha256="d" * 64,
                 security_policy=ROOT / "packaging/release/release-security-policy.json",
                 sdist=artifacts["sdist"],
                 sdist_bom=artifacts["sdist_bom"],

@@ -112,6 +112,38 @@ NUVION_DEPTHAI_READ_TIMEOUT_SEC=2
 NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS=3
 ```
 
+The physical release test builds the same raw-analysis, overlay/H264, rotating
+clip, RTP tee, and disposable `webrtcbin` topology used by the Agent. It creates
+a real local SDP offer, deliberately leaves it unanswered, waits for the
+production answer watchdog to expire, and proves that the terminal STOP, queue,
+request pads, and `webrtcbin` cleanup all belong to that exact generation before
+a post-teardown OAK soak. The default gate is
+120 measured seconds after a 20-second warm-up. It requires at least 27 raw FPS,
+continued splitmux rotation, bounded two-frame live queues, zero GStreamer
+errors, anonymous-RSS OLS slope at most 2 MiB/min, and post-warm-up RSS range at
+most 32 MiB. Administrators may make the proof longer or stricter with
+`NUVION_IQ9075_OAK_SOAK_SECONDS`,
+`NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN`, and
+`NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB`; the harness does not accept values below
+the release-safe minimums.
+
+The privileged updater does not reuse this version-specific topology test for
+every OTA or rollback. Its fixed `probe-iq9075-oak.sh` opens the active slot's
+hash-pinned `depthai==2.32.0.0` runtime, captures one `640x480` RGB frame as the
+non-root `nuvion` user, and exits within a process-group timeout. This stable
+primitive works for both the v0.1.121 candidate and the restored v0.1.120 LKG;
+the updater validates the exact active slot both before and after it. The full
+120-second WebRTC/clip/RSS topology remains a separately signed release gate,
+not a per-device rollback dependency.
+
+Native GStreamer 1.28.2 probes additionally cover unanswered offer timeout,
+incompatible remote-answer promise failure, and valid-answer/no-ICE connection
+timeout. Each path removed the queue and `webrtcbin`, released every tee request
+pad, reached NULL, and emitted terminal STOP. Cleanup failures receive three
+bounded retries and then request a supervisor restart. The systemd unit adds
+`MemoryHigh=50%`, `MemoryMax=60%`, and zero swap as a final board-level guard
+against any future camera/media leak.
+
 Existing UVC deployments remain supported. Select the old auto-discovered V4L2
 path explicitly and use the matching release test:
 

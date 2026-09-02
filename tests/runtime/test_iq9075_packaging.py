@@ -12,6 +12,27 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Iq9075PackagingTest(unittest.TestCase):
+    def test_rollback_oak_probe_is_version_neutral_and_bounded(self) -> None:
+        probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text(
+            encoding="utf-8"
+        )
+        runtime = (ROOT / "nuvion_updater/systemd_runtime.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("/opt/nuv-agent/current/venv/bin/python", probe)
+        self.assertIn('version("depthai") != "2.32.0.0"', probe)
+        self.assertIn("queue.tryGet()", probe)
+        self.assertIn("timeout 30s runuser -u nuvion", probe)
+        self.assertIn('chown nuvion:nuvion "$runtime_dir"', probe)
+        self.assertNotIn("nuvion_app", probe)
+        self.assertNotIn("WebRTCUplinkController", probe)
+        self.assertNotIn("build_uplink_pipeline", probe)
+        self.assertIn(
+            'IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"',
+            runtime,
+        )
+
     def test_deb_declares_camera_and_webrtc_runtime_dependencies(self) -> None:
         build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
             encoding="utf-8"
@@ -225,19 +246,38 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('"XDG_CONFIG_HOME=$probe_runtime_dir/config"', e2e)
         self.assertIn('"XDG_RUNTIME_DIR=$probe_runtime_dir/runtime"', e2e)
         self.assertIn('expected_version = "2.32.0.0"', e2e)
-        self.assertIn("timeout 660s", e2e)
+        self.assertIn("timeout 720s", e2e)
         self.assertIn("DepthAIFrameSource", e2e)
         self.assertIn("DepthAIGStreamerBridge", e2e)
-        self.assertIn("range(30)", e2e)
         self.assertIn('NUVION_IQ9075_OAK_SOAK_SECONDS", "120"', e2e)
         self.assertIn('read_proc_status_kib("RssAnon")', e2e)
         self.assertIn("appsrc buffer bound exceeded", e2e)
         self.assertIn("appsrc byte bound exceeded", e2e)
-        self.assertIn("anonymous RSS growth exceeded bound", e2e)
+        self.assertIn("post-rejection anonymous RSS slope exceeded bound", e2e)
+        self.assertIn("post-rejection anonymous RSS range exceeded bound", e2e)
+        self.assertIn("rss_slope_mib_per_min", e2e)
+        self.assertIn("len(samples) < 18", e2e)
+        self.assertIn("raw_fps < MIN_RAW_FPS", e2e)
+        self.assertIn("minimum_raw_samples = int(0.9 * FPS * soak_seconds)", e2e)
+        self.assertIn('structure.get_name() != "video/x-raw"', e2e)
+        self.assertIn("raw sample is missing a PTS", e2e)
+        self.assertIn("build_bounded_live_queue", e2e)
+        self.assertIn("build_uplink_pipeline", e2e)
+        self.assertIn("clip_enabled=True", e2e)
+        self.assertIn("splitmux fragment progress fell below bound", e2e)
+        self.assertIn("newest_segment_age > 2 * SEGMENT_SECONDS + 5", e2e)
+        self.assertIn("len(segments) > MAX_SEGMENTS", e2e)
+        self.assertIn("offer_answer_timeout_sec=3.0", e2e)
+        self.assertIn('"sessionId": "unanswered-offer"', e2e)
+        self.assertIn("unanswered WebRTC watchdog branch teardown", e2e)
+        self.assertIn("unanswered offer watchdog did not emit exact terminal STOP", e2e)
+        self.assertNotIn("controller.reject_signaling(", e2e)
+        self.assertIn('"profile-level-id=42e01f"', e2e)
+        self.assertIn("old_queue.get_parent() is not None", e2e)
+        self.assertIn("old_webrtc.get_state(0)[1] != Gst.State.NULL", e2e)
+        self.assertIn("request_pad_count(uplink_tee) != 0", e2e)
+        self.assertIn("controller._branch is not None", e2e)
         self.assertIn("bridge.stats_snapshot()", e2e)
-        self.assertIn('structure.get_name() != "application/x-rtp"', e2e)
-        self.assertIn('structure.get_string("encoding-name") != "H264"', e2e)
-        self.assertIn("buffer.pts == Gst.CLOCK_TIME_NONE", e2e)
         self.assertIn("Gst.MessageType.ERROR", e2e)
         self.assertIn('oak_status" -eq 3', e2e)
         self.assertIn('NUVION_GST_SOURCE must be empty', e2e)

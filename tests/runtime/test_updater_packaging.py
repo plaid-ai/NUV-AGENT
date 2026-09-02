@@ -55,6 +55,10 @@ class UpdaterPackagingTest(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=300", unit)
         self.assertIn("StartLimitBurst=3", unit)
         self.assertIn("Restart=always", unit)
+        self.assertIn("MemoryHigh=50%", unit)
+        self.assertIn("MemoryMax=60%", unit)
+        self.assertIn("MemorySwapMax=0", unit)
+        self.assertIn("OOMPolicy=stop", unit)
         self.assertIn(
             'chmod 0755 "$slot_root/bin/nuv-agent" "$slot_root/venv/bin/python"',
             bundle,
@@ -85,6 +89,7 @@ class UpdaterPackagingTest(unittest.TestCase):
         self.assertIn("$PKG_DIR/usr/lib/nuvion-updater", build)
         self.assertIn("python3-cryptography", build)
         self.assertIn("test-iq9075.sh", build)
+        self.assertIn("probe-iq9075-oak.sh", build)
         self.assertIn("PrivateDevices=false", service)
         self.assertNotIn("PrivateDevices=true", service)
         self.assertIn("dpkg-deb --root-owner-group --build", build)

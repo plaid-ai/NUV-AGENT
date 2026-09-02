@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,7 @@ from nuvion_updater.trust import DeviceBinding
 AGENT_SERVICE = "nuv-agent.service"
 SYSTEMCTL = "/usr/bin/systemctl"
 CURRENT_AGENT = "/usr/bin/nuv-agent"
-IQ9075_PROBE = "/usr/lib/nuvion-updater/test-iq9075.sh"
+IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"
 BASH = "/usr/bin/bash"
 RUNUSER = "/usr/sbin/runuser"
 PROC_ROOT = Path("/proc")
@@ -29,6 +31,8 @@ PROC_ROOT = Path("/proc")
 SYSTEMCTL_TIMEOUT_SECONDS = 30
 DOCTOR_TIMEOUT_SECONDS = 120
 IQ9075_PROBE_TIMEOUT_SECONDS = 300
+PROCESS_GROUP_TERM_GRACE_SECONDS = 5.0
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
 MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 64 * 1024
 MAX_PROC_STAT_BYTES = 16 * 1024
@@ -105,14 +109,15 @@ class SystemdRuntime:
 
     def rollback_boot_health_check(self, expected_slot: str) -> tuple[bool, str]:
         try:
-            if self.slots.current_slot() != expected_slot:
-                raise RuntimeError("ROLLBACK_ACTIVE_SLOT_MISMATCH")
-            first_pid = self._main_pid()
-            active_slot = self._active_slot_from_environ(first_pid)
-            if self._main_pid() != first_pid:
-                raise RuntimeError("ROLLBACK_MAIN_PID_CHANGED")
-            if active_slot != expected_slot:
-                raise RuntimeError("ROLLBACK_ACTIVE_SLOT_ENV_MISMATCH")
+            self._validate_rollback_boot(expected_slot)
+            if self.binding.platform_profile == "iq9075_dev":
+                healthy, detail = self._iq9075_functional_check()
+                if not healthy:
+                    raise RuntimeError(detail)
+                # The physical probe deliberately stops and restarts the
+                # restored service. Rebind the result to the exact slot and
+                # process instance after that restart as well.
+                self._validate_rollback_boot(expected_slot)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return self._failed_check(self._reason(exc, "ROLLBACK_BOOT_FAILED"))
         return True, "ROLLBACK_BOOT_HEALTHY"
@@ -194,8 +199,8 @@ class SystemdRuntime:
             )
             if stop_result.returncode != 0:
                 raise RuntimeError("FUNCTIONAL_SERVICE_STOP_FAILED")
-            probe_result = self._run(
-                (BASH, IQ9075_PROBE, "--camera", "oak"),
+            probe_result = self._run_probe_process_group(
+                (BASH, IQ9075_PROBE),
                 timeout=IQ9075_PROBE_TIMEOUT_SECONDS,
             )
             if probe_result.returncode != 0:
@@ -221,6 +226,16 @@ class SystemdRuntime:
         if result.returncode != 0:
             self._stop_after_failure()
             raise RuntimeError("SYSTEMD_RESET_FAILED")
+
+    def _validate_rollback_boot(self, expected_slot: str) -> None:
+        if self.slots.current_slot() != expected_slot:
+            raise RuntimeError("ROLLBACK_ACTIVE_SLOT_MISMATCH")
+        first_pid = self._main_pid()
+        active_slot = self._active_slot_from_environ(first_pid)
+        if self._main_pid() != first_pid:
+            raise RuntimeError("ROLLBACK_MAIN_PID_CHANGED")
+        if active_slot != expected_slot:
+            raise RuntimeError("ROLLBACK_ACTIVE_SLOT_ENV_MISMATCH")
 
     def _validate_staged_state(self, state: UpdateState) -> str:
         if state.candidate_slot is None:
@@ -479,3 +494,93 @@ class SystemdRuntime:
             cwd="/",
             env=_COMMAND_ENV,
         )
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @classmethod
+    def _wait_for_process_group_exit(
+        cls,
+        process: subprocess.Popen[bytes],
+        process_group_id: int,
+        *,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            # poll() reaps the direct child. killpg(..., 0) then proves that
+            # no child or grandchild survives in the dedicated session.
+            process.poll()
+            if not cls._process_group_exists(process_group_id):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    @classmethod
+    def _terminate_process_group(
+        cls,
+        process: subprocess.Popen[bytes],
+        process_group_id: int,
+    ) -> bool:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            process.poll()
+            return True
+        if cls._wait_for_process_group_exit(
+            process,
+            process_group_id,
+            timeout=PROCESS_GROUP_TERM_GRACE_SECONDS,
+        ):
+            return True
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            process.poll()
+            return True
+        return cls._wait_for_process_group_exit(
+            process,
+            process_group_id,
+            timeout=PROCESS_GROUP_KILL_GRACE_SECONDS,
+        )
+
+    @classmethod
+    def _run_probe_process_group(
+        cls,
+        argv: tuple[str, ...],
+        *,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        process = subprocess.Popen(
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env=_COMMAND_ENV,
+            start_new_session=True,
+        )
+        process_group_id = process.pid
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            if not cls._terminate_process_group(process, process_group_id):
+                raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED") from exc
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_TIMEOUT") from exc
+
+        if cls._process_group_exists(process_group_id):
+            cls._terminate_process_group(process, process_group_id)
+            # A successful shell that leaves a child alive is still an
+            # invalid physical-health result. Do not allow it to outlive OTA.
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED")
+        return subprocess.CompletedProcess(argv, returncode, "", "")

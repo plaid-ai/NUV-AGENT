@@ -519,11 +519,14 @@ auth_token_lock = threading.Lock()
 agent_uplink_blocked = False
 agent_uplink_block_reason = ""
 agent_uplink_lock = threading.Lock()
-agent_retry_attempts: dict[str, int] = {}
+_AgentRetryKey = tuple[str, WebRTCSignalingToken | None]
+
+
+agent_retry_attempts: dict[_AgentRetryKey, int] = {}
 agent_retry_lock = threading.Lock()
 last_sent_payloads: dict[str, _CachedPayload] = {}
 last_sent_payloads_lock = threading.Lock()
-webrtc_retry_tasks: set[asyncio.Task[None]] = set()
+webrtc_retry_tasks: dict[_AgentRetryKey, asyncio.Task[None]] = {}
 critical_event_delivery: DurableEventDelivery | None = None
 critical_event_outbox_init_attempted = False
 critical_event_outbox_lock = threading.Lock()
@@ -935,6 +938,8 @@ def _remember_last_payload(
             _clone_payload(payload),
             signaling_token,
         )
+    if destination in WEBRTC_SIGNALING_DESTINATIONS and signaling_token is not None:
+        _retire_stale_webrtc_retries(destination, signaling_token)
 
 
 def _get_last_payload(destination: str) -> _CachedPayload | None:
@@ -954,6 +959,94 @@ def _is_signaling_token_current(token: WebRTCSignalingToken | None) -> bool:
     controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
     validator = getattr(controller, "is_signaling_token_current", None)
     return bool(callable(validator) and validator(token))
+
+
+def _agent_retry_key(
+    destination: str,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> _AgentRetryKey:
+    return destination, signaling_token
+
+
+def _cancel_webrtc_retry(key: _AgentRetryKey) -> None:
+    task = webrtc_retry_tasks.pop(key, None)
+    if task is not None:
+        task.cancel()
+
+
+def _retire_stale_webrtc_retries(
+    destination: str,
+    signaling_token: WebRTCSignalingToken,
+) -> None:
+    current_key = _agent_retry_key(destination, signaling_token)
+    with agent_retry_lock:
+        stale_attempt_keys = tuple(
+            key
+            for key in agent_retry_attempts
+            if key[0] == destination and key != current_key
+        )
+        for key in stale_attempt_keys:
+            agent_retry_attempts.pop(key, None)
+    for key in tuple(webrtc_retry_tasks):
+        if key[0] == destination and key != current_key:
+            _cancel_webrtc_retry(key)
+
+
+def _correlated_webrtc_error(
+    payload: dict,
+    path: str,
+) -> _CachedPayload | None:
+    """Return only the live generation explicitly named by an error envelope."""
+
+    error_session_id = str(payload.get("sessionId") or "").strip()
+    if not error_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] ignored uncorrelated signaling error path=%s",
+            path,
+        )
+        return None
+    cached = _get_last_payload(path)
+    if cached is not None and cached.signaling_token is not None:
+        cached_session_id = str(cached.payload.get("sessionId") or "").strip()
+        if error_session_id != cached_session_id:
+            log.warning(
+                "[WEBRTC-UPLINK] ignored stale signaling error "
+                "path=%s errorSessionId=%s currentSessionId=%s",
+                path,
+                error_session_id,
+                cached_session_id or "<missing>",
+            )
+            return None
+    else:
+        controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+        resolver = getattr(controller, "signaling_token_for_session", None)
+        token = (
+            resolver(
+                error_session_id,
+                terminal=path == WEBRTC_UPLINK_STOP_DEST,
+            )
+            if callable(resolver)
+            else None
+        )
+        if not isinstance(token, WebRTCSignalingToken):
+            log.warning(
+                "[WEBRTC-UPLINK] ignored signaling error without current generation "
+                "path=%s sessionId=%s",
+                path,
+                error_session_id,
+            )
+            return None
+        cached = _CachedPayload({"sessionId": error_session_id}, token)
+    if not _is_signaling_token_current(cached.signaling_token):
+        log.warning(
+            "[WEBRTC-UPLINK] ignored signaling error for inactive generation "
+            "path=%s sessionId=%s generation=%s",
+            path,
+            error_session_id,
+            cached.signaling_token.generation,
+        )
+        return None
+    return cached
 
 
 def _purge_webrtc_outbound_queue() -> int:
@@ -986,7 +1079,7 @@ def _reset_webrtc_signaling_transport() -> None:
     with last_sent_payloads_lock:
         for destination in WEBRTC_SIGNALING_DESTINATIONS:
             last_sent_payloads.pop(destination, None)
-    for task in tuple(webrtc_retry_tasks):
+    for task in tuple(webrtc_retry_tasks.values()):
         task.cancel()
     webrtc_retry_tasks.clear()
     dropped = _purge_webrtc_outbound_queue()
@@ -994,25 +1087,30 @@ def _reset_webrtc_signaling_transport() -> None:
         log.info("[WEBRTC-UPLINK] discarded stale queued signaling frames=%d", dropped)
 
 
-def _reject_current_webrtc_offer(payload: dict, *, reason: str) -> bool:
-    """Bind a server rejection to the current cached offer generation."""
+def _reject_current_webrtc_offer(
+    payload: dict,
+    *,
+    reason: str,
+    correlated: _CachedPayload | None = None,
+) -> bool:
+    """Bind a server rejection to the exact active signaling generation."""
 
     path = str(payload.get("path") or "")
-    if path != WEBRTC_UPLINK_OFFER_DEST:
+    if path not in {WEBRTC_UPLINK_OFFER_DEST, WEBRTC_UPLINK_ICE_CANDIDATE_DEST}:
         return False
-    cached = _get_last_payload(path)
+    cached = correlated or _get_last_payload(path)
     if cached is None or cached.signaling_token is None:
         return False
     rejected_session_id = str(payload.get("sessionId") or "").strip()
     cached_session_id = str(cached.payload.get("sessionId") or "").strip()
     if not rejected_session_id:
         log.warning(
-            "[WEBRTC-UPLINK] uncorrelated offer rejection deferred to answer watchdog"
+            "[WEBRTC-UPLINK] uncorrelated signaling rejection deferred to watchdog"
         )
         return False
     if rejected_session_id != cached_session_id:
         log.warning(
-            "[WEBRTC-UPLINK] ignored stale correlated offer rejection "
+            "[WEBRTC-UPLINK] ignored stale correlated signaling rejection "
             "rejectedSessionId=%s currentSessionId=%s",
             rejected_session_id,
             cached_session_id,
@@ -1026,9 +1124,9 @@ def _reject_current_webrtc_offer(payload: dict, *, reason: str) -> bool:
         current = last_sent_payloads.get(path)
         if current is not None and current.signaling_token == cached.signaling_token:
             last_sent_payloads.pop(path, None)
-    for task in tuple(webrtc_retry_tasks):
-        task.cancel()
-    webrtc_retry_tasks.clear()
+    retry_key = _agent_retry_key(path, cached.signaling_token)
+    _cancel_webrtc_retry(retry_key)
+    _reset_agent_retry_attempt(retry_key)
     return True
 
 
@@ -1053,16 +1151,22 @@ def _is_agent_uplink_blocked(destination: str) -> bool:
         return True
 
 
-def _reset_agent_retry_attempt(destination: str) -> None:
+def _reset_agent_retry_attempt(key: _AgentRetryKey) -> None:
     with agent_retry_lock:
-        if destination in agent_retry_attempts:
-            agent_retry_attempts[destination] = 0
+        agent_retry_attempts.pop(key, None)
 
 
-def _next_agent_retry_attempt(destination: str) -> int:
+def _reset_agent_retry_attempts_for_destination(destination: str) -> None:
     with agent_retry_lock:
-        attempt = agent_retry_attempts.get(destination, 0) + 1
-        agent_retry_attempts[destination] = attempt
+        for key in tuple(agent_retry_attempts):
+            if key[0] == destination:
+                agent_retry_attempts.pop(key, None)
+
+
+def _next_agent_retry_attempt(key: _AgentRetryKey) -> int:
+    with agent_retry_lock:
+        attempt = agent_retry_attempts.get(key, 0) + 1
+        agent_retry_attempts[key] = attempt
         return attempt
 
 
@@ -1928,6 +2032,58 @@ async def handle_agent_error(body: str) -> None:
         log.error("[OUTBOX] %s; critical replay stopped for operator action", reason)
         return
 
+    if not retryable and status_int in (401, 403):
+        # Authentication is transport-wide, unlike a WebRTC negotiation
+        # failure. Preserve the existing fail-closed behavior even when a
+        # candidate/stop frame was intentionally not cached for retry.
+        _reset_agent_retry_attempts_for_destination(path)
+        if path in WEBRTC_SIGNALING_DESTINATIONS:
+            _reset_webrtc_signaling_transport()
+        reason = f"{code} {message}".strip()
+        _set_agent_uplink_blocked(True, reason)
+        log.error(
+            "[AGENT-ERROR][auth] uplink blocked. code=%s status=%s path=%s message=%s detail=%s",
+            code,
+            status_int,
+            path,
+            message,
+            detail,
+        )
+        return
+
+    cached: _CachedPayload | None = None
+    retry_key = _agent_retry_key(path)
+    if path in WEBRTC_SIGNALING_DESTINATIONS:
+        # Server errors are delivered asynchronously and can outlive the
+        # generation that emitted the frame. A path-only or stale error must
+        # never consume the retry budget or tear down a newer session; the
+        # controller's bounded watchdog owns uncorrelated failures.
+        cached = _correlated_webrtc_error(payload, path)
+        if cached is None or cached.signaling_token is None:
+            return
+        retry_key = _agent_retry_key(path, cached.signaling_token)
+        if path != WEBRTC_UPLINK_OFFER_DEST:
+            # ICE candidates are intentionally volatile and STOP is already a
+            # terminal local transition. Neither can be replayed safely. An
+            # exact active candidate rejection tears down its branch; a STOP
+            # rejection is logged after the branch has already been released.
+            _reset_agent_retry_attempt(retry_key)
+            rejected = _reject_current_webrtc_offer(
+                payload,
+                reason=f"signaling frame rejected: {code} status={status_int}",
+                correlated=cached,
+            )
+            log.warning(
+                "[WEBRTC-UPLINK] terminal signaling rejection path=%s "
+                "sessionId=%s disposed=%s code=%s status=%s",
+                path,
+                str(payload.get("sessionId") or ""),
+                rejected,
+                code,
+                status_int,
+            )
+            return
+
     if retryable:
         if path not in AGENT_RETRY_DESTINATIONS:
             log.warning(
@@ -1938,7 +2094,8 @@ async def handle_agent_error(body: str) -> None:
             )
             return
 
-        cached = _get_last_payload(path)
+        if cached is None:
+            cached = _get_last_payload(path)
         if cached is None:
             log.warning(
                 "[AGENT-ERROR][retryable] no cached payload. code=%s path=%s message=%s",
@@ -1948,7 +2105,22 @@ async def handle_agent_error(body: str) -> None:
             )
             return
 
-        attempt = _next_agent_retry_attempt(path)
+        if path == WEBRTC_UPLINK_OFFER_DEST:
+            pending_retry = webrtc_retry_tasks.get(retry_key)
+            if pending_retry is not None and not pending_retry.done():
+                log.warning(
+                    "[AGENT-ERROR][retryable] coalesced duplicate WebRTC error "
+                    "path=%s sessionId=%s",
+                    path,
+                    cached.signaling_token.session_id
+                    if cached.signaling_token is not None
+                    else "<missing>",
+                )
+                return
+            if pending_retry is not None:
+                webrtc_retry_tasks.pop(retry_key, None)
+
+        attempt = _next_agent_retry_attempt(retry_key)
         if attempt > AGENT_ERROR_MAX_RETRIES:
             log.error(
                 "[AGENT-ERROR] retry exhausted. code=%s path=%s max=%d detail=%s",
@@ -1960,6 +2132,7 @@ async def handle_agent_error(body: str) -> None:
             _reject_current_webrtc_offer(
                 payload,
                 reason=f"offer retry exhausted: {code}",
+                correlated=cached,
             )
             return
 
@@ -1987,14 +2160,27 @@ async def handle_agent_error(body: str) -> None:
             )
         )
         if path in WEBRTC_SIGNALING_DESTINATIONS:
-            webrtc_retry_tasks.add(retry_task)
-            retry_task.add_done_callback(webrtc_retry_tasks.discard)
+            previous = webrtc_retry_tasks.get(retry_key)
+            if previous is not None and previous is not retry_task:
+                previous.cancel()
+            webrtc_retry_tasks[retry_key] = retry_task
+
+            def _remove_completed_webrtc_retry(
+                completed: asyncio.Task[None],
+                *,
+                key: _AgentRetryKey = retry_key,
+            ) -> None:
+                if webrtc_retry_tasks.get(key) is completed:
+                    webrtc_retry_tasks.pop(key, None)
+
+            retry_task.add_done_callback(_remove_completed_webrtc_retry)
         return
 
-    _reset_agent_retry_attempt(path)
+    _reset_agent_retry_attempt(retry_key)
     offer_rejected = _reject_current_webrtc_offer(
         payload,
         reason=f"non-retryable server rejection: {code} status={status_int}",
+        correlated=cached,
     )
     if offer_rejected:
         log.warning(
@@ -2003,19 +2189,6 @@ async def handle_agent_error(body: str) -> None:
             code,
             status_int,
         )
-    if status_int in (401, 403):
-        reason = f"{code} {message}".strip()
-        _set_agent_uplink_blocked(True, reason)
-        log.error(
-            "[AGENT-ERROR][auth] uplink blocked. code=%s status=%s path=%s message=%s detail=%s",
-            code,
-            status_int,
-            path,
-            message,
-            detail,
-        )
-        return
-
     if status_int is not None and 400 <= status_int < 500:
         log.warning(
             "[AGENT-ERROR][client] dropped. code=%s status=%s path=%s message=%s detail=%s",
@@ -3228,6 +3401,7 @@ class GStreamerInferenceApp:
             h264_profile_level_id=H264_PROFILE_LEVEL_ID_ENV,
             h264_packetization_mode=H264_PACKETIZATION_MODE_ENV,
             h264_level_asymmetry_allowed=H264_LEVEL_ASYMMETRY_ALLOWED_ENV,
+            on_fatal_cleanup=self._on_webrtc_cleanup_failure,
         )
 
         self.pipeline = None
@@ -3526,6 +3700,14 @@ class GStreamerInferenceApp:
                 "[CONFIG-APPLY] graceful shutdown requested for supervisor restart"
             )
             return True
+
+    def _on_webrtc_cleanup_failure(self, reason: str) -> bool:
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+        log.critical(
+            "[WEBRTC-UPLINK] unreleased media branch requires process recovery: %s",
+            str(reason)[:500],
+        )
+        return self.request_supervisor_restart()
 
     def _on_depthai_failure(self, exc: BaseException) -> None:
         log.error(

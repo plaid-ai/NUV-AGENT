@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      checks: read
       contents: read
     outputs:
       release_tag: ${{ steps.identity.outputs.tag }}
@@ -48,6 +49,10 @@ jobs:
       component_sha: ${{ steps.identity.outputs.component_sha }}
       trusted_publisher_sha: ${{ steps.identity.outputs.trusted_publisher_sha }}
       built_at: ${{ steps.identity.outputs.built_at }}
+      gate_run_id: ${{ steps.release-gate.outputs.gate_run_id }}
+      gate_check_id: ${{ steps.release-gate.outputs.gate_check_id }}
+      gate_check_suite_id: ${{ steps.release-gate.outputs.gate_check_suite_id }}
+      gate_workflow_sha256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
       requested_sequence: ${{ steps.request.outputs.requested_sequence }}
     steps:
       - name: Resolve request without credentials
@@ -186,14 +191,41 @@ jobs:
             --signer-directory publisher/packaging/release/trusted-tag-signers \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Verify trusted release gate for exact component SHA
+        id: release-gate
+        env:
+          COMPONENT_SHA: ${{ steps.identity.outputs.component_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 publisher/packaging/release/verify-agent-release-gate.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --component-sha "$COMPONENT_SHA" \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --candidate-workflow release-source/.github/workflows/agent-release-gate.yml \
+            --trusted-workflow publisher/.github/workflows/agent-release-gate.yml \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Enforce audited dependency release readiness
         env:
           VERSION: ${{ steps.identity.outputs.version }}
+          COMPONENT_SHA: ${{ steps.identity.outputs.component_sha }}
+          GATE_RUN_ID: ${{ steps.release-gate.outputs.gate_run_id }}
+          GATE_CHECK_ID: ${{ steps.release-gate.outputs.gate_check_id }}
+          GATE_CHECK_SUITE_ID: ${{ steps.release-gate.outputs.gate_check_suite_id }}
+          GATE_WORKFLOW_SHA256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
         run: |
           set -euo pipefail
           python3 publisher/packaging/release/verify-release-readiness.py \
             --policy publisher/packaging/release/release-readiness.json \
-            --version "$VERSION"
+            --version "$VERSION" \
+            --component-sha "$COMPONENT_SHA" \
+            --gate-run-id "$GATE_RUN_ID" \
+            --gate-check-id "$GATE_CHECK_ID" \
+            --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
+            --gate-workflow-sha256 "$GATE_WORKFLOW_SHA256" \
+            --security-policy publisher/packaging/release/release-security-policy.json \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
   release-build:
     name: Test and build keyless generic release
@@ -475,6 +507,10 @@ jobs:
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+          GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+          GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+          GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
           SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
           SDIST_SHA256: ${{ needs.release-build.outputs.sdist_sha256 }}
           BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
@@ -508,6 +544,10 @@ jobs:
               --tag "$RELEASE_TAG" \
               --component-sha "$COMPONENT_SHA" \
               --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --gate-run-id "$GATE_RUN_ID" \
+              --gate-check-id "$GATE_CHECK_ID" \
+              --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
+              --gate-workflow-sha256 "$GATE_WORKFLOW_SHA256" \
               --security-policy publisher/packaging/release/release-security-policy.json \
               --sdist "dist/$SDIST_NAME" \
               --sdist-bom "dist/$BOM_NAME" \
@@ -772,6 +812,10 @@ jobs:
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+          GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+          GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+          GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
           SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
           BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
           BUNDLE_NAME: ${{ needs.iq9075-ota-build.outputs.bundle_name }}
@@ -793,6 +837,10 @@ jobs:
               --tag "$RELEASE_TAG" \
               --component-sha "$COMPONENT_SHA" \
               --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --gate-run-id "$GATE_RUN_ID" \
+              --gate-check-id "$GATE_CHECK_ID" \
+              --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
+              --gate-workflow-sha256 "$GATE_WORKFLOW_SHA256" \
               --security-policy publisher/packaging/release/release-security-policy.json \
               --source-plan "dist/$SOURCE_PLAN_NAME" \
               --sdist "dist/$SDIST_NAME" \

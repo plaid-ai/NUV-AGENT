@@ -353,13 +353,28 @@ class UpdaterController:
                 "COMMIT_PROCESS_MISMATCH",
                 "Agent process changed while validating the health attestation",
             )
-        return self.store.commit_command_attested(
-            command_id,
-            gate_id=gate.gate_id,
-            process=second_process,
-            attestation_id=verified.attestation_id,
-            attestation_jws_sha256=verified.compact_jws_sha256,
-        )
+        try:
+            return self.store.commit_command_attested(
+                command_id,
+                gate_id=gate.gate_id,
+                process=second_process,
+                attestation_id=verified.attestation_id,
+                attestation_jws_sha256=verified.compact_jws_sha256,
+                attestation_expires_at=verified.expires_at,
+            )
+        except UpdaterError as exc:
+            # The store rechecks every signed/durable absolute deadline inside
+            # the same IMMEDIATE transaction that would consume the proof. A
+            # slow process check or verifier must therefore roll back, never
+            # commit evidence that expired between the outer checks and the
+            # atomic journal mutation.
+            if exc.code in {
+                "COMMAND_EXPIRED",
+                "COMMIT_TIMEOUT",
+                "HEALTH_ATTESTATION_EXPIRED",
+            }:
+                self.rollback(command_id, reason=exc.code)
+            raise
 
     def rollback(self, command_id: str, *, reason: str = "OPERATOR_REQUEST") -> UpdateState:
         # Do not call _require_state here: deadline enforcement itself enters

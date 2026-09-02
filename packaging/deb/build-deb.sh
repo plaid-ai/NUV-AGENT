@@ -124,6 +124,9 @@ install -m 0755 \
   "$ROOT_DIR/packaging/dev/test-iq9075.sh" \
   "$PKG_DIR/usr/lib/nuvion-updater/test-iq9075.sh"
 install -m 0755 \
+  "$ROOT_DIR/packaging/dev/probe-iq9075-oak.sh" \
+  "$PKG_DIR/usr/lib/nuvion-updater/probe-iq9075-oak.sh"
+install -m 0755 \
   "$ROOT_DIR/packaging/dev/iq9075-board-e2e.py" \
   "$PKG_DIR/usr/local/libexec/nuvion/iq9075-board-e2e.py"
 

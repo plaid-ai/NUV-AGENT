@@ -222,6 +222,9 @@ jobs:
 
   macos-arm64-release-prerequisite:
     name: macos-arm64-release-prerequisite
+    # This remains fail-closed on the standard hosted runner until a trusted
+    # Apple Silicon runner with supported MPS is provisioned. The proof below
+    # records and enforces the real working-set prerequisite before inference.
     runs-on: macos-14
     needs: macos-cpu-reference
     timeout-minutes: 90
@@ -377,6 +380,17 @@ jobs:
           reference_path = Path(os.environ["REFERENCE_PATH"])
           package_path = Path(nuvion_app.__file__).resolve()
           assert os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"
+          physical_memory = int(subprocess.check_output(
+              ["sysctl", "-n", "hw.memsize"], text=True
+          ).strip())
+          recommended_memory = int(torch.mps.recommended_max_memory())
+          print(
+              "MPS proof memory: "
+              f"physical={physical_memory} recommended={recommended_memory}",
+              flush=True,
+          )
+          assert physical_memory >= 12 * 1024**3
+          assert recommended_memory >= 8 * 1024**3
           assert package_path.is_relative_to(formula_prefix / "libexec")
           assert torch.backends.mps.is_available()
           assert path.name == revision

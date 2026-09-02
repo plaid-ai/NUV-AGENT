@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -434,6 +435,11 @@ class SystemdRuntimeTest(unittest.TestCase):
             ) as run,
             mock.patch.object(
                 runtime,
+                "_run_probe_process_group",
+                return_value=self._completed(()),
+            ) as run_probe,
+            mock.patch.object(
+                runtime,
                 "boot_health_check",
                 return_value=(True, "BOOT_HEALTHY"),
             ) as boot_check,
@@ -446,10 +452,13 @@ class SystemdRuntimeTest(unittest.TestCase):
             [call.args[0] for call in run.call_args_list],
             [
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
-                ("/usr/bin/bash", str(probe), "--camera", "oak"),
                 ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "restart", "nuv-agent.service"),
             ],
+        )
+        run_probe.assert_called_once_with(
+            ("/usr/bin/bash", str(probe)),
+            timeout=300,
         )
         boot_check.assert_called_once_with(self.state)
 
@@ -465,13 +474,17 @@ class SystemdRuntimeTest(unittest.TestCase):
             require_root_owner=False,
         )
         ok = self._completed(())
-        failed = self._completed((), returncode=1)
         with (
             mock.patch("nuvion_updater.systemd_runtime.IQ9075_PROBE", str(probe)),
             mock.patch(
                 "nuvion_updater.systemd_runtime.subprocess.run",
-                side_effect=[ok, failed, ok],
+                side_effect=[ok, ok],
             ) as run,
+            mock.patch.object(
+                runtime,
+                "_run_probe_process_group",
+                return_value=self._completed((), returncode=1),
+            ) as run_probe,
         ):
             self.assertEqual(
                 runtime.functional_health_check(self.state),
@@ -481,10 +494,132 @@ class SystemdRuntimeTest(unittest.TestCase):
             [call.args[0] for call in run.call_args_list],
             [
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
-                ("/usr/bin/bash", str(probe), "--camera", "oak"),
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
             ],
         )
+        run_probe.assert_called_once_with(
+            ("/usr/bin/bash", str(probe)),
+            timeout=300,
+        )
+
+    def test_probe_timeout_terminates_dedicated_process_group(self) -> None:
+        process = mock.Mock(pid=731)
+        process.wait.side_effect = subprocess.TimeoutExpired(("probe",), 1)
+        with (
+            mock.patch(
+                "nuvion_updater.systemd_runtime.subprocess.Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(
+                SystemdRuntime,
+                "_terminate_process_group",
+                return_value=True,
+            ) as terminate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "FUNCTIONAL_IQ9075_PROBE_TIMEOUT",
+            ),
+        ):
+            SystemdRuntime._run_probe_process_group(("/probe",), timeout=1)
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertIs(popen.call_args.kwargs["shell"], False)
+        self.assertIs(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        terminate.assert_called_once_with(process, 731)
+
+    def test_probe_process_group_escalates_term_to_kill(self) -> None:
+        process = mock.Mock()
+        with (
+            mock.patch(
+                "nuvion_updater.systemd_runtime.os.killpg",
+            ) as killpg,
+            mock.patch.object(
+                SystemdRuntime,
+                "_wait_for_process_group_exit",
+                side_effect=[False, True],
+            ),
+        ):
+            self.assertTrue(SystemdRuntime._terminate_process_group(process, 812))
+
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(812, signal.SIGTERM), mock.call(812, signal.SIGKILL)],
+        )
+
+    def test_successful_probe_with_surviving_descendant_is_rejected(self) -> None:
+        process = mock.Mock(pid=991)
+        process.wait.return_value = 0
+        with (
+            mock.patch(
+                "nuvion_updater.systemd_runtime.subprocess.Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                SystemdRuntime,
+                "_process_group_exists",
+                return_value=True,
+            ),
+            mock.patch.object(
+                SystemdRuntime,
+                "_terminate_process_group",
+                return_value=True,
+            ) as terminate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "FUNCTIONAL_IQ9075_PROBE_ORPHANED",
+            ),
+        ):
+            SystemdRuntime._run_probe_process_group(("/probe",), timeout=1)
+
+        terminate.assert_called_once_with(process, 991)
+
+    def test_iq9075_rollback_revalidates_physical_oak_and_restored_slot(self) -> None:
+        runtime = SystemdRuntime(
+            slots=self.slots,
+            binding=self._binding(profile="iq9075_dev"),
+            require_root_owner=False,
+        )
+        with (
+            mock.patch.object(runtime, "_validate_rollback_boot") as boot,
+            mock.patch.object(
+                runtime,
+                "_iq9075_functional_check",
+                return_value=(True, "FUNCTIONAL_HEALTHY"),
+            ) as physical,
+        ):
+            self.assertEqual(
+                runtime.rollback_boot_health_check("restored-slot"),
+                (True, "ROLLBACK_BOOT_HEALTHY"),
+            )
+
+        self.assertEqual(
+            boot.call_args_list,
+            [mock.call("restored-slot"), mock.call("restored-slot")],
+        )
+        physical.assert_called_once_with()
+
+    def test_iq9075_rollback_physical_failure_remains_safe_stopped(self) -> None:
+        runtime = SystemdRuntime(
+            slots=self.slots,
+            binding=self._binding(profile="iq9075_dev"),
+            require_root_owner=False,
+        )
+        with (
+            mock.patch.object(runtime, "_validate_rollback_boot"),
+            mock.patch.object(
+                runtime,
+                "_iq9075_functional_check",
+                return_value=(False, "FUNCTIONAL_IQ9075_PROBE_FAILED"),
+            ),
+            mock.patch.object(runtime, "safe_stop") as safe_stop,
+        ):
+            self.assertEqual(
+                runtime.rollback_boot_health_check("restored-slot"),
+                (False, "FUNCTIONAL_IQ9075_PROBE_FAILED"),
+            )
+
+        safe_stop.assert_called_once_with()
 
 
 if __name__ == "__main__":

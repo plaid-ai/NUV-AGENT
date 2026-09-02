@@ -41,10 +41,29 @@ class _FakeGLib:
         func(*args)
 
 
+class _ChangePromise:
+    def __init__(self, callback: Any, token: object) -> None:
+        self.callback = callback
+        self.token = token
+        self.result = "replied"
+        self.reply = None
+
+    def wait(self) -> str:
+        return self.result
+
+    def get_reply(self) -> object | None:
+        return self.reply
+
+    def complete(self, *, result: str = "replied", reply: object = None) -> None:
+        self.result = result
+        self.reply = reply
+        self.callback(self, self.token)
+
+
 class _FakePromise:
     @staticmethod
     def new_with_change_func(callback: Any, token: object, _notify: object) -> object:
-        return types.SimpleNamespace(callback=callback, token=token)
+        return _ChangePromise(callback, token)
 
     @staticmethod
     def new() -> object:
@@ -64,6 +83,10 @@ class _ReplyPromise:
     def get_reply(self) -> Any:
         return self.reply
 
+    @staticmethod
+    def wait() -> str:
+        return "replied"
+
 
 class _Offer:
     sdp = types.SimpleNamespace(
@@ -79,6 +102,16 @@ class _Offer:
 class _OfferReply:
     def get_value(self, name: str) -> object | None:
         return _Offer() if name == "offer" else None
+
+
+class _PromiseErrorReply:
+    @staticmethod
+    def has_field(name: str) -> bool:
+        return name == "error"
+
+    @staticmethod
+    def get_value(name: str) -> object | None:
+        return RuntimeError("rejected") if name == "error" else None
 
 
 class _FakePad:
@@ -124,6 +157,8 @@ class _FakeElement:
         self.state_result = "success"
         self.sync_result = True
         self.handlers: dict[int, tuple[str, Any, tuple[object, ...]]] = {}
+        self.auto_complete_descriptions = True
+        self.description_promises: list[_ChangePromise] = []
         self._next_handler = 1
         self._request_pad_count = 0
         self._static_pads: dict[str, _FakePad] = {}
@@ -174,6 +209,12 @@ class _FakeElement:
 
     def emit(self, signal: str, *args: object) -> None:
         self.emitted.append((signal, args))
+        if signal in {"set-local-description", "set-remote-description"}:
+            promise = args[-1]
+            if isinstance(promise, _ChangePromise):
+                self.description_promises.append(promise)
+                if self.auto_complete_descriptions:
+                    promise.complete()
 
     def get_parent(self) -> _FakePipeline | None:
         return self.parent
@@ -196,6 +237,7 @@ class _FakePipeline:
         self.tee = _FakeElement("tee", "webrtc_uplink_tee")
         self.tee.parent = self
         self.elements: list[_FakeElement] = [self.tee]
+        self.state_changes: list[str] = []
 
     def get_by_name(self, name: str) -> _FakeElement | None:
         return next((item for item in self.elements if item.name == name), None)
@@ -216,6 +258,10 @@ class _FakePipeline:
         _FakeElementFactory.trace.append(("remove", element.name))
         return True
 
+    def set_state(self, state: str) -> str:
+        self.state_changes.append(state)
+        return "success"
+
 
 def _install_fake_gi() -> None:
     gi = types.ModuleType("gi")
@@ -232,6 +278,7 @@ def _install_fake_gi() -> None:
         PadLinkReturn=types.SimpleNamespace(OK="ok"),
         State=types.SimpleNamespace(NULL="null"),
         StateChangeReturn=types.SimpleNamespace(FAILURE="failure"),
+        PromiseResult=types.SimpleNamespace(REPLIED="replied"),
     )
     repository.GstSdp = types.SimpleNamespace(
         SDPMessage=types.SimpleNamespace(new=lambda: (0, object())),
@@ -267,9 +314,11 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
     def _controller(
         self,
         send_message: Any = None,
+        **kwargs: object,
     ) -> tuple[Any, _FakePipeline]:
         controller = self.module.WebRTCUplinkController(
-            send_message=send_message or (lambda *_args: True)
+            send_message=send_message or (lambda *_args: True),
+            **kwargs,
         )
         pipeline = _FakePipeline()
         self.assertTrue(controller.attach_pipeline(pipeline))
@@ -353,6 +402,27 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertTrue(controller.is_signaling_token_current(signaling_token))
         controller.on_signaling_reset()
         self.assertFalse(controller.is_signaling_token_current(signaling_token))
+
+    def test_controller_resolves_only_exact_active_or_terminal_session_token(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+
+        active = controller.signaling_token_for_session("session-1")
+        self.assertIsNotNone(active)
+        self.assertFalse(active.terminal)
+        self.assertIsNone(controller.signaling_token_for_session("session-stale"))
+        self.assertIsNone(
+            controller.signaling_token_for_session("session-1", terminal=True)
+        )
+
+        controller.stop(send_signal=True)
+        terminal = controller.signaling_token_for_session(
+            "session-1",
+            terminal=True,
+        )
+        self.assertIsNotNone(terminal)
+        self.assertTrue(terminal.terminal)
+        self.assertIsNone(controller.signaling_token_for_session("session-1"))
 
     def test_offer_sets_and_sends_the_same_canonical_h264_sdp(self) -> None:
         sent: list[dict[str, object]] = []
@@ -440,7 +510,7 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertEqual(sent[-1][0], self.module.WEBRTC_UPLINK_STOP_DEST)
         self.assertTrue(sent[-1][1].terminal)
 
-    def test_valid_answer_cancels_watchdog_before_it_can_dispose_branch(self) -> None:
+    def test_valid_answer_requires_connection_before_watchdog_is_cancelled(self) -> None:
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")
         branch = controller._branch
@@ -452,9 +522,179 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
         _FakeGLib.drain()
 
-        self.assertEqual(_FakeGLib.timeouts, {})
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
         self.assertIs(controller._branch, branch)
         self.assertTrue(branch.answer_applied)
+        branch.webrtcbin.properties["connection-state"] = types.SimpleNamespace(
+            value_nick="connected"
+        )
+        branch.webrtcbin.properties["ice-connection-state"] = types.SimpleNamespace(
+            value_nick="completed"
+        )
+        controller._on_connection_state_changed(
+            branch.webrtcbin,
+            None,
+            controller._stats_generation,
+            "session-1",
+        )
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+        controller._on_ice_connection_state_changed(
+            branch.webrtcbin,
+            None,
+            controller._stats_generation,
+            "session-1",
+        )
+        self.assertEqual(_FakeGLib.timeouts, {})
+
+    def test_answer_without_connection_is_disposed_by_establishment_timeout(self) -> None:
+        sent: list[tuple[str, object]] = []
+        controller, _pipeline = self._controller(
+            lambda destination, _payload, _remember, token: (
+                sent.append((destination, token)) or True
+            )
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
+        _FakeGLib.drain()
+        controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
+        _FakeGLib.drain()
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+
+        _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertEqual(sent[-1][0], self.module.WEBRTC_UPLINK_STOP_DEST)
+        self.assertTrue(sent[-1][1].terminal)
+
+    def test_local_description_never_reply_times_out_and_late_reply_is_ignored(self) -> None:
+        sent: list[str] = []
+        controller, _pipeline = self._controller(
+            lambda destination, *_args: sent.append(destination) or True
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        branch.webrtcbin.auto_complete_descriptions = False
+        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
+        local_promise = branch.webrtcbin.description_promises[-1]
+        self.assertNotIn(self.module.WEBRTC_UPLINK_OFFER_DEST, sent)
+
+        _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+        _FakeGLib.drain()
+        local_promise.complete()
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertNotIn(self.module.WEBRTC_UPLINK_OFFER_DEST, sent)
+        self.assertEqual(sent[-1], self.module.WEBRTC_UPLINK_STOP_DEST)
+
+    def test_remote_description_error_fails_exact_session(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
+        _FakeGLib.drain()
+        branch.webrtcbin.auto_complete_descriptions = False
+        controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
+        _FakeGLib.drain()
+        remote_promise = branch.webrtcbin.description_promises[-1]
+
+        remote_promise.complete(reply=_PromiseErrorReply())
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertFalse(branch.answer_applied)
+
+    def test_remote_description_never_reply_keeps_answer_timeout_armed(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        branch = controller._branch
+        offer_token = (controller._stats_generation, "session-1", branch.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
+        _FakeGLib.drain()
+        branch.webrtcbin.auto_complete_descriptions = False
+        controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
+        _FakeGLib.drain()
+        self.assertTrue(branch.answer_pending)
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+
+        _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+
+    def test_late_remote_description_error_cannot_kill_replacement(self) -> None:
+        controller, _pipeline = self._controller()
+        self._start(controller, "session-1")
+        first = controller._branch
+        offer_token = (controller._stats_generation, "session-1", first.webrtcbin)
+        controller._on_offer_created(_ReplyPromise(_OfferReply()), offer_token)
+        _FakeGLib.drain()
+        first.webrtcbin.auto_complete_descriptions = False
+        controller.apply_answer({"sessionId": "session-1", "sdp": "v=0\r\n"})
+        _FakeGLib.drain()
+        late_promise = first.webrtcbin.description_promises[-1]
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self._start(controller, "session-2")
+        replacement = controller._branch
+
+        late_promise.complete(reply=_PromiseErrorReply())
+        _FakeGLib.drain()
+
+        self.assertIs(controller._branch, replacement)
+        self.assertEqual(controller._session.session_id, "session-2")
+
+    def test_candidate_enqueue_false_disposes_exact_session(self) -> None:
+        sent: list[str] = []
+
+        def send_message(destination: str, *_args: object) -> bool:
+            sent.append(destination)
+            return destination != self.module.WEBRTC_UPLINK_ICE_CANDIDATE_DEST
+
+        controller, _pipeline = self._controller(send_message)
+        self._start(controller, "session-1")
+        branch = controller._branch
+        controller._on_ice_candidate(
+            branch.webrtcbin,
+            0,
+            "candidate:1 1 UDP 1 127.0.0.1 9 typ host",
+            controller._stats_generation,
+            "session-1",
+        )
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertEqual(sent[-1], self.module.WEBRTC_UPLINK_STOP_DEST)
+
+    def test_candidate_enqueue_exception_still_disposes_branch(self) -> None:
+        calls = 0
+
+        def send_message(destination: str, *_args: object) -> bool:
+            nonlocal calls
+            calls += 1
+            if destination == self.module.WEBRTC_UPLINK_ICE_CANDIDATE_DEST:
+                raise RuntimeError("queue unavailable")
+            return True
+
+        controller, _pipeline = self._controller(send_message)
+        self._start(controller, "session-1")
+        branch = controller._branch
+        controller._on_ice_candidate(
+            branch.webrtcbin,
+            0,
+            "candidate:1 1 UDP 1 127.0.0.1 9 typ host",
+            controller._stats_generation,
+            "session-1",
+        )
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertEqual(calls, 2)
 
     def test_stale_offer_rejection_cannot_dispose_replacement_session(self) -> None:
         controller, _pipeline = self._controller()
@@ -750,7 +990,10 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
 
     def test_incomplete_teardown_refuses_a_replacement_offer(self) -> None:
-        controller, _pipeline = self._controller()
+        fatal_reasons: list[str] = []
+        controller, _pipeline = self._controller(
+            on_fatal_cleanup=lambda reason: fatal_reasons.append(reason) or True
+        )
         self._start(controller, "session-1")
         first = controller._branch
         first.queue.state_result = "failure"
@@ -764,6 +1007,13 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         )
         self.assertEqual(released_once, (1, 1))
         self.assertEqual(first.signal_handler_ids, [])
+
+        while _FakeGLib.timeouts:
+            _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+            _FakeGLib.drain()
+
+        self.assertEqual(len(fatal_reasons), 1)
+        self.assertIn("4 attempts", fatal_reasons[0])
 
         create_count = len(
             [
@@ -797,6 +1047,30 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
             released_once,
         )
         self.assertEqual(first.signal_handler_ids, [])
+        self.assertEqual(len(fatal_reasons), 1)
+
+    def test_cleanup_retry_releases_branch_before_fatal_escalation(self) -> None:
+        fatal_reasons: list[str] = []
+        controller, _pipeline = self._controller(
+            on_fatal_cleanup=lambda reason: fatal_reasons.append(reason) or True
+        )
+        self._start(controller, "session-1")
+        branch = controller._branch
+        branch.queue.state_result = "failure"
+
+        controller.on_signaling_reset()
+        _FakeGLib.drain()
+        self.assertTrue(controller._branch_cleanup_failed)
+        self.assertEqual(len(_FakeGLib.timeouts), 1)
+
+        branch.queue.state_result = "success"
+        _FakeGLib.fire_timeout(next(iter(_FakeGLib.timeouts)))
+        _FakeGLib.drain()
+
+        self.assertIsNone(controller._branch)
+        self.assertFalse(controller._branch_cleanup_failed)
+        self.assertEqual(_FakeGLib.timeouts, {})
+        self.assertEqual(fatal_reasons, [])
 
 
 if __name__ == "__main__":

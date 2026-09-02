@@ -9,12 +9,12 @@ import json
 import os
 import re
 import stat
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from nuvion_app.runtime.release_bom import load_signed_release_bom
 from nuvion_updater.trust import load_release_keyring
-
 
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
@@ -147,12 +147,32 @@ def _distribution_identity(arguments: argparse.Namespace) -> dict[str, Any]:
         "requiredStatusIntegrationId": 15368,
     }:
         raise PromotionError("release governance policy is not the approved single-admin contract")
+    gate_ids = (
+        arguments.gate_run_id,
+        arguments.gate_check_id,
+        arguments.gate_check_suite_id,
+    )
+    if (
+        any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in gate_ids)
+        or not SHA256.fullmatch(arguments.gate_workflow_sha256)
+    ):
+        raise PromotionError("release gate evidence identity is invalid")
     return {
         "agentVersion": version,
         "releaseTag": arguments.tag,
         "componentSha": arguments.component_sha,
         "trustedPublisherSha": arguments.trusted_publisher_sha,
         "governance": governance,
+        "releaseGate": {
+            "componentSha": arguments.component_sha,
+            "workflow": ".github/workflows/agent-release-gate.yml",
+            "workflowSha256": arguments.gate_workflow_sha256,
+            "workflowRunId": arguments.gate_run_id,
+            "checkRunId": arguments.gate_check_id,
+            "checkSuiteId": arguments.gate_check_suite_id,
+            "context": "agent-release-gate",
+            "integrationId": 15368,
+        },
         "artifacts": {
             "pythonSdist": _artifact(arguments.sdist),
             "sdistBom": _artifact(arguments.sdist_bom),
@@ -245,6 +265,7 @@ def build_ota(arguments: argparse.Namespace) -> dict[str, Any]:
         "componentSha",
         "trustedPublisherSha",
         "governance",
+        "releaseGate",
         "sourcePlanDigest",
         "channels",
         "artifacts",
@@ -274,6 +295,20 @@ def build_ota(arguments: argparse.Namespace) -> dict[str, Any]:
             "requiredStatusContext": "agent-release-gate",
             "requiredStatusIntegrationId": 15368,
         }
+        or not isinstance(manifest.get("releaseGate"), dict)
+        or manifest["releaseGate"].get("componentSha") != bom.component_sha
+        or manifest["releaseGate"].get("workflow")
+        != ".github/workflows/agent-release-gate.yml"
+        or not isinstance(manifest["releaseGate"].get("workflowSha256"), str)
+        or not SHA256.fullmatch(manifest["releaseGate"]["workflowSha256"])
+        or manifest["releaseGate"].get("context") != "agent-release-gate"
+        or manifest["releaseGate"].get("integrationId") != 15368
+        or any(
+            isinstance(manifest["releaseGate"].get(field), bool)
+            or not isinstance(manifest["releaseGate"].get(field), int)
+            or manifest["releaseGate"][field] < 1
+            for field in ("workflowRunId", "checkRunId", "checkSuiteId")
+        )
         or manifest.get("channels")
         != {"apt": "PUBLISHED", "github": "IMMUTABLE", "homebrew": "PUBLISHED"}
         or not isinstance(manifest.get("sourcePlanDigest"), str)
@@ -336,6 +371,10 @@ def main() -> int:
         command.add_argument("--tag", required=True)
         command.add_argument("--component-sha", required=True)
         command.add_argument("--trusted-publisher-sha", required=True)
+        command.add_argument("--gate-run-id", type=int, required=True)
+        command.add_argument("--gate-check-id", type=int, required=True)
+        command.add_argument("--gate-check-suite-id", type=int, required=True)
+        command.add_argument("--gate-workflow-sha256", required=True)
         command.add_argument("--security-policy", type=Path, required=True)
         command.add_argument("--sdist", type=Path, required=True)
         command.add_argument("--sdist-bom", type=Path, required=True)
