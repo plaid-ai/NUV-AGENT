@@ -264,20 +264,6 @@ class ZeroShotAnomalyDetector:
                         f"checkpoint tensor shape mismatch: {checkpoint_key}"
                     )
 
-            logit_scale = weights.get_tensor("logit_scale").to(
-                dtype=self._inference_dtype
-            )
-            logit_bias = weights.get_tensor("logit_bias").to(
-                dtype=self._inference_dtype
-            )
-            if (
-                logit_scale.numel() != 1
-                or logit_bias.numel() != 1
-                or not bool(torch.isfinite(logit_scale).all())
-                or not bool(torch.isfinite(logit_bias).all())
-            ):
-                raise RuntimeError("checkpoint SigLIP scoring scalar is invalid")
-
             vision_model.to_empty(device=self._device)
             buffers = dict(vision_model.named_buffers())
             if model_type == "siglip":
@@ -308,7 +294,31 @@ class ZeroShotAnomalyDetector:
                     del source
                 torch.mps.synchronize()
 
-        return vision_model.eval(), logit_scale, logit_bias
+        torch.mps.empty_cache()
+        return vision_model.eval()
+
+    def _load_mps_scoring_scalars(self, torch, model_source: Path):
+        from safetensors import safe_open
+
+        checkpoint = model_source / "model.safetensors"
+        with safe_open(checkpoint, framework="pt", device="cpu") as weights:
+            checkpoint_keys = set(weights.keys())
+            if not {"logit_scale", "logit_bias"}.issubset(checkpoint_keys):
+                raise RuntimeError("checkpoint SigLIP scoring scalars are missing")
+            logit_scale = weights.get_tensor("logit_scale").to(
+                dtype=self._inference_dtype
+            )
+            logit_bias = weights.get_tensor("logit_bias").to(
+                dtype=self._inference_dtype
+            )
+        if (
+            logit_scale.numel() != 1
+            or logit_bias.numel() != 1
+            or not bool(torch.isfinite(logit_scale).all())
+            or not bool(torch.isfinite(logit_bias).all())
+        ):
+            raise RuntimeError("checkpoint SigLIP scoring scalar is invalid")
+        return logit_scale, logit_bias
 
     def __init__(
         self,
@@ -366,14 +376,11 @@ class ZeroShotAnomalyDetector:
                 self._inference_dtype = torch.float16
                 model_source, source_evidence = self._resolve_mps_model_source()
                 text_rows = self._load_isolated_text_features(model_source)
-                model, logit_scale, logit_bias = self._load_mps_vision_model(
-                    torch,
-                    transformers,
-                    model_source,
-                )
-                self._model = model
                 self._processor = self._load_image_processor(
                     transformers, model_source
+                )
+                logit_scale, logit_bias = self._load_mps_scoring_scalars(
+                    torch, model_source
                 )
                 text_features = torch.tensor(
                     text_rows,
@@ -392,6 +399,15 @@ class ZeroShotAnomalyDetector:
                     device=device,
                     dtype=self._inference_dtype,
                 )
+                del text_rows, text_features, norms, logit_scale, logit_bias
+                gc.collect()
+                torch.mps.empty_cache()
+                model = self._load_mps_vision_model(
+                    torch,
+                    transformers,
+                    model_source,
+                )
+                self._model = model
                 self._loaded_model_source = source_evidence
             else:
                 model = AutoModel.from_pretrained(self.model_name).to(device)
