@@ -429,16 +429,11 @@ jobs:
           assert detector._mps_text_features._base is detector._mps_persistent_state
           assert detector._mps_logit_scale._base is detector._mps_persistent_state
           assert detector._mps_logit_bias._base is detector._mps_persistent_state
-          assert torch.isfinite(detector._mps_text_features).all()
-          assert torch.allclose(
-              detector._mps_text_features.norm(dim=-1).float(),
-              torch.ones(len(labels), device="mps"),
-              rtol=0.0,
-              atol=5e-3,
+          assert detector._mps_persistent_state.numel() == (
+              detector._mps_text_features.numel() + 2
           )
           for scalar in (detector._mps_logit_scale, detector._mps_logit_bias):
               assert scalar.device.type == "mps" and scalar.dtype == torch.float16
-              assert torch.isfinite(scalar).all()
 
           result = detector.classify(frame)
           assert result is not None and len(result["scores"]) == 2

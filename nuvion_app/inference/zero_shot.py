@@ -8,6 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from nuvion_app.inference._safetensors_io import (
+    open_safetensors_for_sequential_load,
+)
 from nuvion_app.runtime.inference_mode import normalize_siglip_device
 
 log = logging.getLogger(__name__)
@@ -208,11 +211,6 @@ class ZeroShotAnomalyDetector:
         return self._validate_text_worker_payload(payload, self.labels)
 
     def _load_mps_vision_model(self, torch, transformers, model_source: Path):
-        try:
-            from safetensors import safe_open
-        except ImportError as exc:
-            raise RuntimeError("safetensors is required for low-memory MPS loading") from exc
-
         checkpoint = model_source / "model.safetensors"
         if not checkpoint.is_file():
             raise RuntimeError("low-memory MPS loading requires model.safetensors")
@@ -238,7 +236,7 @@ class ZeroShotAnomalyDetector:
         vision_model = vision_model.to(dtype=self._inference_dtype)
         expected = vision_model.state_dict(keep_vars=True)
 
-        with safe_open(checkpoint, framework="pt", device="cpu") as weights:
+        with open_safetensors_for_sequential_load(checkpoint) as weights:
             checkpoint_keys = set(weights.keys())
             vision_keys = {
                 key for key in checkpoint_keys if key.startswith("vision_model.")
@@ -296,10 +294,8 @@ class ZeroShotAnomalyDetector:
         return vision_model.eval()
 
     def _load_mps_scoring_scalars(self, torch, model_source: Path):
-        from safetensors import safe_open
-
         checkpoint = model_source / "model.safetensors"
-        with safe_open(checkpoint, framework="pt", device="cpu") as weights:
+        with open_safetensors_for_sequential_load(checkpoint) as weights:
             checkpoint_keys = set(weights.keys())
             if not {"logit_scale", "logit_bias"}.issubset(checkpoint_keys):
                 raise RuntimeError("checkpoint SigLIP scoring scalars are missing")

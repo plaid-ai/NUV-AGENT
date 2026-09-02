@@ -3,10 +3,37 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import math
+import stat
 import sys
 from pathlib import Path
+
+try:
+    from nuvion_app.inference._safetensors_io import (
+        open_safetensors_for_sequential_load,
+    )
+except ModuleNotFoundError:
+    # `python -I /path/to/worker.py` intentionally excludes the source root.
+    # Load only this validated sibling for source-tree diagnostics; installed
+    # releases resolve the normal package import above.
+    helper_path = Path(__file__).resolve().with_name("_safetensors_io.py")
+    helper_metadata = helper_path.lstat()
+    if not stat.S_ISREG(helper_metadata.st_mode) or stat.S_ISLNK(
+        helper_metadata.st_mode
+    ):
+        raise RuntimeError("safetensors helper must be a regular package file")
+    helper_spec = importlib.util.spec_from_file_location(
+        "_nuvion_safetensors_io", helper_path
+    )
+    if helper_spec is None or helper_spec.loader is None:
+        raise RuntimeError("unable to load the safetensors helper")
+    helper_module = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(helper_module)
+    open_safetensors_for_sequential_load = (
+        helper_module.open_safetensors_for_sequential_load
+    )
 
 _MAX_REQUEST_BYTES = 1024 * 1024
 _MAX_LABELS = 256
@@ -57,7 +84,6 @@ def main() -> int:
 
     import torch
     import transformers
-    from safetensors import safe_open
 
     model_source = Path(model_name)
     checkpoint = model_source / "model.safetensors"
@@ -127,7 +153,7 @@ def main() -> int:
     if len(embedding_keys) != 1:
         raise ValueError("SigLIP text embedding layout is unsupported")
     embedding_key = embedding_keys[0]
-    with safe_open(checkpoint, framework="pt", device="cpu") as weights:
+    with open_safetensors_for_sequential_load(checkpoint) as weights:
         checkpoint_keys = set(weights.keys())
         text_keys = {
             key for key in checkpoint_keys if key.startswith("text_model.")

@@ -345,15 +345,21 @@ class ReleaseGateTest(unittest.TestCase):
         text_worker = (
             ROOT / "nuvion_app" / "inference" / "_siglip_text_features.py"
         ).read_text(encoding="utf-8")
+        safetensors_io = (
+            ROOT / "nuvion_app" / "inference" / "_safetensors_io.py"
+        ).read_text(encoding="utf-8")
         self.assertIn("dtype=torch.float16", text_worker)
         self.assertIn('with torch.device("meta"):', text_worker)
         self.assertIn('model.to_empty(device="cpu")', text_worker)
-        self.assertIn('from safetensors import safe_open', text_worker)
+        self.assertIn("open_safetensors_for_sequential_load", text_worker)
         self.assertIn("text_config.vocab_size = len(token_ids)", text_worker)
         self.assertIn("token_id : token_id + 1", text_worker)
         self.assertIn('with torch.device("meta"):', zero_shot)
         self.assertIn('vision_model.to_empty(device=self._device)', zero_shot)
-        self.assertIn('from safetensors import safe_open', zero_shot)
+        self.assertIn("open_safetensors_for_sequential_load", zero_shot)
+        self.assertIn('getattr(fcntl, "F_NOCACHE", None)', safetensors_io)
+        self.assertIn('f"/dev/fd/{descriptor}"', safetensors_io)
+        self.assertIn('from safetensors import safe_open', safetensors_io)
         self.assertNotIn(
             "torch.arange(position_ids.shape[1], device=self._device)",
             zero_shot,
