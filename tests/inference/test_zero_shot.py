@@ -139,6 +139,18 @@ class MacMpsZeroShotRegressionTest(unittest.TestCase):
             self.assertEqual(detector._mps_text_features.device.type, "mps")
             self.assertEqual(detector._mps_logit_scale.device.type, "mps")
             self.assertEqual(detector._mps_logit_bias.device.type, "mps")
+            self.assertIs(
+                detector._mps_text_features._base,
+                detector._mps_persistent_state,
+            )
+            self.assertIs(
+                detector._mps_logit_scale._base,
+                detector._mps_persistent_state,
+            )
+            self.assertIs(
+                detector._mps_logit_bias._base,
+                detector._mps_persistent_state,
+            )
             self.assertEqual(detector.loaded_model_source(), str(model_path))
             result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
         self.assertIsNotNone(result)

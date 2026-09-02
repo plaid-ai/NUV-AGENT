@@ -277,10 +277,21 @@ class ReleaseGateTest(unittest.TestCase):
         gate = (ROOT / ".github/workflows/agent-release-gate.yml").read_text(
             encoding="utf-8"
         )
+        oracle = gate.split("  macos-cpu-reference:", maxsplit=1)[1].split(
+            "  macos-arm64-release-prerequisite:", maxsplit=1
+        )[0]
         macos = gate.split(
             "  macos-arm64-release-prerequisite:", maxsplit=1
         )[1].split("  agent-release-gate:", maxsplit=1)[0]
+        self.assertIn("runs-on: macos-14", oracle)
+        self.assertIn("reference-sha256:", oracle)
+        self.assertIn("reference_outputs.logits_per_image", oracle)
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", oracle)
+        self.assertIn("actions/upload-artifact@", oracle)
+        self.assertIn("compression-level: 0", oracle)
+        self.assertIn('wc -c < "$REFERENCE_PATH"', oracle)
         self.assertIn("runs-on: macos-14", macos)
+        self.assertIn("needs: macos-cpu-reference", macos)
         self.assertIn('brew tap-new --no-git "$TAP_NAME"', macos)
         self.assertIn('brew trust --formula "$FORMULA_NAME"', macos)
         self.assertIn(
@@ -308,21 +319,18 @@ class ReleaseGateTest(unittest.TestCase):
         )
         self.assertIn('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -', macos)
         self.assertEqual(
-            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 2
+            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 1
         )
         self.assertIn('package_path.is_relative_to(formula_prefix / "libexec")', macos)
-        self.assertIn("reference_outputs.logits_per_image", macos)
+        self.assertNotIn("reference_outputs.logits_per_image", macos)
         self.assertIn("observed_scores, reference_scores", macos)
-        self.assertIn('REFERENCE_PATH="${RUNNER_TEMP}/siglip-reference-v1.json"', macos)
-        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", macos)
+        self.assertIn("actions/download-artifact@", macos)
+        self.assertIn("needs.macos-cpu-reference.outputs.reference-sha256", macos)
+        self.assertIn('shasum -a 256 "$REFERENCE_PATH"', macos)
+        self.assertIn('wc -c < "$REFERENCE_PATH"', macos)
         self.assertIn('stat.S_IMODE(reference_stat.st_mode) == 0o600', macos)
         self.assertIn('type(reference["schemaVersion"]) is int', macos)
         self.assertIn("and 0.0 <= score <= 1.0", macos)
-        reference = macos.index("reference_outputs.logits_per_image")
-        post_reference_purge = macos.index("sudo purge", reference)
-        mps_detector = macos.index("detector = ZeroShotAnomalyDetector")
-        self.assertLess(reference, post_reference_purge)
-        self.assertLess(post_reference_purge, mps_detector)
         self.assertIn("for _ in range(16):", macos)
         self.assertIn("stable_bytes + 16 * 1024**2", macos)
         self.assertIn("sudo purge", macos)

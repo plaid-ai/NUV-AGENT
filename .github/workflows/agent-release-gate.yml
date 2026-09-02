@@ -48,9 +48,182 @@ jobs:
           assert version("wheel") == "0.46.2"
           PY
 
+  macos-cpu-reference:
+    name: macos-cpu-reference
+    runs-on: macos-14
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      reference-sha256: ${{ steps.reference.outputs.sha256 }}
+    steps:
+      - name: Checkout candidate without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup exact oracle Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install the exact inference tuple
+        env:
+          ORACLE_VENV: ${{ runner.temp }}/siglip-cpu-oracle
+        run: |
+          set -euo pipefail
+          [ "$(uname -m)" = "arm64" ]
+          python -c 'import sys; assert sys.version_info[:2] == (3, 14)'
+          python -m venv "$ORACLE_VENV"
+          "$ORACLE_VENV/bin/python" -m pip install '.[zsad]'
+          "$ORACLE_VENV/bin/python" - <<'PY'
+          import platform
+          import sys
+          from importlib.metadata import version
+          expected = {
+              "torch": "2.10.0",
+              "numpy": "2.4.2",
+              "Pillow": "12.1.0",
+              "transformers": "5.16.1",
+              "huggingface-hub": "1.29.0",
+              "hf-xet": "1.6.0",
+              "tokenizers": "0.23.1",
+              "safetensors": "0.8.0",
+              "sentencepiece": "0.2.2",
+              "protobuf": "7.36.1",
+          }
+          assert platform.machine() == "arm64"
+          assert sys.version_info[:2] == (3, 14)
+          assert {name: version(name) for name in expected} == expected
+          PY
+
+      - name: Download only the reviewed SigLIP snapshot revision
+        id: model
+        env:
+          HF_HOME: ${{ runner.temp }}/huggingface
+          MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+          ORACLE_VENV: ${{ runner.temp }}/siglip-cpu-oracle
+        run: |
+          set -euo pipefail
+          MODEL_PATH=$("$ORACLE_VENV/bin/python" - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+          revision = os.environ["MODEL_REVISION"]
+          path = Path(snapshot_download(
+              repo_id="google/siglip2-base-patch16-224",
+              revision=revision,
+          )).resolve()
+          if path.name != revision:
+              raise SystemExit("resolved model snapshot revision differs")
+          print(path)
+          PY
+          )
+          echo "path=$MODEL_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Compute strict CPU reference
+        id: reference
+        env:
+          HF_HOME: ${{ runner.temp }}/huggingface
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          MODEL_PATH: ${{ steps.model.outputs.path }}
+          MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+          ORACLE_VENV: ${{ runner.temp }}/siglip-cpu-oracle
+          REFERENCE_DIR: ${{ runner.temp }}/siglip-cpu-reference
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$REFERENCE_DIR"
+          REFERENCE_PATH="$REFERENCE_DIR/siglip-reference-v1.json"
+          export REFERENCE_PATH
+          PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import numpy as np
+          import torch
+          from huggingface_hub import snapshot_download
+          from transformers import AutoModel, AutoProcessor
+          import nuvion_app
+          path = Path(os.environ["MODEL_PATH"]).resolve()
+          revision = os.environ["MODEL_REVISION"]
+          oracle_venv = Path(os.environ["ORACLE_VENV"]).resolve()
+          reference_path = Path(os.environ["REFERENCE_PATH"])
+          package_path = Path(nuvion_app.__file__).resolve()
+          assert package_path.is_relative_to(oracle_venv)
+          assert reference_path.parent.resolve() == Path(os.environ["REFERENCE_DIR"]).resolve()
+          assert path.name == revision
+          assert Path(snapshot_download(
+              repo_id="google/siglip2-base-patch16-224",
+              revision=revision,
+              local_files_only=True,
+          )).resolve() == path
+          labels = ["normal scene", "anomalous scene"]
+          texts = [f"This is a photo of {label}." for label in labels]
+          frame = np.zeros((224, 224, 3), dtype=np.uint8)
+
+          reference_model = AutoModel.from_pretrained(
+              str(path), dtype=torch.float16, low_cpu_mem_usage=True
+          ).eval()
+          reference_processor = AutoProcessor.from_pretrained(str(path))
+          reference_inputs = reference_processor(
+              text=texts,
+              images=frame,
+              padding="max_length",
+              max_length=64,
+              return_tensors="pt",
+          )
+          reference_inputs = {
+              key: value.to(dtype=torch.float16)
+              if value.is_floating_point()
+              else value
+              for key, value in reference_inputs.items()
+          }
+          with torch.inference_mode():
+              reference_outputs = reference_model(**reference_inputs)
+          reference_scores = torch.sigmoid(
+              reference_outputs.logits_per_image
+          ).squeeze(0).float()
+          scores = [float(score) for score in reference_scores]
+          assert len(scores) == len(labels) and all(math.isfinite(score) for score in scores)
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          if hasattr(os, "O_NOFOLLOW"):
+              flags |= os.O_NOFOLLOW
+          descriptor = os.open(reference_path, flags, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+              json.dump(
+                  {
+                      "schemaVersion": 1,
+                      "modelRevision": revision,
+                      "labels": labels,
+                      "scores": scores,
+                  },
+                  output,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              output.flush()
+              os.fsync(output.fileno())
+          PY
+          [ -f "$REFERENCE_PATH" ]
+          [ ! -L "$REFERENCE_PATH" ]
+          [ "$(wc -c < "$REFERENCE_PATH" | tr -d ' ')" -le 4096 ]
+          echo "sha256=$(shasum -a 256 "$REFERENCE_PATH" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer strict CPU reference
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: siglip-cpu-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/siglip-cpu-reference/siglip-reference-v1.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
   macos-arm64-release-prerequisite:
     name: macos-arm64-release-prerequisite
     runs-on: macos-14
+    needs: macos-cpu-reference
     timeout-minutes: 90
     permissions:
       contents: read
@@ -150,6 +323,12 @@ jobs:
           )
           echo "path=$MODEL_PATH" >> "$GITHUB_OUTPUT"
 
+      - name: Download strict CPU reference from the fresh runner
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: siglip-cpu-reference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/siglip-cpu-reference
+
       - name: Prove offline MPS inference with the exact shipped tuple
         env:
           HF_HOME: ${{ runner.temp }}/huggingface
@@ -157,6 +336,8 @@ jobs:
           TRANSFORMERS_OFFLINE: "1"
           MODEL_PATH: ${{ steps.model.outputs.path }}
           MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+          REFERENCE_PATH: ${{ runner.temp }}/siglip-cpu-reference/siglip-reference-v1.json
+          REFERENCE_SHA256: ${{ needs.macos-cpu-reference.outputs.reference-sha256 }}
         run: |
           set -euo pipefail
           # Reclaim the large filesystem cache left by the Formula install
@@ -165,89 +346,14 @@ jobs:
           sudo purge
           FORMULA_PREFIX="$(brew --prefix nuv-agent)"
           FORMULA_PYTHON="$FORMULA_PREFIX/libexec/bin/python"
-          REFERENCE_PATH="${RUNNER_TEMP}/siglip-reference-v1.json"
           export FORMULA_PREFIX
-          export REFERENCE_PATH
-          trap 'rm -f "$REFERENCE_PATH"' EXIT
+          [ -f "$REFERENCE_PATH" ]
+          [ ! -L "$REFERENCE_PATH" ]
+          [ "$(wc -c < "$REFERENCE_PATH" | tr -d ' ')" -le 4096 ]
+          [[ "$REFERENCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [ "$(shasum -a 256 "$REFERENCE_PATH" | awk '{print $1}')" = "$REFERENCE_SHA256" ]
+          chmod 0600 "$REFERENCE_PATH"
           cd "$RUNNER_TEMP"
-          # Compute the CPU oracle in its own process. Process exit returns the
-          # full reference model to macOS before the real MPS proof starts.
-          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
-          import json
-          import math
-          import os
-          from pathlib import Path
-          import numpy as np
-          import torch
-          from huggingface_hub import snapshot_download
-          from transformers import AutoModel, AutoProcessor
-          import nuvion_app
-          path = Path(os.environ["MODEL_PATH"]).resolve()
-          revision = os.environ["MODEL_REVISION"]
-          formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
-          reference_path = Path(os.environ["REFERENCE_PATH"])
-          package_path = Path(nuvion_app.__file__).resolve()
-          assert package_path.is_relative_to(formula_prefix / "libexec")
-          assert reference_path.parent.resolve() == Path(os.environ["RUNNER_TEMP"]).resolve()
-          assert path.name == revision
-          assert Path(snapshot_download(
-              repo_id="google/siglip2-base-patch16-224",
-              revision=revision,
-              local_files_only=True,
-          )).resolve() == path
-          assert torch.backends.mps.is_available()
-          labels = ["normal scene", "anomalous scene"]
-          texts = [f"This is a photo of {label}." for label in labels]
-          frame = np.zeros((224, 224, 3), dtype=np.uint8)
-
-          reference_model = AutoModel.from_pretrained(
-              str(path), dtype=torch.float16, low_cpu_mem_usage=True
-          ).eval()
-          reference_processor = AutoProcessor.from_pretrained(str(path))
-          reference_inputs = reference_processor(
-              text=texts,
-              images=frame,
-              padding="max_length",
-              max_length=64,
-              return_tensors="pt",
-          )
-          reference_inputs = {
-              key: value.to(dtype=torch.float16)
-              if value.is_floating_point()
-              else value
-              for key, value in reference_inputs.items()
-          }
-          with torch.inference_mode():
-              reference_outputs = reference_model(**reference_inputs)
-          reference_scores = torch.sigmoid(
-              reference_outputs.logits_per_image
-          ).squeeze(0).float()
-          scores = [float(score) for score in reference_scores]
-          assert len(scores) == len(labels) and all(math.isfinite(score) for score in scores)
-          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-          if hasattr(os, "O_NOFOLLOW"):
-              flags |= os.O_NOFOLLOW
-          descriptor = os.open(reference_path, flags, 0o600)
-          with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-              json.dump(
-                  {
-                      "schemaVersion": 1,
-                      "modelRevision": revision,
-                      "labels": labels,
-                      "scores": scores,
-                  },
-                  output,
-                  sort_keys=True,
-                  separators=(",", ":"),
-              )
-              output.flush()
-              os.fsync(output.fileno())
-          PY
-
-          # The hosted runner uses unified memory. Purge file-backed caches only
-          # after the CPU oracle process has released every model allocation.
-          sync
-          sudo purge
           PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
           import json
           import math
@@ -265,6 +371,7 @@ jobs:
           reference_path = Path(os.environ["REFERENCE_PATH"])
           package_path = Path(nuvion_app.__file__).resolve()
           assert package_path.is_relative_to(formula_prefix / "libexec")
+          assert torch.backends.mps.is_available()
           assert path.name == revision
           assert Path(snapshot_download(
               repo_id="google/siglip2-base-patch16-224",
@@ -313,6 +420,9 @@ jobs:
           assert {parameter.dtype for parameter in vision_parameters} == {torch.float16}
           assert detector._mps_text_features.device.type == "mps"
           assert detector._mps_text_features.dtype == torch.float16
+          assert detector._mps_text_features._base is detector._mps_persistent_state
+          assert detector._mps_logit_scale._base is detector._mps_persistent_state
+          assert detector._mps_logit_bias._base is detector._mps_persistent_state
           assert torch.isfinite(detector._mps_text_features).all()
           assert torch.allclose(
               detector._mps_text_features.norm(dim=-1).float(),
@@ -354,7 +464,7 @@ jobs:
   agent-release-gate:
     name: agent-release-gate
     runs-on: ubuntu-latest
-    needs: [arm64-release-prerequisite, macos-arm64-release-prerequisite]
+    needs: [arm64-release-prerequisite, macos-cpu-reference, macos-arm64-release-prerequisite]
     if: always()
     permissions:
       contents: read
@@ -362,10 +472,13 @@ jobs:
       - name: Enforce arm64 prerequisite result
         env:
           ARM64_RESULT: ${{ needs.arm64-release-prerequisite.result }}
+          CPU_REFERENCE_RESULT: ${{ needs.macos-cpu-reference.result }}
           MACOS_RESULT: ${{ needs.macos-arm64-release-prerequisite.result }}
         run: |
           [ "$ARM64_RESULT" = "success" ] \
             || { echo "arm64 release prerequisite did not succeed" >&2; exit 1; }
+          [ "$CPU_REFERENCE_RESULT" = "success" ] \
+            || { echo "macOS CPU reference prerequisite did not succeed" >&2; exit 1; }
           [ "$MACOS_RESULT" = "success" ] \
             || { echo "macOS arm64 release prerequisite did not succeed" >&2; exit 1; }
 

@@ -343,6 +343,7 @@ class ZeroShotAnomalyDetector:
         self._mps_text_features = None
         self._mps_logit_scale = None
         self._mps_logit_bias = None
+        self._mps_persistent_state = None
         self._loaded_model_source: str | None = None
 
         if not self.enabled:
@@ -384,22 +385,46 @@ class ZeroShotAnomalyDetector:
                 )
                 text_features = torch.tensor(
                     text_rows,
-                    device=device,
                     dtype=self._inference_dtype,
                 )
                 norms = text_features.norm(dim=-1, keepdim=True)
                 if not bool(torch.isfinite(norms).all()) or bool((norms <= 0).any()):
                     raise RuntimeError("text-feature norms are invalid")
-                self._mps_text_features = text_features / norms
-                self._mps_logit_scale = logit_scale.to(
-                    device=device,
-                    dtype=self._inference_dtype,
-                ).exp()
-                self._mps_logit_bias = logit_bias.to(
+                normalized_features = text_features / norms
+                scoring_scale = logit_scale.exp()
+                if (
+                    not bool(torch.isfinite(normalized_features).all())
+                    or not bool(torch.isfinite(scoring_scale).all())
+                ):
+                    raise RuntimeError("normalized SigLIP scoring state is invalid")
+                feature_shape = normalized_features.shape
+                feature_values = normalized_features.numel()
+                packed_state = torch.cat(
+                    (
+                        normalized_features.reshape(-1),
+                        scoring_scale.reshape(-1),
+                        logit_bias.reshape(-1),
+                    )
+                ).to(
                     device=device,
                     dtype=self._inference_dtype,
                 )
-                del text_rows, text_features, norms, logit_scale, logit_bias
+                self._mps_persistent_state = packed_state
+                self._mps_text_features = packed_state[:feature_values].reshape(
+                    feature_shape
+                )
+                self._mps_logit_scale = packed_state[feature_values]
+                self._mps_logit_bias = packed_state[feature_values + 1]
+                del (
+                    text_rows,
+                    text_features,
+                    norms,
+                    normalized_features,
+                    logit_scale,
+                    logit_bias,
+                    scoring_scale,
+                    packed_state,
+                )
                 gc.collect()
                 torch.mps.empty_cache()
                 model = self._load_mps_vision_model(
@@ -442,6 +467,7 @@ class ZeroShotAnomalyDetector:
             self._mps_text_features = None
             self._mps_logit_scale = None
             self._mps_logit_bias = None
+            self._mps_persistent_state = None
             gc.collect()
             if device == "mps":
                 try:

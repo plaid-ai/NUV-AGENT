@@ -447,11 +447,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("  agent-release-gate:\n    name: agent-release-gate", gate)
         self.assertIn("runs-on: ubuntu-24.04-arm", gate)
         self.assertIn(
-            "needs: [arm64-release-prerequisite, macos-arm64-release-prerequisite]",
+            "needs: [arm64-release-prerequisite, macos-cpu-reference, macos-arm64-release-prerequisite]",
             gate,
         )
         self.assertIn("if: always()", gate)
         self.assertIn("needs.arm64-release-prerequisite.result", gate)
+        self.assertIn("needs.macos-cpu-reference.result", gate)
         self.assertIn("needs.macos-arm64-release-prerequisite.result", gate)
         self.assertIn("requirements-agent-bundle-arm64.txt", gate)
         self.assertIn("packaging/release/run-isolated-tests.py", gate)
