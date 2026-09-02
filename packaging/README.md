@@ -224,8 +224,13 @@ Required secrets:
   protected-main verification material; it is deliberately not a secret
 
 모든 credential job은 24시간 이내 platform-admin signed settings attestation을
-protected environment 진입 직후와 첫 secret 사용 직전에 다시 검증합니다. Attestation은 exact
-trusted publisher commit의 전체 tracked surface와 default-branch workflow bytes를 묶습니다.
+protected environment 진입 직후와 GitHub/APT/GCP/signing/ambient credential의 각 접근 직전에
+다시 검증합니다. Attestation은 exact trusted publisher commit의 전체 tracked surface와
+default-branch workflow bytes를 묶습니다. 일반 writer는 CODEOWNER approval 1개와 strict
+`agent-release-gate`가 필요하고, Platform-Admin 팀만 exact `pull_request` bypass를 사용합니다.
+Face artifact GCP 권한은 별도 `face-artifacts-release` exact-main environment에만 두며,
+allowlisted Platform-Admin이 서명한 tag/commit/model/channel/artifact digest manifest 없이는
+GCP 인증 전에 fail closed 합니다. 따라서 별도 2인 environment 승인은 요구하지 않습니다.
 Unsigned legacy tag(v0.1.120 포함)는 이 publisher에서 지원하지 않습니다.
 
 To host an APT repo, use a tool like `aptly` or `reprepro`, then publish the generated `.deb`.

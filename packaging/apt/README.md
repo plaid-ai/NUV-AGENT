@@ -78,6 +78,12 @@ Required GitHub secrets:
 - `packaging/release/trusted-release-keyrings/iq9075-dev.json`: protected-main
   public verification keyring, byte-identical to the board keyring (not a secret)
 
+The workflow materializes `APT_GPG_PASSPHRASE` once as an owned mode-`0600`
+file under `RUNNER_TEMP`, passes it to both signing commands with aptly's
+`-batch -passphrase-file=...`, and removes it after publication. A manual
+`publish-gcs.sh` invocation must set `APTLY_PASSPHRASE_FILE` to an equivalent
+non-symlink file; plaintext argv and gpg-agent cache-only signing are rejected.
+
 Runner requirement:
 
 - Release jobs are fixed to GitHub-hosted `ubuntu-24.04-arm`. The required

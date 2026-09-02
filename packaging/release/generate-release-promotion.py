@@ -135,12 +135,18 @@ def _distribution_identity(arguments: argparse.Namespace) -> dict[str, Any]:
     _, security_policy = _strict_json_artifact(arguments.security_policy)
     governance = security_policy.get("governance")
     if governance != {
-        "pullRequestApprovals": 0,
+        "pullRequestApprovals": 1,
+        "dismissStaleReviewsOnPush": True,
+        "requireCodeOwnerReview": True,
+        "requireLastPushApproval": True,
+        "requireExtraApprovalForUnattributedChanges": True,
+        "requiredReviewThreadResolution": True,
+        "allowedMergeMethods": ["merge", "squash", "rebase"],
         "environmentReviewers": 0,
         "requiredStatusContext": "agent-release-gate",
         "requiredStatusIntegrationId": 15368,
     }:
-        raise PromotionError("release governance policy is not the approved zero-approval contract")
+        raise PromotionError("release governance policy is not the approved single-admin contract")
     return {
         "agentVersion": version,
         "releaseTag": arguments.tag,
@@ -257,7 +263,13 @@ def build_ota(arguments: argparse.Namespace) -> dict[str, Any]:
         or not SHA.fullmatch(manifest["trustedPublisherSha"])
         or manifest.get("governance")
         != {
-            "pullRequestApprovals": 0,
+            "pullRequestApprovals": 1,
+            "dismissStaleReviewsOnPush": True,
+            "requireCodeOwnerReview": True,
+            "requireLastPushApproval": True,
+            "requireExtraApprovalForUnattributedChanges": True,
+            "requiredReviewThreadResolution": True,
+            "allowedMergeMethods": ["merge", "squash", "rebase"],
             "environmentReviewers": 0,
             "requiredStatusContext": "agent-release-gate",
             "requiredStatusIntegrationId": 15368,

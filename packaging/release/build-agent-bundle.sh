@@ -149,7 +149,7 @@ chmod 0755 "$slot_root/bin/nuv-agent" "$slot_root/venv/bin/python"
 # and changing cwd prevent the checkout from shadowing the installed package.
 (
   cd "$slot_root"
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= NUVION_SYSTEM_PYTHON=/usr/local/bin/python3 \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH='' NUVION_SYSTEM_PYTHON=/usr/local/bin/python3 \
     "$slot_root/venv/bin/python" -s - \
       "$VERSION" "$EXPECTED_COMPONENT_SHA" "$slot_root" <<'PY'
 from importlib.metadata import version
@@ -171,7 +171,7 @@ if build_info.AGENT_VERSION != expected_version:
 if build_info.COMPONENT_SHA != expected_sha:
     raise SystemExit("agent-bundle component SHA does not match the stamped release")
 PY
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH= NUVION_SYSTEM_PYTHON=/usr/local/bin/python3 \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH='' NUVION_SYSTEM_PYTHON=/usr/local/bin/python3 \
     "$slot_root/bin/nuv-agent" --help >/dev/null
 )
 find "$slot_root" -exec touch -h -d "@$SOURCE_EPOCH" {} +

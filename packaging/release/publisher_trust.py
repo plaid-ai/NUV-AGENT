@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import stat
@@ -205,4 +206,29 @@ def verify_executing_workflow(
     ):
         raise PublisherTrustError(
             "executing default-branch workflow differs from trusted publisher bytes"
+        )
+
+
+def verify_additional_executing_workflow(
+    publisher_root: Path,
+    executing_workflow: Path,
+    *,
+    publisher_relative_path: str,
+) -> None:
+    relative = Path(publisher_relative_path)
+    if (
+        relative.is_absolute()
+        or relative.parts[:2] != (".github", "workflows")
+        or len(relative.parts) != 3
+        or relative.suffix not in {".yml", ".yaml"}
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise PublisherTrustError("additional trusted workflow path is invalid")
+    publisher_digest = _regular_file_hashes(
+        publisher_root.resolve() / relative
+    )[0]
+    executing_digest = _regular_file_hashes(executing_workflow.resolve())[0]
+    if not hmac.compare_digest(publisher_digest, executing_digest):
+        raise PublisherTrustError(
+            "additional executing workflow differs from trusted publisher bytes"
         )

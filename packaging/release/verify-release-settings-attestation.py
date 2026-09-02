@@ -17,6 +17,7 @@ from typing import Any
 from publisher_trust import (
     PublisherTrustError,
     publisher_surface,
+    verify_additional_executing_workflow,
     verify_executing_workflow,
 )
 
@@ -183,6 +184,7 @@ def verify_attestation(
     trusted_publisher_sha: str,
     publisher_root: Path,
     executing_workflow: Path,
+    additional_executing_workflows: tuple[tuple[str, Path], ...] = (),
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     if not REPOSITORY.fullmatch(repository):
@@ -267,6 +269,21 @@ def verify_attestation(
     )
     if surface["workflowSha256"] != attestation["workflowSha256"]:
         raise AttestationError("trusted publisher workflow digest differs from attestation")
+    for publisher_relative_path, additional_workflow in additional_executing_workflows:
+        verify_additional_executing_workflow(
+            publisher_root,
+            additional_workflow,
+            publisher_relative_path=publisher_relative_path,
+        )
+    if additional_executing_workflows:
+        final_surface = publisher_surface(
+            publisher_root,
+            expected_sha=trusted_publisher_sha,
+        )
+        if final_surface != surface:
+            raise AttestationError(
+                "trusted publisher changed during additional workflow verification"
+            )
     return {
         "schemaVersion": 1,
         "repository": repository,
@@ -290,6 +307,13 @@ def main() -> int:
     parser.add_argument("--trusted-publisher-sha", required=True)
     parser.add_argument("--publisher-root", type=Path, required=True)
     parser.add_argument("--executing-workflow", type=Path, required=True)
+    parser.add_argument(
+        "--trusted-additional-workflow",
+        action="append",
+        nargs=2,
+        default=[],
+        metavar=("PUBLISHER_RELATIVE_PATH", "EXECUTING_PATH"),
+    )
     arguments = parser.parse_args()
     try:
         result = verify_attestation(
@@ -301,6 +325,10 @@ def main() -> int:
             trusted_publisher_sha=arguments.trusted_publisher_sha,
             publisher_root=arguments.publisher_root,
             executing_workflow=arguments.executing_workflow,
+            additional_executing_workflows=tuple(
+                (relative, Path(path))
+                for relative, path in arguments.trusted_additional_workflow
+            ),
         )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     except (

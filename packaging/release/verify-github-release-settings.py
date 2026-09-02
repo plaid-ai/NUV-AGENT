@@ -20,6 +20,11 @@ from publisher_trust import PublisherTrustError, publisher_surface
 
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,99}$")
+MAX_API_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_API_PAGES = 100
+PER_PAGE = 100
+API_NOT_FOUND = object()
 
 
 class SettingsError(RuntimeError):
@@ -50,7 +55,9 @@ class GitHubApi:
         self.repository = repository
         self.token = token
 
-    def get(self, path: str) -> Any:
+    def _get(self, path: str, *, allow_not_found: bool) -> Any:
+        if not path.startswith("/") or "\r" in path or "\n" in path:
+            raise SettingsError("GitHub settings API path is invalid")
         request = urllib.request.Request(
             f"https://api.github.com{path}",
             headers={
@@ -63,16 +70,141 @@ class GitHubApi:
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                payload = response.read(2 * 1024 * 1024 + 1)
+                payload = response.read(MAX_API_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
+            if allow_not_found and exc.code == 404:
+                return API_NOT_FOUND
             raise SettingsError(
                 f"GitHub settings API denied {path} with HTTP {exc.code}"
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise SettingsError(f"GitHub settings API failed for {path}: {exc}") from exc
-        if len(payload) > 2 * 1024 * 1024:
+        if len(payload) > MAX_API_RESPONSE_BYTES:
             raise SettingsError("GitHub settings API response exceeds limit")
         return _strict_json(payload, label="GitHub API response")
+
+    def get(self, path: str) -> Any:
+        result = self._get(path, allow_not_found=False)
+        if result is API_NOT_FOUND:  # pragma: no cover - guarded by allow_not_found
+            raise SettingsError("GitHub settings API returned no response")
+        return result
+
+    def get_optional(self, path: str) -> Any:
+        return self._get(path, allow_not_found=True)
+
+
+def _page_path(path: str, page: int) -> str:
+    if page < 1 or re.search(r"(?:^|[?&])(page|per_page)=", path):
+        raise SettingsError("paginated GitHub API path is invalid")
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}per_page={PER_PAGE}&page={page}"
+
+
+def _paginated_list(api: GitHubApi, path: str, *, label: str) -> list[Any]:
+    result: list[Any] = []
+    for page in range(1, MAX_API_PAGES + 1):
+        payload = api.get(_page_path(path, page))
+        if not isinstance(payload, list) or len(payload) > PER_PAGE:
+            raise SettingsError(f"{label} page is invalid")
+        result.extend(payload)
+        if len(payload) < PER_PAGE:
+            return result
+    raise SettingsError(f"{label} pagination exceeds limit")
+
+
+def _paginated_collection(
+    api: GitHubApi,
+    path: str,
+    *,
+    member: str,
+    label: str,
+) -> list[Any]:
+    result: list[Any] = []
+    expected_total: int | None = None
+    for page in range(1, MAX_API_PAGES + 1):
+        payload = api.get(_page_path(path, page))
+        if not isinstance(payload, dict):
+            raise SettingsError(f"{label} page is invalid")
+        total = payload.get("total_count")
+        values = payload.get(member)
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, int)
+            or total < 0
+            or not isinstance(values, list)
+            or len(values) > PER_PAGE
+        ):
+            raise SettingsError(f"{label} page is invalid")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise SettingsError(f"{label} total changed during pagination")
+        result.extend(values)
+        if len(result) > total:
+            raise SettingsError(f"{label} exceeds declared total")
+        if len(values) < PER_PAGE:
+            if len(result) != total:
+                raise SettingsError(f"{label} does not match declared total")
+            return result
+    raise SettingsError(f"{label} pagination exceeds limit")
+
+
+def _secret_names(values: list[Any], *, label: str) -> set[str]:
+    names: set[str] = set()
+    for value in values:
+        name = value.get("name") if isinstance(value, dict) else None
+        if not isinstance(name, str) or not SECRET_NAME.fullmatch(name) or name in names:
+            raise SettingsError(f"{label} contains invalid or duplicate metadata")
+        names.add(name)
+    return names
+
+
+def _organization_secret_applies(
+    api: GitHubApi,
+    *,
+    repository: str,
+    repository_id: int,
+    repository_private: bool,
+    organization: str,
+    secret: dict[str, Any],
+) -> bool:
+    name = secret.get("name")
+    visibility = secret.get("visibility")
+    if not isinstance(name, str) or not SECRET_NAME.fullmatch(name):
+        raise SettingsError("organization secret metadata is invalid")
+    if visibility == "all":
+        return True
+    if visibility == "private":
+        return repository_private
+    if visibility != "selected":
+        raise SettingsError(f"organization secret {name} visibility is invalid")
+    selected = _paginated_collection(
+        api,
+        f"/orgs/{urllib.parse.quote(organization, safe='')}/actions/secrets/"
+        f"{urllib.parse.quote(name, safe='')}/repositories",
+        member="repositories",
+        label=f"organization secret {name} selected repositories",
+    )
+    identifiers: set[int] = set()
+    for value in selected:
+        identifier = value.get("id") if isinstance(value, dict) else None
+        full_name = value.get("full_name") if isinstance(value, dict) else None
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier < 1
+            or identifier in identifiers
+            or not isinstance(full_name, str)
+        ):
+            raise SettingsError(
+                f"organization secret {name} selected repository metadata is invalid"
+            )
+        identifiers.add(identifier)
+        if identifier == repository_id and full_name != repository:
+            raise SettingsError(
+                f"organization secret {name} repository identity is inconsistent"
+            )
+    return repository_id in identifiers
 
 
 def _ruleset_covers(
@@ -81,112 +213,112 @@ def _ruleset_covers(
     target: str,
     include: str,
     required_rules: set[str],
+    required_name: str | None = None,
+    required_source: str | None = None,
     required_status_context: str | None = None,
     required_status_integration_id: int | None = None,
-    require_pull_request_hardening: bool = False,
+    required_pull_request_approvals: int | None = None,
     required_bypass_team_id: int | None = None,
     required_bypass_mode: str | None = None,
 ) -> bool:
-    for ruleset in rulesets:
-        if (
-            not isinstance(ruleset, dict)
-            or ruleset.get("target") != target
-            or ruleset.get("enforcement") != "active"
-        ):
-            continue
-        conditions = ruleset.get("conditions")
-        if not isinstance(conditions, dict):
-            continue
-        ref_name = conditions.get("ref_name")
-        includes = ref_name.get("include") if isinstance(ref_name, dict) else None
-        excludes = ref_name.get("exclude") if isinstance(ref_name, dict) else None
-        if (
-            not isinstance(includes, list)
-            or include not in includes
-            or not isinstance(excludes, list)
-            or excludes
-        ):
-            continue
-        rules = ruleset.get("rules")
-        if not isinstance(rules, list):
-            continue
-        types = {
-            rule.get("type")
-            for rule in rules
-            if isinstance(rule, dict) and isinstance(rule.get("type"), str)
-        }
-        if not required_rules <= types:
-            continue
-        if required_bypass_team_id is not None:
-            bypass_actors = ruleset.get("bypass_actors")
-            if not isinstance(bypass_actors, list):
-                continue
-            observed = {
-                (
-                    actor.get("actor_id"),
-                    actor.get("actor_type"),
-                    actor.get("bypass_mode"),
-                )
-                for actor in bypass_actors
-                if isinstance(actor, dict)
-            }
-            if observed != {
-                (required_bypass_team_id, "Team", required_bypass_mode)
-            }:
-                continue
-        if required_status_context is not None:
-            status_rules = [
-                rule
-                for rule in rules
-                if isinstance(rule, dict) and rule.get("type") == "required_status_checks"
-            ]
-            if len(status_rules) != 1:
-                continue
-            parameters = status_rules[0].get("parameters")
-            checks = (
-                parameters.get("required_status_checks")
-                if isinstance(parameters, dict)
-                else None
+    candidates = [
+        value
+        for value in rulesets
+        if isinstance(value, dict)
+        and value.get("target") == target
+        and value.get("enforcement") == "active"
+    ]
+    if len(candidates) != 1:
+        return False
+    ruleset = candidates[0]
+    if required_name is not None and ruleset.get("name") != required_name:
+        return False
+    if required_source is not None and (
+        ruleset.get("source") != required_source
+        or ruleset.get("source_type") != "Repository"
+    ):
+        return False
+    conditions = ruleset.get("conditions")
+    if not isinstance(conditions, dict) or set(conditions) != {"ref_name"}:
+        return False
+    ref_name = conditions.get("ref_name")
+    if not isinstance(ref_name, dict) or ref_name != {
+        "include": [include],
+        "exclude": [],
+    }:
+        return False
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list) or len(rules) != len(required_rules):
+        return False
+    types = [
+        rule.get("type")
+        for rule in rules
+        if isinstance(rule, dict) and isinstance(rule.get("type"), str)
+    ]
+    if len(types) != len(rules) or set(types) != required_rules:
+        return False
+    for rule in rules:
+        rule_type = rule.get("type")
+        if rule_type not in {"pull_request", "required_status_checks"} and set(rule) != {
+            "type"
+        }:
+            return False
+
+    bypass_actors = ruleset.get("bypass_actors", [])
+    if not isinstance(bypass_actors, list):
+        return False
+    if required_bypass_team_id is None:
+        if bypass_actors:
+            return False
+    else:
+        observed = [
+            (
+                actor.get("actor_id"),
+                actor.get("actor_type"),
+                actor.get("bypass_mode"),
             )
-            if (
-                not isinstance(parameters, dict)
-                or parameters.get("strict_required_status_checks_policy") is not True
-                or parameters.get("do_not_enforce_on_create") is not False
-                or checks
-                != [
-                    {
-                        "context": required_status_context,
-                        "integration_id": required_status_integration_id,
-                    }
-                ]
-            ):
-                continue
-        if require_pull_request_hardening:
-            pull_request_rules = [
-                rule
-                for rule in rules
-                if isinstance(rule, dict) and rule.get("type") == "pull_request"
-            ]
-            if len(pull_request_rules) != 1:
-                continue
-            parameters = pull_request_rules[0].get("parameters")
-            approvals = (
-                parameters.get("required_approving_review_count")
-                if isinstance(parameters, dict)
-                else None
-            )
-            if (
-                isinstance(approvals, bool)
-                or not isinstance(approvals, int)
-                or approvals != 0
-                or parameters.get("dismiss_stale_reviews_on_push") is not False
-                or parameters.get("require_code_owner_review") is not False
-                or parameters.get("require_last_push_approval") is not False
-                or parameters.get("required_review_thread_resolution") is not True
-            ):
-                continue
-        return True
-    return False
+            for actor in bypass_actors
+            if isinstance(actor, dict)
+        ]
+        if len(observed) != len(bypass_actors) or observed != [
+            (required_bypass_team_id, "Team", required_bypass_mode)
+        ]:
+            return False
+
+    if required_status_context is not None:
+        status_rules = [
+            rule for rule in rules if rule.get("type") == "required_status_checks"
+        ]
+        if len(status_rules) != 1 or status_rules[0].get("parameters") != {
+            "strict_required_status_checks_policy": True,
+            "do_not_enforce_on_create": False,
+            "required_status_checks": [
+                {
+                    "context": required_status_context,
+                    "integration_id": required_status_integration_id,
+                }
+            ],
+        }:
+            return False
+    if required_pull_request_approvals is not None:
+        pull_request_rules = [
+            rule for rule in rules if rule.get("type") == "pull_request"
+        ]
+        if len(pull_request_rules) != 1 or pull_request_rules[0].get(
+            "parameters"
+        ) != {
+            "allowed_merge_methods": ["merge", "squash", "rebase"],
+            "dismiss_stale_reviews_on_push": True,
+            "dismissal_restriction": {"allowed_actors": [], "enabled": False},
+            "require_code_owner_review": True,
+            "require_extra_approval_for_unattributed_changes": True,
+            "require_last_push_approval": True,
+            "required_approving_review_count": required_pull_request_approvals,
+            "required_review_thread_resolution": True,
+            "required_reviewers": [],
+        }:
+            return False
+    return True
 
 
 def verify_settings(
@@ -200,31 +332,66 @@ def verify_settings(
     if not COMMIT_SHA.fullmatch(trusted_publisher_sha):
         raise SettingsError("trusted publisher SHA is invalid")
     policy = _strict_json(policy_path.read_bytes(), label="release security policy")
-    if not isinstance(policy, dict) or policy.get("schemaVersion") != 1:
+    if (
+        not isinstance(policy, dict)
+        or policy.get("schemaVersion") != 1
+        or set(policy)
+        != {
+            "schemaVersion",
+            "defaultBranch",
+            "requiredStatusContext",
+            "releaseAdminTeamId",
+            "immutableReleases",
+            "trustedTagSignerFingerprints",
+            "legacyUnsignedReruns",
+            "governance",
+            "requiredEnvironments",
+            "forbiddenRepositorySecrets",
+            "apt",
+            "iq9075",
+        }
+    ):
         raise SettingsError("release security policy is invalid")
     default_branch = policy.get("defaultBranch")
     required_status_context = policy.get("requiredStatusContext")
     environments = policy.get("requiredEnvironments")
     release_admin_team_id = policy.get("releaseAdminTeamId")
     governance = policy.get("governance")
+    expected_governance = {
+        "pullRequestApprovals": 1,
+        "dismissStaleReviewsOnPush": True,
+        "requireCodeOwnerReview": True,
+        "requireLastPushApproval": True,
+        "requireExtraApprovalForUnattributedChanges": True,
+        "requiredReviewThreadResolution": True,
+        "allowedMergeMethods": ["merge", "squash", "rebase"],
+        "environmentReviewers": 0,
+        "requiredStatusContext": required_status_context,
+        "requiredStatusIntegrationId": 15368,
+    }
+    expected_environment_secrets = {
+        "homebrew-release": ["HOMEBREW_TAP_TOKEN"],
+        "apt-release": [
+            "APT_GPG_PASSPHRASE",
+            "APT_GPG_PRIVATE_KEY",
+            "GCP_PROJECT_ID",
+            "GCP_SA_KEY",
+        ],
+        "iq9075-release": [
+            "GCP_PROJECT_ID",
+            "GCP_SA_KEY",
+            "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
+        ],
+        "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
+    }
     if (
-        not isinstance(default_branch, str)
-        or not isinstance(required_status_context, str)
-        or not required_status_context
+        default_branch != "main"
+        or required_status_context != "agent-release-gate"
         or not isinstance(environments, dict)
-        or isinstance(release_admin_team_id, bool)
-        or not isinstance(release_admin_team_id, int)
-        or release_admin_team_id < 1
+        or release_admin_team_id != 16128529
         or policy.get("immutableReleases") is not True
-        or governance
-        != {
-            "pullRequestApprovals": 0,
-            "environmentReviewers": 0,
-            "requiredStatusContext": required_status_context,
-            "requiredStatusIntegrationId": 15368,
-        }
-        or set(environments)
-        != {"homebrew-release", "apt-release", "iq9075-release"}
+        or governance != expected_governance
+        or set(environments) != set(expected_environment_secrets)
     ):
         raise SettingsError("release security policy settings are invalid")
     api = GitHubApi(repository, token)
@@ -240,36 +407,71 @@ def verify_settings(
     branch = api.get(f"/repos/{repository}/branches/{urllib.parse.quote(default_branch)}")
     if not isinstance(branch, dict) or branch.get("protected") is not True:
         raise SettingsError("default branch is not protected")
-    ruleset_summaries = api.get(f"/repos/{repository}/rulesets?includes_parents=true")
-    if not isinstance(ruleset_summaries, list):
-        raise SettingsError("repository ruleset response is invalid")
+    ruleset_summaries = _paginated_list(
+        api,
+        f"/repos/{repository}/rulesets?includes_parents=true",
+        label="effective repository rulesets",
+    )
     rulesets: list[Any] = []
+    identifiers: set[int] = set()
     for summary in ruleset_summaries:
         identifier = summary.get("id") if isinstance(summary, dict) else None
-        if isinstance(identifier, bool) or not isinstance(identifier, int) or identifier < 1:
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier < 1
+            or identifier in identifiers
+        ):
             raise SettingsError("repository ruleset identifier is invalid")
-        rulesets.append(api.get(f"/repos/{repository}/rulesets/{identifier}"))
+        identifiers.add(identifier)
+        detail = api.get(f"/repos/{repository}/rulesets/{identifier}")
+        if not isinstance(detail, dict) or detail.get("id") != identifier:
+            raise SettingsError("repository ruleset detail identity is invalid")
+        rulesets.append(detail)
+    active_rulesets = [
+        value
+        for value in rulesets
+        if isinstance(value, dict) and value.get("enforcement") == "active"
+    ]
+    active_targets = [value.get("target") for value in active_rulesets]
+    if (
+        len(active_rulesets) != 2
+        or not all(isinstance(value, str) for value in active_targets)
+        or sorted(active_targets) != ["branch", "tag"]
+    ):
+        raise SettingsError("effective release governance has unexpected active rulesets")
     if not _ruleset_covers(
-        rulesets,
+        active_rulesets,
         target="branch",
         include=f"refs/heads/{default_branch}",
         required_rules={"deletion", "non_fast_forward", "pull_request", "required_status_checks"},
+        required_name="protected-main",
+        required_source=repository,
         required_status_context=required_status_context,
         required_status_integration_id=15368,
-        require_pull_request_hardening=True,
+        required_pull_request_approvals=1,
         required_bypass_team_id=release_admin_team_id,
         required_bypass_mode="pull_request",
     ):
         raise SettingsError("active protected-main ruleset is incomplete")
     if not _ruleset_covers(
-        rulesets,
+        active_rulesets,
         target="tag",
         include="refs/tags/v*",
         required_rules={"creation", "deletion", "non_fast_forward"},
+        required_name="protected-release-tags",
+        required_source=repository,
         required_bypass_team_id=release_admin_team_id,
         required_bypass_mode="always",
     ):
         raise SettingsError("active v* tag ruleset is incomplete")
+    classic_protection = api.get_optional(
+        f"/repos/{repository}/branches/{urllib.parse.quote(default_branch)}/protection"
+    )
+    if classic_protection is not API_NOT_FOUND:
+        raise SettingsError(
+            "classic default-branch protection must be absent; the exact ruleset is authoritative"
+        )
     permissions = api.get(f"/repos/{repository}/actions/permissions/workflow")
     if not isinstance(permissions, dict) or (
         permissions.get("default_workflow_permissions") != "read"
@@ -281,21 +483,33 @@ def verify_settings(
         if not isinstance(name, str) or not isinstance(requirements, dict):
             raise SettingsError("environment policy is invalid")
         required_secrets = requirements.get("requiredSecrets")
+        expected_branch_policy = {
+            "protectedBranches": False,
+            "customBranchPolicies": True,
+        }
+        expected_deployment_policies = [{"name": default_branch, "type": "branch"}]
         if (
             set(requirements)
             != {
                 "requireReviewers",
                 "preventSelfReview",
                 "reviewerTeamId",
+                "deploymentBranchPolicy",
+                "deploymentBranchPolicies",
+                "protectionRuleTypes",
                 "requiredSecrets",
             }
             or requirements.get("requireReviewers") is not False
             or requirements.get("preventSelfReview") is not False
             or requirements.get("reviewerTeamId") is not None
+            or requirements.get("deploymentBranchPolicy") != expected_branch_policy
+            or requirements.get("deploymentBranchPolicies")
+            != expected_deployment_policies
+            or requirements.get("protectionRuleTypes") != ["branch_policy"]
             or not isinstance(required_secrets, list)
-            or not required_secrets
+            or required_secrets != expected_environment_secrets[name]
             or not all(
-                isinstance(secret, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,99}", secret)
+                isinstance(secret, str) and SECRET_NAME.fullmatch(secret)
                 for secret in required_secrets
             )
             or len(set(required_secrets)) != len(required_secrets)
@@ -307,15 +521,37 @@ def verify_settings(
         if not isinstance(environment, dict) or environment.get("name") != name:
             raise SettingsError(f"required environment is unavailable: {name}")
         branch_policy = environment.get("deployment_branch_policy")
-        if not isinstance(branch_policy, dict) or (
-            branch_policy.get("protected_branches") is not True
-            or branch_policy.get("custom_branch_policies") is not False
-        ):
-            raise SettingsError(f"environment {name} is not restricted to protected branches")
+        if branch_policy != {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        }:
+            raise SettingsError(f"environment {name} branch-policy mode is invalid")
         protection_rules = environment.get("protection_rules")
-        if not isinstance(protection_rules, list) or protection_rules:
+        if (
+            not isinstance(protection_rules, list)
+            or len(protection_rules) != 1
+            or not isinstance(protection_rules[0], dict)
+            or protection_rules[0].get("type") != "branch_policy"
+        ):
             raise SettingsError(
-                f"environment {name} must have no approval or wait protection rules"
+                f"environment {name} must have exactly the branch-policy protection rule"
+            )
+        deployment_policies = _paginated_collection(
+            api,
+            f"/repos/{repository}/environments/{urllib.parse.quote(name, safe='')}/deployment-branch-policies",
+            member="branch_policies",
+            label=f"environment {name} deployment branch policies",
+        )
+        normalized_policies = [
+            {"name": value.get("name"), "type": value.get("type")}
+            for value in deployment_policies
+            if isinstance(value, dict)
+        ]
+        if len(normalized_policies) != len(deployment_policies) or normalized_policies != [
+            {"name": default_branch, "type": "branch"}
+        ]:
+            raise SettingsError(
+                f"environment {name} must allow exactly the main branch"
             )
 
     if include_secret_scopes:
@@ -327,37 +563,91 @@ def verify_settings(
             variable = api.get(f"/repos/{repository}/actions/variables/{name}")
             if not isinstance(variable, dict) or variable.get("value") != expected:
                 raise SettingsError(f"repository variable {name} does not match policy")
-        repository_secrets = api.get(f"/repos/{repository}/actions/secrets?per_page=100")
-        if not isinstance(repository_secrets, dict) or not isinstance(
-            repository_secrets.get("secrets"), list
-        ):
-            raise SettingsError("repository secret metadata response is invalid")
-        names = {
-            value.get("name")
-            for value in repository_secrets["secrets"]
-            if isinstance(value, dict)
-        }
         forbidden = policy.get("forbiddenRepositorySecrets")
-        if not isinstance(forbidden, list) or names & set(forbidden):
-            raise SettingsError("high-impact release secrets remain repository-scoped")
-        for name, requirements in environments.items():
-            secret_payload = api.get(
-                f"/repos/{repository}/environments/{urllib.parse.quote(name, safe='')}/secrets?per_page=100"
+        expected_forbidden = [
+            "APT_GPG_PASSPHRASE",
+            "APT_GPG_PRIVATE_KEY",
+            "GCP_PROJECT_ID",
+            "GCP_SA_KEY",
+            "HOMEBREW_TAP_TOKEN",
+            "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
+            "IQ9075_RELEASE_SIGNING_KEY_ID",
+            "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
+        ]
+        if (
+            not isinstance(forbidden, list)
+            or not forbidden
+            or forbidden != expected_forbidden
+            or len(set(forbidden)) != len(forbidden)
+            or not all(
+                isinstance(value, str) and SECRET_NAME.fullmatch(value)
+                for value in forbidden
             )
-            if not isinstance(secret_payload, dict) or not isinstance(
-                secret_payload.get("secrets"), list
-            ):
-                raise SettingsError(
-                    f"environment {name} secret metadata response is invalid"
-                )
-            available = {
-                value.get("name")
-                for value in secret_payload["secrets"]
-                if isinstance(value, dict)
-            }
+        ):
+            raise SettingsError("forbidden release secret policy is invalid")
+        forbidden_names = set(forbidden)
+        repository_secrets = _paginated_collection(
+            api,
+            f"/repos/{repository}/actions/secrets",
+            member="secrets",
+            label="repository secret metadata",
+        )
+        names = _secret_names(repository_secrets, label="repository secret metadata")
+        if names & forbidden_names:
+            raise SettingsError("high-impact release secrets remain repository-scoped")
+
+        repository_id = repo.get("id") if isinstance(repo, dict) else None
+        repository_private = repo.get("private") if isinstance(repo, dict) else None
+        owner = repo.get("owner") if isinstance(repo, dict) else None
+        owner_login = owner.get("login") if isinstance(owner, dict) else None
+        owner_type = owner.get("type") if isinstance(owner, dict) else None
+        if (
+            isinstance(repository_id, bool)
+            or not isinstance(repository_id, int)
+            or repository_id < 1
+            or not isinstance(repository_private, bool)
+            or not isinstance(owner_login, str)
+            or owner_login.lower() != repository.split("/", 1)[0].lower()
+            or owner_type not in {"Organization", "User"}
+        ):
+            raise SettingsError("repository owner metadata is invalid")
+        if owner_type == "Organization":
+            organization_secrets = _paginated_collection(
+                api,
+                f"/orgs/{urllib.parse.quote(owner_login, safe='')}/actions/secrets",
+                member="secrets",
+                label="organization secret metadata",
+            )
+            _secret_names(organization_secrets, label="organization secret metadata")
+            for value in organization_secrets:
+                if not isinstance(value, dict):  # guarded by _secret_names
+                    raise SettingsError("organization secret metadata is invalid")
+                if value.get("name") in forbidden_names and _organization_secret_applies(
+                    api,
+                    repository=repository,
+                    repository_id=repository_id,
+                    repository_private=repository_private,
+                    organization=owner_login,
+                    secret=value,
+                ):
+                    raise SettingsError(
+                        "high-impact release secret is shared from the organization"
+                    )
+        for name, requirements in environments.items():
+            secret_metadata = _paginated_collection(
+                api,
+                f"/repos/{repository}/environments/{urllib.parse.quote(name, safe='')}/secrets",
+                member="secrets",
+                label=f"environment {name} secret metadata",
+            )
+            available = _secret_names(
+                secret_metadata, label=f"environment {name} secret metadata"
+            )
             required = requirements.get("requiredSecrets")
-            if not isinstance(required, list) or not set(required) <= available:
-                raise SettingsError(f"environment {name} is missing required secret metadata")
+            if not isinstance(required, list) or set(required) != available:
+                raise SettingsError(
+                    f"environment {name} secret metadata differs from exact policy"
+                )
     return {
         "schemaVersion": 1,
         "repository": repository,

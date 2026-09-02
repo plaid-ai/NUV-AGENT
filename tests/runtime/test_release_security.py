@@ -59,6 +59,10 @@ SETTINGS_ATTESTATION = load_script(
     "verify_release_settings_attestation",
     "packaging/release/verify-release-settings-attestation.py",
 )
+FACE_MANIFEST = load_script(
+    "face_artifact_manifest",
+    "packaging/release/face-artifact-manifest.py",
+)
 
 
 class ReleaseSecurityWorkflowTest(unittest.TestCase):
@@ -69,6 +73,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.request = (
             ROOT / ".github/workflows/release-request.yml"
         ).read_text(encoding="utf-8")
+        self.face = (
+            ROOT / ".github/workflows/publish-face-artifacts.yml"
+        ).read_text(encoding="utf-8")
 
     def _job(self, name: str) -> str:
         start = self.publish.index(f"  {name}:")
@@ -76,6 +83,24 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         return self.publish[start:] if following is None else self.publish[
             start : start + 1 + following.start()
         ]
+
+    def _steps(self, section: str) -> list[str]:
+        return re.split(r"^      - name: ", section, flags=re.MULTILINE)[1:]
+
+    def _assert_immediate_revalidation(
+        self, section: str, credential_step_name: str
+    ) -> None:
+        steps = self._steps(section)
+        indexes = [
+            index
+            for index, step in enumerate(steps)
+            if step.startswith(credential_step_name + "\n")
+        ]
+        self.assertEqual(len(indexes), 1, credential_step_name)
+        self.assertGreater(indexes[0], 0, credential_step_name)
+        previous = steps[indexes[0] - 1]
+        self.assertIn("verify-release-settings-attestation.py", previous)
+        self.assertIn("--publisher-root publisher", previous)
 
     def test_tag_push_is_secret_zero_and_default_branch_starts_publisher(self) -> None:
         self.assertIn("on:\n  push:\n    tags:", self.request)
@@ -113,6 +138,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "apt-publish": "${{ secrets.",
             "iq9075-ota-publish": "${{ secrets.",
         }
+        verifier_count = {
+            "github-release-publish": 2,
+            "homebrew-publish": 2,
+            "apt-publish": 6,
+            "iq9075-ota-publish": 7,
+        }
         for name in job_names:
             section = self._job(name)
             with self.subTest(job=name):
@@ -127,19 +158,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 self.assertIn("path: publisher", section)
                 self.assertIn("path: settings-evidence", section)
                 self.assertEqual(
-                    section.count("verify-release-settings-attestation.py"), 2
+                    section.count("verify-release-settings-attestation.py"),
+                    verifier_count[name],
                 )
-                self.assertEqual(section.count("--publisher-root publisher"), 2)
+                self.assertEqual(
+                    section.count("--publisher-root publisher"), verifier_count[name]
+                )
                 self.assertEqual(
                     section.count(
                         "--executing-workflow settings-evidence/.github/workflows/release-publish.yml"
                     ),
-                    2,
+                    verifier_count[name],
                 )
-                self.assertLess(
-                    section.rindex("verify-release-settings-attestation.py"),
-                    section.index(credential_reference[name]),
-                )
+                self.assertIn(credential_reference[name], section)
                 if name == "github-release-publish":
                     self.assertIn("permissions:\n      contents: write", section)
                     self.assertNotIn("GITHUB_RELEASE_TOKEN", section)
@@ -147,6 +178,138 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     self.assertNotIn("contents: write", section)
                 self.assertNotIn("ref: ${{ needs.release-preflight.outputs.release_tag }}", section)
                 self.assertNotIn("build-agent-bundle.sh", section)
+
+        credential_steps = {
+            "github-release-publish": [
+                "Finalize exact immutable GitHub release before live channels"
+            ],
+            "homebrew-publish": ["Update Homebrew tap with trusted publisher"],
+            "apt-publish": [
+                "Import APT signing key",
+                "Authenticate APT-only GCP publisher",
+                "Setup gcloud",
+                "Publish exact deb set with trusted publisher",
+                "Publish final distribution promotion after both live channels",
+            ],
+            "iq9075-ota-publish": [
+                "Authenticate OTA-only GCP publisher",
+                "Setup gcloud",
+                "Atomically reserve exact release sequence",
+                "Sign exact bundle BOM with trusted signer",
+                "Publish verified exact bundle with trusted publisher",
+                "Generate and atomically publish final OTA promotion",
+            ],
+        }
+        for job, names in credential_steps.items():
+            for name in names:
+                with self.subTest(job=job, credential_step=name):
+                    self._assert_immediate_revalidation(self._job(job), name)
+
+    def test_face_publisher_is_main_only_pinned_and_revalidates_each_credential(self) -> None:
+        self.assertIn("environment: face-artifacts-release", self.face)
+        self.assertIn("group: face-artifacts-global-publisher", self.face)
+        self.assertIn('[ "$GITHUB_REF" = "refs/heads/main" ]', self.face)
+        self.assertIn("persist-credentials: false", self.face)
+        self.assertIn("--trusted-additional-workflow", self.face)
+        self.assertIn(".github/workflows/publish-face-artifacts.yml", self.face)
+        self.assertIn('"immutable": True', self.face)
+        self.assertIn("verify-release-source.py", self.face)
+        self.assertEqual(self.face.count("face-artifact-manifest.py verify"), 2)
+        self.assertIn("face-artifact-manifest.json.asc", self.face)
+        self.assertIn("immutable face release asset set is not exact", self.face)
+        self.assertEqual(
+            self.face.count("verify-release-settings-attestation.py"), 5
+        )
+        for name in (
+            "Checkout signed face release source as data",
+            "Download exact face artifacts from immutable GitHub release",
+            "Authenticate face-artifact-only GCP publisher",
+            "Setup gcloud",
+            "Publish to model-scoped GCS paths and update pointers",
+        ):
+            with self.subTest(credential_step=name):
+                self._assert_immediate_revalidation(self.face, name)
+        self.assertNotIn('"${{ inputs.', self.face)
+
+    def test_apt_signing_uses_owned_mode_0600_passphrase_file(self) -> None:
+        apt_job = self._job("apt-publish")
+        apt_script = (ROOT / "packaging/apt/publish-gcs.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(apt_job.count("secrets.APT_GPG_PASSPHRASE"), 1)
+        self.assertIn('chmod 0600 "$passphrase_file"', apt_job)
+        self.assertIn('--passphrase-file "$passphrase_file"', apt_job)
+        self.assertNotIn('--passphrase "$GPG_PASSPHRASE"', apt_job)
+        self.assertIn("trap cleanup_import_passphrase EXIT", apt_job)
+        self.assertIn("trap - EXIT", apt_job)
+        self.assertIn("trap cleanup_passphrase EXIT", apt_job)
+        self.assertIn("Remove APT passphrase file on every exit path", apt_job)
+        self.assertIn('APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime', apt_job)
+        self.assertIn('file_mode" != "600"', apt_script)
+        self.assertIn('file_owner" != "$(id -u)"', apt_script)
+        self.assertEqual(
+            apt_script.count('-batch -passphrase-file="$APTLY_PASSPHRASE_FILE"'),
+            2,
+        )
+
+    def test_apt_import_failure_removes_passphrase_before_environment_handoff(self) -> None:
+        apt_job = self._job("apt-publish")
+        import_step = next(
+            step
+            for step in self._steps(apt_job)
+            if step.startswith("Import APT signing key\n")
+        )
+        raw_script = import_step.split("        run: |\n", 1)[1]
+        script_lines: list[str] = []
+        for line in raw_script.splitlines():
+            if line.startswith("      - name: "):
+                break
+            if line.startswith("          "):
+                script_lines.append(line[10:])
+            elif line:
+                self.fail(f"unexpected workflow script indentation: {line}")
+        script = "\n".join(script_lines) + "\n"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            fake_bin = root / "bin"
+            runner_temp = root / "runner-temp"
+            gpg_home = root / "gnupg"
+            github_env = root / "github-env"
+            fake_bin.mkdir()
+            runner_temp.mkdir()
+            fake_gpg = fake_bin / "gpg"
+            fake_gpg.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if [[ \" $* \" == *\" --sign \"* ]]; then exit 19; fi\n"
+                "cat >/dev/null\n",
+                encoding="utf-8",
+            )
+            fake_gpg.chmod(0o755)
+            fake_gpgconf = fake_bin / "gpgconf"
+            fake_gpgconf.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_gpgconf.chmod(0o755)
+            result = subprocess.run(
+                ["bash"],
+                input=script,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "GNUPGHOME": str(gpg_home),
+                    "RUNNER_TEMP": str(runner_temp),
+                    "GITHUB_ENV": str(github_env),
+                    "GPG_PRIVATE_KEY": "private-key-material",
+                    "GPG_PASSPHRASE": "passphrase-material",
+                    "GPG_KEY_ID": "TEST-KEY",
+                },
+                check=False,
+            )
+            self.assertEqual(result.returncode, 19, result.stderr)
+            self.assertEqual(list(runner_temp.glob("nuv-aptly-passphrase.*")), [])
+            self.assertFalse(github_env.exists())
 
     def test_github_is_immutable_before_rerunnable_live_channel_promotion(self) -> None:
         github = self._job("github-release-publish")
@@ -261,15 +424,15 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertNotIn("secrets.IQ9075_RELEASE_SIGNING_KEY_ID", self.publish)
         self.assertNotIn(
             "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
-            policy_path.read_text(encoding="utf-8"),
+            policy["requiredEnvironments"]["iq9075-release"]["requiredSecrets"],
+        )
+        self.assertIn(
+            "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
+            policy["forbiddenRepositorySecrets"],
         )
 
     def test_all_external_actions_are_full_sha_pinned(self) -> None:
-        for path in (
-            ROOT / ".github/workflows/agent-release-gate.yml",
-            ROOT / ".github/workflows/release-request.yml",
-            ROOT / ".github/workflows/release-publish.yml",
-        ):
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
             for line in path.read_text(encoding="utf-8").splitlines():
                 match = re.search(r"\buses:\s*([^\s#]+)", line)
                 if match is None or match.group(1).startswith("./"):
@@ -533,7 +696,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
             second = PROMOTION.build_distribution(arguments)
             self.assertEqual(first, second)
             self.assertEqual(first["status"], "PROMOTED")
-            self.assertEqual(first["governance"]["pullRequestApprovals"], 0)
+            self.assertEqual(first["governance"]["pullRequestApprovals"], 1)
             self.assertEqual(first["governance"]["environmentReviewers"], 0)
             self.assertEqual(
                 first["artifacts"]["homebrewFormula"]["name"], "formula"
@@ -665,6 +828,35 @@ SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             ),
             ("c" * 64, 123),
         )
+
+    def test_apt_passphrase_file_rejects_weak_mode_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            deb = root / "nuv-agent_0.1.121_arm64.deb"
+            deb.write_bytes(b"not reached")
+            passphrase = root / "apt-passphrase"
+            passphrase.write_text("secret", encoding="utf-8")
+            passphrase.chmod(0o644)
+            environment = {
+                **os.environ,
+                "APTLY_PASSPHRASE_FILE": str(passphrase),
+                "APT_RUNTIME_ROOT": str(root / "runtime"),
+            }
+            command = [str(ROOT / "packaging/apt/publish-gcs.sh"), str(deb)]
+            weak = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+            self.assertNotEqual(weak.returncode, 0)
+            self.assertIn("mode 0600", weak.stderr)
+            passphrase.chmod(0o600)
+            symlink = root / "passphrase-link"
+            symlink.symlink_to(passphrase)
+            environment["APTLY_PASSPHRASE_FILE"] = str(symlink)
+            linked = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertIn("regular file", linked.stderr)
 
     def _fake_gcloud(self, root: Path) -> tuple[Path, Path, Path]:
         binary = root / "bin"
@@ -873,7 +1065,7 @@ esac
 
 
 class SettingsPolicyTest(unittest.TestCase):
-    def test_approved_governance_is_zero_approval_but_status_gate_remains_strict(self) -> None:
+    def test_general_writers_require_hardened_review_with_single_admin_bypass(self) -> None:
         policy = json.loads(
             (ROOT / "packaging/release/release-security-policy.json").read_text(
                 encoding="utf-8"
@@ -882,20 +1074,65 @@ class SettingsPolicyTest(unittest.TestCase):
         self.assertEqual(
             policy["governance"],
             {
-                "pullRequestApprovals": 0,
+                "pullRequestApprovals": 1,
+                "dismissStaleReviewsOnPush": True,
+                "requireCodeOwnerReview": True,
+                "requireLastPushApproval": True,
+                "requireExtraApprovalForUnattributedChanges": True,
+                "requiredReviewThreadResolution": True,
+                "allowedMergeMethods": ["merge", "squash", "rebase"],
                 "environmentReviewers": 0,
                 "requiredStatusContext": "agent-release-gate",
                 "requiredStatusIntegrationId": 15368,
+            },
+        )
+        self.assertEqual(
+            set(policy["requiredEnvironments"]),
+            {
+                "homebrew-release",
+                "apt-release",
+                "iq9075-release",
+                "face-artifacts-release",
             },
         )
         for environment in policy["requiredEnvironments"].values():
             self.assertFalse(environment["requireReviewers"])
             self.assertFalse(environment["preventSelfReview"])
             self.assertIsNone(environment["reviewerTeamId"])
+            self.assertEqual(
+                environment["deploymentBranchPolicy"],
+                {"protectedBranches": False, "customBranchPolicies": True},
+            )
+            self.assertEqual(
+                environment["deploymentBranchPolicies"],
+                [{"name": "main", "type": "branch"}],
+            )
+            self.assertEqual(environment["protectionRuleTypes"], ["branch_policy"])
+        codeowners = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        self.assertIn("/.github/workflows/** @plaid-ai/platform-admin", codeowners)
+        self.assertIn("/packaging/** @plaid-ai/platform-admin", codeowners)
+        self.assertIn("/nuvion_updater/** @plaid-ai/platform-admin", codeowners)
         self.assertNotIn("GITHUB_RELEASE_TOKEN", json.dumps(policy))
+        self.assertEqual(
+            policy["forbiddenRepositorySecrets"],
+            [
+                "APT_GPG_PASSPHRASE",
+                "APT_GPG_PRIVATE_KEY",
+                "GCP_PROJECT_ID",
+                "GCP_SA_KEY",
+                "HOMEBREW_TAP_TOKEN",
+                "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
+                "IQ9075_RELEASE_SIGNING_KEY_ID",
+                "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
+            ],
+        )
 
     def test_settings_audit_accepts_no_environment_wait_and_rejects_reviewer_rule(self) -> None:
         branch_ruleset = {
+            "id": 1,
+            "name": "protected-main",
+            "source": "plaid-ai/NUV-AGENT",
+            "source_type": "Repository",
             "target": "branch",
             "enforcement": "active",
             "conditions": {
@@ -914,11 +1151,18 @@ class SettingsPolicyTest(unittest.TestCase):
                 {
                     "type": "pull_request",
                     "parameters": {
-                        "required_approving_review_count": 0,
-                        "dismiss_stale_reviews_on_push": False,
-                        "require_code_owner_review": False,
-                        "require_last_push_approval": False,
+                        "allowed_merge_methods": ["merge", "squash", "rebase"],
+                        "dismiss_stale_reviews_on_push": True,
+                        "dismissal_restriction": {
+                            "allowed_actors": [],
+                            "enabled": False,
+                        },
+                        "require_code_owner_review": True,
+                        "require_extra_approval_for_unattributed_changes": True,
+                        "require_last_push_approval": True,
+                        "required_approving_review_count": 1,
                         "required_review_thread_resolution": True,
+                        "required_reviewers": [],
                     },
                 },
                 {
@@ -937,6 +1181,10 @@ class SettingsPolicyTest(unittest.TestCase):
             ],
         }
         tag_ruleset = {
+            "id": 2,
+            "name": "protected-release-tags",
+            "source": "plaid-ai/NUV-AGENT",
+            "source_type": "Repository",
             "target": "tag",
             "enforcement": "active",
             "conditions": {
@@ -956,10 +1204,15 @@ class SettingsPolicyTest(unittest.TestCase):
             ],
         }
         responses: dict[str, object] = {
-            "/repos/plaid-ai/NUV-AGENT": {"default_branch": "main"},
+            "/repos/plaid-ai/NUV-AGENT": {
+                "id": 1149331364,
+                "default_branch": "main",
+                "private": False,
+                "owner": {"login": "plaid-ai", "type": "Organization"},
+            },
             "/repos/plaid-ai/NUV-AGENT/immutable-releases": {"enabled": True},
             "/repos/plaid-ai/NUV-AGENT/branches/main": {"protected": True},
-            "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true": [
+            "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true&per_page=100&page=1": [
                 {"id": 1},
                 {"id": 2},
             ],
@@ -970,18 +1223,57 @@ class SettingsPolicyTest(unittest.TestCase):
                 "can_approve_pull_request_reviews": False,
             },
         }
-        for name in ("homebrew-release", "apt-release", "iq9075-release"):
+        for name in (
+            "homebrew-release",
+            "apt-release",
+            "iq9075-release",
+            "face-artifacts-release",
+        ):
             responses[f"/repos/plaid-ai/NUV-AGENT/environments/{name}"] = {
                 "name": name,
                 "deployment_branch_policy": {
-                    "protected_branches": True,
-                    "custom_branch_policies": False,
+                    "protected_branches": False,
+                    "custom_branch_policies": True,
                 },
-                "protection_rules": [],
+                "protection_rules": [{"id": 1, "type": "branch_policy"}],
+            }
+            responses[
+                f"/repos/plaid-ai/NUV-AGENT/environments/{name}/deployment-branch-policies?per_page=100&page=1"
+            ] = {
+                "total_count": 1,
+                "branch_policies": [{"id": 1, "name": "main", "type": "branch"}],
+            }
+
+        policy = json.loads(
+            (ROOT / "packaging/release/release-security-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        responses[
+            "/repos/plaid-ai/NUV-AGENT/actions/variables/RELEASE_SECURITY_POLICY_VERSION"
+        ] = {"value": "1"}
+        responses[
+            "/repos/plaid-ai/NUV-AGENT/actions/variables/RELEASE_TRUSTED_PUBLISHER_SHA"
+        ] = {"value": "a" * 40}
+        responses[
+            "/repos/plaid-ai/NUV-AGENT/actions/secrets?per_page=100&page=1"
+        ] = {"total_count": 0, "secrets": []}
+        responses[
+            "/orgs/plaid-ai/actions/secrets?per_page=100&page=1"
+        ] = {"total_count": 0, "secrets": []}
+        for name, requirements in policy["requiredEnvironments"].items():
+            responses[
+                f"/repos/plaid-ai/NUV-AGENT/environments/{name}/secrets?per_page=100&page=1"
+            ] = {
+                "total_count": len(requirements["requiredSecrets"]),
+                "secrets": [
+                    {"name": secret} for secret in requirements["requiredSecrets"]
+                ],
             }
 
         fake_api = mock.Mock()
         fake_api.get.side_effect = lambda path: responses[path]
+        fake_api.get_optional.return_value = SETTINGS.API_NOT_FOUND
         with mock.patch.object(SETTINGS, "GitHubApi", return_value=fake_api):
             result = SETTINGS.verify_settings(
                 repository="plaid-ai/NUV-AGENT",
@@ -990,10 +1282,67 @@ class SettingsPolicyTest(unittest.TestCase):
                 trusted_publisher_sha="a" * 40,
                 include_secret_scopes=False,
             )
-            self.assertEqual(result["governance"]["pullRequestApprovals"], 0)
+            self.assertEqual(result["governance"]["pullRequestApprovals"], 1)
+            result = SETTINGS.verify_settings(
+                repository="plaid-ai/NUV-AGENT",
+                token="admin-metadata-only",
+                policy_path=ROOT / "packaging/release/release-security-policy.json",
+                trusted_publisher_sha="a" * 40,
+                include_secret_scopes=True,
+            )
+            self.assertTrue(result["secretScopesChecked"])
             responses[
                 "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
-            ]["protection_rules"] = [{"type": "required_reviewers"}]
+            ]["protection_rules"].append({"type": "required_reviewers"})
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[
+                "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
+            ]["protection_rules"].pop()
+            fake_api.get_optional.return_value = {
+                "required_pull_request_reviews": None,
+                "required_status_checks": None,
+            }
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            fake_api.get_optional.return_value = SETTINGS.API_NOT_FOUND
+            branch_policy_path = (
+                "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release/"
+                "deployment-branch-policies?per_page=100&page=1"
+            )
+            responses[branch_policy_path]["total_count"] = 2
+            responses[branch_policy_path]["branch_policies"].append(
+                {"id": 2, "name": "develop", "type": "branch"}
+            )
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[branch_policy_path]["total_count"] = 1
+            responses[branch_policy_path]["branch_policies"].pop()
+            extra = json.loads(json.dumps(branch_ruleset))
+            extra["id"] = 3
+            extra["rules"][2]["parameters"]["required_approving_review_count"] = 2
+            responses[
+                "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true&per_page=100&page=1"
+            ].append({"id": 3})
+            responses["/repos/plaid-ai/NUV-AGENT/rulesets/3"] = extra
             with self.assertRaises(SETTINGS.SettingsError):
                 SETTINGS.verify_settings(
                     repository="plaid-ai/NUV-AGENT",
@@ -1003,15 +1352,131 @@ class SettingsPolicyTest(unittest.TestCase):
                     include_secret_scopes=False,
                 )
 
+    def test_settings_api_pagination_and_org_secret_scope_are_fail_closed(self) -> None:
+        fake_api = mock.Mock()
+        list_page = [{"id": value} for value in range(1, 101)]
+        fake_api.get.side_effect = lambda path: {
+            "/rulesets?includes_parents=true&per_page=100&page=1": list_page,
+            "/rulesets?includes_parents=true&per_page=100&page=2": [{"id": 101}],
+        }[path]
+        self.assertEqual(
+            len(
+                SETTINGS._paginated_list(
+                    fake_api,
+                    "/rulesets?includes_parents=true",
+                    label="rulesets",
+                )
+            ),
+            101,
+        )
+
+        fake_api.get.side_effect = lambda path: {
+            "/branch-policies?per_page=100&page=1": {
+                "total_count": 1,
+                "branch_policies": [{"name": "main", "type": "branch"}],
+            }
+        }[path]
+        self.assertEqual(
+            SETTINGS._paginated_collection(
+                fake_api,
+                "/branch-policies",
+                member="branch_policies",
+                label="branch policies",
+            ),
+            [{"name": "main", "type": "branch"}],
+        )
+        secret_page = [{"name": f"SECRET_{value:03d}"} for value in range(100)]
+        fake_api.get.side_effect = lambda path: {
+            "/actions/secrets?per_page=100&page=1": {
+                "total_count": 101,
+                "secrets": secret_page,
+            },
+            "/actions/secrets?per_page=100&page=2": {
+                "total_count": 101,
+                "secrets": [{"name": "GCP_SA_KEY"}],
+            },
+        }[path]
+        paginated_secrets = SETTINGS._paginated_collection(
+            fake_api,
+            "/actions/secrets",
+            member="secrets",
+            label="secrets",
+        )
+        self.assertIn("GCP_SA_KEY", SETTINGS._secret_names(paginated_secrets, label="secrets"))
+        fake_api.get.side_effect = lambda path: {
+            "/branch-policies?per_page=100&page=1": {
+                "total_count": 2,
+                "branch_policies": [{"name": "main", "type": "branch"}],
+            }
+        }[path]
+        with self.assertRaises(SETTINGS.SettingsError):
+            SETTINGS._paginated_collection(
+                fake_api,
+                "/branch-policies",
+                member="branch_policies",
+                label="branch policies",
+            )
+
+        fake_api.get.side_effect = lambda path: {
+            "/orgs/plaid-ai/actions/secrets/GCP_SA_KEY/repositories?per_page=100&page=1": {
+                "total_count": 1,
+                "repositories": [
+                    {"id": 1149331364, "full_name": "plaid-ai/NUV-AGENT"}
+                ],
+            }
+        }[path]
+        self.assertTrue(
+            SETTINGS._organization_secret_applies(
+                fake_api,
+                repository="plaid-ai/NUV-AGENT",
+                repository_id=1149331364,
+                repository_private=False,
+                organization="plaid-ai",
+                secret={"name": "GCP_SA_KEY", "visibility": "selected"},
+            )
+        )
+        self.assertFalse(
+            SETTINGS._organization_secret_applies(
+                fake_api,
+                repository="plaid-ai/NUV-AGENT",
+                repository_id=1149331364,
+                repository_private=False,
+                organization="plaid-ai",
+                secret={"name": "GCP_SA_KEY", "visibility": "private"},
+            )
+        )
+
+    def test_classic_protection_probe_accepts_only_http_404(self) -> None:
+        api = SETTINGS.GitHubApi("plaid-ai/NUV-AGENT", "metadata-token")
+        not_found = SETTINGS.urllib.error.HTTPError(
+            "https://api.github.test/protection", 404, "not found", None, None
+        )
+        with mock.patch.object(
+            SETTINGS.urllib.request, "urlopen", side_effect=not_found
+        ):
+            self.assertIs(
+                api.get_optional("/repos/plaid-ai/NUV-AGENT/branches/main/protection"),
+                SETTINGS.API_NOT_FOUND,
+            )
+        denied = SETTINGS.urllib.error.HTTPError(
+            "https://api.github.test/protection", 403, "forbidden", None, None
+        )
+        with mock.patch.object(
+            SETTINGS.urllib.request, "urlopen", side_effect=denied
+        ), self.assertRaises(SETTINGS.SettingsError):
+            api.get_optional("/repos/plaid-ai/NUV-AGENT/branches/main/protection")
+
     def test_publisher_surface_binds_every_tracked_helper_and_workflow_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             repository = root / "publisher"
             workflow = repository / ".github/workflows/release-publish.yml"
+            face_workflow = repository / ".github/workflows/publish-face-artifacts.yml"
             helper = repository / "packaging/release/helper.sh"
             workflow.parent.mkdir(parents=True)
             helper.parent.mkdir(parents=True)
             workflow.write_text("name: trusted\n", encoding="utf-8")
+            face_workflow.write_text("name: trusted-face\n", encoding="utf-8")
             helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             helper.chmod(0o755)
             subprocess.run(["git", "init", "-b", "main", repository], check=True, capture_output=True)
@@ -1030,6 +1495,26 @@ class SettingsPolicyTest(unittest.TestCase):
                 executing,
                 expected_workflow_sha256=surface["workflowSha256"],
             )
+            executing_face = root / "executing-face.yml"
+            executing_face.write_bytes(face_workflow.read_bytes())
+            PUBLISHER_TRUST.verify_additional_executing_workflow(
+                repository,
+                executing_face,
+                publisher_relative_path=".github/workflows/publish-face-artifacts.yml",
+            )
+            executing_face.write_text("name: attacker-face\n", encoding="utf-8")
+            with self.assertRaises(PUBLISHER_TRUST.PublisherTrustError):
+                PUBLISHER_TRUST.verify_additional_executing_workflow(
+                    repository,
+                    executing_face,
+                    publisher_relative_path=".github/workflows/publish-face-artifacts.yml",
+                )
+            with self.assertRaises(PUBLISHER_TRUST.PublisherTrustError):
+                PUBLISHER_TRUST.verify_additional_executing_workflow(
+                    repository,
+                    executing_face,
+                    publisher_relative_path="../../attacker.yml",
+                )
             subprocess.run(
                 [
                     "git",
@@ -1100,6 +1585,9 @@ class SettingsPolicyTest(unittest.TestCase):
     def test_main_ruleset_requires_real_agent_release_gate_context(self) -> None:
         rulesets = [
             {
+                "name": "protected-main",
+                "source": "plaid-ai/NUV-AGENT",
+                "source_type": "Repository",
                 "target": "branch",
                 "enforcement": "active",
                 "conditions": {
@@ -1111,11 +1599,18 @@ class SettingsPolicyTest(unittest.TestCase):
                     {
                         "type": "pull_request",
                         "parameters": {
-                            "required_approving_review_count": 0,
-                            "dismiss_stale_reviews_on_push": False,
-                            "require_code_owner_review": False,
-                            "require_last_push_approval": False,
+                            "allowed_merge_methods": ["merge", "squash", "rebase"],
+                            "dismiss_stale_reviews_on_push": True,
+                            "dismissal_restriction": {
+                                "allowed_actors": [],
+                                "enabled": False,
+                            },
+                            "require_code_owner_review": True,
+                            "require_extra_approval_for_unattributed_changes": True,
+                            "require_last_push_approval": True,
+                            "required_approving_review_count": 1,
                             "required_review_thread_resolution": True,
+                            "required_reviewers": [],
                         },
                     },
                     {
@@ -1137,6 +1632,8 @@ class SettingsPolicyTest(unittest.TestCase):
         arguments = {
             "target": "branch",
             "include": "refs/heads/main",
+            "required_name": "protected-main",
+            "required_source": "plaid-ai/NUV-AGENT",
             "required_rules": {
                 "deletion",
                 "non_fast_forward",
@@ -1145,15 +1642,20 @@ class SettingsPolicyTest(unittest.TestCase):
             },
             "required_status_context": "agent-release-gate",
             "required_status_integration_id": 15368,
-            "require_pull_request_hardening": True,
+            "required_pull_request_approvals": 1,
         }
         self.assertTrue(SETTINGS._ruleset_covers(rulesets, **arguments))
         mutations = [
+            ("name", lambda value: value[0].update(name="almost-protected-main")),
+            ("source", lambda value: value[0].update(source_type="Organization")),
             ("exclude", lambda value: value[0]["conditions"]["ref_name"].update(exclude=["refs/heads/main-hotfix"])),
-            ("approval-count", lambda value: value[0]["rules"][2]["parameters"].update(required_approving_review_count=1)),
-            ("dismiss-stale", lambda value: value[0]["rules"][2]["parameters"].update(dismiss_stale_reviews_on_push=True)),
-            ("code-owner", lambda value: value[0]["rules"][2]["parameters"].update(require_code_owner_review=True)),
-            ("last-push", lambda value: value[0]["rules"][2]["parameters"].update(require_last_push_approval=True)),
+            ("approval-count", lambda value: value[0]["rules"][2]["parameters"].update(required_approving_review_count=2)),
+            ("dismiss-stale", lambda value: value[0]["rules"][2]["parameters"].update(dismiss_stale_reviews_on_push=False)),
+            ("code-owner", lambda value: value[0]["rules"][2]["parameters"].update(require_code_owner_review=False)),
+            ("last-push", lambda value: value[0]["rules"][2]["parameters"].update(require_last_push_approval=False)),
+            ("unattributed", lambda value: value[0]["rules"][2]["parameters"].update(require_extra_approval_for_unattributed_changes=False)),
+            ("merge-method", lambda value: value[0]["rules"][2]["parameters"]["allowed_merge_methods"].remove("rebase")),
+            ("fixed-reviewer", lambda value: value[0]["rules"][2]["parameters"]["required_reviewers"].append({"type": "User", "id": 1})),
             ("resolve-threads", lambda value: value[0]["rules"][2]["parameters"].update(required_review_thread_resolution=False)),
             ("strict", lambda value: value[0]["rules"][3]["parameters"].update(strict_required_status_checks_policy=False)),
             ("create", lambda value: value[0]["rules"][3]["parameters"].update(do_not_enforce_on_create=True)),
@@ -1166,6 +1668,12 @@ class SettingsPolicyTest(unittest.TestCase):
             mutate(candidate)
             with self.subTest(label=label):
                 self.assertFalse(SETTINGS._ruleset_covers(candidate, **arguments))
+
+        duplicate = json.loads(json.dumps(rulesets)) + json.loads(json.dumps(rulesets))
+        self.assertFalse(SETTINGS._ruleset_covers(duplicate, **arguments))
+        extra_rule = json.loads(json.dumps(rulesets))
+        extra_rule[0]["rules"].append({"type": "required_signatures"})
+        self.assertFalse(SETTINGS._ruleset_covers(extra_rule, **arguments))
 
     def test_short_lived_settings_attestation_binds_policy_and_expiry(self) -> None:
         settings_verifier = (
@@ -1191,12 +1699,9 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "defaultBranch": "main",
-                    "governance": {
-                        "pullRequestApprovals": 0,
-                        "environmentReviewers": 0,
-                        "requiredStatusContext": "agent-release-gate",
-                        "requiredStatusIntegrationId": 15368,
-                    },
+                    "governance": json.loads(policy.read_text(encoding="utf-8"))[
+                        "governance"
+                    ],
                     "secretScopesChecked": True,
                     "status": "VERIFIED",
                 },
@@ -1332,12 +1837,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "defaultBranch": "main",
-                    "governance": {
-                        "pullRequestApprovals": 0,
-                        "environmentReviewers": 0,
-                        "requiredStatusContext": "agent-release-gate",
-                        "requiredStatusIntegrationId": 15368,
-                    },
+                    "governance": policy_payload["governance"],
                     "secretScopesChecked": True,
                     "status": "VERIFIED",
                 },
@@ -1430,6 +1930,238 @@ class SettingsPolicyTest(unittest.TestCase):
             {"actor_id": 1, "actor_type": "User", "bypass_mode": "always"}
         )
         self.assertFalse(SETTINGS._ruleset_covers(rulesets, **arguments))
+
+
+class FaceArtifactManifestTest(unittest.TestCase):
+    @staticmethod
+    def _artifacts(root: Path) -> Path:
+        artifacts = root / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "face_detector.onnx").write_bytes(b"onnx-model")
+        (artifacts / "face_detector.plan").write_bytes(b"tensorrt-plan")
+        (artifacts / "face_detector.config.pbtxt").write_bytes(b"name: face\n")
+        return artifacts
+
+    @unittest.skipUnless(shutil.which("gpg"), "gpg is required")
+    def test_signed_manifest_binds_release_commit_model_channel_and_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            artifacts = self._artifacts(root)
+            common = {
+                "repository": "plaid-ai/NUV-AGENT",
+                "release_tag": "v0.1.121",
+                "component_sha": "a" * 40,
+                "model_name": "anomalyclip",
+                "model_version": "v0002",
+                "channel_pointer": "gs://nuv-model/pointers/anomalyclip/prod.json",
+                "artifact_directory": artifacts,
+            }
+            manifest_payload = FACE_MANIFEST.build_manifest(**common)
+            manifest = root / "face-artifact-manifest.json"
+            manifest.write_text(
+                json.dumps(manifest_payload, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+
+            gpg_home = root / "gpg"
+            gpg_home.mkdir(mode=0o700)
+            environment = {**os.environ, "GNUPGHOME": str(gpg_home)}
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--passphrase",
+                    "",
+                    "--quick-generate-key",
+                    "Face Release Signer <face@example.invalid>",
+                    "ed25519",
+                    "cert",
+                    "1d",
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            listing = subprocess.check_output(
+                ["gpg", "--batch", "--with-colons", "--list-keys"],
+                text=True,
+                env=environment,
+            )
+            fingerprint = next(
+                line.split(":")[9]
+                for line in listing.splitlines()
+                if line.startswith("fpr:")
+            )
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--passphrase",
+                    "",
+                    "--quick-add-key",
+                    fingerprint,
+                    "ed25519",
+                    "sign",
+                    "1d",
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            policy_payload = json.loads(
+                (ROOT / "packaging/release/release-security-policy.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            policy_payload["trustedTagSignerFingerprints"] = [fingerprint]
+            policy = root / "policy.json"
+            policy.write_text(
+                json.dumps(policy_payload, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            signature = root / "face-artifact-manifest.json.asc"
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--armor",
+                    "--detach-sign",
+                    "--local-user",
+                    fingerprint,
+                    "--output",
+                    str(signature),
+                    str(manifest),
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            signers = root / "signers"
+            signers.mkdir()
+            (signers / "face-release.asc").write_bytes(
+                subprocess.check_output(
+                    ["gpg", "--batch", "--armor", "--export", fingerprint],
+                    env=environment,
+                )
+            )
+
+            result = FACE_MANIFEST.verify_manifest(
+                manifest_path=manifest,
+                signature_path=signature,
+                policy_path=policy,
+                signer_directory=signers,
+                **common,
+            )
+            self.assertEqual(result["status"], "VERIFIED")
+            self.assertEqual(result["signerFingerprint"], fingerprint)
+
+            untrusted_policy_payload = json.loads(json.dumps(policy_payload))
+            untrusted_policy_payload["trustedTagSignerFingerprints"] = ["B" * 40]
+            untrusted_policy = root / "untrusted-policy.json"
+            untrusted_policy.write_text(
+                json.dumps(
+                    untrusted_policy_payload, sort_keys=True, separators=(",", ":")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                FACE_MANIFEST.verify_manifest(
+                    manifest_path=manifest,
+                    signature_path=signature,
+                    policy_path=untrusted_policy,
+                    signer_directory=signers,
+                    **common,
+                )
+
+            original = (artifacts / "face_detector.onnx").read_bytes()
+            (artifacts / "face_detector.onnx").write_bytes(b"evil-model")
+            with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                FACE_MANIFEST.verify_manifest(
+                    manifest_path=manifest,
+                    signature_path=signature,
+                    policy_path=policy,
+                    signer_directory=signers,
+                    **common,
+                )
+            (artifacts / "face_detector.onnx").write_bytes(original)
+
+            original_manifest = manifest.read_bytes()
+            tampered_manifest = json.loads(original_manifest)
+            tampered_manifest["artifacts"]["face_detector.onnx"]["sha256"] = "0" * 64
+            manifest.write_text(
+                json.dumps(tampered_manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                FACE_MANIFEST.verify_manifest(
+                    manifest_path=manifest,
+                    signature_path=signature,
+                    policy_path=policy,
+                    signer_directory=signers,
+                    **common,
+                )
+            manifest.write_bytes(original_manifest)
+
+            manifest.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
+            noncanonical_signature = root / "noncanonical.asc"
+            subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--armor",
+                    "--detach-sign",
+                    "--local-user",
+                    fingerprint,
+                    "--output",
+                    str(noncanonical_signature),
+                    str(manifest),
+                ],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                FACE_MANIFEST.verify_manifest(
+                    manifest_path=manifest,
+                    signature_path=noncanonical_signature,
+                    policy_path=policy,
+                    signer_directory=signers,
+                    **common,
+                )
+            manifest.write_bytes(original_manifest)
+
+            for changed in (
+                {**common, "release_tag": "v0.1.122"},
+                {**common, "component_sha": "b" * 40},
+                {**common, "model_version": "v0003"},
+                {
+                    **common,
+                    "channel_pointer": "gs://nuv-model/pointers/anomalyclip/canary.json",
+                },
+            ):
+                with self.subTest(changed=changed):
+                    with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                        FACE_MANIFEST.verify_manifest(
+                            manifest_path=manifest,
+                            signature_path=signature,
+                            policy_path=policy,
+                            signer_directory=signers,
+                            **changed,
+                        )
+
+            signature.write_text("unsigned\n", encoding="utf-8")
+            with self.assertRaises(FACE_MANIFEST.FaceManifestError):
+                FACE_MANIFEST.verify_manifest(
+                    manifest_path=manifest,
+                    signature_path=signature,
+                    policy_path=policy,
+                    signer_directory=signers,
+                    **common,
+                )
 
 
 class ImmutableGitHubReleaseTest(unittest.TestCase):

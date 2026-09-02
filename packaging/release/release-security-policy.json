@@ -9,7 +9,13 @@
   ],
   "legacyUnsignedReruns": {},
   "governance": {
-    "pullRequestApprovals": 0,
+    "pullRequestApprovals": 1,
+    "dismissStaleReviewsOnPush": true,
+    "requireCodeOwnerReview": true,
+    "requireLastPushApproval": true,
+    "requireExtraApprovalForUnattributedChanges": true,
+    "requiredReviewThreadResolution": true,
+    "allowedMergeMethods": ["merge", "squash", "rebase"],
     "environmentReviewers": 0,
     "requiredStatusContext": "agent-release-gate",
     "requiredStatusIntegrationId": 15368
@@ -19,12 +25,24 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
       "requiredSecrets": ["HOMEBREW_TAP_TOKEN"]
     },
     "apt-release": {
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
       "requiredSecrets": [
         "APT_GPG_PASSPHRASE",
         "APT_GPG_PRIVATE_KEY",
@@ -36,11 +54,29 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
       "requiredSecrets": [
         "GCP_PROJECT_ID",
         "GCP_SA_KEY",
         "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
       ]
+    },
+    "face-artifacts-release": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
+      "requiredSecrets": ["GCP_PROJECT_ID", "GCP_SA_KEY"]
     }
   },
   "forbiddenRepositorySecrets": [
@@ -49,6 +85,8 @@
     "GCP_PROJECT_ID",
     "GCP_SA_KEY",
     "HOMEBREW_TAP_TOKEN",
+    "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
+    "IQ9075_RELEASE_SIGNING_KEY_ID",
     "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
   ],
   "apt": {

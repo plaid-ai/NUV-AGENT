@@ -47,7 +47,18 @@ if [ -n "$BOM_PATH" ]; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT_DIR"
+RUNTIME_ROOT="${APT_RUNTIME_ROOT:-$ROOT_DIR}"
+if [ -L "$RUNTIME_ROOT" ]; then
+  echo "APT_RUNTIME_ROOT must not be a symbolic link" >&2
+  exit 1
+fi
+mkdir -p "$RUNTIME_ROOT"
+RUNTIME_ROOT="$(realpath "$RUNTIME_ROOT")"
+if [ ! -d "$RUNTIME_ROOT" ]; then
+  echo "APT_RUNTIME_ROOT must be a regular directory" >&2
+  exit 1
+fi
+cd "$RUNTIME_ROOT"
 APTLY_CONFIG="$ROOT_DIR/aptly.conf"
 REPO_NAME=${REPO_NAME:-nuv-agent}
 DIST=${DIST:-stable}
@@ -55,7 +66,7 @@ COMPONENT=${COMPONENT:-main}
 ARCH=${ARCH:-arm64}
 BUCKET=${BUCKET:-apt.plaidai.io}
 CACHE_CONTROL=${CACHE_CONTROL:-"no-cache, max-age=0"}
-PUBLIC_DIR="${APT_PUBLIC_DIR:-$ROOT_DIR/.aptly/public}"
+PUBLIC_DIR="${APT_PUBLIC_DIR:-$RUNTIME_ROOT/.aptly/public}"
 mkdir -p "$PUBLIC_DIR"
 PUBLIC_DIR="$(realpath "$PUBLIC_DIR")"
 PUBLIC_KEY_PATH="$PUBLIC_DIR/public.gpg"
@@ -67,6 +78,30 @@ case "$SKIP_APT_PUBLISH" in
   true|false) ;;
   *) echo "SKIP_APT_PUBLISH must be true or false" >&2; exit 2 ;;
 esac
+APTLY_PASSPHRASE_FILE="${APTLY_PASSPHRASE_FILE:-}"
+
+if [ "$SKIP_APT_PUBLISH" = false ]; then
+  if [ -z "$APTLY_PASSPHRASE_FILE" ] || [ -L "$APTLY_PASSPHRASE_FILE" ] \
+    || [ ! -f "$APTLY_PASSPHRASE_FILE" ] || [ ! -s "$APTLY_PASSPHRASE_FILE" ]; then
+    echo "APTLY_PASSPHRASE_FILE must be a non-empty regular file" >&2
+    exit 1
+  fi
+  APTLY_PASSPHRASE_FILE="$(realpath "$APTLY_PASSPHRASE_FILE")"
+  if file_mode="$(stat -c '%a' "$APTLY_PASSPHRASE_FILE" 2>/dev/null)"; then
+    :
+  else
+    file_mode="$(stat -f '%Lp' "$APTLY_PASSPHRASE_FILE")"
+  fi
+  if file_owner="$(stat -c '%u' "$APTLY_PASSPHRASE_FILE" 2>/dev/null)"; then
+    :
+  else
+    file_owner="$(stat -f '%u' "$APTLY_PASSPHRASE_FILE")"
+  fi
+  if [ "$file_mode" != "600" ] || [ "$file_owner" != "$(id -u)" ]; then
+    echo "APTLY_PASSPHRASE_FILE must be mode 0600 and owned by the publisher" >&2
+    exit 1
+  fi
+fi
 
 if [ "$SKIP_APT_PUBLISH" = false ]; then
   aptly -config="$APTLY_CONFIG" repo create -distribution="$DIST" -component="$COMPONENT" "$REPO_NAME" || true
@@ -79,9 +114,11 @@ if [ "$SKIP_APT_PUBLISH" = false ]; then
   aptly -config="$APTLY_CONFIG" repo add "$REPO_NAME" "$DEB_PATH"
 
   if aptly -config="$APTLY_CONFIG" publish list | grep -q "^$DIST"; then
-    aptly -config="$APTLY_CONFIG" publish update "$DIST"
+    aptly -config="$APTLY_CONFIG" publish update \
+      -batch -passphrase-file="$APTLY_PASSPHRASE_FILE" "$DIST"
   else
-    aptly -config="$APTLY_CONFIG" publish repo -acquire-by-hash \
+    aptly -config="$APTLY_CONFIG" publish repo \
+      -batch -passphrase-file="$APTLY_PASSPHRASE_FILE" -acquire-by-hash \
       -distribution="$DIST" -architectures="$ARCH" \
       -component="$COMPONENT" "$REPO_NAME"
   fi

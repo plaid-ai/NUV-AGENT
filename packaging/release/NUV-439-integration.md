@@ -76,6 +76,10 @@ independent hash-locked immutable bundle and a privileged Docker/Triton helper.
   evidence.
 - Complete the external GitHub settings prerequisite from the v0.1.121
   runbook: protected-main/tag rulesets, exact `agent-release-gate` integration,
-  immutable releases, reviewer-free protected environments under the approved
-  zero-approval contract, environment-scoped
-  secrets, trusted publisher SHA, and a fresh signed settings attestation.
+  immutable releases, one CODEOWNER approval for general writers with the exact
+  Platform-Admin single-admin PR bypass, reviewer-free exact-main environments,
+  environment-scoped secrets, trusted publisher SHA, and a fresh signed settings
+  attestation. Face artifact publication additionally requires an allowlisted
+  Platform-Admin signature over the exact tag, component, model/channel tuple,
+  and each artifact digest/size; immutable GitHub release state by itself is not
+  treated as provenance.

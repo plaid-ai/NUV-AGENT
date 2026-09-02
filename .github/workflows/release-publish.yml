@@ -497,7 +497,10 @@ jobs:
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${SDIST_NAME}" \
           SHA256="$SDIST_SHA256" VERSION="$VERSION" \
             publisher/packaging/release/update-homebrew-formula.sh
-          ! grep -q '__URL__\|__SHA256__' "dist/$FORMULA_NAME"
+          if grep -q '__URL__\|__SHA256__' "dist/$FORMULA_NAME"; then
+            echo "Homebrew formula still contains unresolved placeholders" >&2
+            exit 1
+          fi
           NAME="nuv_agent-${VERSION}-distribution-source-plan.json"
           PYTHONPATH=publisher python3 \
             publisher/packaging/release/generate-release-promotion.py distribution-plan \
@@ -684,6 +687,7 @@ jobs:
       GNUPGHOME: ${{ github.workspace }}/.gnupg
       GPG_KEY_ID: E5230C3090A66BC5
       BUCKET: apt.plaidai.io
+      APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -833,32 +837,114 @@ jobs:
           echo "pinentry-mode loopback" > "$GNUPGHOME/gpg.conf"
           gpgconf --kill gpg-agent || true
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          passphrase_file="$(mktemp "${RUNNER_TEMP}/nuv-aptly-passphrase.XXXXXX")"
+          cleanup_import_passphrase() {
+            if [ -n "${passphrase_file:-}" ]; then
+              chmod 0600 "$passphrase_file" 2>/dev/null || true
+              rm -f -- "$passphrase_file"
+            fi
+          }
+          trap cleanup_import_passphrase EXIT
+          chmod 0600 "$passphrase_file"
+          printf '%s' "$GPG_PASSPHRASE" > "$passphrase_file"
           echo "test" | gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "$GPG_PASSPHRASE" --local-user "$GPG_KEY_ID" --sign >/dev/null
+            --passphrase-file "$passphrase_file" \
+            --local-user "$GPG_KEY_ID" --sign >/dev/null
+          echo "APTLY_PASSPHRASE_FILE=$passphrase_file" >> "$GITHUB_ENV"
+          trap - EXIT
+          unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
+      - name: Revalidate trust immediately before APT GCP authentication
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Authenticate APT-only GCP publisher
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Revalidate trust immediately before APT GCP project secret use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
+      - name: Revalidate trust immediately before APT signing and GCS publication
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Publish exact deb set with trusted publisher
         env:
-          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
           DEB_NAME: ${{ needs.iq9075-ota-build.outputs.deb_name }}
           DEB_SHA256: ${{ needs.iq9075-ota-build.outputs.deb_sha256 }}
           ROLLBACK_DEB_PATH: ${{ steps.rollback.outputs.path }}
         run: |
           set -euo pipefail
+          case "$APTLY_PASSPHRASE_FILE" in
+            "$RUNNER_TEMP"/nuv-aptly-passphrase.*) ;;
+            *) echo "APT passphrase path is outside runner temp" >&2; exit 1 ;;
+          esac
+          cleanup_passphrase() {
+            chmod 0600 "$APTLY_PASSPHRASE_FILE" 2>/dev/null || true
+            rm -f -- "$APTLY_PASSPHRASE_FILE"
+          }
+          trap cleanup_passphrase EXIT
           DEB_PATH="dist/$DEB_NAME"
           [ "$(sha256sum "$DEB_PATH" | awk '{print $1}')" = "$DEB_SHA256" ]
           APT_PREVIOUS_DEB_PATH="$ROLLBACK_DEB_PATH" \
             publisher/packaging/apt/publish-gcs.sh "$DEB_PATH"
+
+      - name: Revalidate trust immediately before distribution promotion credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Publish final distribution promotion after both live channels
         env:
@@ -878,6 +964,19 @@ jobs:
           compression-level: 0
           retention-days: 1
 
+      - name: Remove APT passphrase file on every exit path
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${APTLY_PASSPHRASE_FILE:-}" ]; then
+            case "$APTLY_PASSPHRASE_FILE" in
+              "$RUNNER_TEMP"/nuv-aptly-passphrase.*) ;;
+              *) echo "Refusing unexpected APT passphrase cleanup path" >&2; exit 1 ;;
+            esac
+            chmod 0600 "$APTLY_PASSPHRASE_FILE" 2>/dev/null || true
+            rm -f -- "$APTLY_PASSPHRASE_FILE"
+          fi
+
   iq9075-ota-publish:
     name: Reserve, sign, publish, and promote IQ9075 OTA
     if: github.event_name == 'workflow_dispatch' && inputs.publish_iq9075_ota == true
@@ -889,6 +988,8 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+    env:
+      APT_RUNTIME_ROOT: ${{ github.workspace }}/nuv-ota-publish-runtime
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -1001,10 +1102,40 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Revalidate trust immediately before OTA GCP project secret use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Revalidate trust immediately before OTA sequence reservation credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Atomically reserve exact release sequence
         env:
@@ -1013,6 +1144,21 @@ jobs:
           publisher/packaging/release/publish-immutable-gcs-file.sh \
             dist/iq9075-sequence-reservation.json \
             apt.plaidai.io "$RESERVATION_OBJECT"
+
+      - name: Revalidate trust after CAS and immediately before IQ signing key use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Sign exact bundle BOM with trusted signer
         env:
@@ -1078,6 +1224,21 @@ jobs:
           load_signed_release_bom(Path(sys.argv[1]), Path(sys.argv[2]), release_keyring=keyring)
           PY
 
+      - name: Revalidate trust immediately before OTA bundle publication credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+
       - name: Publish verified exact bundle with trusted publisher
         env:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
@@ -1094,6 +1255,21 @@ jobs:
           SKIP_APT_PUBLISH=true \
             publisher/packaging/apt/publish-gcs.sh \
               "$BUNDLE_PATH" "$BOM_PATH" "$BOM_PATH.sig" "$BUNDLE_PATH"
+
+      - name: Revalidate trust immediately before OTA promotion credential use
+        env:
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
 
       - name: Generate and atomically publish final OTA promotion
         env:

@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 if gh repo view "$ORG/$REPO" >/dev/null 2>&1; then
   echo "Repo exists: $ORG/$REPO"
 else
-  gh repo create "$ORG/$REPO" --$VISIBILITY --confirm
+  gh repo create "$ORG/$REPO" --"$VISIBILITY" --confirm
 fi
 
 git clone "https://github.com/$ORG/$REPO.git" "$TMP_DIR/tap"
