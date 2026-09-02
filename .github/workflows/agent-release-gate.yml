@@ -1,0 +1,249 @@
+name: agent-release-gate
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-release-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-release-prerequisite:
+    name: arm64-release-prerequisite
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout candidate without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup bundle Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Prove native arm64 runner and locked bundle resolution
+        run: |
+          set -euo pipefail
+          [ "$(dpkg --print-architecture)" = "arm64" ]
+          python -m venv "${RUNNER_TEMP}/arm64-release-prerequisite"
+          "${RUNNER_TEMP}/arm64-release-prerequisite/bin/python" -m pip install \
+            --require-hashes \
+            --only-binary=:all: \
+            -r packaging/release/requirements-agent-bundle-arm64.txt
+          "${RUNNER_TEMP}/arm64-release-prerequisite/bin/python" - <<'PY'
+          import platform
+          from importlib.metadata import version
+          assert platform.machine() in {"aarch64", "arm64"}
+          assert version("cryptography") == "50.0.0"
+          assert version("setuptools") == "83.0.0"
+          assert version("wheel") == "0.46.2"
+          PY
+
+  macos-arm64-release-prerequisite:
+    name: macos-arm64-release-prerequisite
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout candidate without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup exact formula Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Build exact local sdist and formula
+        env:
+          BUILD_VENV: ${{ runner.temp }}/nuv-agent-formula-build
+        run: |
+          set -euo pipefail
+          [ "$(uname -m)" = "arm64" ]
+          python -c 'import sys; assert sys.version_info[:2] == (3, 14)'
+          python -m venv "$BUILD_VENV"
+          "$BUILD_VENV/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: \
+            -r packaging/release/requirements-release-build.txt
+          "$BUILD_VENV/bin/python" -m build --sdist --no-isolation --outdir dist
+          VERSION=$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          SDIST="dist/nuv_agent-${VERSION}.tar.gz"
+          [ -s "$SDIST" ]
+          cp packaging/homebrew/nuv-agent.rb "${RUNNER_TEMP}/nuv-agent.rb"
+          FORMULA_PATH="${RUNNER_TEMP}/nuv-agent.rb" \
+          URL="file://${GITHUB_WORKSPACE}/${SDIST}" \
+          SHA256="$(shasum -a 256 "$SDIST" | awk '{print $1}')" \
+          VERSION="$VERSION" \
+            packaging/release/update-homebrew-formula.sh
+
+      - name: Install the exact shipped Homebrew tuple
+        run: |
+          set -euo pipefail
+          brew install --formula --build-from-source "${RUNNER_TEMP}/nuv-agent.rb"
+          FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
+          [ -x "$FORMULA_PYTHON" ]
+          "$FORMULA_PYTHON" -m pip check
+          "$FORMULA_PYTHON" - <<'PY'
+          import platform
+          import sys
+          from importlib.metadata import version
+          expected = {
+              "torch": "2.10.0",
+              "numpy": "2.4.2",
+              "Pillow": "12.1.0",
+              "transformers": "5.16.1",
+              "huggingface-hub": "1.29.0",
+              "hf-xet": "1.6.0",
+              "tokenizers": "0.23.1",
+              "safetensors": "0.8.0",
+              "sentencepiece": "0.2.2",
+              "protobuf": "7.36.1",
+          }
+          assert platform.machine() == "arm64"
+          assert sys.version_info[:2] == (3, 14)
+          assert {name: version(name) for name in expected} == expected
+          PY
+
+      - name: Download only the reviewed SigLIP snapshot revision
+        id: model
+        env:
+          HF_HOME: ${{ runner.temp }}/huggingface
+          MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+        run: |
+          set -euo pipefail
+          FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
+          MODEL_PATH=$("$FORMULA_PYTHON" - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+          revision = os.environ["MODEL_REVISION"]
+          path = Path(snapshot_download(
+              repo_id="google/siglip2-base-patch16-224",
+              revision=revision,
+          )).resolve()
+          if path.name != revision:
+              raise SystemExit("resolved model snapshot revision differs")
+          print(path)
+          PY
+          )
+          echo "path=$MODEL_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Prove offline MPS inference with the exact shipped tuple
+        env:
+          HF_HOME: ${{ runner.temp }}/huggingface
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          MODEL_PATH: ${{ steps.model.outputs.path }}
+          MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+        run: |
+          set -euo pipefail
+          FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
+          "$FORMULA_PYTHON" - <<'PY'
+          import os
+          from pathlib import Path
+          import numpy as np
+          import torch
+          from huggingface_hub import snapshot_download
+          from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+          path = Path(os.environ["MODEL_PATH"]).resolve()
+          revision = os.environ["MODEL_REVISION"]
+          assert path.name == revision
+          assert Path(snapshot_download(
+              repo_id="google/siglip2-base-patch16-224",
+              revision=revision,
+              local_files_only=True,
+          )).resolve() == path
+          assert torch.backends.mps.is_available()
+          detector = ZeroShotAnomalyDetector(
+              enabled=True,
+              model_name=str(path),
+              labels=["normal scene", "anomalous scene"],
+              anomaly_labels=["anomalous scene"],
+              threshold=0.5,
+              device_preference="mps",
+          )
+          assert detector.ready and detector._device == "mps"
+          result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
+          assert result is not None and len(result["scores"]) == 2
+          PY
+
+  agent-release-gate:
+    name: agent-release-gate
+    runs-on: ubuntu-latest
+    needs: [arm64-release-prerequisite, macos-arm64-release-prerequisite]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce arm64 prerequisite result
+        env:
+          ARM64_RESULT: ${{ needs.arm64-release-prerequisite.result }}
+          MACOS_RESULT: ${{ needs.macos-arm64-release-prerequisite.result }}
+        run: |
+          [ "$ARM64_RESULT" = "success" ] \
+            || { echo "arm64 release prerequisite did not succeed" >&2; exit 1; }
+          [ "$MACOS_RESULT" = "success" ] \
+            || { echo "macOS arm64 release prerequisite did not succeed" >&2; exit 1; }
+
+      - name: Checkout candidate without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test and shell runtimes
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -m pip install \
+            transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
+            tokenizers==0.23.1 safetensors==0.8.0
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            --output "$archive"
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  $archive" \
+            | sha256sum --check --strict
+          mkdir "${RUNNER_TEMP}/actionlint"
+          tar -xzf "$archive" -C "${RUNNER_TEMP}/actionlint" actionlint
+          shellcheck_archive="${RUNNER_TEMP}/shellcheck.tar.xz"
+          curl --fail --silent --show-error --location \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz \
+            --output "$shellcheck_archive"
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $shellcheck_archive" \
+            | sha256sum --check --strict
+          tar -xJf "$shellcheck_archive" -C "${RUNNER_TEMP}"
+
+      - name: Validate workflows and release shell
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/actionlint/actionlint" -color=false
+          "${RUNNER_TEMP}/shellcheck-v0.11.0/shellcheck" \
+            packaging/apt/publish-gcs.sh \
+            packaging/release/publish-immutable-gcs-file.sh
+          bash -n \
+            packaging/apt/publish-gcs.sh \
+            packaging/release/publish-immutable-gcs-file.sh
+
+      - name: Run isolated Agent suite
+        env:
+          NUV_AGENT_CONFIG: ${{ runner.temp }}/agent-release-gate-${{ github.run_id }}.env
+        run: python packaging/release/run-isolated-tests.py

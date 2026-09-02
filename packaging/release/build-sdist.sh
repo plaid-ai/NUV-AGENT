@@ -7,7 +7,16 @@ DIST_DIR="$ROOT_DIR/dist"
 python3 -m pip install --upgrade build >/dev/null
 python3 -m build --sdist --outdir "$DIST_DIR" >/dev/null
 
-TARBALL=$(ls -t "$DIST_DIR"/nuv-agent-*.tar.gz | head -1)
+TARBALL=$(python3 - "$DIST_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+dist = Path(sys.argv[1])
+candidates = [*dist.glob("nuv_agent-*.tar.gz"), *dist.glob("nuv-agent-*.tar.gz")]
+if candidates:
+    print(max(candidates, key=lambda path: path.stat().st_mtime_ns))
+PY
+)
 if [ -z "$TARBALL" ]; then
   echo "No sdist tarball found in $DIST_DIR" >&2
   exit 1

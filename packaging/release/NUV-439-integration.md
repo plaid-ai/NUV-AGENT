@@ -74,7 +74,12 @@ independent hash-locked immutable bundle and a privileged Docker/Triton helper.
 - Run the exact signed IQ9075_DEV bundle through real QCS9075-EVK + OAK-D Lite
   boot/functional failure and power-loss tests. macOS simulation is not hardware
   evidence.
-- Split the generic sdist GitHub Release/Homebrew publisher into a clean job as
-  was done for IQ9075 APT/OTA. All actions are SHA-pinned and checkout
-  credentials are disabled now, but separate jobs are the final defense against
-  a hostile test process surviving until later publisher credentials arrive.
+- Complete the external GitHub settings prerequisite from the v0.1.121
+  runbook: protected-main/tag rulesets, exact `agent-release-gate` integration,
+  immutable releases, one CODEOWNER approval for general writers with the exact
+  Platform-Admin single-admin PR bypass, reviewer-free exact-main environments,
+  environment-scoped secrets, trusted publisher SHA, and a fresh signed settings
+  attestation. Face artifact publication additionally requires an allowlisted
+  Platform-Admin signature over the exact tag, component, model/channel tuple,
+  and each artifact digest/size; immutable GitHub release state by itself is not
+  treated as provenance.

@@ -10,6 +10,19 @@ This directory provides a minimal `aptly` flow to host a private APT repo.
 ## Publish to GCS (recommended)
 This flow syncs the published repo to `gs://apt.plaidai.io` and serves it via `https://apt.plaidai.io`.
 
+Release CI sets `APT_PREVIOUS_DEB_PATH` to the highest lower Agent version from
+the independently verified current `InRelease`. Because the aptly database is
+ephemeral, this explicitly keeps the current and previous packages in the new
+signed `Packages` index. Retaining an unindexed pool object is not considered a
+rollback path.
+
+Immutable pool/by-hash/BOM/bundle objects and OTA reservation/promotion markers use
+Cloud Storage `ifGenerationMatch=0` create-only CAS, followed by exact remote
+byte comparison. APT is generated with `Acquire-By-Hash: yes`; ordinary
+metadata is uploaded only after immutable by-hash objects and signed
+`InRelease` is the last discovery write. No remote delete or `gsutil cp -n`
+concurrency assumption is used, so every partial stage is safely rerunnable.
+
 ```bash
 ./publish-gcs.sh /path/to/nuv-agent_0.1.0_arm64.deb
 ```
@@ -22,12 +35,12 @@ artifact 인자에 같은 `agent-bundle`을 전달합니다. APT `.deb` build/pu
 RELEASE_KEYRING_PATH=/secure/release-keyring.json \
 RELEASE_TRUST_DOMAIN=iq9075-dev \
 SKIP_APT_PUBLISH=true \
-VERSION=0.1.120 \
+VERSION=0.1.121 \
 ./publish-gcs.sh \
-  /path/to/nuv-agent_0.1.120_iq9075-aarch64.agent-bundle.tar.gz \
+  /path/to/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz \
   /path/to/release-bom.json \
   /path/to/release-bom.json.sig \
-  /path/to/nuv-agent_0.1.120_iq9075-aarch64.agent-bundle.tar.gz
+  /path/to/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz
 ```
 
 세 release 파일은 동일한
@@ -35,7 +48,7 @@ VERSION=0.1.120 \
 다르면 publish를 거부합니다.
 
 Requirements:
-- `gcloud` + `gsutil`
+- `gcloud storage`
 - A GCS bucket named `apt.plaidai.io`
 - A public HTTPS endpoint for the bucket (Cloud CDN + HTTPS Load Balancer recommended)
 
@@ -61,12 +74,24 @@ Required GitHub secrets:
 - `GCP_SA_KEY`: GCP service account JSON with write access to the bucket
 - `GCP_PROJECT_ID`: GCP project ID
 - `IQ9075_RELEASE_SIGNING_PRIVATE_KEY`: Ed25519 publisher private key material
-- `IQ9075_RELEASE_SIGNING_KEY_ID`: key id present in the public keyring
-- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON`: separate `iq9075-dev` release keyring JSON
+- Publisher key ID is protected-main metadata in `release-security-policy.json`
+- `packaging/release/trusted-release-keyrings/iq9075-dev.json`: protected-main
+  public verification keyring, byte-identical to the board keyring (not a secret)
 
-Runner note:
-- Default is `ubuntu-24.04-arm`. If you don't have access, change the job to `self-hosted`
-  and attach an arm64 runner (e.g., Jetson or Graviton).
+The workflow materializes `APT_GPG_PASSPHRASE` once as an owned mode-`0600`
+file under `RUNNER_TEMP`, passes it to both signing commands with aptly's
+`-batch -passphrase-file=...`, and removes it after publication. A manual
+`publish-gcs.sh` invocation must set `APTLY_PASSPHRASE_FILE` to an equivalent
+non-symlink file; plaintext argv and gpg-agent cache-only signing are rejected.
+
+Runner requirement:
+
+- Release jobs are fixed to GitHub-hosted `ubuntu-24.04-arm`. The required
+  `agent-release-gate` depends on secret-zero `ubuntu-24.04-arm` and `macos-14`
+  prerequisites that verify the locked bundle and actual Formula/MPS tuple.
+  A queued, unavailable, or failed prerequisite blocks release. Do not replace
+  it with a long-lived self-hosted runner or bypass its status without a
+  separately reviewed runner design.
 
 Provisioning (GCP):
 - `packaging/apt/gcp/setup-apt-hosting.sh`

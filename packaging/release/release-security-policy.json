@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "defaultBranch": "main",
+  "requiredStatusContext": "agent-release-gate",
+  "releaseAdminTeamId": 16128529,
+  "immutableReleases": true,
+  "trustedTagSignerFingerprints": [
+    "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+  ],
+  "legacyUnsignedReruns": {},
+  "governance": {
+    "pullRequestApprovals": 1,
+    "dismissStaleReviewsOnPush": true,
+    "requireCodeOwnerReview": true,
+    "requireLastPushApproval": true,
+    "requireExtraApprovalForUnattributedChanges": true,
+    "requiredReviewThreadResolution": true,
+    "allowedMergeMethods": ["merge", "squash", "rebase"],
+    "environmentReviewers": 0,
+    "requiredStatusContext": "agent-release-gate",
+    "requiredStatusIntegrationId": 15368
+  },
+  "requiredEnvironments": {
+    "homebrew-release": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
+      "requiredSecrets": ["HOMEBREW_TAP_TOKEN"]
+    },
+    "apt-release": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
+      "requiredSecrets": [
+        "APT_GPG_PASSPHRASE",
+        "APT_GPG_PRIVATE_KEY",
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY"
+      ]
+    },
+    "iq9075-release": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
+      "requiredSecrets": [
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY",
+        "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+      ]
+    },
+    "face-artifacts-release": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
+      "protectionRuleTypes": ["branch_policy"],
+      "requiredSecrets": ["GCP_PROJECT_ID", "GCP_SA_KEY"]
+    }
+  },
+  "forbiddenRepositorySecrets": [
+    "APT_GPG_PASSPHRASE",
+    "APT_GPG_PRIVATE_KEY",
+    "GCP_PROJECT_ID",
+    "GCP_SA_KEY",
+    "HOMEBREW_TAP_TOKEN",
+    "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
+    "IQ9075_RELEASE_SIGNING_KEY_ID",
+    "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+  ],
+  "apt": {
+    "baseUrl": "https://apt.plaidai.io",
+    "bucket": "apt.plaidai.io",
+    "gpgFingerprint": "C6915E8C74A9C4B3EEFBA39FE5230C3090A66BC5",
+    "rollbackPackageCount": 1
+  },
+  "iq9075": {
+    "bucket": "apt.plaidai.io",
+    "trustDomain": "iq9075-dev",
+    "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
+    "publicKeyringSha256": "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",
+    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+    "target": {
+      "productModel": "IQ9075_DEV",
+      "platformProfile": "iq9075_dev",
+      "hardwareRevision": "QCS9075-EVK",
+      "architecture": "aarch64"
+    },
+    "legacyPromotedBaseline": {
+      "agentVersion": "0.1.120",
+      "releaseSequence": 1,
+      "bomDigest": "sha256:26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+    }
+  }
+}
