@@ -163,16 +163,25 @@ jobs:
           # before allocating from the same unified-memory pool.
           sync
           sudo purge
-          FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
-          "$FORMULA_PYTHON" - <<'PY'
+          FORMULA_PREFIX="$(brew --prefix nuv-agent)"
+          FORMULA_PYTHON="$FORMULA_PREFIX/libexec/bin/python"
+          export FORMULA_PREFIX
+          cd "$RUNNER_TEMP"
+          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
+          import gc
           import os
           from pathlib import Path
           import numpy as np
           import torch
           from huggingface_hub import snapshot_download
+          from transformers import AutoModel, AutoProcessor
+          import nuvion_app
           from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
           path = Path(os.environ["MODEL_PATH"]).resolve()
           revision = os.environ["MODEL_REVISION"]
+          formula_prefix = Path(os.environ["FORMULA_PREFIX"]).resolve()
+          package_path = Path(nuvion_app.__file__).resolve()
+          assert package_path.is_relative_to(formula_prefix / "libexec")
           assert path.name == revision
           assert Path(snapshot_download(
               repo_id="google/siglip2-base-patch16-224",
@@ -180,10 +189,39 @@ jobs:
               local_files_only=True,
           )).resolve() == path
           assert torch.backends.mps.is_available()
+          labels = ["normal scene", "anomalous scene"]
+          texts = [f"This is a photo of {label}." for label in labels]
+          frame = np.zeros((224, 224, 3), dtype=np.uint8)
+
+          reference_model = AutoModel.from_pretrained(
+              str(path), dtype=torch.float16, low_cpu_mem_usage=True
+          ).eval()
+          reference_processor = AutoProcessor.from_pretrained(str(path))
+          reference_inputs = reference_processor(
+              text=texts,
+              images=frame,
+              padding="max_length",
+              max_length=64,
+              return_tensors="pt",
+          )
+          reference_inputs = {
+              key: value.to(dtype=torch.float16)
+              if value.is_floating_point()
+              else value
+              for key, value in reference_inputs.items()
+          }
+          with torch.inference_mode():
+              reference_outputs = reference_model(**reference_inputs)
+          reference_scores = torch.sigmoid(
+              reference_outputs.logits_per_image
+          ).squeeze(0).float()
+          del reference_inputs, reference_outputs, reference_model, reference_processor
+          gc.collect()
+
           detector = ZeroShotAnomalyDetector(
               enabled=True,
               model_name=str(path),
-              labels=["normal scene", "anomalous scene"],
+              labels=labels,
               anomaly_labels=["anomalous scene"],
               threshold=0.5,
               device_preference="mps",
@@ -191,11 +229,39 @@ jobs:
           assert detector.ready and detector._device == "mps"
           assert detector._inference_dtype == torch.float16
           assert detector._model.text_model is None
-          assert next(detector._model.parameters()).dtype == torch.float16
-          assert next(detector._model.vision_model.parameters()).device.type == "mps"
+          vision_parameters = tuple(detector._model.vision_model.parameters())
+          assert vision_parameters
+          assert {parameter.device.type for parameter in vision_parameters} == {"mps"}
+          assert {parameter.dtype for parameter in vision_parameters} == {torch.float16}
           assert detector._mps_text_features.device.type == "mps"
-          result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
+          assert detector._mps_text_features.dtype == torch.float16
+          assert torch.isfinite(detector._mps_text_features).all()
+          assert torch.allclose(
+              detector._mps_text_features.norm(dim=-1).float(),
+              torch.ones(len(labels), device="mps"),
+              rtol=0.0,
+              atol=5e-3,
+          )
+          for scalar in (detector._mps_logit_scale, detector._mps_logit_bias):
+              assert scalar.device.type == "mps" and scalar.dtype == torch.float16
+              assert torch.isfinite(scalar).all()
+
+          result = detector.classify(frame)
           assert result is not None and len(result["scores"]) == 2
+          observed = {
+              label: score for label, score in zip(result["labels"], result["scores"])
+          }
+          observed_scores = torch.tensor([observed[label] for label in labels])
+          assert torch.allclose(
+              observed_scores, reference_scores, rtol=5e-2, atol=1e-5
+          )
+          torch.mps.synchronize()
+          stable_bytes = torch.mps.current_allocated_memory()
+          for _ in range(16):
+              repeated = detector.classify(frame)
+              assert repeated is not None and len(repeated["scores"]) == 2
+          torch.mps.synchronize()
+          assert torch.mps.current_allocated_memory() <= stable_bytes + 16 * 1024**2
           assert torch.mps.current_allocated_memory() < 512 * 1024**2
           assert torch.mps.driver_allocated_memory() < 1024 * 1024**2
           PY

@@ -38,7 +38,27 @@ class _FakeTorch:
         self.cuda = _FakeCUDA(cuda_available)
 
 
+class _TensorLike:
+    def norm(self):
+        return "norm"
+
+
+class _PooledOutput:
+    def __init__(self, value):
+        self.pooler_output = value
+
+
 class ZeroShotDeviceResolveTest(unittest.TestCase):
+    def test_feature_output_accepts_tensor_or_explicit_pooler_only(self) -> None:
+        tensor = _TensorLike()
+        self.assertIs(ZeroShotAnomalyDetector._pooled_feature_tensor(tensor), tensor)
+        self.assertIs(
+            ZeroShotAnomalyDetector._pooled_feature_tensor(_PooledOutput(tensor)),
+            tensor,
+        )
+        with self.assertRaisesRegex(TypeError, "no tensor pooler output"):
+            ZeroShotAnomalyDetector._pooled_feature_tensor(_PooledOutput(None))
+
     def test_auto_prefers_mps(self) -> None:
         fake_torch = _FakeTorch(mps_available=True, cuda_available=True)
         device = ZeroShotAnomalyDetector._resolve_device(fake_torch, "auto")
@@ -89,6 +109,8 @@ class MacMpsZeroShotRegressionTest(unittest.TestCase):
                 next(detector._model.vision_model.parameters()).device.type, "mps"
             )
             self.assertEqual(detector._mps_text_features.device.type, "mps")
+            self.assertEqual(detector._mps_logit_scale.device.type, "mps")
+            self.assertEqual(detector._mps_logit_bias.device.type, "mps")
             self.assertEqual(detector.loaded_model_source(), str(model_path))
             result = detector.classify(np.zeros((224, 224, 3), dtype=np.uint8))
         self.assertIsNotNone(result)

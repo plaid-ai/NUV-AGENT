@@ -13,6 +13,17 @@ class ZeroShotAnomalyDetector:
     def _format_exc(exc: Exception) -> str:
         return f"{exc.__class__.__name__}: {exc}"
 
+    @staticmethod
+    def _pooled_feature_tensor(output):
+        """Accept both Transformers feature return contracts, fail closed otherwise."""
+
+        pooled = getattr(output, "pooler_output", None)
+        if pooled is not None:
+            output = pooled
+        if not callable(getattr(output, "norm", None)):
+            raise TypeError("model feature output has no tensor pooler output")
+        return output
+
     def _load_processor(self, transformers):
         attempts: list[str] = []
 
@@ -86,8 +97,8 @@ class ZeroShotAnomalyDetector:
         self._device = None
         self._inference_dtype = None
         self._mps_text_features = None
-        self._mps_logit_scale: float | None = None
-        self._mps_logit_bias: float | None = None
+        self._mps_logit_scale = None
+        self._mps_logit_bias = None
         self._loaded_model_source: str | None = None
 
         if not self.enabled:
@@ -113,6 +124,7 @@ class ZeroShotAnomalyDetector:
             return
 
         device = self._resolve_device(torch, self.device_preference)
+        model = None
 
         try:
             if device == "mps":
@@ -155,6 +167,18 @@ class ZeroShotAnomalyDetector:
             )
         except Exception as exc:  # noqa: BLE001 - model loader is third-party.
             log.warning("Failed to load zero-shot model '%s': %s", self.model_name, exc)
+            self._model = None
+            model = None
+            self._processor = None
+            self._mps_text_features = None
+            self._mps_logit_scale = None
+            self._mps_logit_bias = None
+            gc.collect()
+            if device == "mps":
+                try:
+                    torch.mps.empty_cache()
+                except Exception:  # noqa: BLE001 - preserve the original failure.
+                    pass
             self.enabled = False
 
     def _partition_mps_model(self) -> None:
@@ -169,24 +193,29 @@ class ZeroShotAnomalyDetector:
         )
         with self._torch.inference_mode():
             text_features = self._model.get_text_features(**text_inputs)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = self._pooled_feature_tensor(text_features)
 
-        self._mps_logit_scale = float(
-            self._model.logit_scale.detach().float().exp().item()
-        )
-        self._mps_logit_bias = float(
-            self._model.logit_bias.detach().float().item()
+        self._mps_logit_scale = self._model.logit_scale.detach().to(
+            device=self._device,
+            dtype=self._inference_dtype,
+        ).exp()
+        self._mps_logit_bias = self._model.logit_bias.detach().to(
+            device=self._device,
+            dtype=self._inference_dtype,
         )
 
         # Labels never change after construction. Releasing the 538 MiB text
         # tower leaves only the 177 MiB vision tower resident on constrained
-        # Apple unified-memory devices while preserving exact SigLIP logits.
+        # Apple unified-memory devices while preserving SigLIP scoring semantics.
         self._model.text_model = None
         gc.collect()
         self._model.vision_model = self._model.vision_model.to(self._device).eval()
-        self._mps_text_features = text_features.to(
+        text_features = text_features.to(
             device=self._device,
             dtype=self._inference_dtype,
+        )
+        self._mps_text_features = text_features / text_features.norm(
+            dim=-1, keepdim=True
         )
 
     def loaded_model_source(self) -> str | None:
@@ -254,6 +283,7 @@ class ZeroShotAnomalyDetector:
             with self._torch.no_grad():
                 if self._mps_text_features is not None:
                     image_features = self._model.get_image_features(**inputs)
+                    image_features = self._pooled_feature_tensor(image_features)
                     image_features = image_features / image_features.norm(
                         dim=-1, keepdim=True
                     )
@@ -283,6 +313,8 @@ class ZeroShotAnomalyDetector:
                                 if key in inputs
                             }
                         )
+                        image_features = self._pooled_feature_tensor(image_features)
+                        text_features = self._pooled_feature_tensor(text_features)
                         image_features = image_features / image_features.norm(
                             dim=-1, keepdim=True
                         )

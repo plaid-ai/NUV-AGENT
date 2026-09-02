@@ -300,6 +300,12 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn(
             "torch.mps.current_allocated_memory() < 512 * 1024**2", macos
         )
+        self.assertIn('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -', macos)
+        self.assertIn('package_path.is_relative_to(formula_prefix / "libexec")', macos)
+        self.assertIn("reference_outputs.logits_per_image", macos)
+        self.assertIn("observed_scores, reference_scores", macos)
+        self.assertIn("for _ in range(16):", macos)
+        self.assertIn("stable_bytes + 16 * 1024**2", macos)
         self.assertIn("sudo purge", macos)
         zero_shot = (
             ROOT / "nuvion_app" / "inference" / "zero_shot.py"
