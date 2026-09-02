@@ -67,6 +67,22 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Stamp exact checked-out candidate identity
+        run: |
+          set -euo pipefail
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          CANDIDATE_VERSION="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          python packaging/release/stamp-build-info.py \
+            --sha "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION"
+          [ "$(git status --porcelain --untracked-files=all)" = " M nuvion_app/build_info.py" ]
+          {
+            echo "CANDIDATE_SHA=$CANDIDATE_SHA"
+            echo "CANDIDATE_VERSION=$CANDIDATE_VERSION"
+          } >> "$GITHUB_ENV"
+
       - name: Install the exact inference tuple
         env:
           ORACLE_VENV: ${{ runner.temp }}/siglip-cpu-oracle
@@ -77,9 +93,11 @@ jobs:
           python -m venv "$ORACLE_VENV"
           "$ORACLE_VENV/bin/python" -m pip install '.[zsad]'
           "$ORACLE_VENV/bin/python" - <<'PY'
+          import os
           import platform
           import sys
           from importlib.metadata import version
+          from nuvion_app import build_info
           expected = {
               "torch": "2.10.0",
               "numpy": "2.4.2",
@@ -95,6 +113,8 @@ jobs:
           assert platform.machine() == "arm64"
           assert sys.version_info[:2] == (3, 14)
           assert {name: version(name) for name in expected} == expected
+          assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
+          assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
           PY
 
       - name: Download only the reviewed SigLIP snapshot revision
@@ -195,6 +215,8 @@ jobs:
               json.dump(
                   {
                       "schemaVersion": 1,
+                      "componentSha": os.environ["CANDIDATE_SHA"],
+                      "agentVersion": os.environ["CANDIDATE_VERSION"],
                       "modelRevision": revision,
                       "labels": labels,
                       "scores": scores,
@@ -241,6 +263,22 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Stamp exact checked-out candidate identity
+        run: |
+          set -euo pipefail
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          CANDIDATE_VERSION="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          python packaging/release/stamp-build-info.py \
+            --sha "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION"
+          [ "$(git status --porcelain --untracked-files=all)" = " M nuvion_app/build_info.py" ]
+          {
+            echo "CANDIDATE_SHA=$CANDIDATE_SHA"
+            echo "CANDIDATE_VERSION=$CANDIDATE_VERSION"
+          } >> "$GITHUB_ENV"
+
       - name: Build exact local sdist and formula
         env:
           BUILD_VENV: ${{ runner.temp }}/nuv-agent-formula-build
@@ -282,9 +320,11 @@ jobs:
           [ -x "$FORMULA_PYTHON" ]
           "$FORMULA_PYTHON" -m pip check
           "$FORMULA_PYTHON" - <<'PY'
+          import os
           import platform
           import sys
           from importlib.metadata import version
+          from nuvion_app import build_info
           expected = {
               "torch": "2.10.0",
               "numpy": "2.4.2",
@@ -300,6 +340,8 @@ jobs:
           assert platform.machine() == "arm64"
           assert sys.version_info[:2] == (3, 14)
           assert {name: version(name) for name in expected} == expected
+          assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
+          assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
           PY
 
       - name: Download only the reviewed SigLIP snapshot revision
@@ -404,12 +446,15 @@ jobs:
           assert stat.S_IMODE(reference_stat.st_mode) == 0o600
           reference = json.loads(reference_path.read_text(encoding="utf-8"))
           assert set(reference) == {
-              "schemaVersion", "modelRevision", "labels", "scores"
+              "schemaVersion", "componentSha", "agentVersion",
+              "modelRevision", "labels", "scores"
           }
           labels = ["normal scene", "anomalous scene"]
           frame = np.zeros((224, 224, 3), dtype=np.uint8)
           assert type(reference["schemaVersion"]) is int
           assert reference["schemaVersion"] == 1
+          assert reference["componentSha"] == os.environ["CANDIDATE_SHA"]
+          assert reference["agentVersion"] == os.environ["CANDIDATE_VERSION"]
           assert reference["modelRevision"] == revision
           assert reference["labels"] == labels
           scores = reference["scores"]
@@ -518,6 +563,22 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Stamp exact checked-out candidate identity
+        run: |
+          set -euo pipefail
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          CANDIDATE_SHA="$(git rev-parse HEAD)"
+          CANDIDATE_VERSION="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          python packaging/release/stamp-build-info.py \
+            --sha "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION"
+          [ "$(git status --porcelain --untracked-files=all)" = " M nuvion_app/build_info.py" ]
+          {
+            echo "CANDIDATE_SHA=$CANDIDATE_SHA"
+            echo "CANDIDATE_VERSION=$CANDIDATE_VERSION"
+          } >> "$GITHUB_ENV"
+
       - name: Install test and shell runtimes
         run: |
           set -euo pipefail
@@ -526,6 +587,7 @@ jobs:
           python -m pip install \
             transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
             tokenizers==0.23.1 safetensors==0.8.0
+          python -c 'import os; from nuvion_app import build_info; assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]; assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]'
           archive="${RUNNER_TEMP}/actionlint.tar.gz"
           curl --fail --silent --show-error --location \
             https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \

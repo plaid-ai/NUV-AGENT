@@ -25,13 +25,27 @@ Demo mode:
 Build the IQ9075 base bundle and package on a native arm64 Docker host. Both
 builders execute in digest-pinned containers:
 ```bash
-export COMPONENT_SHA=<full-stamped-source-sha>
-export SOURCE_DATE_EPOCH=<source-commit-epoch>
-packaging/release/build-agent-bundle.sh \
-  0.1.121 dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz
-BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz \
-  packaging/deb/build-deb.sh
+SOURCE_TREE=/path/to/clean/nuv-agent-checkout
+COMPONENT_SHA=$(git -C "$SOURCE_TREE" rev-parse HEAD)
+SOURCE_DATE_EPOCH=$(git -C "$SOURCE_TREE" show -s --format=%ct "$COMPONENT_SHA")
+STAGED_SOURCE=$(mktemp -d /tmp/nuv-agent-stamped-source.XXXXXX)
+git -C "$SOURCE_TREE" archive --format=tar "$COMPONENT_SHA" | \
+  tar -xf - -C "$STAGED_SOURCE"
+python3 "$STAGED_SOURCE/packaging/release/stamp-build-info.py" \
+  --sha "$COMPONENT_SHA" --version 0.1.121
+(
+  cd "$STAGED_SOURCE"
+  export COMPONENT_SHA SOURCE_DATE_EPOCH VERSION=0.1.121 ARCH=arm64
+  packaging/release/build-agent-bundle.sh \
+    0.1.121 dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz
+  BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz \
+    OUTPUT_DEB=dist/nuv-agent_0.1.121_arm64.deb packaging/deb/build-deb.sh
+)
 ```
+
+The archive step copies only committed bytes and the stamp changes only that
+disposable source tree. Do not build an immutable candidate from an unstamped
+checkout or alter the component worktree solely to manufacture the stamp.
 
 This script:
 - Embeds the exact hash-locked bundle and its SHA-256; `postinst` performs no
@@ -212,8 +226,10 @@ Runtime privilege boundary:
 - `packaging/release/build-agent-bundle.sh`: IQ9075 OTA용 self-contained immutable
   slot bundle을 만들며, symlink 없는 tar.gz, CPython 3.12/Linux aarch64
   hash-lock, pinned DepthAI wheel, stamped component SHA를 강제합니다. 직접 실행할
-  때는 `SOURCE_DATE_EPOCH=<commit epoch> COMPONENT_SHA=<full commit SHA>
-  packaging/release/build-agent-bundle.sh <version> <output>`을 사용합니다.
+  때도 위 절차처럼 exact commit의 disposable archive에서
+  `stamp-build-info.py`를 먼저 실행한 뒤 `SOURCE_DATE_EPOCH`와
+  `COMPONENT_SHA`를 전달해야 합니다. 환경 변수만 지정한 unstamped source는
+  의도적으로 거부됩니다.
 - `packaging/release/generate-release-bom.py`: v1 telemetry BOM 또는 exact product
   target, release sequence, minimum updater version, detached Ed25519 signature를
   가진 release-bom-v2를 생성합니다.

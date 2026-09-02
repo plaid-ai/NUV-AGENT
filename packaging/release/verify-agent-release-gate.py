@@ -223,7 +223,12 @@ def verify_release_gate(
         or run.get("path") != WORKFLOW_PATH
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
-        or run.get("event") not in {"pull_request", "merge_group", "workflow_dispatch"}
+        # PR check-runs report the branch head SHA even though checkout tests
+        # refs/pull/<n>/merge. Publication may therefore consume only the
+        # explicit post-merge dispatch whose checkout HEAD is the landed
+        # component commit on main.
+        or run.get("event") != "workflow_dispatch"
+        or run.get("head_branch") != "main"
         or not isinstance(run_repository, dict)
         or run_repository.get("full_name") != repository
     ):

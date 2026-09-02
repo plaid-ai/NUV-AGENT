@@ -415,7 +415,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "path": ".github/workflows/agent-release-gate.yml",
             "status": "completed",
             "conclusion": "success",
-            "event": "pull_request",
+            "event": "workflow_dispatch",
+            "head_branch": "main",
             "repository": {"full_name": repository},
         }
 
@@ -433,6 +434,25 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertEqual(evidence["workflowRunId"], 8003)
         self.assertEqual(evidence["checkRunId"], 7002)
         self.assertEqual(evidence["checkSuiteId"], 6001)
+
+        for event, branch in (("pull_request", "main"), ("workflow_dispatch", "dev")):
+            with self.subTest(event=event, branch=branch), self.assertRaisesRegex(
+                RELEASE_GATE.ReleaseGateError,
+                "exact release workflow run",
+            ):
+                RELEASE_GATE.verify_release_gate(
+                    repository=repository,
+                    component_sha=component_sha,
+                    required_context="agent-release-gate",
+                    required_integration_id=15368,
+                    workflow_sha256="b" * 64,
+                    check_runs=[check],
+                    workflow_run=lambda _run_id, event=event, branch=branch: {
+                        **run,
+                        "event": event,
+                        "head_branch": branch,
+                    },
+                )
 
     def test_ready_decision_requires_signed_physical_and_live_gate_evidence(self) -> None:
         component_sha = "a" * 40

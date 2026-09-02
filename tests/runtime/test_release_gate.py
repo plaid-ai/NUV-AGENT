@@ -220,6 +220,45 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn(f'VERSION="${{VERSION:-{version}}}"', deb)
         self.assertIn(f'version "{version}"', homebrew)
 
+    def test_prerequisite_builds_use_exact_stamped_checkout_identity(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "agent-release-gate.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            workflow.count("- name: Stamp exact checked-out candidate identity"),
+            3,
+        )
+        self.assertEqual(workflow.count('CANDIDATE_SHA="$(git rev-parse HEAD)"'), 3)
+        self.assertEqual(
+            workflow.count(
+                '[ "$(git status --porcelain --untracked-files=all)" = '
+                '" M nuvion_app/build_info.py" ]'
+            ),
+            3,
+        )
+        self.assertEqual(
+            workflow.count(
+                '--sha "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION"'
+            ),
+            3,
+        )
+        self.assertGreaterEqual(
+            workflow.count(
+                'build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]'
+            ),
+            3,
+        )
+        self.assertIn(
+            'reference["componentSha"] == os.environ["CANDIDATE_SHA"]',
+            workflow,
+        )
+        self.assertIn(
+            'reference["agentVersion"] == os.environ["CANDIDATE_VERSION"]',
+            workflow,
+        )
+        self.assertNotIn('CANDIDATE_SHA="$GITHUB_SHA"', workflow)
+
     def test_command_verifier_dependencies_are_pinned_for_homebrew(self) -> None:
         homebrew = (ROOT / "packaging" / "homebrew" / "nuv-agent.rb").read_text(
             encoding="utf-8"
