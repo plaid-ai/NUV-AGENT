@@ -88,6 +88,19 @@ class CommandTransportTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["reportedState"], {"configVersion": 11})
 
+        lifecycle = build_command_ack_payload(
+            CommandAck(
+                ack_id=deterministic_ack_id(command_id, "RECEIVED"),
+                command_id=command_id,
+                sequence=42,
+                status="RECEIVED",
+                observed_at="2026-09-01T02:00:02Z",
+                reported_state=None,
+            )
+        )
+        self.assertEqual(lifecycle["reportedState"], {})
+        self.assertIsInstance(lifecycle["reportedState"], dict)
+
     async def test_http_pull_uses_after_sequence_and_bearer_auth(self) -> None:
         first_id = str(uuid.uuid4())
         second_id = str(uuid.uuid4())

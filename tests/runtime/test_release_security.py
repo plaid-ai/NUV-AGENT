@@ -15,6 +15,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from nuvion_app.runtime.release_bom import (
+    ReleaseTarget,
+    build_release_bom_v2_payload,
+    canonical_release_bom_json,
+)
+from nuvion_app.runtime import stable_file as STABLE_FILE
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -67,6 +73,14 @@ FACE_MANIFEST = load_script(
     "face_artifact_manifest",
     "packaging/release/face-artifact-manifest.py",
 )
+FLEET_E2E = load_script(
+    "release_security_iq9075_fleet_e2e",
+    "packaging/dev/run-iq9075-fleet-e2e.py",
+)
+PHYSICAL_EVIDENCE = load_script(
+    "assemble_iq9075_physical_evidence",
+    "packaging/release/assemble-iq9075-physical-evidence.py",
+)
 
 
 class ReleaseSecurityWorkflowTest(unittest.TestCase):
@@ -92,7 +106,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         return re.split(r"^      - name: ", section, flags=re.MULTILINE)[1:]
 
     def _assert_immediate_revalidation(
-        self, section: str, credential_step_name: str
+        self,
+        section: str,
+        credential_step_name: str,
+        *,
+        require_live_authorization: bool = True,
     ) -> None:
         steps = self._steps(section)
         indexes = [
@@ -105,6 +123,400 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         previous = steps[indexes[0] - 1]
         self.assertIn("verify-release-settings-attestation.py", previous)
         self.assertIn("--publisher-root publisher", previous)
+        if require_live_authorization:
+            self.assertIn(
+                "revalidate-live-release-authorization.sh", previous
+            )
+
+    @staticmethod
+    def _physical_fixture(
+        root: Path,
+        *,
+        component_sha: str,
+    ) -> tuple[dict[str, object], Path, Path]:
+        run_id = "12345678-1234-4abc-8def-123456789abc"
+        manifest_path = root / "iq9075-v0.1.121-harness-manifest.json"
+        result_path = root / "iq9075-v0.1.121-harness-result.json"
+        oak_soak_path = root / "iq9075-v0.1.121-oak-soak-result.json"
+        artifact_path = (
+            root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+        )
+        artifact_path.write_bytes(b"exact deterministic candidate bundle")
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        bom_path = root / "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json"
+        bom = build_release_bom_v2_payload(
+            bom_id="nuv-agent-0.1.121-iq9075-aarch64",
+            release_sequence=2,
+            agent_version="0.1.121",
+            component_sha=component_sha,
+            config_schema="12",
+            min_updater_version="0.2.0",
+            targets=[
+                ReleaseTarget(
+                    product_model="IQ9075_DEV",
+                    platform_profile="iq9075_dev",
+                    hardware_revision="QCS9075-EVK",
+                    architecture="aarch64",
+                )
+            ],
+            artifact_path=artifact_path,
+            artifact_kind="agent-bundle",
+            built_at="2026-09-03T09:00:00Z",
+        )
+        bom_path.write_text(canonical_release_bom_json(bom), encoding="utf-8")
+        bom_file_sha256 = hashlib.sha256(bom_path.read_bytes()).hexdigest()
+        harness = ROOT / "packaging/dev/test-iq9075.sh"
+        fleet_runner = ROOT / "packaging/dev/run-iq9075-fleet-e2e.py"
+        fleet_manifest_path = root / "iq9075-v0.1.121-fleet-manifest.json"
+        fleet_evidence_path = root / "iq9075-v0.1.121-fleet-evidence.json"
+        baseline_digest = (
+            "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+        )
+        fleet_release = {
+            "agentVersion": "0.1.121",
+            "releaseSequence": 2,
+            "artifactDigest": "sha256:" + artifact_sha256,
+            "componentSha": component_sha,
+            "configSchema": "12",
+            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+        }
+        fleet_manifest = FLEET_E2E.build_manifest(
+            run_id=run_id,
+            tool_sha256=hashlib.sha256(
+                (ROOT / "packaging/dev/iq9075-board-e2e.py").read_bytes()
+            ).hexdigest(),
+            input_digests={
+                "commandSha256": "6" * 64,
+                "releaseSha256": (
+                    "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
+                ),
+                "healthSha256": "8" * 64,
+                "bindingSha256": "9" * 64,
+            },
+            identity={
+                "deviceId": "sp-3-nuvion-physical",
+                "spaceId": 3,
+                "productModel": "IQ9075_DEV",
+                "platformProfile": "iq9075_dev",
+                "hardwareRevision": "QCS9075-EVK",
+                "architecture": "aarch64",
+                "dockerRequired": False,
+            },
+            scenario_type="oak-fault-rollback",
+            expected_command_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            expected_bom_digest=bom["bomDigest"],
+            expected_candidate_slot=(
+                "/opt/nuv-agent/releases/" + bom["bomDigest"][7:]
+            ),
+            expected_previous_slot="releases/" + baseline_digest,
+            expected_previous_version="0.1.120",
+            hold_seconds=10,
+            release=fleet_release,
+        )
+        fleet_manifest_path.write_text(
+            json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        candidate_relative = "releases/" + bom["bomDigest"][7:]
+        baseline_relative = "releases/" + baseline_digest
+        services = {
+            "nuv-agent.service": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 4200,
+            },
+            "nuv-agent-updater.service": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 4300,
+            },
+            "nuv-agent-updater.socket": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 0,
+            },
+        }
+        fleet_evidence = {
+            "schemaVersion": 1,
+            "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+            "runId": run_id,
+            "generatedAt": "2026-09-03T10:03:00Z",
+            "scenario": "oak-fault-rollback",
+            "complete": True,
+            "gates": {
+                "foundation": True,
+                "backup": True,
+                "trust": True,
+                "updater2": True,
+                "oak": True,
+                "services": True,
+                "scenario": True,
+            },
+            "oak": {
+                "port": "2-1.1",
+                "vendorId": "03e7",
+                "productId": "f63b",
+                "speedMbps": 5000,
+                "mxidSha256": "3" * 64,
+                "attached": True,
+                "bound": True,
+            },
+            "services": services,
+            "runtimePids": {"candidate": 4100, "restored": 4200},
+            "slots": {
+                "current": baseline_relative,
+                "previous": candidate_relative,
+                "currentVersion": "0.1.120",
+                "release": {
+                    "schemaVersion": 2,
+                    "bomDigest": "sha256:" + baseline_digest,
+                    "agentVersion": "0.1.120",
+                    "releaseSequence": 1,
+                    "artifactDigest": "sha256:" + "e" * 64,
+                    "componentSha": "f" * 40,
+                    "configSchema": "12",
+                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                },
+                "previousRelease": {
+                    "schemaVersion": 2,
+                    "bomDigest": bom["bomDigest"],
+                    **fleet_release,
+                },
+            },
+            "updater": {
+                "capabilityAvailable": True,
+                "authenticatedHelper": True,
+                "reason": "READY",
+                "updaterVersion": "0.2.0",
+                "update": {
+                    "commandId": fleet_manifest["scenario"]["expectedCommandId"],
+                    "sequence": 2,
+                    "targetVersion": "0.1.121",
+                    "bomDigest": bom["bomDigest"],
+                    "phase": "ROLLED_BACK",
+                    "updatePhase": "ROLLED_BACK",
+                    "updatedAt": "2026-09-03T10:02:00Z",
+                    "commandExpiresAt": "2026-09-03T11:00:00Z",
+                    "candidateSlot": fleet_manifest["scenario"][
+                        "expectedCandidateSlot"
+                    ],
+                    "previousSlot": baseline_relative,
+                    "previousVersion": "0.1.120",
+                    "releaseSequence": 2,
+                    "artifactDigest": "sha256:" + artifact_sha256,
+                    "componentSha": component_sha,
+                    "configSchema": "12",
+                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                    "bomVerificationStatus": "VERIFIED",
+                    "slot": baseline_relative,
+                    "rollbackSlot": baseline_relative,
+                    "rollbackVersion": "0.1.120",
+                    "errorCode": "ROLLED_BACK",
+                    "health": "LKG_RESTORED",
+                    "functionalHealth": "FUNCTIONAL_UNHEALTHY",
+                },
+            },
+        }
+        fleet_evidence_path.write_text(
+            json.dumps(fleet_evidence, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        manifest = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-physical-manifest",
+            "runId": run_id,
+            "agentVersion": "0.1.121",
+            "componentSha": component_sha,
+            "harnessSha256": hashlib.sha256(harness.read_bytes()).hexdigest(),
+            "fleetRunnerSha256": hashlib.sha256(
+                fleet_runner.read_bytes()
+            ).hexdigest(),
+            "fleetManifest": {
+                "file": fleet_manifest_path.name,
+                "sha256": hashlib.sha256(
+                    fleet_manifest_path.read_bytes()
+                ).hexdigest(),
+            },
+            "fleetEvidence": {
+                "file": fleet_evidence_path.name,
+                "sha256": hashlib.sha256(
+                    fleet_evidence_path.read_bytes()
+                ).hexdigest(),
+            },
+            "testedArtifact": {
+                "name": artifact_path.name,
+                "sha256": artifact_sha256,
+                "sizeBytes": artifact_path.stat().st_size,
+            },
+            "testedBom": {
+                "file": bom_path.name,
+                "sha256": bom_file_sha256,
+            },
+            "board": {
+                "productModel": "IQ9075_DEV",
+                "platformProfile": "iq9075_dev",
+                "hardwareRevision": "QCS9075-EVK",
+                "architecture": "aarch64",
+                "kernel": "6.8.0-qcom",
+                "depthaiVersion": "2.32.0.0",
+                "gstreamerVersion": "1.24.2",
+            },
+            "oakMxidSha256": "3" * 64,
+            "startedAt": "2026-09-03T10:00:00Z",
+            "expectedRollback": {
+                "agentVersion": "0.1.120",
+                "slot": (
+                    "releases/"
+                    "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+                ),
+            },
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        rss_samples = [
+            {"elapsedSec": float(second), "rssAnonKiB": 131072}
+            for second in range(0, 121, 5)
+        ]
+        result = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-physical-result",
+            "runId": run_id,
+            "agentVersion": "0.1.121",
+            "componentSha": component_sha,
+            "manifestSha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "artifactSha256": artifact_sha256,
+            "bomSha256": bom_file_sha256,
+            "exitCode": 0,
+            "soak": {
+                "durationSeconds": 120.0,
+                "targetFps": 30.0,
+                "rawSamples": 3600,
+                "rssAnonSamples": rss_samples,
+                "gstreamerErrors": [],
+                "maxAppsrcBuffers": 2,
+                "maxAppsrcBytes": 1843200,
+                "queueHighWatermarks": {
+                    "clip_live_queue": 2,
+                    "physical_overlay_queue": 1,
+                    "physical_raw_queue": 1,
+                    "uplink_live_queue": 2,
+                },
+            },
+            "webrtc": {
+                "offerCount": 1,
+                "terminalStopCount": 1,
+                "offerSdpHadPinnedProfile": True,
+                "branchParentDetached": True,
+                "queueParentDetached": True,
+                "webrtcParentDetached": True,
+                "teeRequestPadCount": 0,
+                "queueState": "NULL",
+                "webrtcState": "NULL",
+                "hasPipeline": False,
+            },
+            "splitmux": {
+                "segmentSeconds": 4.0,
+                "retentionLimit": 30,
+                "segmentsAtEnd": 30,
+                "fragmentsOpenedDuringSoak": 30,
+                "newestSegmentAgeSeconds": 2.0,
+            },
+            "rollback": {
+                "expectedSlot": (
+                    "releases/"
+                    "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+                ),
+                "candidateSlot": "releases/" + bom["bomDigest"][7:],
+                "restoredSlot": (
+                    "releases/"
+                    "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+                ),
+                "candidatePid": 4100,
+                "restoredPid": 4200,
+                "oakProbeExitCode": 0,
+                "oakReady": True,
+            },
+        }
+        result_path.write_text(
+            json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        oak_soak = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-oak-soak-result",
+            "startedAt": manifest["startedAt"],
+            "board": manifest["board"],
+            "oakMxidSha256": manifest["oakMxidSha256"],
+            "deviceIdentity": {
+                "deviceId": "sp-3-nuvion-physical",
+                "spaceId": 3,
+            },
+            "runtimeIdentity": {
+                "agentVersion": "0.1.121",
+                "componentSha": component_sha,
+                "bomDigest": bom["bomDigest"],
+                "pythonPath": (
+                    "/opt/nuv-agent/releases/"
+                    + bom["bomDigest"][7:]
+                    + "/venv/bin/python"
+                ),
+                "releaseMarkerSha256": "4" * 64,
+            },
+            "soak": result["soak"],
+            "webrtc": result["webrtc"],
+            "splitmux": result["splitmux"],
+        }
+        oak_soak_path.write_text(
+            json.dumps(oak_soak, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest["oakSoak"] = {
+            "file": oak_soak_path.name,
+            "sha256": hashlib.sha256(oak_soak_path.read_bytes()).hexdigest(),
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        result["manifestSha256"] = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
+        result_path.write_text(
+            json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        summary: dict[str, object] = {
+            "schemaVersion": 2,
+            "kind": "nuvion-iq9075-physical-release-evidence",
+            "agentVersion": "0.1.121",
+            "componentSha": component_sha,
+            "harnessManifest": {
+                "file": manifest_path.name,
+                "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            },
+            "harnessResult": {
+                "file": result_path.name,
+                "sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+            },
+            "physicalGate": {
+                "oakSoakSeconds": 120.0,
+                "rawFps": 30.0,
+                "rssSlopeMiBPerMinute": 0.0,
+                "rssRangeMiB": 0.0,
+                "gstreamerErrors": 0,
+                "webrtcBranchDisposed": True,
+                "splitmuxRotated": True,
+                "rollbackOakReady": True,
+            },
+        }
+        return summary, manifest_path, result_path
 
     def test_tag_push_is_secret_zero_and_default_branch_starts_publisher(self) -> None:
         self.assertIn("on:\n  push:\n    tags:", self.request)
@@ -175,8 +587,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     verifier_count[name],
                 )
                 self.assertIn(credential_reference[name], section)
+                self.assertIn("actions: read", section)
+                self.assertIn("checks: read", section)
                 if name == "github-release-publish":
-                    self.assertIn("permissions:\n      contents: write", section)
+                    self.assertIn("contents: write", section)
                     self.assertNotIn("GITHUB_RELEASE_TOKEN", section)
                 else:
                     self.assertNotIn("contents: write", section)
@@ -209,6 +623,32 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 with self.subTest(job=job, credential_step=name):
                     self._assert_immediate_revalidation(self._job(job), name)
 
+        self.assertEqual(
+            self.publish.count(
+                "publisher/packaging/release/"
+                "revalidate-live-release-authorization.sh"
+            ),
+            13,
+        )
+
+    def test_homebrew_token_never_enters_argv_or_git_config(self) -> None:
+        homebrew = self._job("homebrew-publish")
+        self.assertNotIn("x-access-token:${GH_TOKEN}@", homebrew)
+        self.assertNotIn("git remote set-url", homebrew)
+        self.assertIn(
+            'git clone "https://github.com/${TAP_REPO}.git" tap', homebrew
+        )
+        self.assertIn(
+            '[ "$(git remote get-url origin)" = '
+            '"https://github.com/${TAP_REPO}.git" ]',
+            homebrew,
+        )
+        self.assertIn('askpass="$(mktemp ', homebrew)
+        self.assertIn("chmod 0700 \"$askpass\"", homebrew)
+        self.assertIn("trap cleanup_askpass EXIT", homebrew)
+        self.assertIn("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=", homebrew)
+        self.assertIn('*Password*) printf \'%s\\n\' "${GH_TOKEN:?}"', homebrew)
+
     def test_face_publisher_is_main_only_pinned_and_revalidates_each_credential(self) -> None:
         self.assertIn("environment: face-artifacts-release", self.face)
         self.assertIn("group: face-artifacts-global-publisher", self.face)
@@ -232,7 +672,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "Publish to model-scoped GCS paths and update pointers",
         ):
             with self.subTest(credential_step=name):
-                self._assert_immediate_revalidation(self.face, name)
+                self._assert_immediate_revalidation(
+                    self.face,
+                    name,
+                    require_live_authorization=False,
+                )
         self.assertNotIn('"${{ inputs.', self.face)
 
     def test_apt_signing_uses_owned_mode_0600_passphrase_file(self) -> None:
@@ -337,6 +781,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.publish.index("  homebrew-publish:"), self.publish.index("  apt-publish:")
         )
         self.assertNotIn("softprops/action-gh-release", self.publish)
+        self.assertIn(
+            "tag_object_sha: ${{ steps.identity.outputs.tag_object_sha }}",
+            self.publish,
+        )
+        self.assertIn('--tag-object-sha "$TAG_OBJECT_SHA"', self.publish)
 
     def test_v121_release_is_blocked_until_live_release_gates_succeed(self) -> None:
         preflight = self.publish.split("  release-preflight:", maxsplit=1)[1].split(
@@ -454,6 +903,54 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     },
                 )
 
+    def test_live_gate_revalidation_requires_exact_preflight_evidence(self) -> None:
+        evidence = {
+            "workflowRunId": 101,
+            "checkRunId": 102,
+            "checkSuiteId": 103,
+            "workflowSha256": "a" * 64,
+        }
+        RELEASE_GATE.verify_expected_evidence(
+            evidence,
+            run_id=101,
+            check_id=102,
+            check_suite_id=103,
+            workflow_sha256="a" * 64,
+        )
+        mutations = (
+            {**evidence, "workflowRunId": 999},
+            {**evidence, "checkRunId": 999},
+            {**evidence, "checkSuiteId": 999},
+            {**evidence, "workflowSha256": "b" * 64},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(
+                RELEASE_GATE.ReleaseGateError
+            ):
+                RELEASE_GATE.verify_expected_evidence(
+                    mutation,
+                    run_id=101,
+                    check_id=102,
+                    check_suite_id=103,
+                    workflow_sha256="a" * 64,
+                )
+
+        helper = (
+            ROOT
+            / "packaging/release/revalidate-live-release-authorization.sh"
+        )
+        self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
+        script = helper.read_text(encoding="utf-8")
+        self.assertIn("verify-agent-release-gate.py", script)
+        self.assertIn("verify-release-readiness.py", script)
+        for option in (
+            "--expected-run-id",
+            "--expected-check-id",
+            "--expected-check-suite-id",
+            "--expected-workflow-sha256",
+        ):
+            self.assertIn(option, script)
+
     def test_ready_decision_requires_signed_physical_and_live_gate_evidence(self) -> None:
         component_sha = "a" * 40
         fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
@@ -467,26 +964,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "context": "agent-release-gate",
             "integrationId": 15368,
         }
-        physical_document = {
-            "schemaVersion": 1,
-            "kind": "nuvion-iq9075-physical-release-evidence",
-            "agentVersion": "0.1.121",
-            "componentSha": component_sha,
-            "harnessManifestSha256": "c" * 64,
-            "harnessEvidenceSha256": "d" * 64,
-            "physicalGate": {
-                "oakSoakSeconds": 120,
-                "rawFps": 29.9,
-                "rssSlopeMiBPerMinute": 0.05,
-                "rssRangeMiB": 9.6,
-                "gstreamerErrors": 0,
-                "webrtcBranchDisposed": True,
-                "splitmuxRotated": True,
-                "rollbackOakReady": True,
-            },
-        }
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
+            physical_document, _manifest, _result = self._physical_fixture(
+                root,
+                component_sha=component_sha,
+            )
             evidence = root / "iq9075-v0.1.121-physical-evidence.json"
             signature = root / "iq9075-v0.1.121-physical-evidence.json.asc"
             evidence.write_text(
@@ -533,7 +1016,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "_verify_detached_signature",
                 return_value=fingerprint,
             ) as verify_signature:
-                READINESS.verify_readiness(
+                verified = READINESS.verify_readiness(
                     readiness,
                     version="0.1.121",
                     component_sha=component_sha,
@@ -544,7 +1027,16 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     signer_directory=(
                         ROOT / "packaging/release/trusted-tag-signers"
                     ),
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                 )
+            self.assertEqual(
+                verified["physical_artifact_sha256"],
+                json.loads(_result.read_text(encoding="utf-8"))["artifactSha256"],
+            )
+            self.assertEqual(
+                verified["physical_bom_sha256"],
+                json.loads(_result.read_text(encoding="utf-8"))["bomSha256"],
+            )
             verify_signature.assert_called_once()
 
             mismatched_gate = {**gate_evidence, "workflowRunId": 999}
@@ -563,7 +1055,694 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     signer_directory=(
                         ROOT / "packaging/release/trusted-tag-signers"
                     ),
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                 )
+
+    def test_raw_iq9075_evidence_is_dereferenced_and_recomputed(self) -> None:
+        security = json.loads(
+            (ROOT / "packaging/release/release-security-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        def validate(root: Path, summary: dict[str, object]) -> None:
+            READINESS._validate_physical_documents(
+                policy_path=root / "release-readiness.json",
+                version="0.1.121",
+                component_sha="a" * 40,
+                summary=summary,
+                security=security,
+                candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+            )
+
+        mutations = {
+            "raw-frame-shortfall": lambda result: result["soak"].update(
+                rawSamples=100
+            ),
+            "gstreamer-error": lambda result: result["soak"].update(
+                gstreamerErrors=["pipeline-error"]
+            ),
+            "bool-exit-code": lambda result: result.update(exitCode=False),
+            "too-few-rss-samples": lambda result: result["soak"].update(
+                rssAnonSamples=result["soak"]["rssAnonSamples"][:3]
+            ),
+            "duplicate-rss-time": lambda result: result["soak"][
+                "rssAnonSamples"
+            ][1].update(elapsedSec=0.0),
+            "large-rss-gap": lambda result: result["soak"].update(
+                rssAnonSamples=[
+                    {"elapsedSec": 0.0, "rssAnonKiB": 131072},
+                    *[
+                        {"elapsedSec": float(value), "rssAnonKiB": 131072}
+                        for value in range(20, 121, 5)
+                    ],
+                ]
+            ),
+            "terminal-stop-missing": lambda result: result["webrtc"].update(
+                terminalStopCount=0
+            ),
+            "branch-parent-left": lambda result: result["webrtc"].update(
+                branchParentDetached=False
+            ),
+            "queue-set-empty": lambda result: result["soak"].update(
+                queueHighWatermarks={}
+            ),
+            "queue-set-one": lambda result: result["soak"].update(
+                queueHighWatermarks={"physical_raw_queue": 1}
+            ),
+            "queue-set-three": lambda result: result["soak"].update(
+                queueHighWatermarks={
+                    key: value
+                    for key, value in result["soak"]["queueHighWatermarks"].items()
+                    if key != "clip_live_queue"
+                }
+            ),
+            "queue-set-five": lambda result: result["soak"][
+                "queueHighWatermarks"
+            ].update(unknown_queue=0),
+            "queue-set-unknown": lambda result: result["soak"].update(
+                queueHighWatermarks={
+                    "physical_raw_queue": 1,
+                    "physical_overlay_queue": 1,
+                    "uplink_live_queue": 2,
+                    "unknown_queue": 2,
+                }
+            ),
+            "tee-pad-left": lambda result: result["webrtc"].update(
+                teeRequestPadCount=1
+            ),
+            "wrong-splitmux-contract": lambda result: result["splitmux"].update(
+                segmentSeconds=60.0,
+                retentionLimit=1,
+                segmentsAtEnd=1,
+                fragmentsOpenedDuringSoak=0,
+            ),
+            "rollback-slot-mismatch": lambda result: result["rollback"].update(
+                restoredSlot="releases/" + "f" * 64
+            ),
+            "rollback-pid-reuse": lambda result: result["rollback"].update(
+                restoredPid=result["rollback"]["candidatePid"]
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                summary, _manifest_path, result_path = self._physical_fixture(
+                    root, component_sha="a" * 40
+                )
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                mutate(result)
+                result_path.write_text(
+                    json.dumps(
+                        result,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                summary["harnessResult"]["sha256"] = hashlib.sha256(
+                    result_path.read_bytes()
+                ).hexdigest()
+                with self.assertRaises(READINESS.ReadinessError):
+                    validate(root, summary)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            summary, manifest_path, result_path = self._physical_fixture(
+                root, component_sha="a" * 40
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            oak_path = root / manifest["oakSoak"]["file"]
+            oak = json.loads(oak_path.read_text(encoding="utf-8"))
+            oak["runtimeIdentity"]["agentVersion"] = "0.1.120"
+            oak_path.write_text(
+                json.dumps(oak, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            manifest["oakSoak"]["sha256"] = hashlib.sha256(
+                oak_path.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["manifestSha256"] = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            result_path.write_text(
+                json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            summary["harnessManifest"]["sha256"] = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            summary["harnessResult"]["sha256"] = hashlib.sha256(
+                result_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "OAK soak source identity"
+            ):
+                validate(root, summary)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            summary, _manifest_path, result_path = self._physical_fixture(
+                root, component_sha="a" * 40
+            )
+            result_path.write_bytes(result_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "does not match signed summary"
+            ):
+                validate(root, summary)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            summary, _manifest_path, result_path = self._physical_fixture(
+                root, component_sha="a" * 40
+            )
+            raw = result_path.read_text(encoding="utf-8")
+            result_path.write_text(
+                raw.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+                encoding="utf-8",
+            )
+            summary["harnessResult"]["sha256"] = hashlib.sha256(
+                result_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(READINESS.ReadinessError, "duplicate"):
+                validate(root, summary)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            summary, _manifest_path, result_path = self._physical_fixture(
+                root, component_sha="a" * 40
+            )
+            raw = result_path.read_text(encoding="utf-8")
+            result_path.write_text(
+                raw.replace('"durationSeconds":120.0', '"durationSeconds":NaN'),
+                encoding="utf-8",
+            )
+            summary["harnessResult"]["sha256"] = hashlib.sha256(
+                result_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(READINESS.ReadinessError, "constant"):
+                validate(root, summary)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            summary, manifest_path, result_path = self._physical_fixture(
+                root, component_sha="a" * 40
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            fleet_manifest_path = root / manifest["fleetManifest"]["file"]
+            fleet_manifest = json.loads(
+                fleet_manifest_path.read_text(encoding="utf-8")
+            )
+            fleet_manifest["toolSha256"] = "f" * 64
+            fleet_manifest_path.write_text(
+                json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest["fleetManifest"]["sha256"] = hashlib.sha256(
+                fleet_manifest_path.read_bytes()
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["manifestSha256"] = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            result_path.write_text(
+                json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            summary["harnessManifest"]["sha256"] = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            summary["harnessResult"]["sha256"] = hashlib.sha256(
+                result_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "board harness bytes"
+            ):
+                validate(root, summary)
+
+        def mutate_release_sha(manifest, _evidence) -> None:
+            manifest["inputs"]["releaseSha256"] = "e" * 64
+
+        def mutate_publisher_key(manifest, evidence) -> None:
+            manifest["scenario"]["release"]["publisherKeyId"] = "attacker-key"
+            evidence["updater"]["update"]["publisherKeyId"] = "attacker-key"
+            evidence["slots"]["previousRelease"]["publisherKeyId"] = (
+                "attacker-key"
+            )
+
+        def mutate_config_schema(manifest, evidence) -> None:
+            manifest["scenario"]["release"]["configSchema"] = "99"
+            evidence["updater"]["update"]["configSchema"] = "99"
+            evidence["slots"]["previousRelease"]["configSchema"] = "99"
+
+        def mutate_oak_state(_manifest, evidence) -> None:
+            evidence["oak"]["attached"] = False
+
+        def mutate_service_state(_manifest, evidence) -> None:
+            evidence["services"]["nuv-agent.service"]["active"] = False
+
+        def mutate_device_identity(manifest, _evidence) -> None:
+            manifest["identity"]["deviceId"] = "sp-3-nuvion-other-board"
+
+        def mutate_manifest_schema(manifest, _evidence) -> None:
+            manifest["schemaVersion"] = 999
+
+        def mutate_manifest_protocol(manifest, _evidence) -> None:
+            manifest["protocolVersion"] = "evil"
+
+        def mutate_manifest_destinations(manifest, _evidence) -> None:
+            manifest["destinations"] = {}
+
+        def mutate_manifest_product(manifest, _evidence) -> None:
+            manifest["identity"]["productModel"] = "NUVION"
+
+        def mutate_manifest_command_id(manifest, evidence) -> None:
+            manifest["scenario"]["expectedCommandId"] = "not-a-uuid"
+            evidence["updater"]["update"]["commandId"] = "not-a-uuid"
+
+        def mutate_manifest_bool_schema(manifest, _evidence) -> None:
+            manifest["schemaVersion"] = True
+
+        def mutate_manifest_docker_bool(manifest, _evidence) -> None:
+            manifest["identity"]["dockerRequired"] = 0
+
+        def mutate_manifest_hold_float(manifest, _evidence) -> None:
+            manifest["scenario"]["holdSeconds"] = 10.0
+
+        def mutate_release_type(manifest, evidence) -> None:
+            manifest["scenario"]["release"]["configSchema"] = 12
+            evidence["updater"]["update"]["configSchema"] = 12
+            evidence["slots"]["previousRelease"]["configSchema"] = 12
+
+        def mutate_evidence_bool_schema(_manifest, evidence) -> None:
+            evidence["schemaVersion"] = True
+
+        def mutate_evidence_extra_root(_manifest, evidence) -> None:
+            evidence["contradictory"] = True
+
+        def mutate_updater_unavailable(_manifest, evidence) -> None:
+            evidence["updater"].update(
+                capabilityAvailable=False,
+                authenticatedHelper=False,
+                reason="UPDATER_UNAVAILABLE",
+            )
+
+        def mutate_update_extra(_manifest, evidence) -> None:
+            evidence["updater"]["update"]["contradictory"] = True
+
+        def mutate_update_message_type(_manifest, evidence) -> None:
+            evidence["updater"]["update"]["message"] = {}
+
+        def mutate_update_expiry_type(_manifest, evidence) -> None:
+            evidence["updater"]["update"]["commandExpiresAt"] = False
+
+        def mutate_release_marker_extra(_manifest, evidence) -> None:
+            evidence["slots"]["release"]["contradictory"] = True
+
+        def mutate_rollback_generated_before_update(_manifest, evidence) -> None:
+            evidence["generatedAt"] = "2026-09-03T10:01:59Z"
+
+        def mutate_rollback_update_after_generated(_manifest, evidence) -> None:
+            evidence["updater"]["update"]["updatedAt"] = (
+                "2026-09-03T10:03:01Z"
+            )
+
+        def mutate_rollback_health_deadline(_manifest, evidence) -> None:
+            evidence["updater"]["update"]["healthDeadline"] = (
+                "2026-09-03T10:30:00Z"
+            )
+
+        for label, mutate in {
+            "release-keyring": mutate_release_sha,
+            "publisher-key": mutate_publisher_key,
+            "config-schema": mutate_config_schema,
+            "oak-state": mutate_oak_state,
+            "service-state": mutate_service_state,
+            "device-identity": mutate_device_identity,
+            "manifest-schema": mutate_manifest_schema,
+            "manifest-protocol": mutate_manifest_protocol,
+            "manifest-destinations": mutate_manifest_destinations,
+            "manifest-product": mutate_manifest_product,
+            "manifest-command-id": mutate_manifest_command_id,
+            "manifest-bool-schema": mutate_manifest_bool_schema,
+            "manifest-docker-bool": mutate_manifest_docker_bool,
+            "manifest-hold-float": mutate_manifest_hold_float,
+            "release-type": mutate_release_type,
+            "evidence-bool-schema": mutate_evidence_bool_schema,
+            "evidence-extra-root": mutate_evidence_extra_root,
+            "updater-unavailable": mutate_updater_unavailable,
+            "update-extra": mutate_update_extra,
+            "update-message-type": mutate_update_message_type,
+            "update-expiry-type": mutate_update_expiry_type,
+            "release-marker-extra": mutate_release_marker_extra,
+            "rollback-generated-before-update": mutate_rollback_generated_before_update,
+            "rollback-updated-after-generated": mutate_rollback_update_after_generated,
+            "rollback-health-deadline": mutate_rollback_health_deadline,
+        }.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                summary, manifest_path, result_path = self._physical_fixture(
+                    root, component_sha="a" * 40
+                )
+                physical_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                fleet_manifest_path = (
+                    root / physical_manifest["fleetManifest"]["file"]
+                )
+                fleet_evidence_path = (
+                    root / physical_manifest["fleetEvidence"]["file"]
+                )
+                fleet_manifest = json.loads(
+                    fleet_manifest_path.read_text(encoding="utf-8")
+                )
+                fleet_evidence = json.loads(
+                    fleet_evidence_path.read_text(encoding="utf-8")
+                )
+                mutate(fleet_manifest, fleet_evidence)
+                for path, payload in (
+                    (fleet_manifest_path, fleet_manifest),
+                    (fleet_evidence_path, fleet_evidence),
+                ):
+                    path.write_text(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                physical_manifest["fleetManifest"]["sha256"] = hashlib.sha256(
+                    fleet_manifest_path.read_bytes()
+                ).hexdigest()
+                physical_manifest["fleetEvidence"]["sha256"] = hashlib.sha256(
+                    fleet_evidence_path.read_bytes()
+                ).hexdigest()
+                manifest_path.write_text(
+                    json.dumps(
+                        physical_manifest, sort_keys=True, separators=(",", ":")
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                result["manifestSha256"] = hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest()
+                result_path.write_text(
+                    json.dumps(result, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+                summary["harnessManifest"]["sha256"] = hashlib.sha256(
+                    manifest_path.read_bytes()
+                ).hexdigest()
+                summary["harnessResult"]["sha256"] = hashlib.sha256(
+                    result_path.read_bytes()
+                ).hexdigest()
+                with self.assertRaises(READINESS.ReadinessError):
+                    validate(root, summary)
+
+    def test_raw_iq9075_evidence_rejects_non_regular_or_oversize_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            regular = root / "regular.json"
+            regular.write_text("{}\n", encoding="utf-8")
+            link = root / "link.json"
+            link.symlink_to(regular)
+            fifo = root / "fifo.json"
+            os.mkfifo(fifo)
+            oversize = root / "oversize.json"
+            with oversize.open("wb") as output:
+                output.truncate(READINESS.MAX_EVIDENCE_BYTES + 1)
+            for path in (link, fifo, oversize):
+                with self.subTest(path=path.name), self.assertRaises(
+                    READINESS.ReadinessError
+                ):
+                    READINESS._regular_bytes(path)
+
+    def test_evidence_readers_reject_swap_to_symlink_races(self) -> None:
+        for label, reader, error in (
+            ("readiness", READINESS._regular_bytes, READINESS.ReadinessError),
+            ("assembler", PHYSICAL_EVIDENCE._regular_bytes, PHYSICAL_EVIDENCE.AssemblyError),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                victim = root / "evidence.json"
+                backup = root / "evidence.original"
+                attacker = root / "attacker.json"
+                victim.write_text('{"trusted":true}\n', encoding="utf-8")
+                attacker.write_text('{"trusted":false}\n', encoding="utf-8")
+                real_open = STABLE_FILE.os.open
+
+                def swap_before_open(path, flags, *args):
+                    self.assertEqual(Path(path), victim)
+                    victim.rename(backup)
+                    victim.symlink_to(attacker)
+                    try:
+                        return real_open(path, flags, *args)
+                    finally:
+                        victim.unlink()
+                        backup.rename(victim)
+
+                with mock.patch.object(
+                    STABLE_FILE.os, "open", side_effect=swap_before_open
+                ), self.assertRaises(error):
+                    reader(victim)
+                self.assertEqual(victim.read_text(encoding="utf-8"), '{"trusted":true}\n')
+
+    def test_iq9075_physical_evidence_assembler_roundtrip_is_atomic(self) -> None:
+        component_sha = "a" * 40
+
+        def inputs(source: Path) -> dict[str, object]:
+            _summary, manifest_path, _result_path = self._physical_fixture(
+                source, component_sha=component_sha
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return {
+                "soak_result_path": source / manifest["oakSoak"]["file"],
+                "fleet_manifest_path": source / manifest["fleetManifest"]["file"],
+                "fleet_evidence_path": source / manifest["fleetEvidence"]["file"],
+                "artifact_path": (
+                    source
+                    / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+                ),
+                "bom_path": source / manifest["testedBom"]["file"],
+                "candidate_harness": ROOT / "packaging/dev/test-iq9075.sh",
+                "candidate_fleet_runner": (
+                    ROOT / "packaging/dev/run-iq9075-fleet-e2e.py"
+                ),
+                "candidate_board_tool": ROOT / "packaging/dev/iq9075-board-e2e.py",
+                "security_policy_path": (
+                    ROOT / "packaging/release/release-security-policy.json"
+                ),
+                "version": "0.1.121",
+                "component_sha": component_sha,
+            }
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            arguments = inputs(source)
+            result = PHYSICAL_EVIDENCE.assemble(
+                **arguments, output_directory=output
+            )
+            self.assertEqual(len(list(output.iterdir())), 7)
+            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
+            security = json.loads(
+                arguments["security_policy_path"].read_text(encoding="utf-8")
+            )
+            verified = READINESS._validate_physical_documents(
+                policy_path=output / "release-readiness.json",
+                version="0.1.121",
+                component_sha=component_sha,
+                summary=summary,
+                security=security,
+                candidate_harness=arguments["candidate_harness"],
+            )
+            self.assertEqual(
+                verified["physical_artifact_sha256"], result["artifactSha256"]
+            )
+
+        def corrupt_artifact(arguments: dict[str, object]) -> None:
+            arguments["artifact_path"].write_bytes(b"different artifact")
+
+        def corrupt_bom(arguments: dict[str, object]) -> None:
+            arguments["bom_path"].write_text("{}\n", encoding="utf-8")
+
+        def corrupt_fleet_tool(arguments: dict[str, object]) -> None:
+            path = arguments["fleet_manifest_path"]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["toolSha256"] = "f" * 64
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        def duplicate_soak_member(arguments: dict[str, object]) -> None:
+            path = arguments["soak_result_path"]
+            raw = path.read_text(encoding="utf-8")
+            path.write_text(
+                raw.replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1'),
+                encoding="utf-8",
+            )
+
+        def nan_soak_metric(arguments: dict[str, object]) -> None:
+            path = arguments["soak_result_path"]
+            raw = path.read_text(encoding="utf-8")
+            path.write_text(
+                raw.replace('"durationSeconds":120.0', '"durationSeconds":NaN'),
+                encoding="utf-8",
+            )
+
+        def validation_failure(arguments: dict[str, object]) -> None:
+            path = arguments["soak_result_path"]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["soak"]["rawSamples"] = 1
+            path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def bool_schema(arguments: dict[str, object]) -> None:
+            path = arguments["soak_result_path"]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["schemaVersion"] = True
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        for label, corrupt in {
+            "artifact": corrupt_artifact,
+            "bom": corrupt_bom,
+            "fleet-tool": corrupt_fleet_tool,
+            "duplicate": duplicate_soak_member,
+            "nan": nan_soak_metric,
+            "validator": validation_failure,
+            "bool-schema": bool_schema,
+        }.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                source = root / "source"
+                output = root / "output"
+                source.mkdir(mode=0o700)
+                output.mkdir(mode=0o700)
+                arguments = inputs(source)
+                corrupt(arguments)
+                with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                    PHYSICAL_EVIDENCE.assemble(
+                        **arguments, output_directory=output
+                    )
+                self.assertEqual(list(output.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            arguments = inputs(source)
+            actual = arguments["soak_result_path"]
+            link = source / "soak-link.json"
+            link.symlink_to(actual)
+            arguments["soak_result_path"] = link
+            with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                PHYSICAL_EVIDENCE.assemble(**arguments, output_directory=output)
+            self.assertEqual(list(output.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source = root / "source"
+            real_output = root / "real-output"
+            output_link = root / "output"
+            source.mkdir(mode=0o700)
+            real_output.mkdir(mode=0o700)
+            output_link.symlink_to(real_output, target_is_directory=True)
+            arguments = inputs(source)
+            with self.assertRaisesRegex(
+                PHYSICAL_EVIDENCE.AssemblyError, "symbolic link"
+            ):
+                PHYSICAL_EVIDENCE.assemble(
+                    **arguments, output_directory=output_link
+                )
+            self.assertEqual(list(real_output.iterdir()), [])
+
+    def test_physical_evidence_assembler_isolated_mode_blocks_source_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            fake = root / "nuvion_app/runtime"
+            fake.mkdir(parents=True)
+            (fake.parent / "__init__.py").write_text(
+                'raise RuntimeError("source shadow imported")\n', encoding="utf-8"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(
+                        ROOT
+                        / "packaging/release/assemble-iq9075-physical-evidence.py"
+                    ),
+                    "--help",
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for script in (
+                "assemble-iq9075-physical-evidence.py",
+                "verify-release-readiness.py",
+            ):
+                with self.subTest(script=script):
+                    nonisolated = subprocess.run(
+                        [
+                            sys.executable,
+                            str(ROOT / "packaging/release" / script),
+                            "--help",
+                        ],
+                        cwd=root,
+                        env=environment,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    self.assertEqual(nonisolated.returncode, 2)
+                    self.assertIn("requires Python isolated mode", nonisolated.stderr)
+
+    def test_iq9075_runbook_keeps_unsafe_capture_blocked_and_isolates_tools(self) -> None:
+        runbook = (
+            ROOT / "packaging/release/v0.1.121-release-runbook.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "The raw capture sequence below is not currently authorized to run",
+            runbook,
+        )
+        self.assertIn("`IQ9075-PHYSICAL-OAK-SOAK` blocked", runbook)
+        self.assertIn(
+            '"$candidate_bom" "$release_sha" <<\'PY\'', runbook
+        )
+        self.assertNotIn("--device-id sp-3-nuvion-iq9075 --space-id 3", runbook)
+        self.assertIn('--device-id "$device_id" --space-id "$space_id"', runbook)
+        self.assertGreaterEqual(
+            runbook.count("env -u PYTHONPATH PYTHONNOUSERSITE=1"), 4
+        )
+        self.assertIn('test ! -e "$evidence_target" -a ! -L "$evidence_target"', runbook)
 
     def test_latest_failed_gate_supersedes_older_success(self) -> None:
         component_sha = "a" * 40
@@ -879,6 +2058,10 @@ class ReleaseSourceVerificationTest(unittest.TestCase):
                 signer_directory=signers,
             )
             self.assertEqual(verified["tag_signer_fingerprint"], fingerprint)
+            self.assertEqual(
+                verified["tag_object_sha"],
+                self._git(repository, "rev-parse", "refs/tags/v1.2.3^{tag}"),
+            )
 
 
 class SequenceAndPromotionTest(unittest.TestCase):
@@ -2068,6 +3251,32 @@ class SettingsPolicyTest(unittest.TestCase):
                         now=now + dt.timedelta(days=1),
                     )
 
+                moments = iter(
+                    (
+                        now,
+                        now + dt.timedelta(days=1),
+                    )
+                )
+                with self.assertRaisesRegex(
+                    SETTINGS_ATTESTATION.AttestationError,
+                    "expired during verification",
+                ):
+                    SETTINGS_ATTESTATION.verify_attestation(
+                        attestation_path=path,
+                        signature_path=signature,
+                        policy_path=policy,
+                        signer_directory=(
+                            ROOT / "packaging/release/trusted-tag-signers"
+                        ),
+                        repository="plaid-ai/NUV-AGENT",
+                        trusted_publisher_sha="a" * 40,
+                        publisher_root=ROOT,
+                        executing_workflow=(
+                            ROOT / ".github/workflows/release-publish.yml"
+                        ),
+                        clock=lambda: next(moments),
+                    )
+
     @unittest.skipUnless(shutil.which("gpg"), "gpg is required")
     def test_settings_attestation_requires_allowlisted_gpg_signature(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -2478,6 +3687,19 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
         def release(self, tag: str):
             return self.value
 
+        def tag_reference(self, tag: str):
+            return {
+                "ref": f"refs/tags/{tag}",
+                "object": {"type": "tag", "sha": "b" * 40},
+            }
+
+        def annotated_tag(self, object_sha: str):
+            return {
+                "sha": object_sha,
+                "tag": "v0.1.121",
+                "object": {"type": "commit", "sha": "a" * 40},
+            }
+
         def request(self, method: str, path: str, payload=None):
             if path.endswith("/immutable-releases"):
                 return {"enabled": True, "enforced_by_owner": False}
@@ -2534,6 +3756,7 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
                 result = GITHUB_RELEASE.publish_release(
                     api=api,
                     tag="v0.1.121",
+                    tag_object_sha="b" * 40,
                     component_sha="a" * 40,
                     phase="finalize",
                     asset_paths=paths,
@@ -2544,6 +3767,7 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
             rerun = GITHUB_RELEASE.publish_release(
                 api=api,
                 tag="v0.1.121",
+                tag_object_sha="b" * 40,
                 component_sha="a" * 40,
                 phase="finalize",
                 asset_paths=paths,
@@ -2559,9 +3783,44 @@ class ImmutableGitHubReleaseTest(unittest.TestCase):
                 GITHUB_RELEASE.publish_release(
                     api=api,
                     tag="v0.1.121",
+                    tag_object_sha="b" * 40,
                     component_sha="a" * 40,
                     phase="stage",
                     asset_paths=[asset],
+                )
+
+    def test_live_tag_must_still_resolve_to_preflight_object_and_commit(self) -> None:
+        api = self.FakeApi(self._release(draft=True, immutable=False))
+        for label, reference, annotated in (
+            (
+                "retargeted-reference",
+                {
+                    "ref": "refs/tags/v0.1.121",
+                    "object": {"type": "tag", "sha": "c" * 40},
+                },
+                api.annotated_tag("b" * 40),
+            ),
+            (
+                "retargeted-commit",
+                api.tag_reference("v0.1.121"),
+                {
+                    "sha": "b" * 40,
+                    "tag": "v0.1.121",
+                    "object": {"type": "commit", "sha": "c" * 40},
+                },
+            ),
+        ):
+            with (
+                self.subTest(label=label),
+                mock.patch.object(api, "tag_reference", return_value=reference),
+                mock.patch.object(api, "annotated_tag", return_value=annotated),
+                self.assertRaises(GITHUB_RELEASE.GitHubReleaseError),
+            ):
+                GITHUB_RELEASE.verify_live_tag(
+                    api,
+                    tag="v0.1.121",
+                    tag_object_sha="b" * 40,
+                    component_sha="a" * 40,
                 )
 
 

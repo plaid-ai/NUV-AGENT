@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import base64
 import ast
+import base64
+import copy
 import hashlib
 import importlib.util
 import json
@@ -200,6 +201,7 @@ class HarnessFixture:
         self._write("/sys/bus/usb/devices/2-1/speed", "10000\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1.1/idVendor", "03e7\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1.1/idProduct", "f63b\n", 0o444)
+        self._write("/sys/bus/usb/devices/2-1.1/serial", "oak-iq9075-test\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1.1/speed", "5000\n", 0o444)
         self._write("/sys/bus/usb/drivers/usb/unbind", "", 0o600)
         self._write("/sys/bus/usb/drivers/usb/bind", "", 0o600)
@@ -369,9 +371,13 @@ class HarnessFixture:
     def update_state(self, phase: str) -> dict[str, object]:
         state: dict[str, object] = {
             "commandId": self.command_id,
+            "sequence": 2,
             "targetVersion": "0.1.121",
             "bomDigest": f"sha256:{self.current_digest}",
             "phase": phase,
+            "updatePhase": phase,
+            "updatedAt": "2026-09-02T10:02:00Z",
+            "commandExpiresAt": "2026-09-02T23:00:00Z",
             "candidateSlot": f"/opt/nuv-agent/releases/{self.current_digest}",
             "previousSlot": f"releases/{self.previous_digest}",
             "previousVersion": "0.1.120",
@@ -886,6 +892,10 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 current.symlink_to(f"releases/{fixture.previous_digest}")
                 previous.unlink()
                 previous.symlink_to(f"releases/{fixture.current_digest}")
+                fixture.runner.run(
+                    ["/usr/bin/systemctl", "restart", "nuv-agent.service"],
+                    timeout=30,
+                )
                 fixture.runner.updater["update"] = fixture.update_state("ROLLED_BACK")
                 exact = fixture.harness.evidence(fixture.run_id)
                 self.assertTrue(exact["complete"])
@@ -1155,6 +1165,36 @@ class PollingRunTransport:
                     "services": True,
                     "scenario": True,
                 },
+                "oak": {
+                    "port": "2-1.1",
+                    "vendorId": "03e7",
+                    "productId": "f63b",
+                    "speedMbps": 5000,
+                    "mxidSha256": "a" * 64,
+                    "attached": True,
+                    "bound": True,
+                },
+                "services": {
+                    "nuv-agent.service": {
+                        "active": True,
+                        "enabled": True,
+                        "unitFileState": "enabled",
+                        "mainPid": 101,
+                    },
+                    "nuv-agent-updater.service": {
+                        "active": True,
+                        "enabled": True,
+                        "unitFileState": "enabled",
+                        "mainPid": 102,
+                    },
+                    "nuv-agent-updater.socket": {
+                        "active": True,
+                        "enabled": True,
+                        "unitFileState": "enabled",
+                        "mainPid": 0,
+                    },
+                },
+                "runtimePids": None,
                 "slots": {
                     "current": candidate,
                     "previous": scenario["expectedPreviousSlot"],
@@ -1164,14 +1204,31 @@ class PollingRunTransport:
                         "bomDigest": scenario["expectedBomDigest"],
                         **release,
                     },
+                    "previousRelease": {
+                        "schemaVersion": 2,
+                        "bomDigest": "sha256:" + self.baseline_digest,
+                        "agentVersion": "0.1.120",
+                        "releaseSequence": 1,
+                        "artifactDigest": "sha256:" + "e" * 64,
+                        "componentSha": "f" * 40,
+                        "configSchema": "12",
+                        "publisherKeyId": "release-iq9075-dev",
+                    },
                 },
                 "updater": {
+                    "capabilityAvailable": True,
+                    "authenticatedHelper": True,
+                    "reason": "READY",
                     "updaterVersion": "0.2.0",
                     "update": {
                         "commandId": scenario["expectedCommandId"],
+                        "sequence": 2,
                         "targetVersion": release["agentVersion"],
                         "bomDigest": scenario["expectedBomDigest"],
                         "phase": "COMMITTED",
+                        "updatePhase": "COMMITTED",
+                        "updatedAt": "2026-09-02T00:00:02Z",
+                        "commandExpiresAt": "2026-09-02T01:00:00Z",
                         "candidateSlot": scenario["expectedCandidateSlot"],
                         "previousSlot": scenario["expectedPreviousSlot"],
                         "previousVersion": scenario["expectedPreviousVersion"],
@@ -1254,6 +1311,10 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             HOST.validate_cleanup_result({**exact, "unexpected": True}, run_id=run_id)
         with self.assertRaises(HOST.RunnerError):
             HOST.validate_cleanup_result(exact, run_id=str(uuid.uuid4()))
+        with self.assertRaises(HOST.RunnerError):
+            HOST.validate_cleanup_result(
+                {**exact, "schemaVersion": True}, run_id=run_id
+            )
 
     def _known_hosts(self, root: Path) -> tuple[Path, str]:
         key = b"deterministic-iq9075-host-public-key"
@@ -1435,18 +1496,45 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
 
     def test_final_validator_rejects_any_false_gate(self) -> None:
         run_id = str(uuid.uuid4())
-        manifest = {
-            "runId": run_id,
-            "scenario": {
-                "type": "commit",
-                "expectedCommandId": str(uuid.uuid4()),
-                "expectedBomDigest": "sha256:" + "a" * 64,
+        manifest = HOST.build_manifest(
+            run_id=run_id,
+            tool_sha256="f" * 64,
+            input_digests={
+                "commandSha256": "1" * 64,
+                "releaseSha256": "2" * 64,
+                "healthSha256": "3" * 64,
+                "bindingSha256": "4" * 64,
             },
-        }
+            identity={
+                "deviceId": "sp-3-nuvion-iq9075",
+                "spaceId": 3,
+                "productModel": "IQ9075_DEV",
+                "platformProfile": "iq9075_dev",
+                "hardwareRevision": "QCS9075-EVK",
+                "architecture": "aarch64",
+                "dockerRequired": False,
+            },
+            scenario_type="commit",
+            expected_command_id=str(uuid.uuid4()),
+            expected_bom_digest="sha256:" + "a" * 64,
+            expected_candidate_slot="/opt/nuv-agent/releases/" + "a" * 64,
+            expected_previous_slot="releases/" + "b" * 64,
+            expected_previous_version="0.1.120",
+            hold_seconds=0,
+            release={
+                "agentVersion": "0.1.121",
+                "releaseSequence": 2,
+                "artifactDigest": "sha256:" + "c" * 64,
+                "componentSha": "d" * 40,
+                "configSchema": "12",
+                "publisherKeyId": "release-test",
+            },
+        )
         evidence = {
             "schemaVersion": 1,
             "protocolVersion": HOST.PROTOCOL_VERSION,
             "runId": run_id,
+            "generatedAt": "2026-09-02T00:00:00Z",
             "scenario": "commit",
             "complete": True,
             "gates": {
@@ -1458,10 +1546,93 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
                 "services": True,
                 "scenario": False,
             },
+            "oak": {},
+            "services": {},
+            "runtimePids": None,
+            "slots": {},
             "updater": {"updaterVersion": "0.2.0", "update": {}},
         }
         with self.assertRaisesRegex(HOST.RunnerError, "false or missing gate"):
             HOST.validate_final_evidence(evidence, manifest)
+
+    def test_commit_evidence_rejects_contradictory_fields_and_expired_order(self) -> None:
+        baseline = "b" * 64
+        transport = PollingRunTransport(tool_sha="f" * 64, baseline_digest=baseline)
+        manifest = HOST.build_manifest(
+            run_id=str(uuid.uuid4()),
+            tool_sha256="f" * 64,
+            input_digests={
+                "commandSha256": "1" * 64,
+                "releaseSha256": "2" * 64,
+                "healthSha256": "3" * 64,
+                "bindingSha256": "4" * 64,
+            },
+            identity={
+                "deviceId": "sp-3-nuvion-iq9075",
+                "spaceId": 3,
+                "productModel": "IQ9075_DEV",
+                "platformProfile": "iq9075_dev",
+                "hardwareRevision": "QCS9075-EVK",
+                "architecture": "aarch64",
+                "dockerRequired": False,
+            },
+            scenario_type="commit",
+            expected_command_id=str(uuid.uuid4()),
+            expected_bom_digest="sha256:" + "a" * 64,
+            expected_candidate_slot="/opt/nuv-agent/releases/" + "a" * 64,
+            expected_previous_slot="releases/" + baseline,
+            expected_previous_version="0.1.120",
+            hold_seconds=0,
+            release={
+                "agentVersion": "0.1.121",
+                "releaseSequence": 2,
+                "artifactDigest": "sha256:" + "c" * 64,
+                "componentSha": "d" * 40,
+                "configSchema": "12",
+                "publisherKeyId": "release-iq9075-dev",
+            },
+        )
+        transport.manifest = manifest
+        transport.evidence_calls = 1
+        evidence = transport.invoke_board("evidence")
+        HOST.validate_final_evidence(evidence, manifest)
+        same_second = copy.deepcopy(evidence)
+        same_second["updater"]["update"]["updatedAt"] = (
+            "2026-09-02T00:00:02.900Z"
+        )
+        same_second["generatedAt"] = "2026-09-02T00:00:02.901Z"
+        HOST.validate_final_evidence(same_second, manifest)
+        generated_too_early = copy.deepcopy(same_second)
+        generated_too_early["generatedAt"] = "2026-09-02T00:00:02.899Z"
+        with self.assertRaisesRegex(HOST.RunnerError, "predates"):
+            HOST.validate_final_evidence(generated_too_early, manifest)
+
+        mutations = {
+            "errorCode": lambda item: item["updater"]["update"].__setitem__(
+                "errorCode", "CONTRADICTORY"
+            ),
+            "message": lambda item: item["updater"]["update"].__setitem__(
+                "message", "contradictory"
+            ),
+            "rollbackSlot": lambda item: item["updater"]["update"].__setitem__(
+                "rollbackSlot", "releases/" + baseline
+            ),
+            "healthDeadline": lambda item: item["updater"]["update"].__setitem__(
+                "healthDeadline", "2026-09-02T00:30:00Z"
+            ),
+            "expired": lambda item: item["updater"]["update"].__setitem__(
+                "updatedAt", "2026-09-02T02:00:00Z"
+            ),
+            "generated-before-update": lambda item: item.__setitem__(
+                "generatedAt", "2026-09-01T23:59:59Z"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(evidence)
+                mutate(candidate)
+                with self.assertRaises(HOST.RunnerError):
+                    HOST.validate_final_evidence(candidate, manifest)
 
     def test_out_of_band_bootstrap_is_separate_non_ota_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

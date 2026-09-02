@@ -78,6 +78,9 @@ class UpdaterPackagingTest(unittest.TestCase):
         build = (ROOT / "packaging/deb/build-deb.sh").read_text(encoding="utf-8")
         protocol = (ROOT / "nuvion_updater/protocol.py").read_text(encoding="utf-8")
         postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+        tmpfiles = (
+            ROOT / "packaging/tmpfiles/nuvion-updater.conf"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("User=root", service)
         self.assertIn("ProtectSystem=strict", service)
@@ -96,6 +99,27 @@ class UpdaterPackagingTest(unittest.TestCase):
         self.assertIn("bootstrap-agent-bundle.tar.gz", build)
         self.assertIn("requirements-agent-bundle-arm64.txt", build)
         self.assertIn("health-attestation-keyring.json", postinst)
+        self.assertEqual(tmpfiles, "d /run/nuvion-updater 0750 root nuvion -\n")
+        self.assertIn("$PKG_DIR/usr/lib/tmpfiles.d", build)
+        self.assertIn("packaging/tmpfiles/nuvion-updater.conf", build)
+        self.assertIn(
+            "/usr/bin/systemd-tmpfiles --create "
+            "/usr/lib/tmpfiles.d/nuvion-updater.conf",
+            postinst,
+        )
+        self.assertIn(
+            "Unsafe updater runtime directory identity", postinst
+        )
+        self.assertLess(
+            postinst.index("systemd-tmpfiles --create"),
+            postinst.index("systemctl enable --now nuv-agent-updater.socket"),
+        )
+        self.assertIn("After=systemd-tmpfiles-setup.service", socket_unit)
+        self.assertIn("Before=nuv-agent.service", socket_unit)
+        self.assertLess(
+            postinst.index("systemctl enable --now nuv-agent-updater.socket"),
+            postinst.index("systemctl restart nuv-agent.service"),
+        )
 
     def test_dpkg_root_owner_group_normalizes_unprivileged_builder_ids(self) -> None:
         dpkg_deb = shutil.which("dpkg-deb")

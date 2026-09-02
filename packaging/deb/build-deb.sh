@@ -84,6 +84,7 @@ mkdir -p "$PKG_DIR/DEBIAN" \
          "$PKG_DIR/usr/bin" \
          "$PKG_DIR/usr/local/libexec/nuvion" \
          "$PKG_DIR/usr/lib/udev/rules.d" \
+         "$PKG_DIR/usr/lib/tmpfiles.d" \
          "$PKG_DIR/lib/systemd/system" \
          "$PKG_DIR/etc/nuv-agent" \
          "$PKG_DIR/etc/nuvion-updater" \
@@ -160,6 +161,9 @@ install -m 0755 \
 install -m 0644 \
   "$ROOT_DIR/packaging/udev/80-movidius.rules" \
   "$PKG_DIR/usr/lib/udev/rules.d/80-movidius.rules"
+install -m 0644 \
+  "$ROOT_DIR/packaging/tmpfiles/nuvion-updater.conf" \
+  "$PKG_DIR/usr/lib/tmpfiles.d/nuvion-updater.conf"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent.service" "$PKG_DIR/lib/systemd/system/nuv-agent.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.service" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.socket" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket"

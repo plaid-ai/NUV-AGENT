@@ -120,6 +120,7 @@ ALLOWED_UPDATE_FIELDS = frozenset(
         "configSchema",
         "bomVerificationStatus",
         "publisherKeyId",
+        "commandExpiresAt",
         "healthDeadline",
         "errorCode",
         "slot",
@@ -280,7 +281,9 @@ class StagedInput:
 
 def utc_now() -> str:
     return (
-        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -523,7 +526,11 @@ def validate_ed25519_keyring(payload: bytes, *, role: str) -> dict[str, Any]:
     expected = {"schemaVersion", "trustDomain", "keys"}
     if role == "health":
         expected.add("purpose")
-    if set(value) != expected or value.get("schemaVersion") != 1:
+    if (
+        set(value) != expected
+        or type(value.get("schemaVersion")) is not int
+        or value.get("schemaVersion") != 1
+    ):
         raise HarnessError(f"{role} keyring fields do not match schema v1")
     if value.get("trustDomain") != TRUST_DOMAIN:
         raise HarnessError(f"{role} keyring trust domain mismatch")
@@ -589,7 +596,11 @@ def validate_binding(payload: bytes, identity: Mapping[str, object]) -> dict[str
         "architecture",
         "dockerRequired",
     }
-    if set(value) != expected_fields or value.get("schemaVersion") != 1:
+    if (
+        set(value) != expected_fields
+        or type(value.get("schemaVersion")) is not int
+        or value.get("schemaVersion") != 1
+    ):
         raise HarnessError("device binding fields do not match schema v1")
     expected_binding = {"schemaVersion": 1, "trustDomain": TRUST_DOMAIN, **identity}
     if value != expected_binding:
@@ -630,10 +641,12 @@ def validate_manifest(value: Mapping[str, Any], *, run_id: str) -> None:
     }:
         raise HarnessError("immutable manifest fields are invalid")
     if (
-        value.get("schemaVersion") != 1
+        type(value.get("schemaVersion")) is not int
+        or value.get("schemaVersion") != 1
         or value.get("protocolVersion") != PROTOCOL_VERSION
         or value.get("runId") != run_id
-        or not SHA256_RE.fullmatch(str(value.get("toolSha256") or ""))
+        or not isinstance(value.get("toolSha256"), str)
+        or not SHA256_RE.fullmatch(value["toolSha256"])
     ):
         raise HarnessError("immutable manifest identity is invalid")
     inputs = value.get("inputs")
@@ -644,7 +657,10 @@ def validate_manifest(value: Mapping[str, Any], *, run_id: str) -> None:
         "bindingSha256",
     }:
         raise HarnessError("immutable manifest input digests are invalid")
-    if not all(SHA256_RE.fullmatch(str(item)) for item in inputs.values()):
+    if not all(
+        isinstance(item, str) and SHA256_RE.fullmatch(item)
+        for item in inputs.values()
+    ):
         raise HarnessError("immutable manifest contains an invalid input digest")
     if value.get("destinations") != FIXED_DESTINATIONS:
         raise HarnessError("immutable manifest destinations are not fixed")
@@ -682,13 +698,21 @@ def validate_manifest(value: Mapping[str, Any], *, run_id: str) -> None:
         and not 0 <= hold <= MAX_FAULT_HOLD_SECONDS
     ):
         raise HarnessError("immutable manifest fault hold is invalid")
+    expected_command_id = scenario.get("expectedCommandId")
+    if not isinstance(expected_command_id, str):
+        raise HarnessError("expected commandId is invalid")
     try:
-        command_id = str(uuid.UUID(str(scenario.get("expectedCommandId"))))
+        command_id = str(uuid.UUID(expected_command_id))
     except ValueError as exc:
         raise HarnessError("expected commandId is invalid") from exc
     if command_id != scenario.get("expectedCommandId"):
         raise HarnessError("expected commandId is not canonical")
-    match = DIGEST_RE.fullmatch(str(scenario.get("expectedBomDigest") or ""))
+    expected_bom_digest = scenario.get("expectedBomDigest")
+    match = (
+        DIGEST_RE.fullmatch(expected_bom_digest)
+        if isinstance(expected_bom_digest, str)
+        else None
+    )
     if match is None:
         raise HarnessError("expected BOM digest is invalid")
     digest = match.group(1)
@@ -699,7 +723,10 @@ def validate_manifest(value: Mapping[str, Any], *, run_id: str) -> None:
         r"(?:releases/[0-9a-f]{64}|bootstrap/[0-9A-Za-z.+-]{1,64})", previous
     ):
         raise HarnessError("expected previous slot is invalid")
-    if not SEMVER_RE.fullmatch(str(scenario.get("expectedPreviousVersion") or "")):
+    if (
+        not isinstance(scenario.get("expectedPreviousVersion"), str)
+        or not SEMVER_RE.fullmatch(scenario["expectedPreviousVersion"])
+    ):
         raise HarnessError("expected previous Agent version is invalid")
     release = scenario.get("release")
     if not isinstance(release, dict) or set(release) != {
@@ -711,18 +738,33 @@ def validate_manifest(value: Mapping[str, Any], *, run_id: str) -> None:
         "publisherKeyId",
     }:
         raise HarnessError("expected release identity is invalid")
-    if not SEMVER_RE.fullmatch(str(release.get("agentVersion") or "")):
+    if (
+        not isinstance(release.get("agentVersion"), str)
+        or not SEMVER_RE.fullmatch(release["agentVersion"])
+    ):
         raise HarnessError("expected Agent version is invalid")
     sequence = release.get("releaseSequence")
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
         raise HarnessError("expected release sequence is invalid")
-    if DIGEST_RE.fullmatch(str(release.get("artifactDigest") or "")) is None:
+    if (
+        not isinstance(release.get("artifactDigest"), str)
+        or DIGEST_RE.fullmatch(release["artifactDigest"]) is None
+    ):
         raise HarnessError("expected artifact digest is invalid")
-    if COMPONENT_RE.fullmatch(str(release.get("componentSha") or "")) is None:
+    if (
+        not isinstance(release.get("componentSha"), str)
+        or COMPONENT_RE.fullmatch(release["componentSha"]) is None
+    ):
         raise HarnessError("expected component SHA is invalid")
-    if re.fullmatch(r"[1-9][0-9]*", str(release.get("configSchema") or "")) is None:
+    if (
+        not isinstance(release.get("configSchema"), str)
+        or re.fullmatch(r"[1-9][0-9]*", release["configSchema"]) is None
+    ):
         raise HarnessError("expected config schema is invalid")
-    if KEY_ID_RE.fullmatch(str(release.get("publisherKeyId") or "")) is None:
+    if (
+        not isinstance(release.get("publisherKeyId"), str)
+        or KEY_ID_RE.fullmatch(release["publisherKeyId"]) is None
+    ):
         raise HarnessError("expected publisher key id is invalid")
 
 
@@ -796,7 +838,8 @@ class BoardHarness:
             raise HarnessError("run journal ownership or mode is unsafe")
         state = strict_json(payload, label="run journal")
         if (
-            state.get("schemaVersion") != 2
+            type(state.get("schemaVersion")) is not int
+            or state.get("schemaVersion") != 2
             or state.get("protocolVersion") != PROTOCOL_VERSION
             or state.get("runId") != run_id
         ):
@@ -891,7 +934,8 @@ class BoardHarness:
             raise HarnessError("Fleet E2E board lease ownership or mode is unsafe")
         lease = strict_json(payload, label="Fleet E2E board lease")
         if set(lease) != {"schemaVersion", "protocolVersion", "runId"} or (
-            lease.get("schemaVersion") != 1
+            type(lease.get("schemaVersion")) is not int
+            or lease.get("schemaVersion") != 1
             or lease.get("protocolVersion") != PROTOCOL_VERSION
             or lease.get("runId") != run_id
         ):
@@ -1118,22 +1162,41 @@ class BoardHarness:
         if metadata.st_uid != self.root_uid or stat.S_IMODE(metadata.st_mode) & 0o022:
             raise HarnessError("release marker ownership or mode is unsafe")
         value = strict_json(payload, label="release marker")
-        if set(value) != RELEASE_FIELDS or value.get("schemaVersion") != 2:
+        if (
+            set(value) != RELEASE_FIELDS
+            or type(value.get("schemaVersion")) is not int
+            or value.get("schemaVersion") != 2
+        ):
             raise HarnessError("release marker fields are invalid")
         if value.get("bomDigest") != f"sha256:{digest}":
             raise HarnessError("release marker does not match its slot digest")
-        if not SEMVER_RE.fullmatch(str(value.get("agentVersion") or "")):
+        if (
+            not isinstance(value.get("agentVersion"), str)
+            or not SEMVER_RE.fullmatch(value["agentVersion"])
+        ):
             raise HarnessError("release marker Agent version is invalid")
         sequence = value.get("releaseSequence")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
             raise HarnessError("release marker sequence is invalid")
-        if DIGEST_RE.fullmatch(str(value.get("artifactDigest") or "")) is None:
+        if (
+            not isinstance(value.get("artifactDigest"), str)
+            or DIGEST_RE.fullmatch(value["artifactDigest"]) is None
+        ):
             raise HarnessError("release marker artifact digest is invalid")
-        if COMPONENT_RE.fullmatch(str(value.get("componentSha") or "")) is None:
+        if (
+            not isinstance(value.get("componentSha"), str)
+            or COMPONENT_RE.fullmatch(value["componentSha"]) is None
+        ):
             raise HarnessError("release marker component SHA is invalid")
-        if re.fullmatch(r"[1-9][0-9]*", str(value.get("configSchema") or "")) is None:
+        if (
+            not isinstance(value.get("configSchema"), str)
+            or re.fullmatch(r"[1-9][0-9]*", value["configSchema"]) is None
+        ):
             raise HarnessError("release marker config schema is invalid")
-        if KEY_ID_RE.fullmatch(str(value.get("publisherKeyId") or "")) is None:
+        if (
+            not isinstance(value.get("publisherKeyId"), str)
+            or KEY_ID_RE.fullmatch(value["publisherKeyId"]) is None
+        ):
             raise HarnessError("release marker publisher id is invalid")
         return {key: value[key] for key in sorted(RELEASE_FIELDS)}
 
@@ -1219,6 +1282,9 @@ class BoardHarness:
             raise HarnessError("OAK USB speed is invalid") from exc
         if speed < OAK_MIN_SPEED_MBPS:
             raise HarnessError("OAK-D Lite must negotiate at 5Gbps")
+        mxid = text("serial")
+        if re.fullmatch(r"[a-z0-9._:-]{1,128}", mxid) is None:
+            raise HarnessError("OAK-D Lite sysfs serial/MXID is invalid")
         driver = device / "driver"
         bound = driver.is_symlink()
         if require_bound:
@@ -1232,6 +1298,7 @@ class BoardHarness:
             "vendorId": vendor,
             "productId": product,
             "speedMbps": int(speed),
+            "mxidSha256": hashlib.sha256(mxid.encode("utf-8")).hexdigest(),
             "attached": True,
             "bound": bound,
         }
@@ -1506,6 +1573,7 @@ class BoardHarness:
             )
             if (
                 set(manifest) != {"schemaVersion", "runId", "entries", "missing"}
+                or type(manifest.get("schemaVersion")) is not int
                 or manifest.get("schemaVersion") != 1
                 or manifest.get("runId") != run_id
                 or not isinstance(manifest.get("entries"), dict)
@@ -2583,6 +2651,15 @@ class BoardHarness:
             digest = str(scenario["expectedBomDigest"])[7:]
             if self._slot_link("current", required=True) != f"releases/{digest}":
                 raise HarnessError("active slot is not the exact candidate")
+            candidate_service = self._unit_status("nuv-agent.service")
+            candidate_pid = candidate_service.get("mainPid")
+            if (
+                candidate_service.get("active") is not True
+                or isinstance(candidate_pid, bool)
+                or not isinstance(candidate_pid, int)
+                or candidate_pid < 2
+            ):
+                raise HarnessError("candidate Agent PID is unavailable before OAK fault")
             oak = self.verify_oak()
             port = canonical_oak_port(oak["port"])
             fault = {
@@ -2592,6 +2669,7 @@ class BoardHarness:
                 "commandId": scenario["expectedCommandId"],
                 "bomDigest": scenario["expectedBomDigest"],
                 "candidateSlot": scenario["expectedCandidateSlot"],
+                "candidatePid": candidate_pid,
                 "armedAt": self.clock(),
             }
             state["oakFault"] = fault
@@ -3037,6 +3115,7 @@ class BoardHarness:
                     "vendorId": OAK_VENDOR,
                     "productId": OAK_PRODUCT,
                     "speedMbps": None,
+                    "mxidSha256": None,
                     "attached": False,
                     "bound": False,
                 }
@@ -3064,6 +3143,28 @@ class BoardHarness:
                 previous_marker,
                 state,
             )
+            runtime_pids: dict[str, int] | None = None
+            if manifest["scenario"]["type"] == "oak-fault-rollback":
+                fault = state.get("oakFault")
+                candidate_pid = (
+                    fault.get("candidatePid") if isinstance(fault, Mapping) else None
+                )
+                restored_pid = services["nuv-agent.service"].get("mainPid")
+                pid_gate = (
+                    isinstance(candidate_pid, int)
+                    and not isinstance(candidate_pid, bool)
+                    and candidate_pid >= 2
+                    and isinstance(restored_pid, int)
+                    and not isinstance(restored_pid, bool)
+                    and restored_pid >= 2
+                    and restored_pid != candidate_pid
+                )
+                scenario_gate = scenario_gate and pid_gate
+                if pid_gate:
+                    runtime_pids = {
+                        "candidate": candidate_pid,
+                        "restored": restored_pid,
+                    }
             gates = {
                 "foundation": state.get("foundation", {}).get("verified") is True
                 and foundation_live,
@@ -3085,6 +3186,7 @@ class BoardHarness:
                 "gates": gates,
                 "oak": oak,
                 "services": services,
+                "runtimePids": runtime_pids,
                 "slots": {
                     "current": current,
                     "previous": previous,

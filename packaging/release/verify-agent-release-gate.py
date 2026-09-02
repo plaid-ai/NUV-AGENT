@@ -261,6 +261,33 @@ def _append_outputs(path: Path, evidence: dict[str, object]) -> None:
         raise ReleaseGateError("cannot persist release gate workflow outputs") from exc
 
 
+def verify_expected_evidence(
+    evidence: dict[str, object],
+    *,
+    run_id: int,
+    check_id: int,
+    check_suite_id: int,
+    workflow_sha256: str,
+) -> None:
+    expected = {
+        "workflowRunId": run_id,
+        "checkRunId": check_id,
+        "checkSuiteId": check_suite_id,
+        "workflowSha256": workflow_sha256,
+    }
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (run_id, check_id, check_suite_id)
+        )
+        or not SHA256.fullmatch(workflow_sha256)
+        or any(evidence.get(key) != value for key, value in expected.items())
+    ):
+        raise ReleaseGateError(
+            "live release gate differs from preflight authorization evidence"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
@@ -269,6 +296,10 @@ def main() -> int:
     parser.add_argument("--candidate-workflow", type=Path, required=True)
     parser.add_argument("--trusted-workflow", type=Path, required=True)
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--expected-run-id", type=int)
+    parser.add_argument("--expected-check-id", type=int)
+    parser.add_argument("--expected-check-suite-id", type=int)
+    parser.add_argument("--expected-workflow-sha256")
     arguments = parser.parse_args()
     try:
         context, integration_id = _load_policy(arguments.policy)
@@ -286,6 +317,24 @@ def main() -> int:
             check_runs=api.check_runs(arguments.component_sha),
             workflow_run=api.workflow_run,
         )
+        expected_values = (
+            arguments.expected_run_id,
+            arguments.expected_check_id,
+            arguments.expected_check_suite_id,
+            arguments.expected_workflow_sha256,
+        )
+        if any(value is not None for value in expected_values):
+            if any(value is None for value in expected_values):
+                raise ReleaseGateError(
+                    "preflight release gate evidence must be supplied as one tuple"
+                )
+            verify_expected_evidence(
+                evidence,
+                run_id=arguments.expected_run_id,
+                check_id=arguments.expected_check_id,
+                check_suite_id=arguments.expected_check_suite_id,
+                workflow_sha256=arguments.expected_workflow_sha256,
+            )
         if arguments.github_output is not None:
             _append_outputs(arguments.github_output, evidence)
     except ReleaseGateError as exc:

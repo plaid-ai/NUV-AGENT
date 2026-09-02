@@ -247,7 +247,24 @@ class ReleaseGateTest(unittest.TestCase):
             workflow.count(
                 'build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]'
             ),
-            3,
+            4,
+        )
+        self.assertGreaterEqual(workflow.count('cd "$RUNNER_TEMP"'), 3)
+        self.assertIn(
+            'PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I -',
+            workflow,
+        )
+        self.assertIn(
+            'PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -',
+            workflow,
+        )
+        self.assertIn(
+            "package_path.is_relative_to(Path(sys.prefix).resolve())",
+            workflow,
+        )
+        self.assertIn(
+            'not package_path.is_relative_to(Path(os.environ["GITHUB_WORKSPACE"]).resolve())',
+            workflow,
         )
         self.assertIn(
             'reference["componentSha"] == os.environ["CANDIDATE_SHA"]',
@@ -258,6 +275,18 @@ class ReleaseGateTest(unittest.TestCase):
             workflow,
         )
         self.assertNotIn('CANDIDATE_SHA="$GITHUB_SHA"', workflow)
+
+        publisher = (
+            ROOT / ".github" / "workflows" / "release-publish.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'PYTHONNOUSERSITE=1 "$RELEASE_SMOKE_VENV/bin/python" -I -',
+            publisher,
+        )
+        self.assertIn(
+            'package_path.is_relative_to(Path(os.environ["RELEASE_SMOKE_VENV"]).resolve())',
+            publisher,
+        )
 
     def test_command_verifier_dependencies_are_pinned_for_homebrew(self) -> None:
         homebrew = (ROOT / "packaging" / "homebrew" / "nuv-agent.rb").read_text(
@@ -328,6 +357,12 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", oracle)
         self.assertIn("actions/upload-artifact@", oracle)
         self.assertIn("compression-level: 0", oracle)
+        self.assertIn('cd "$RUNNER_TEMP"', oracle)
+        self.assertIn(
+            'MODEL_PATH=$(PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I -',
+            oracle,
+        )
+        self.assertIn("huggingface_hub imported outside CPU oracle venv", oracle)
         self.assertIn('wc -c < "$REFERENCE_PATH"', oracle)
         self.assertIn("runs-on: macos-14", macos)
         self.assertIn("needs: macos-cpu-reference", macos)
@@ -363,8 +398,10 @@ class ReleaseGateTest(unittest.TestCase):
         )
         self.assertIn('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -', macos)
         self.assertEqual(
-            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 1
+            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 3
         )
+        self.assertIn("huggingface_hub imported outside Formula libexec", macos)
+        self.assertIn('cd "$RUNNER_TEMP"', macos)
         self.assertIn('package_path.is_relative_to(formula_prefix / "libexec")', macos)
         self.assertNotIn("reference_outputs.logits_per_image", macos)
         self.assertIn("observed_scores, reference_scores", macos)

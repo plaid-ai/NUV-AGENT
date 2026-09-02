@@ -1223,7 +1223,7 @@ def build_manifest(
     if scenario_type not in {"commit", "oak-fault-rollback"}:
         raise RunnerError("scenario type is invalid")
     if (
-        isinstance(hold_seconds, bool)
+        type(hold_seconds) is not int
         or (scenario_type == "commit" and hold_seconds != 0)
         or (scenario_type == "oak-fault-rollback" and not 0 <= hold_seconds <= 60)
     ):
@@ -1256,6 +1256,7 @@ def build_manifest(
         or not isinstance(identity.get("spaceId"), int)
         or device_match is None
         or int(device_match.group(1)) != identity.get("spaceId")
+        or identity.get("dockerRequired") is not False
         or any(identity.get(key) != value for key, value in expected_identity.items())
     ):
         raise RunnerError("IQ9075 identity tuple is invalid")
@@ -1269,14 +1270,19 @@ def build_manifest(
     }:
         raise RunnerError("release identity fields are invalid")
     if (
-        not SEMVER_RE.fullmatch(str(release["agentVersion"]))
+        not isinstance(release["agentVersion"], str)
+        or not SEMVER_RE.fullmatch(release["agentVersion"])
         or isinstance(release["releaseSequence"], bool)
         or not isinstance(release["releaseSequence"], int)
         or int(release["releaseSequence"]) < 1
-        or not DIGEST_RE.fullmatch(str(release["artifactDigest"]))
-        or not COMPONENT_RE.fullmatch(str(release["componentSha"]))
-        or re.fullmatch(r"[1-9][0-9]*", str(release["configSchema"])) is None
-        or KEY_ID_RE.fullmatch(str(release["publisherKeyId"])) is None
+        or not isinstance(release["artifactDigest"], str)
+        or not DIGEST_RE.fullmatch(release["artifactDigest"])
+        or not isinstance(release["componentSha"], str)
+        or not COMPONENT_RE.fullmatch(release["componentSha"])
+        or not isinstance(release["configSchema"], str)
+        or re.fullmatch(r"[1-9][0-9]*", release["configSchema"]) is None
+        or not isinstance(release["publisherKeyId"], str)
+        or KEY_ID_RE.fullmatch(release["publisherKeyId"]) is None
     ):
         raise RunnerError("release identity value is invalid")
     return {
@@ -1300,15 +1306,151 @@ def build_manifest(
     }
 
 
+def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, object]:
+    """Rebuild and exact-compare an externally supplied immutable manifest."""
+
+    if set(manifest) != {
+        "schemaVersion",
+        "protocolVersion",
+        "runId",
+        "toolSha256",
+        "inputs",
+        "destinations",
+        "identity",
+        "scenario",
+    }:
+        raise RunnerError("immutable manifest root fields are invalid")
+    scenario = manifest.get("scenario")
+    if not isinstance(scenario, Mapping) or set(scenario) != {
+        "type",
+        "expectedCommandId",
+        "expectedBomDigest",
+        "expectedCandidateSlot",
+        "expectedPreviousSlot",
+        "expectedPreviousVersion",
+        "holdSeconds",
+        "release",
+    }:
+        raise RunnerError("immutable manifest scenario fields are invalid")
+    identity = manifest.get("identity")
+    inputs = manifest.get("inputs")
+    release = scenario.get("release")
+    if (
+        type(manifest.get("schemaVersion")) is not int
+        or manifest.get("schemaVersion") != 1
+        or manifest.get("protocolVersion") != PROTOCOL_VERSION
+        or manifest.get("destinations") != FIXED_DESTINATIONS
+        or not isinstance(identity, Mapping)
+        or not isinstance(inputs, Mapping)
+        or not isinstance(release, Mapping)
+    ):
+        raise RunnerError("immutable manifest envelope is invalid")
+    rebuilt = build_manifest(
+        run_id=str(manifest.get("runId") or ""),
+        tool_sha256=str(manifest.get("toolSha256") or ""),
+        input_digests=inputs,
+        identity=identity,
+        scenario_type=str(scenario.get("type") or ""),
+        expected_command_id=str(scenario.get("expectedCommandId") or ""),
+        expected_bom_digest=str(scenario.get("expectedBomDigest") or ""),
+        expected_candidate_slot=str(scenario.get("expectedCandidateSlot") or ""),
+        expected_previous_slot=str(scenario.get("expectedPreviousSlot") or ""),
+        expected_previous_version=str(
+            scenario.get("expectedPreviousVersion") or ""
+        ),
+        hold_seconds=scenario.get("holdSeconds"),
+        release=release,
+    )
+    if dict(manifest) != rebuilt:
+        raise RunnerError("immutable manifest is not canonical")
+    return rebuilt
+
+
+def validate_release_marker(
+    marker: object,
+    *,
+    expected_bom_digest: str,
+    expected_version: str,
+    expected_release: Mapping[str, Any] | None = None,
+) -> None:
+    fields = {
+        "schemaVersion",
+        "bomDigest",
+        "agentVersion",
+        "releaseSequence",
+        "artifactDigest",
+        "componentSha",
+        "configSchema",
+        "publisherKeyId",
+    }
+    if (
+        not isinstance(marker, Mapping)
+        or set(marker) != fields
+        or type(marker.get("schemaVersion")) is not int
+        or marker.get("schemaVersion") != 2
+        or marker.get("bomDigest") != expected_bom_digest
+        or marker.get("agentVersion") != expected_version
+        or isinstance(marker.get("releaseSequence"), bool)
+        or not isinstance(marker.get("releaseSequence"), int)
+        or marker["releaseSequence"] < 1
+        or not isinstance(marker.get("artifactDigest"), str)
+        or DIGEST_RE.fullmatch(marker["artifactDigest"]) is None
+        or not isinstance(marker.get("componentSha"), str)
+        or COMPONENT_RE.fullmatch(marker["componentSha"]) is None
+        or not isinstance(marker.get("configSchema"), str)
+        or re.fullmatch(r"[1-9][0-9]*", marker["configSchema"]) is None
+        or not isinstance(marker.get("publisherKeyId"), str)
+        or KEY_ID_RE.fullmatch(marker["publisherKeyId"]) is None
+    ):
+        raise RunnerError("release marker identity is invalid")
+    if expected_release is not None and dict(marker) != {
+        "schemaVersion": 2,
+        "bomDigest": expected_bom_digest,
+        **dict(expected_release),
+    }:
+        raise RunnerError("release marker differs from the expected release")
+
+
 def validate_final_evidence(
     evidence: Mapping[str, Any], manifest: Mapping[str, Any]
 ) -> None:
+    validate_manifest(manifest)
+    if set(evidence) != {
+        "schemaVersion",
+        "protocolVersion",
+        "runId",
+        "generatedAt",
+        "scenario",
+        "complete",
+        "gates",
+        "oak",
+        "services",
+        "runtimePids",
+        "slots",
+        "updater",
+    }:
+        raise RunnerError("final evidence root fields are invalid")
+    generated_at = evidence.get("generatedAt")
+    if not isinstance(generated_at, str) or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{3})?Z",
+        generated_at,
+    ) is None:
+        raise RunnerError("final evidence generatedAt is invalid")
+    try:
+        parsed_generated_at = datetime.fromisoformat(
+            generated_at[:-1] + "+00:00"
+        )
+    except ValueError as exc:
+        raise RunnerError("final evidence generatedAt is invalid") from exc
     if (
-        evidence.get("schemaVersion") != 1
+        type(evidence.get("schemaVersion")) is not int
+        or evidence.get("schemaVersion") != 1
         or evidence.get("protocolVersion") != PROTOCOL_VERSION
         or evidence.get("runId") != manifest.get("runId")
         or evidence.get("scenario") != manifest["scenario"]["type"]
         or evidence.get("complete") is not True
+        or parsed_generated_at.tzinfo != timezone.utc
     ):
         raise RunnerError("final evidence is not complete for the immutable run")
     gates = evidence.get("gates")
@@ -1327,14 +1469,128 @@ def validate_final_evidence(
         or any(value is not True for value in gates.values())
     ):
         raise RunnerError("final evidence contains a false or missing gate")
+    oak = evidence.get("oak")
+    if (
+        not isinstance(oak, dict)
+        or set(oak)
+        != {
+            "port",
+            "vendorId",
+            "productId",
+            "speedMbps",
+            "mxidSha256",
+            "attached",
+            "bound",
+        }
+        or not isinstance(oak.get("port"), str)
+        or re.fullmatch(r"2-1(?:\.[1-9][0-9]*)+", oak["port"]) is None
+        or oak.get("vendorId") != "03e7"
+        or oak.get("productId") != "f63b"
+        or isinstance(oak.get("speedMbps"), bool)
+        or not isinstance(oak.get("speedMbps"), int)
+        or oak["speedMbps"] < 5000
+        or not isinstance(oak.get("mxidSha256"), str)
+        or SHA256_RE.fullmatch(oak["mxidSha256"]) is None
+        or oak.get("attached") is not True
+        or oak.get("bound") is not True
+    ):
+        raise RunnerError("final evidence lacks exact USB1 runtime OAK proof")
+    services = evidence.get("services")
+    expected_units = {
+        "nuv-agent.service",
+        "nuv-agent-updater.service",
+        "nuv-agent-updater.socket",
+    }
+    if not isinstance(services, dict) or set(services) != expected_units:
+        raise RunnerError("final evidence service set is invalid")
+    for unit, status in services.items():
+        if (
+            not isinstance(status, dict)
+            or set(status) != {"active", "enabled", "unitFileState", "mainPid"}
+            or status.get("active") is not True
+            or status.get("enabled") is not True
+            or status.get("unitFileState") not in {"enabled", "static", "indirect"}
+            or isinstance(status.get("mainPid"), bool)
+            or not isinstance(status.get("mainPid"), int)
+            or (unit.endswith(".service") and status["mainPid"] < 2)
+            or (unit.endswith(".socket") and status["mainPid"] != 0)
+        ):
+            raise RunnerError("final evidence service state is invalid")
     updater = evidence.get("updater")
-    if not isinstance(updater, dict) or updater.get("updaterVersion") != "0.2.0":
+    if (
+        not isinstance(updater, dict)
+        or set(updater)
+        != {
+            "capabilityAvailable",
+            "authenticatedHelper",
+            "reason",
+            "updaterVersion",
+            "update",
+        }
+        or updater.get("capabilityAvailable") is not True
+        or updater.get("authenticatedHelper") is not True
+        or updater.get("reason") != "READY"
+        or updater.get("updaterVersion") != "0.2.0"
+    ):
         raise RunnerError("final evidence is missing updater 0.2.0 proof")
     update = updater.get("update")
     scenario = manifest["scenario"]
     release = scenario["release"]
     expected_candidate_relative = "releases/" + scenario["expectedBomDigest"][7:]
-    if not isinstance(update, dict) or any(
+    allowed_update_fields = {
+        "commandId",
+        "sequence",
+        "targetVersion",
+        "bomDigest",
+        "phase",
+        "updatePhase",
+        "updatedAt",
+        "candidateSlot",
+        "previousSlot",
+        "previousVersion",
+        "releaseSequence",
+        "artifactDigest",
+        "componentSha",
+        "configSchema",
+        "bomVerificationStatus",
+        "publisherKeyId",
+        "commandExpiresAt",
+        "healthDeadline",
+        "errorCode",
+        "message",
+        "slot",
+        "rollbackSlot",
+        "rollbackVersion",
+        "health",
+        "functionalHealth",
+    }
+    required_update_fields = {
+        "commandId",
+        "sequence",
+        "targetVersion",
+        "bomDigest",
+        "phase",
+        "updatePhase",
+        "updatedAt",
+        "candidateSlot",
+        "previousSlot",
+        "previousVersion",
+        "releaseSequence",
+        "artifactDigest",
+        "componentSha",
+        "configSchema",
+        "bomVerificationStatus",
+        "publisherKeyId",
+        "commandExpiresAt",
+        "slot",
+        "health",
+        "functionalHealth",
+    }
+    if (
+        not isinstance(update, dict)
+        or not required_update_fields.issubset(update)
+        or not set(update).issubset(allowed_update_fields)
+        or any(
         (
             update.get("commandId") != scenario["expectedCommandId"],
             update.get("bomDigest") != scenario["expectedBomDigest"],
@@ -1349,17 +1605,91 @@ def validate_final_evidence(
             update.get("publisherKeyId") != release["publisherKeyId"],
             update.get("bomVerificationStatus") != "VERIFIED",
         )
+        )
     ):
         raise RunnerError("final updater identity does not match the manifest")
+    if (
+        isinstance(update.get("sequence"), bool)
+        or not isinstance(update.get("sequence"), int)
+        or update["sequence"] < 1
+        or isinstance(update.get("releaseSequence"), bool)
+        or not isinstance(update.get("releaseSequence"), int)
+        or update.get("updatePhase") != update.get("phase")
+    ):
+        raise RunnerError("final updater lifecycle fields are invalid")
+    update_times: dict[str, datetime] = {}
+    for field in ("updatedAt", "commandExpiresAt", "healthDeadline"):
+        if field not in update:
+            continue
+        value = update[field]
+        if not isinstance(value, str) or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{3})?Z",
+            value,
+        ) is None:
+            raise RunnerError(f"final updater {field} is invalid")
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as exc:
+            raise RunnerError(f"final updater {field} is invalid") from exc
+        if parsed.tzinfo != timezone.utc:
+            raise RunnerError(f"final updater {field} is invalid")
+        update_times[field] = parsed
+    for field in ("errorCode", "message", "rollbackSlot", "rollbackVersion"):
+        if field in update and (
+            not isinstance(update[field], str) or not update[field]
+        ):
+            raise RunnerError(f"final updater {field} is invalid")
+    if parsed_generated_at < update_times["updatedAt"]:
+        raise RunnerError("final evidence predates its updater state")
+    if "healthDeadline" in update:
+        raise RunnerError("terminal evidence contains a stale health deadline")
     slots = evidence.get("slots")
-    if not isinstance(slots, dict):
+    if not isinstance(slots, dict) or set(slots) != {
+        "current",
+        "previous",
+        "currentVersion",
+        "release",
+        "previousRelease",
+    }:
         raise RunnerError("final evidence is missing live slot proof")
     if scenario["type"] == "commit":
+        forbidden_commit_fields = {
+            "errorCode",
+            "message",
+            "rollbackSlot",
+            "rollbackVersion",
+        }
+        if evidence.get("runtimePids") is not None:
+            raise RunnerError("commit evidence must not contain rollback PIDs")
+        if set(update) & forbidden_commit_fields:
+            raise RunnerError("commit evidence contains contradictory updater fields")
+        if (
+            update_times["updatedAt"] >= update_times["commandExpiresAt"]
+        ):
+            raise RunnerError("commit evidence timestamp ordering is invalid")
         expected_marker = {
             "schemaVersion": 2,
             "bomDigest": scenario["expectedBomDigest"],
             **release,
         }
+        validate_release_marker(
+            slots.get("release"),
+            expected_bom_digest=scenario["expectedBomDigest"],
+            expected_version=release["agentVersion"],
+            expected_release=release,
+        )
+        previous_marker = slots.get("previousRelease")
+        if scenario["expectedPreviousSlot"].startswith("releases/"):
+            validate_release_marker(
+                previous_marker,
+                expected_bom_digest=(
+                    "sha256:" + scenario["expectedPreviousSlot"][9:]
+                ),
+                expected_version=scenario["expectedPreviousVersion"],
+            )
+        elif previous_marker is not None:
+            raise RunnerError("bootstrap previous slot cannot have a release marker")
         if any(
             (
                 update.get("phase") != "COMMITTED",
@@ -1374,16 +1704,43 @@ def validate_final_evidence(
         ):
             raise RunnerError("commit scenario did not reach COMMITTED")
     else:
+        runtime_pids = evidence.get("runtimePids")
+        services = evidence.get("services")
+        agent_service = (
+            services.get("nuv-agent.service")
+            if isinstance(services, Mapping)
+            else None
+        )
+        if (
+            not isinstance(runtime_pids, Mapping)
+            or set(runtime_pids) != {"candidate", "restored"}
+            or isinstance(runtime_pids.get("candidate"), bool)
+            or not isinstance(runtime_pids.get("candidate"), int)
+            or runtime_pids["candidate"] < 2
+            or isinstance(runtime_pids.get("restored"), bool)
+            or not isinstance(runtime_pids.get("restored"), int)
+            or runtime_pids["restored"] < 2
+            or runtime_pids["candidate"] == runtime_pids["restored"]
+            or not isinstance(agent_service, Mapping)
+            or agent_service.get("mainPid") != runtime_pids["restored"]
+        ):
+            raise RunnerError("rollback evidence lacks exact candidate/restored PID proof")
         expected_previous = scenario["expectedPreviousSlot"]
         marker = slots.get("release")
-        marker_valid = marker is None
         if expected_previous.startswith("releases/"):
-            marker_valid = (
-                isinstance(marker, dict)
-                and marker.get("schemaVersion") == 2
-                and marker.get("bomDigest") == "sha256:" + expected_previous[9:]
-                and marker.get("agentVersion") == scenario["expectedPreviousVersion"]
+            validate_release_marker(
+                marker,
+                expected_bom_digest="sha256:" + expected_previous[9:],
+                expected_version=scenario["expectedPreviousVersion"],
             )
+        elif marker is not None:
+            raise RunnerError("bootstrap rollback slot cannot have a release marker")
+        validate_release_marker(
+            slots.get("previousRelease"),
+            expected_bom_digest=scenario["expectedBomDigest"],
+            expected_version=release["agentVersion"],
+            expected_release=release,
+        )
         if any(
             (
                 update.get("phase") != "ROLLED_BACK",
@@ -1402,7 +1759,6 @@ def validate_final_evidence(
                     "bomDigest": scenario["expectedBomDigest"],
                     **release,
                 },
-                not marker_valid,
             )
         ):
             raise RunnerError("rollback scenario lacks exact rollback/error proof")
@@ -1427,7 +1783,8 @@ def validate_cleanup_result(result: Mapping[str, Any], *, run_id: str) -> None:
     }.issubset(result):
         raise RunnerError("cleanup response fields are invalid")
     if (
-        result.get("schemaVersion") != 1
+        type(result.get("schemaVersion")) is not int
+        or result.get("schemaVersion") != 1
         or result.get("runId") != run_id
         or result.get("complete") is not True
         or not isinstance(result.get("recovered"), bool)
@@ -1557,6 +1914,7 @@ class FleetRunner:
         }
         if set(remote) != expected_fields or any(
             (
+                type(remote.get("schemaVersion")) is not int,
                 remote.get("schemaVersion") != 1,
                 remote.get("protocolVersion") != PROTOCOL_VERSION,
                 remote.get("runId") != self.run_id,
@@ -1615,6 +1973,7 @@ class FleetRunner:
             )
         if set(persisted) != {*expected_fields, "boardToolIdentityVerified"} or any(
             (
+                type(persisted.get("schemaVersion")) is not int,
                 persisted.get("schemaVersion") != 1,
                 persisted.get("protocolVersion") != PROTOCOL_VERSION,
                 persisted.get("runId") != self.run_id,
@@ -1712,6 +2071,8 @@ class FleetRunner:
             if manifest_exists
             else None
         )
+        if persisted_manifest is not None:
+            validate_manifest(persisted_manifest)
         foundation = self._call("foundation", "preflight", ["--run-id", self.run_id])
         live_foundation = foundation.get("foundation")
         live_slots = (

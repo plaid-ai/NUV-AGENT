@@ -179,6 +179,9 @@ def verify_release_source(
         raise VerificationError("trusted publisher SHA must be a full lowercase commit SHA")
     if _git_value(repository, ["cat-file", "-t", f"refs/tags/{tag}"]) != "tag":
         raise VerificationError("release tag must be an annotated tag object")
+    tag_object_sha = _git_value(repository, ["rev-parse", f"refs/tags/{tag}^{{tag}}"])
+    if not COMMIT_SHA.fullmatch(tag_object_sha):
+        raise VerificationError("release annotated tag object SHA is invalid")
     component_sha = _git_value(repository, ["rev-parse", f"refs/tags/{tag}^{{commit}}"])
     if not COMMIT_SHA.fullmatch(component_sha):
         raise VerificationError("release component SHA is invalid")
@@ -286,6 +289,7 @@ def verify_release_source(
     built_at = _git_value(repository, ["show", "-s", "--format=%cI", component_sha])
     return {
         "tag": tag,
+        "tag_object_sha": tag_object_sha,
         "version": match.group(1),
         "component_sha": component_sha,
         "trusted_publisher_sha": trusted_publisher_sha,

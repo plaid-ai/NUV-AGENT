@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import signal
 import subprocess
 import tempfile
 import unittest
@@ -141,7 +140,11 @@ class SystemdRuntimeTest(unittest.TestCase):
     def test_restart_and_safe_stop_use_only_fixed_argv_without_shell(self) -> None:
         with mock.patch(
             "nuvion_updater.systemd_runtime.subprocess.run",
-            return_value=self._completed(()),
+            side_effect=[
+                self._completed((), returncode=1),
+                self._completed(()),
+                self._completed(()),
+            ],
         ) as run:
             current_slot = self.slots.current_slot()
             assert current_slot is not None
@@ -150,7 +153,7 @@ class SystemdRuntimeTest(unittest.TestCase):
 
         self.assertEqual(
             run.call_args_list[0].args[0],
-            ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
+            ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
         )
         self.assertEqual(
             run.call_args_list[1].args[0],
@@ -184,11 +187,12 @@ class SystemdRuntimeTest(unittest.TestCase):
         )
 
     def test_start_limit_reset_failure_safe_stops_before_restart(self) -> None:
+        is_failed = self._completed((), returncode=0)
         failed = self._completed((), returncode=1)
         stopped = self._completed(())
         with mock.patch(
             "nuvion_updater.systemd_runtime.subprocess.run",
-            side_effect=[failed, stopped],
+            side_effect=[is_failed, failed, stopped],
         ) as run, self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESET_FAILED"):
             current_slot = self.slots.current_slot()
             assert current_slot is not None
@@ -196,10 +200,37 @@ class SystemdRuntimeTest(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
+                ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
             ],
         )
+
+    def test_clean_inactive_or_unloaded_unit_skips_reset_and_can_restart(self) -> None:
+        for status in (1, 4):
+            with self.subTest(is_failed_status=status), mock.patch(
+                "nuvion_updater.systemd_runtime.subprocess.run",
+                side_effect=[
+                    self._completed((), returncode=status),
+                    self._completed(()),
+                ],
+            ) as run:
+                current_slot = self.slots.current_slot()
+                assert current_slot is not None
+                self.runtime.restart_agent(current_slot)
+
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    (
+                        "/usr/bin/systemctl",
+                        "is-failed",
+                        "--quiet",
+                        "nuv-agent.service",
+                    ),
+                    ("/usr/bin/systemctl", "restart", "nuv-agent.service"),
+                ],
+            )
 
     def test_boot_check_matches_marker_current_slot_and_stable_main_pid_env(
         self,
@@ -431,11 +462,15 @@ class SystemdRuntimeTest(unittest.TestCase):
             mock.patch("nuvion_updater.systemd_runtime.IQ9075_PROBE", str(probe)),
             mock.patch(
                 "nuvion_updater.systemd_runtime.subprocess.run",
-                return_value=self._completed(()),
+                side_effect=[
+                    self._completed(()),
+                    self._completed((), returncode=1),
+                    self._completed(()),
+                ],
             ) as run,
             mock.patch.object(
                 runtime,
-                "_run_probe_process_group",
+                "_run_probe_control_group",
                 return_value=self._completed(()),
             ) as run_probe,
             mock.patch.object(
@@ -452,7 +487,7 @@ class SystemdRuntimeTest(unittest.TestCase):
             [call.args[0] for call in run.call_args_list],
             [
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
-                ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
+                ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "restart", "nuv-agent.service"),
             ],
         )
@@ -482,7 +517,7 @@ class SystemdRuntimeTest(unittest.TestCase):
             ) as run,
             mock.patch.object(
                 runtime,
-                "_run_probe_process_group",
+                "_run_probe_control_group",
                 return_value=self._completed((), returncode=1),
             ) as run_probe,
         ):
@@ -502,77 +537,125 @@ class SystemdRuntimeTest(unittest.TestCase):
             timeout=300,
         )
 
-    def test_probe_timeout_terminates_dedicated_process_group(self) -> None:
-        process = mock.Mock(pid=731)
-        process.wait.side_effect = subprocess.TimeoutExpired(("probe",), 1)
+    def test_probe_runs_in_bounded_systemd_control_group(self) -> None:
+        unit = "nuvion-iq9075-probe-" + "a" * 32 + ".service"
         with (
-            mock.patch(
-                "nuvion_updater.systemd_runtime.subprocess.Popen",
-                return_value=process,
-            ) as popen,
+            mock.patch("nuvion_updater.systemd_runtime.uuid.uuid4") as uuid4,
             mock.patch.object(
                 SystemdRuntime,
-                "_terminate_process_group",
-                return_value=True,
-            ) as terminate,
+                "_run",
+                side_effect=[
+                    self._completed(()),
+                    self._completed((), returncode=3, stdout="inactive\n"),
+                ],
+            ) as run,
+        ):
+            uuid4.return_value.hex = "a" * 32
+            result = SystemdRuntime._run_probe_control_group(
+                ("/usr/bin/bash", "/probe"), timeout=300
+            )
+
+        self.assertEqual(result.returncode, 0)
+        command = run.call_args_list[0].args[0]
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        for required in (
+            f"--unit={unit}",
+            "--collect",
+            "--wait",
+            "--no-ask-password",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            "--property=RuntimeMaxSec=300s",
+            "--property=TimeoutStopSec=5s",
+            "--property=SendSIGKILL=yes",
+            "--property=MemoryHigh=1G",
+            "--property=MemoryMax=2G",
+            "--property=MemorySwapMax=0",
+            "--property=OOMPolicy=stop",
+            "--property=StandardOutput=null",
+        ):
+            self.assertIn(required, command)
+        self.assertEqual(command[-3:], ("--", "/usr/bin/bash", "/probe"))
+        self.assertEqual(run.call_args_list[0].kwargs["timeout"], 330)
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ("/usr/bin/systemctl", "--no-ask-password", "is-active", unit),
+        )
+
+    def test_probe_timeout_kills_entire_transient_control_group(self) -> None:
+        unit = "nuvion-iq9075-probe-" + "b" * 32 + ".service"
+        with (
+            mock.patch("nuvion_updater.systemd_runtime.uuid.uuid4") as uuid4,
+            mock.patch.object(
+                SystemdRuntime,
+                "_run",
+                side_effect=[
+                    subprocess.TimeoutExpired(("systemd-run",), 31),
+                    self._completed(()),
+                    self._completed(()),
+                    self._completed((), returncode=3, stdout="inactive\n"),
+                    self._completed(()),
+                ],
+            ) as run,
             self.assertRaisesRegex(
                 RuntimeError,
                 "FUNCTIONAL_IQ9075_PROBE_TIMEOUT",
             ),
         ):
-            SystemdRuntime._run_probe_process_group(("/probe",), timeout=1)
-
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertIs(popen.call_args.kwargs["shell"], False)
-        self.assertIs(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
-        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
-        terminate.assert_called_once_with(process, 731)
-
-    def test_probe_process_group_escalates_term_to_kill(self) -> None:
-        process = mock.Mock()
-        with (
-            mock.patch(
-                "nuvion_updater.systemd_runtime.os.killpg",
-            ) as killpg,
-            mock.patch.object(
-                SystemdRuntime,
-                "_wait_for_process_group_exit",
-                side_effect=[False, True],
-            ),
-        ):
-            self.assertTrue(SystemdRuntime._terminate_process_group(process, 812))
+            uuid4.return_value.hex = "b" * 32
+            SystemdRuntime._run_probe_control_group(("/probe",), timeout=1)
 
         self.assertEqual(
-            killpg.call_args_list,
-            [mock.call(812, signal.SIGTERM), mock.call(812, signal.SIGKILL)],
+            run.call_args_list[1].args[0],
+            (
+                "/usr/bin/systemctl",
+                "--no-ask-password",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                unit,
+            ),
+        )
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ("/usr/bin/systemctl", "--no-ask-password", "stop", unit),
         )
 
-    def test_successful_probe_with_surviving_descendant_is_rejected(self) -> None:
-        process = mock.Mock(pid=991)
-        process.wait.return_value = 0
+    def test_active_probe_unit_after_wait_is_killed_and_rejected(self) -> None:
+        unit = "nuvion-iq9075-probe-" + "c" * 32 + ".service"
         with (
-            mock.patch(
-                "nuvion_updater.systemd_runtime.subprocess.Popen",
-                return_value=process,
-            ),
+            mock.patch("nuvion_updater.systemd_runtime.uuid.uuid4") as uuid4,
             mock.patch.object(
                 SystemdRuntime,
-                "_process_group_exists",
-                return_value=True,
-            ),
-            mock.patch.object(
-                SystemdRuntime,
-                "_terminate_process_group",
-                return_value=True,
-            ) as terminate,
+                "_run",
+                side_effect=[
+                    self._completed(()),
+                    self._completed((), stdout="active\n"),
+                    self._completed(()),
+                    self._completed(()),
+                    self._completed((), returncode=3, stdout="inactive\n"),
+                    self._completed(()),
+                ],
+            ) as run,
             self.assertRaisesRegex(
                 RuntimeError,
                 "FUNCTIONAL_IQ9075_PROBE_ORPHANED",
             ),
         ):
-            SystemdRuntime._run_probe_process_group(("/probe",), timeout=1)
+            uuid4.return_value.hex = "c" * 32
+            SystemdRuntime._run_probe_control_group(("/probe",), timeout=1)
 
-        terminate.assert_called_once_with(process, 991)
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            (
+                "/usr/bin/systemctl",
+                "--no-ask-password",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                unit,
+            ),
+        )
 
     def test_iq9075_rollback_revalidates_physical_oak_and_restored_slot(self) -> None:
         runtime = SystemdRuntime(

@@ -12,7 +12,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from publisher_trust import (
     PublisherTrustError,
@@ -186,7 +186,19 @@ def verify_attestation(
     executing_workflow: Path,
     additional_executing_workflows: tuple[tuple[str, Path], ...] = (),
     now: dt.datetime | None = None,
+    clock: Callable[[], dt.datetime] | None = None,
 ) -> dict[str, Any]:
+    if now is not None and clock is not None:
+        raise AttestationError("settings attestation verifier clock is ambiguous")
+
+    def read_clock() -> dt.datetime:
+        current = now if now is not None else (
+            clock() if clock is not None else dt.datetime.now(dt.timezone.utc)
+        )
+        if not isinstance(current, dt.datetime) or current.tzinfo != dt.timezone.utc:
+            raise AttestationError("settings attestation verifier clock must be UTC")
+        return current
+
     if not REPOSITORY.fullmatch(repository):
         raise AttestationError("settings attestation repository is invalid")
     if re.fullmatch(r"[0-9a-f]{40}", trusted_publisher_sha) is None:
@@ -241,9 +253,7 @@ def verify_attestation(
         raise AttestationError("settings attestation identity does not match policy")
     verified_at = _timestamp(attestation.get("verifiedAt"), label="verifiedAt")
     expires_at = _timestamp(attestation.get("expiresAt"), label="expiresAt")
-    current = now or dt.datetime.now(dt.timezone.utc)
-    if current.tzinfo != dt.timezone.utc:
-        raise AttestationError("settings attestation verifier clock must be UTC")
+    current = read_clock()
     if verified_at > current + dt.timedelta(minutes=5):
         raise AttestationError("settings attestation is from the future")
     if expires_at <= current:
@@ -284,6 +294,11 @@ def verify_attestation(
             raise AttestationError(
                 "trusted publisher changed during additional workflow verification"
             )
+    # Signature, git-tree, and workflow verification can be slow. An audit that
+    # expires while those checks run is not valid authorization to cross a
+    # credential boundary.
+    if expires_at <= read_clock():
+        raise AttestationError("settings attestation expired during verification")
     return {
         "schemaVersion": 1,
         "repository": repository,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import stat
 import subprocess
 import time
@@ -22,6 +21,7 @@ from nuvion_updater.trust import DeviceBinding
 
 AGENT_SERVICE = "nuv-agent.service"
 SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
 CURRENT_AGENT = "/usr/bin/nuv-agent"
 IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"
 BASH = "/usr/bin/bash"
@@ -31,8 +31,8 @@ PROC_ROOT = Path("/proc")
 SYSTEMCTL_TIMEOUT_SECONDS = 30
 DOCTOR_TIMEOUT_SECONDS = 120
 IQ9075_PROBE_TIMEOUT_SECONDS = 300
-PROCESS_GROUP_TERM_GRACE_SECONDS = 5.0
-PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+PROBE_UNIT_STOP_GRACE_SECONDS = 7.0
+PROBE_UNIT_STATUS_TIMEOUT_SECONDS = 5
 MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 64 * 1024
 MAX_PROC_STAT_BYTES = 16 * 1024
@@ -199,7 +199,7 @@ class SystemdRuntime:
             )
             if stop_result.returncode != 0:
                 raise RuntimeError("FUNCTIONAL_SERVICE_STOP_FAILED")
-            probe_result = self._run_probe_process_group(
+            probe_result = self._run_probe_control_group(
                 (BASH, IQ9075_PROBE),
                 timeout=IQ9075_PROBE_TIMEOUT_SECONDS,
             )
@@ -219,6 +219,15 @@ class SystemdRuntime:
         return True, "FUNCTIONAL_HEALTHY"
 
     def _reset_agent_start_limit(self) -> None:
+        # reset-failed returns an error for a clean inactive/not-yet-loaded
+        # unit on IQ9075 even though a subsequent start succeeds. Query the
+        # predicate first and reset only an actual failed unit.
+        failed_state = self._run(
+            (SYSTEMCTL, "is-failed", "--quiet", AGENT_SERVICE),
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+        if failed_state.returncode != 0:
+            return
         result = self._run(
             (SYSTEMCTL, "reset-failed", AGENT_SERVICE),
             timeout=SYSTEMCTL_TIMEOUT_SECONDS,
@@ -495,30 +504,63 @@ class SystemdRuntime:
             env=_COMMAND_ENV,
         )
 
-    @staticmethod
-    def _process_group_exists(process_group_id: int) -> bool:
-        try:
-            os.killpg(process_group_id, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
+    @classmethod
+    def _probe_unit_active(
+        cls,
+        unit: str,
+    ) -> bool:
+        result = cls._run(
+            (SYSTEMCTL, "--no-ask-password", "is-active", unit),
+            timeout=PROBE_UNIT_STATUS_TIMEOUT_SECONDS,
+        )
+        state = result.stdout.strip()
+        if state in {"active", "activating", "deactivating", "reloading"}:
             return True
-        return True
+        if state in {"inactive", "failed", "unknown"}:
+            return False
+        if not state and result.returncode in {3, 4}:
+            # A collected transient unit is no longer addressable.
+            return False
+        raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_STATUS_UNVERIFIED")
 
     @classmethod
-    def _wait_for_process_group_exit(
+    def _terminate_probe_unit(
         cls,
-        process: subprocess.Popen[bytes],
-        process_group_id: int,
-        *,
-        timeout: float,
+        unit: str,
     ) -> bool:
-        deadline = time.monotonic() + timeout
+        # setpgid()/setsid() can escape a POSIX process group but cannot leave
+        # this systemd-owned cgroup. KillMode=control-group plus an explicit
+        # all-process SIGKILL therefore bounds every nested timeout/runuser/OAK
+        # descendant, including a child that ignores SIGTERM.
+        for argv in (
+            (
+                SYSTEMCTL,
+                "--no-ask-password",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                unit,
+            ),
+            (SYSTEMCTL, "--no-ask-password", "stop", unit),
+        ):
+            try:
+                cls._run(argv, timeout=SYSTEMCTL_TIMEOUT_SECONDS)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        deadline = time.monotonic() + PROBE_UNIT_STOP_GRACE_SECONDS
         while True:
-            # poll() reaps the direct child. killpg(..., 0) then proves that
-            # no child or grandchild survives in the dedicated session.
-            process.poll()
-            if not cls._process_group_exists(process_group_id):
+            try:
+                active = cls._probe_unit_active(unit)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                active = True
+            if not active:
+                try:
+                    cls._run(
+                        (SYSTEMCTL, "--no-ask-password", "reset-failed", unit),
+                        timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -526,61 +568,67 @@ class SystemdRuntime:
             time.sleep(min(0.05, remaining))
 
     @classmethod
-    def _terminate_process_group(
-        cls,
-        process: subprocess.Popen[bytes],
-        process_group_id: int,
-    ) -> bool:
-        try:
-            os.killpg(process_group_id, signal.SIGTERM)
-        except ProcessLookupError:
-            process.poll()
-            return True
-        if cls._wait_for_process_group_exit(
-            process,
-            process_group_id,
-            timeout=PROCESS_GROUP_TERM_GRACE_SECONDS,
-        ):
-            return True
-        try:
-            os.killpg(process_group_id, signal.SIGKILL)
-        except ProcessLookupError:
-            process.poll()
-            return True
-        return cls._wait_for_process_group_exit(
-            process,
-            process_group_id,
-            timeout=PROCESS_GROUP_KILL_GRACE_SECONDS,
-        )
-
-    @classmethod
-    def _run_probe_process_group(
+    def _run_probe_control_group(
         cls,
         argv: tuple[str, ...],
         *,
         timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        process = subprocess.Popen(
-            argv,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd="/",
-            env=_COMMAND_ENV,
-            start_new_session=True,
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int)
+            or not 1 <= timeout <= IQ9075_PROBE_TIMEOUT_SECONDS
+            or not argv
+            or any(not isinstance(value, str) or not value for value in argv)
+        ):
+            raise ValueError("invalid bounded IQ9075 probe invocation")
+        unit = f"nuvion-iq9075-probe-{uuid.uuid4().hex}.service"
+        command = (
+            SYSTEMD_RUN,
+            f"--unit={unit}",
+            "--collect",
+            "--wait",
+            "--quiet",
+            "--no-ask-password",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            f"--property=RuntimeMaxSec={timeout}s",
+            "--property=TimeoutStopSec=5s",
+            "--property=SendSIGKILL=yes",
+            # The compatibility probe reads one OAK frame and never loads an
+            # inference model. Keep it in a separate, bounded cgroup so a
+            # native-driver regression cannot exhaust unified device memory.
+            "--property=MemoryHigh=1G",
+            "--property=MemoryMax=2G",
+            "--property=MemorySwapMax=0",
+            "--property=OOMPolicy=stop",
+            "--property=StandardInput=null",
+            "--property=StandardOutput=null",
+            "--property=StandardError=null",
+            "--property=WorkingDirectory=/",
+            "--setenv=LANG=C",
+            "--setenv=LC_ALL=C",
+            "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--setenv=NUV_AGENT_CONFIG=/etc/nuv-agent/agent.env",
+            "--",
+            *argv,
         )
-        process_group_id = process.pid
         try:
-            returncode = process.wait(timeout=timeout)
+            result = cls._run(
+                command,
+                timeout=timeout + SYSTEMCTL_TIMEOUT_SECONDS,
+            )
         except subprocess.TimeoutExpired as exc:
-            if not cls._terminate_process_group(process, process_group_id):
+            if not cls._terminate_probe_unit(unit):
                 raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED") from exc
             raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_TIMEOUT") from exc
-
-        if cls._process_group_exists(process_group_id):
-            cls._terminate_process_group(process, process_group_id)
-            # A successful shell that leaves a child alive is still an
-            # invalid physical-health result. Do not allow it to outlive OTA.
+        try:
+            active = cls._probe_unit_active(unit)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            cls._terminate_probe_unit(unit)
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED") from exc
+        if active:
+            cls._terminate_probe_unit(unit)
             raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED")
-        return subprocess.CompletedProcess(argv, returncode, "", "")
+        return subprocess.CompletedProcess(argv, result.returncode, "", "")

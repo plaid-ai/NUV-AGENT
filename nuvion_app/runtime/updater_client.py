@@ -47,6 +47,7 @@ _UPDATE_EVIDENCE_KEYS = frozenset(
         "configSchema",
         "bomVerificationStatus",
         "publisherKeyId",
+        "commandExpiresAt",
         "healthDeadline",
         "errorCode",
         "message",

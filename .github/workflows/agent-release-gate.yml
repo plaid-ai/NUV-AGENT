@@ -92,11 +92,14 @@ jobs:
           python -c 'import sys; assert sys.version_info[:2] == (3, 14)'
           python -m venv "$ORACLE_VENV"
           "$ORACLE_VENV/bin/python" -m pip install '.[zsad]'
-          "$ORACLE_VENV/bin/python" - <<'PY'
+          cd "$RUNNER_TEMP"
+          PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I - <<'PY'
           import os
           import platform
           import sys
           from importlib.metadata import version
+          from pathlib import Path
+          import nuvion_app
           from nuvion_app import build_info
           expected = {
               "torch": "2.10.0",
@@ -113,6 +116,9 @@ jobs:
           assert platform.machine() == "arm64"
           assert sys.version_info[:2] == (3, 14)
           assert {name: version(name) for name in expected} == expected
+          assert Path(nuvion_app.__file__).resolve().is_relative_to(
+              Path(os.environ["ORACLE_VENV"]).resolve()
+          )
           assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
           assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
           PY
@@ -125,10 +131,16 @@ jobs:
           ORACLE_VENV: ${{ runner.temp }}/siglip-cpu-oracle
         run: |
           set -euo pipefail
-          MODEL_PATH=$("$ORACLE_VENV/bin/python" - <<'PY'
+          cd "$RUNNER_TEMP"
+          MODEL_PATH=$(PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I - <<'PY'
           import os
           from pathlib import Path
+          import huggingface_hub
           from huggingface_hub import snapshot_download
+          if not Path(huggingface_hub.__file__).resolve().is_relative_to(
+              Path(os.environ["ORACLE_VENV"]).resolve()
+          ):
+              raise SystemExit("huggingface_hub imported outside CPU oracle venv")
           revision = os.environ["MODEL_REVISION"]
           path = Path(snapshot_download(
               repo_id="google/siglip2-base-patch16-224",
@@ -319,11 +331,16 @@ jobs:
           FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
           [ -x "$FORMULA_PYTHON" ]
           "$FORMULA_PYTHON" -m pip check
-          "$FORMULA_PYTHON" - <<'PY'
+          FORMULA_PREFIX="$(brew --prefix nuv-agent)"
+          export FORMULA_PREFIX
+          cd "$RUNNER_TEMP"
+          PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
           import os
           import platform
           import sys
           from importlib.metadata import version
+          from pathlib import Path
+          import nuvion_app
           from nuvion_app import build_info
           expected = {
               "torch": "2.10.0",
@@ -340,6 +357,9 @@ jobs:
           assert platform.machine() == "arm64"
           assert sys.version_info[:2] == (3, 14)
           assert {name: version(name) for name in expected} == expected
+          assert Path(nuvion_app.__file__).resolve().is_relative_to(
+              Path(os.environ["FORMULA_PREFIX"]).resolve() / "libexec"
+          )
           assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
           assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
           PY
@@ -351,11 +371,19 @@ jobs:
           MODEL_REVISION: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
         run: |
           set -euo pipefail
-          FORMULA_PYTHON="$(brew --prefix nuv-agent)/libexec/bin/python"
-          MODEL_PATH=$("$FORMULA_PYTHON" - <<'PY'
+          FORMULA_PREFIX="$(brew --prefix nuv-agent)"
+          FORMULA_PYTHON="$FORMULA_PREFIX/libexec/bin/python"
+          export FORMULA_PREFIX
+          cd "$RUNNER_TEMP"
+          MODEL_PATH=$(PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I - <<'PY'
           import os
           from pathlib import Path
+          import huggingface_hub
           from huggingface_hub import snapshot_download
+          if not Path(huggingface_hub.__file__).resolve().is_relative_to(
+              Path(os.environ["FORMULA_PREFIX"]).resolve() / "libexec"
+          ):
+              raise SystemExit("huggingface_hub imported outside Formula libexec")
           revision = os.environ["MODEL_REVISION"]
           path = Path(snapshot_download(
               repo_id="google/siglip2-base-patch16-224",
@@ -415,6 +443,7 @@ jobs:
           import torch
           from huggingface_hub import snapshot_download
           import nuvion_app
+          from nuvion_app import build_info
           from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
           path = Path(os.environ["MODEL_PATH"]).resolve()
           revision = os.environ["MODEL_REVISION"]
@@ -434,6 +463,8 @@ jobs:
           assert physical_memory >= 12 * 1024**3
           assert recommended_memory >= 8 * 1024**3
           assert package_path.is_relative_to(formula_prefix / "libexec")
+          assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
+          assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
           assert torch.backends.mps.is_available()
           assert path.name == revision
           assert Path(snapshot_download(
@@ -587,7 +618,19 @@ jobs:
           python -m pip install \
             transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
             tokenizers==0.23.1 safetensors==0.8.0
-          python -c 'import os; from nuvion_app import build_info; assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]; assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]'
+          cd "$RUNNER_TEMP"
+          PYTHONNOUSERSITE=1 python -I - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          import nuvion_app
+          from nuvion_app import build_info
+          package_path = Path(nuvion_app.__file__).resolve()
+          assert package_path.is_relative_to(Path(sys.prefix).resolve())
+          assert not package_path.is_relative_to(Path(os.environ["GITHUB_WORKSPACE"]).resolve())
+          assert build_info.AGENT_VERSION == os.environ["CANDIDATE_VERSION"]
+          assert build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]
+          PY
           archive="${RUNNER_TEMP}/actionlint.tar.gz"
           curl --fail --silent --show-error --location \
             https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \

@@ -724,14 +724,22 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
     )
 
 
-def build_bounded_live_queue(*, max_buffers: int = 2) -> str:
+def build_bounded_live_queue(
+    *, max_buffers: int = 2, element_name: str | None = None
+) -> str:
     """Bound one live raw-video branch independently and prefer fresh frames."""
 
     buffers = int(max_buffers)
     if buffers <= 0 or buffers > 60:
         raise ValueError("live queue max_buffers must be in [1, 60]")
+    name_property = ""
+    if element_name is not None:
+        normalized_name = str(element_name or "").strip()
+        if not normalized_name.replace("_", "").isalnum():
+            raise ValueError("live queue element_name must be alphanumeric/underscore")
+        name_property = f" name={normalized_name}"
     return (
-        f"queue max-size-buffers={buffers} "
+        f"queue{name_property} max-size-buffers={buffers} "
         "max-size-bytes=0 max-size-time=0 leaky=downstream"
     )
 
@@ -760,7 +768,8 @@ def build_uplink_pipeline(
     segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
     segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
     clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
-    live_queue = build_bounded_live_queue()
+    live_queue = build_bounded_live_queue(element_name="uplink_live_queue")
+    clip_queue = build_bounded_live_queue(element_name="clip_live_queue")
     return (
         "tee name=stream_split "
         f"stream_split. ! {live_queue} ! "
@@ -769,7 +778,7 @@ def build_uplink_pipeline(
         f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
         "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
         "tee name=webrtc_uplink_tee allow-not-linked=true "
-        f"stream_split. ! {live_queue} ! "
+        f"stream_split. ! {clip_queue} ! "
         f"{clip_encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "

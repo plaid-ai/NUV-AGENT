@@ -3,6 +3,10 @@ set -euo pipefail
 
 allow_no_camera=false
 camera_mode="oak"
+evidence_output=""
+expected_version=""
+expected_component_sha=""
+expected_bom_digest=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --allow-no-camera)
@@ -21,8 +25,35 @@ while [ "$#" -gt 0 ]; do
       camera_mode="${1#*=}"
       shift
       ;;
+    --evidence-output)
+      [ "$#" -ge 2 ] || {
+        echo "Usage: $0 [--camera oak|uvc] [--allow-no-camera] [--evidence-output PATH]" >&2
+        exit 2
+      }
+      evidence_output="$2"
+      shift 2
+      ;;
+    --evidence-output=*)
+      evidence_output="${1#*=}"
+      shift
+      ;;
+    --expected-version)
+      [ "$#" -ge 2 ] || exit 2
+      expected_version="$2"
+      shift 2
+      ;;
+    --expected-component-sha)
+      [ "$#" -ge 2 ] || exit 2
+      expected_component_sha="$2"
+      shift 2
+      ;;
+    --expected-bom-digest)
+      [ "$#" -ge 2 ] || exit 2
+      expected_bom_digest="$2"
+      shift 2
+      ;;
     *)
-      echo "Usage: $0 [--camera oak|uvc] [--allow-no-camera]" >&2
+      echo "Usage: $0 [--camera oak|uvc] [--allow-no-camera] [--evidence-output PATH]" >&2
       exit 2
       ;;
   esac
@@ -34,11 +65,22 @@ case "$camera_mode" in
     exit 2
     ;;
 esac
-
 die() {
   echo "[iq9075-e2e] ERROR: $*" >&2
   exit 1
 }
+
+[ -z "$evidence_output" ] || [ "$camera_mode" = "oak" ] || \
+  die "--evidence-output requires --camera oak"
+if [ -n "$evidence_output" ]; then
+  [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    die "--expected-version is required for evidence mode"
+  [[ "$expected_component_sha" =~ ^[0-9a-f]{40}$ ]] || \
+    die "--expected-component-sha is required for evidence mode"
+  [[ "$expected_bom_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+    die "--expected-bom-digest is required for evidence mode"
+  [ -z "${PYTHONPATH:-}" ] || die "PYTHONPATH is forbidden in evidence mode"
+fi
 
 for command in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl timeout python3 readlink \
   mktemp install id; do
@@ -80,6 +122,11 @@ timeout 20s gst-launch-1.0 -q \
 
 default_agent_python=/opt/nuv-agent/current/venv/bin/python
 requested_agent_python="${NUVION_AGENT_PYTHON:-$default_agent_python}"
+if [ -n "$evidence_output" ]; then
+  expected_agent_python="/opt/nuv-agent/releases/${expected_bom_digest#sha256:}/venv/bin/python"
+  [ "$requested_agent_python" = "$expected_agent_python" ] || \
+    die "evidence mode requires the exact BOM-addressed candidate Python"
+fi
 set +e
 agent_python="$(/usr/bin/python3 -I - "$requested_agent_python" <<'PY'
 import os
@@ -149,6 +196,75 @@ else
     install -d -m 0700 "$probe_runtime_dir/$directory"
   done
 fi
+
+validate_release_identity() {
+  (
+    cd "$probe_runtime_dir"
+    PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+      "$agent_python" -I - \
+      "$expected_version" "$expected_component_sha" "$expected_bom_digest" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+version, component_sha, bom_digest = sys.argv[1:]
+slot = Path("/opt/nuv-agent/releases") / bom_digest.removeprefix("sha256:")
+marker = slot / ".nuvion/release.json"
+before = marker.lstat()
+if (
+    stat.S_ISLNK(before.st_mode)
+    or not stat.S_ISREG(before.st_mode)
+    or before.st_uid != 0
+    or before.st_mode & 0o022
+):
+    raise SystemExit("candidate release marker metadata is unsafe")
+raw = marker.read_bytes()
+after = marker.lstat()
+identity = lambda item: (
+    item.st_dev,
+    item.st_ino,
+    item.st_mode,
+    item.st_size,
+    item.st_mtime_ns,
+    item.st_ctime_ns,
+)
+if identity(before) != identity(after):
+    raise SystemExit("candidate release marker changed while reading")
+try:
+    value = json.loads(raw)
+except (UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit("candidate release marker is invalid") from error
+if (
+    not isinstance(value, dict)
+    or value.get("agentVersion") != version
+    or value.get("componentSha") != component_sha
+    or value.get("bomDigest") != bom_digest
+):
+    raise SystemExit("candidate release marker identity mismatch")
+from nuvion_app import build_info
+
+module_path = Path(build_info.__file__).resolve(strict=True)
+if (
+    not module_path.is_relative_to(slot.resolve(strict=True))
+    or build_info.AGENT_VERSION != version
+    or build_info.COMPONENT_SHA != component_sha
+):
+    raise SystemExit("installed candidate build identity mismatch")
+print(hashlib.sha256(raw).hexdigest())
+PY
+  )
+}
+
+release_marker_sha=""
+if [ -n "$evidence_output" ]; then
+  release_marker_sha="$(validate_release_identity)" || \
+    die "candidate release identity validation failed"
+  [[ "$release_marker_sha" =~ ^[0-9a-f]{64}$ ]] || \
+    die "candidate release marker digest is invalid"
+fi
 probe_environment=(
   "HOME=$probe_runtime_dir/home"
   "XDG_CACHE_HOME=$probe_runtime_dir/cache"
@@ -158,11 +274,18 @@ probe_environment=(
 
 webrtc_python=(
   /usr/bin/env
+  -C "$probe_runtime_dir"
   "${probe_environment[@]}"
   "PYTHONPATH=${PYTHONPATH:-}"
+  "PYTHONNOUSERSITE=1"
+  "PYTHONDONTWRITEBYTECODE=1"
+  "NUVION_IQ9075_EXPECTED_BOM_DIGEST=$expected_bom_digest"
   "G_DEBUG=fatal-criticals"
   "$agent_python"
 )
+if [ -n "$evidence_output" ]; then
+  webrtc_python+=("-I")
+fi
 if [ "$(id -u)" -eq 0 ]; then
   command -v runuser >/dev/null 2>&1 || die "runuser is required for non-root Agent probes"
   webrtc_python=(
@@ -174,6 +297,8 @@ fi
 echo "[iq9075-e2e] checking disposable WebRTC branches across signaling resets"
 G_DEBUG=fatal-criticals timeout 20s "${webrtc_python[@]}" <<'PY'
 import gi
+import os
+from pathlib import Path
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstWebRTC", "1.0")
@@ -181,8 +306,18 @@ gi.require_version("GstSdp", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
+from nuvion_app import build_info as installed_build_info
+import nuvion_app.inference.webrtc_uplink as installed_webrtc_module
 
 Gst.init(None)
+expected_bom_digest = os.environ.get("NUVION_IQ9075_EXPECTED_BOM_DIGEST", "")
+if expected_bom_digest:
+    expected_slot = (
+        Path("/opt/nuv-agent/releases") / expected_bom_digest.removeprefix("sha256:")
+    ).resolve(strict=True)
+    for module in (installed_build_info, installed_webrtc_module):
+        if not Path(module.__file__).resolve(strict=True).is_relative_to(expected_slot):
+            raise RuntimeError("WebRTC evidence probe imported outside candidate slot")
 pipeline = Gst.parse_launch(
     "videotestsrc is-live=true ! "
     "video/x-raw,width=640,height=480,framerate=30/1 ! "
@@ -283,13 +418,25 @@ PY
 if [ "$camera_mode" = "oak" ]; then
   oak_python=(
     /usr/bin/env
+    -C "$probe_runtime_dir"
     "${probe_environment[@]}"
     "PYTHONPATH=${PYTHONPATH:-}"
+    "PYTHONNOUSERSITE=1"
+    "PYTHONDONTWRITEBYTECODE=1"
     "NUVION_IQ9075_OAK_SOAK_SECONDS=${NUVION_IQ9075_OAK_SOAK_SECONDS:-120}"
     "NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN=${NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN:-2}"
     "NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB=${NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB:-32}"
+    "NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/oak-soak-result.json"
+    "NUVION_IQ9075_EXPECTED_VERSION=$expected_version"
+    "NUVION_IQ9075_EXPECTED_COMPONENT_SHA=$expected_component_sha"
+    "NUVION_IQ9075_EXPECTED_BOM_DIGEST=$expected_bom_digest"
+    "NUVION_IQ9075_RELEASE_MARKER_SHA256=$release_marker_sha"
+    "NUVION_AGENT_PYTHON=$agent_python"
     "$agent_python"
   )
+  if [ -n "$evidence_output" ]; then
+    oak_python+=("-I")
+  fi
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
     oak_python=(
@@ -305,8 +452,12 @@ if [ "$camera_mode" = "oak" ]; then
   timeout 720s "${oak_python[@]}" <<'PY'
 from importlib.metadata import version
 from pathlib import Path
+from datetime import datetime, timezone
+import hashlib
+import json
 import math
 import os
+import platform
 import re
 import threading
 import time
@@ -326,6 +477,11 @@ from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_STOP_DEST,
 )
 from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
+from nuvion_app import build_info as installed_build_info
+import nuvion_app.inference.depthai_gst as installed_depthai_gst_module
+import nuvion_app.inference.depthai_source as installed_depthai_source_module
+import nuvion_app.inference.pipeline as installed_pipeline_module
+import nuvion_app.inference.webrtc_uplink as installed_webrtc_module
 
 import gi
 
@@ -343,6 +499,34 @@ RSS_WARMUP_SECONDS = 20.0
 RSS_SAMPLE_SECONDS = 5.0
 MIN_RAW_FPS = 27.0
 MAX_APPSRC_BYTES = 2 * WIDTH * HEIGHT * 3
+started_at = (
+    datetime.now(timezone.utc)
+    .replace(microsecond=0)
+    .isoformat()
+    .replace("+00:00", "Z")
+)
+
+expected_bom_digest = os.environ.get("NUVION_IQ9075_EXPECTED_BOM_DIGEST", "")
+if expected_bom_digest:
+    expected_slot = (
+        Path("/opt/nuv-agent/releases") / expected_bom_digest.removeprefix("sha256:")
+    ).resolve(strict=True)
+    expected_version = os.environ["NUVION_IQ9075_EXPECTED_VERSION"]
+    expected_component_sha = os.environ["NUVION_IQ9075_EXPECTED_COMPONENT_SHA"]
+    if (
+        installed_build_info.AGENT_VERSION != expected_version
+        or installed_build_info.COMPONENT_SHA != expected_component_sha
+    ):
+        raise SystemExit("OAK evidence process loaded a different build identity")
+    for module in (
+        installed_build_info,
+        installed_depthai_gst_module,
+        installed_depthai_source_module,
+        installed_pipeline_module,
+        installed_webrtc_module,
+    ):
+        if not Path(module.__file__).resolve(strict=True).is_relative_to(expected_slot):
+            raise SystemExit("OAK evidence process imported outside candidate slot")
 
 expected_version = "2.32.0.0"
 installed_version = version("depthai")
@@ -355,6 +539,17 @@ if installed_version != expected_version or module_version != expected_version:
     )
 
 values = dotenv_values(Path("/etc/nuv-agent/agent.env"))
+configured_device_id = str(values.get("NUVION_DEVICE_ID") or "").strip()
+try:
+    configured_space_id = int(str(values.get("NUVION_SPACE_ID") or ""))
+except ValueError as error:
+    raise SystemExit("NUVION_SPACE_ID is invalid") from error
+device_match = re.fullmatch(
+    r"sp-([1-9][0-9]*)-nuvion-[a-z0-9][a-z0-9-]{0,100}",
+    configured_device_id,
+)
+if device_match is None or int(device_match.group(1)) != configured_space_id:
+    raise SystemExit("Agent device/space identity is invalid")
 video_source = str(values.get("NUVION_VIDEO_SOURCE") or "oak").strip() or "oak"
 gst_source_override = str(values.get("NUVION_GST_SOURCE") or "").strip()
 demo_mode = str(values.get("NUVION_DEMO_MODE") or "false").strip().lower()
@@ -380,8 +575,6 @@ def read_sysfs(device: Path, name: str) -> str:
 def discover_oak_usb_paths(products: set[str]) -> list[Path]:
     matches = []
     for candidate in sorted(usb_devices_root.iterdir(), key=lambda item: item.name):
-        if usb_topology_re.fullmatch(candidate.name) is None:
-            continue
         try:
             resolved = candidate.resolve(strict=True)
             vendor = read_sysfs(candidate, "idVendor")
@@ -439,6 +632,8 @@ if not oak_usb_paths:
 if len(oak_usb_paths) != 1:
     raise SystemExit("USB1 downstream must contain exactly one OAK-D Lite")
 initial_usb_path = oak_usb_paths[0]
+if usb_topology_re.fullmatch(initial_usb_path.name) is None:
+    raise SystemExit("the only attached OAK-D Lite is outside the USB1 dual hub")
 try:
     initial_product = read_sysfs(initial_usb_path, "idProduct")
     initial_speed_mbps = float(read_sysfs(initial_usb_path, "speed"))
@@ -469,7 +664,10 @@ if not available_ids:
         "OAK USB device is present but DepthAI could not enumerate it; "
         "check udev permissions and native runtime"
     )
-if device_id is not None and device_id not in available_ids:
+if len(available_ids) != 1:
+    raise SystemExit("IQ9075 physical release test requires exactly one OAK MXID")
+selected_mxid = next(iter(available_ids))
+if device_id is not None and device_id != selected_mxid:
     raise SystemExit("configured OAK MXID is not attached")
 
 startup_timeout = float(
@@ -525,7 +723,14 @@ source_pipeline = build_video_source_pipeline(
     FPS,
     platform_name="linux",
 )
-live_queue = build_bounded_live_queue(max_buffers=2)
+raw_live_queue = build_bounded_live_queue(
+    max_buffers=2,
+    element_name="physical_raw_queue",
+)
+overlay_live_queue = build_bounded_live_queue(
+    max_buffers=2,
+    element_name="physical_overlay_queue",
+)
 uplink_pipeline = build_uplink_pipeline(
     rtp_ssrc=9075,
     clip_enabled=True,
@@ -536,9 +741,9 @@ uplink_pipeline = build_uplink_pipeline(
 )
 pipeline_description = (
     f"{source_pipeline} ! tee name=t "
-    f"t. ! {live_queue} ! "
+    f"t. ! {raw_live_queue} ! "
     "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
-    f"t. ! {live_queue} ! "
+    f"t. ! {overlay_live_queue} ! "
     "videoconvert ! textoverlay name=zsad_overlay "
     'font-desc="Sans 24" halignment=left valignment=top '
     'shaded-background=true text="" ! '
@@ -866,6 +1071,18 @@ try:
         raise RuntimeError("rejected WebRTC tee request pad was not released")
     if controller.runtime_health_snapshot()["hasPipeline"]:
         raise RuntimeError("rejected WebRTC runtime still reports an active pipeline")
+    webrtc_evidence = {
+        "offerCount": len(offer_snapshot()),
+        "terminalStopCount": len(terminal_stops),
+        "offerSdpHadPinnedProfile": "profile-level-id=42e01f" in offer_sdp,
+        "branchParentDetached": True,
+        "queueParentDetached": old_queue.get_parent() is None,
+        "webrtcParentDetached": old_webrtc.get_parent() is None,
+        "teeRequestPadCount": request_pad_count(uplink_tee),
+        "queueState": "NULL",
+        "webrtcState": "NULL",
+        "hasPipeline": False,
+    }
 
     warmup_deadline = time.monotonic() + RSS_WARMUP_SECONDS
     while time.monotonic() < warmup_deadline:
@@ -945,6 +1162,75 @@ finally:
     pipeline.set_state(Gst.State.NULL)
     pipeline.get_state(5 * Gst.SECOND)
 
+evidence_path = Path(os.environ["NUVION_IQ9075_OAK_EVIDENCE_OUTPUT"])
+if evidence_path.parent.resolve(strict=True) != runtime_root or evidence_path.name != "oak-soak-result.json":
+    raise SystemExit("OAK evidence output escaped the private runtime root")
+evidence = {
+    "schemaVersion": 1,
+    "kind": "nuvion-iq9075-oak-soak-result",
+    "startedAt": started_at,
+    "board": {
+        "productModel": "IQ9075_DEV",
+        "platformProfile": "iq9075_dev",
+        "hardwareRevision": "QCS9075-EVK",
+        "architecture": "aarch64",
+        "kernel": platform.release(),
+        "depthaiVersion": installed_version,
+        "gstreamerVersion": Gst.version_string(),
+    },
+    "oakMxidSha256": hashlib.sha256(
+        selected_mxid.lower().encode("utf-8")
+    ).hexdigest(),
+    "deviceIdentity": {
+        "deviceId": configured_device_id,
+        "spaceId": configured_space_id,
+    },
+    "runtimeIdentity": {
+        "agentVersion": os.environ["NUVION_IQ9075_EXPECTED_VERSION"],
+        "componentSha": os.environ["NUVION_IQ9075_EXPECTED_COMPONENT_SHA"],
+        "bomDigest": os.environ["NUVION_IQ9075_EXPECTED_BOM_DIGEST"],
+        "pythonPath": str(Path(os.environ.get("NUVION_AGENT_PYTHON", "/opt/nuv-agent/current/venv/bin/python"))),
+        "releaseMarkerSha256": os.environ["NUVION_IQ9075_RELEASE_MARKER_SHA256"],
+    },
+    "soak": {
+        "durationSeconds": round(soak_elapsed, 6),
+        "targetFps": float(FPS),
+        "rawSamples": soak_raw_samples,
+        "rssAnonSamples": [
+            {
+                "elapsedSec": round(timestamp - soak_started, 6),
+                "rssAnonKiB": rss_kib,
+            }
+            for timestamp, rss_kib in rss_samples
+        ],
+        "gstreamerErrors": list(gst_errors),
+        "maxAppsrcBuffers": max_appsrc_buffers,
+        "maxAppsrcBytes": max_appsrc_bytes,
+        "queueHighWatermarks": dict(sorted(queue_high_watermarks.items())),
+    },
+    "webrtc": webrtc_evidence,
+    "splitmux": {
+        "segmentSeconds": float(SEGMENT_SECONDS),
+        "retentionLimit": MAX_SEGMENTS,
+        "segmentsAtEnd": len(segments),
+        "fragmentsOpenedDuringSoak": fragment_delta,
+        "newestSegmentAgeSeconds": round(newest_segment_age, 6),
+    },
+}
+serialized = (json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+descriptor = os.open(
+    evidence_path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    with os.fdopen(descriptor, "wb", closefd=False) as output:
+        output.write(serialized)
+        output.flush()
+        os.fsync(output.fileno())
+finally:
+    os.close(descriptor)
+
 print(
     "[iq9075-e2e] OAK production offer/watchdog/teardown RSS soak: PASS "
     f"(depthai={installed_version}, usb={runtime_usb_path.name}, "
@@ -963,6 +1249,53 @@ PY
       exit 0
     fi
     die "OAK-D RGB/appsrc/H264/RTP test failed (status=$oak_status); check runtime, USB permissions, configured MXID, and camera health"
+  fi
+  if [ -n "$evidence_output" ]; then
+    post_release_marker_sha="$(validate_release_identity)" || \
+      die "candidate release identity changed after OAK soak"
+    [ "$post_release_marker_sha" = "$release_marker_sha" ] || \
+      die "candidate release marker changed during OAK soak"
+    /usr/bin/python3 -I - \
+      "$probe_runtime_dir/oak-soak-result.json" "$evidence_output" "$(id -u)" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+expected_uid = int(sys.argv[3])
+if (
+    not destination.is_absolute()
+    or os.path.normpath(str(destination)) != str(destination)
+    or destination.name in {"", ".", ".."}
+    or destination.suffix != ".json"
+    or destination.exists()
+    or destination.is_symlink()
+):
+    raise SystemExit("unsafe IQ9075 evidence destination")
+parent = destination.parent.resolve(strict=True)
+metadata = parent.stat()
+if (
+    not stat.S_ISDIR(metadata.st_mode)
+    or metadata.st_uid != expected_uid
+    or metadata.st_mode & 0o022
+):
+    raise SystemExit("IQ9075 evidence destination directory is not private")
+raw = source.read_bytes()
+if not raw or len(raw) > 1024 * 1024:
+    raise SystemExit("IQ9075 evidence payload size is invalid")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(destination, flags, 0o600)
+try:
+    with os.fdopen(descriptor, "wb", closefd=False) as output:
+        output.write(raw)
+        output.flush()
+        os.fsync(output.fileno())
+finally:
+    os.close(descriptor)
+PY
+    echo "[iq9075-e2e] canonical OAK evidence: $evidence_output"
   fi
   echo "[iq9075-e2e] local OAK-D/GStreamer/WebRTC path: PASS"
   exit 0

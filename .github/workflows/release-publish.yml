@@ -45,6 +45,7 @@ jobs:
       contents: read
     outputs:
       release_tag: ${{ steps.identity.outputs.tag }}
+      tag_object_sha: ${{ steps.identity.outputs.tag_object_sha }}
       release_version: ${{ steps.identity.outputs.version }}
       component_sha: ${{ steps.identity.outputs.component_sha }}
       trusted_publisher_sha: ${{ steps.identity.outputs.trusted_publisher_sha }}
@@ -53,6 +54,8 @@ jobs:
       gate_check_id: ${{ steps.release-gate.outputs.gate_check_id }}
       gate_check_suite_id: ${{ steps.release-gate.outputs.gate_check_suite_id }}
       gate_workflow_sha256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
+      physical_artifact_sha256: ${{ steps.readiness.outputs.physical_artifact_sha256 }}
+      physical_bom_sha256: ${{ steps.readiness.outputs.physical_bom_sha256 }}
       requested_sequence: ${{ steps.request.outputs.requested_sequence }}
     steps:
       - name: Resolve request without credentials
@@ -207,6 +210,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Enforce audited dependency release readiness
+        id: readiness
         env:
           VERSION: ${{ steps.identity.outputs.version }}
           COMPONENT_SHA: ${{ steps.identity.outputs.component_sha }}
@@ -216,7 +220,8 @@ jobs:
           GATE_WORKFLOW_SHA256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
         run: |
           set -euo pipefail
-          python3 publisher/packaging/release/verify-release-readiness.py \
+          env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
+            publisher/packaging/release/verify-release-readiness.py \
             --policy publisher/packaging/release/release-readiness.json \
             --version "$VERSION" \
             --component-sha "$COMPONENT_SHA" \
@@ -225,7 +230,9 @@ jobs:
             --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
             --gate-workflow-sha256 "$GATE_WORKFLOW_SHA256" \
             --security-policy publisher/packaging/release/release-security-policy.json \
-            --signer-directory publisher/packaging/release/trusted-tag-signers
+            --signer-directory publisher/packaging/release/trusted-tag-signers \
+            --candidate-harness release-source/packaging/dev/test-iq9075.sh \
+            --github-output "$GITHUB_OUTPUT"
 
   release-build:
     name: Test and build keyless generic release
@@ -331,8 +338,20 @@ jobs:
           python -m venv "$RELEASE_SMOKE_VENV"
           "$RELEASE_SMOKE_VENV/bin/python" -m pip install --upgrade pip
           "$RELEASE_SMOKE_VENV/bin/python" -m pip install --no-cache-dir "$SDIST"
-          "$RELEASE_SMOKE_VENV/bin/python" -c \
-            "from nuvion_app import build_info; assert build_info.AGENT_VERSION == '${VERSION}'; assert build_info.COMPONENT_SHA == '${COMPONENT_SHA}'"
+          cd "$RUNNER_TEMP"
+          export RELEASE_SMOKE_VENV
+          PYTHONNOUSERSITE=1 "$RELEASE_SMOKE_VENV/bin/python" -I - <<'PY'
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+          import nuvion_app
+          from nuvion_app import build_info
+          package_path = Path(nuvion_app.__file__).resolve()
+          assert package_path.is_relative_to(Path(os.environ["RELEASE_SMOKE_VENV"]).resolve())
+          assert version("nuv-agent") == os.environ["VERSION"]
+          assert build_info.AGENT_VERSION == os.environ["VERSION"]
+          assert build_info.COMPONENT_SHA == os.environ["COMPONENT_SHA"]
+          PY
           "$RELEASE_SMOKE_VENV/bin/nuv-agent" --help >/dev/null
 
       - name: Record generic artifact identities
@@ -403,6 +422,7 @@ jobs:
         env:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+          PHYSICAL_ARTIFACT_SHA256: ${{ needs.release-preflight.outputs.physical_artifact_sha256 }}
         run: |
           set -euo pipefail
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")
@@ -410,6 +430,8 @@ jobs:
           BUNDLE_NAME="nuv-agent_${VERSION}_iq9075-aarch64.agent-bundle.tar.gz"
           BUNDLE_PATH="dist/$BUNDLE_NAME"
           packaging/release/build-agent-bundle.sh "$VERSION" "$BUNDLE_PATH"
+          [ "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$PHYSICAL_ARTIFACT_SHA256" ] \
+            || { echo "release bundle differs from signed IQ9075 physical evidence" >&2; exit 1; }
           DEB_NAME="nuv-agent_${VERSION}_arm64.deb"
           DEB_PATH="dist/$DEB_NAME"
           BOOTSTRAP_BUNDLE_PATH="$BUNDLE_PATH" OUTPUT_DEB="$DEB_PATH" \
@@ -447,8 +469,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: [release-preflight, release-build, iq9075-ota-build]
     permissions:
+      actions: read
+      checks: read
       contents: write
     environment: homebrew-release
+    env:
+      RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
+      RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+      RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+      RELEASE_AUTH_GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+      RELEASE_AUTH_GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+      RELEASE_AUTH_GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
     outputs:
       source_plan_name: ${{ steps.source-plan.outputs.name }}
       source_plan_sha256: ${{ steps.source-plan.outputs.sha256 }}
@@ -564,6 +595,7 @@ jobs:
 
       - name: Revalidate trust immediately before GitHub credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -576,11 +608,13 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Finalize exact immutable GitHub release before live channels
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ needs.release-preflight.outputs.tag_object_sha }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
           SDIST_NAME: ${{ needs.release-build.outputs.sdist_name }}
           BOM_NAME: ${{ needs.release-build.outputs.sdist_bom_name }}
@@ -593,6 +627,7 @@ jobs:
             publisher/packaging/release/publish-github-release.py \
               --repository "$GITHUB_REPOSITORY" \
               --tag "$RELEASE_TAG" \
+              --tag-object-sha "$TAG_OBJECT_SHA" \
               --component-sha "$COMPONENT_SHA" \
               --phase finalize \
               --asset "dist/$SDIST_NAME" \
@@ -617,10 +652,18 @@ jobs:
     needs: [release-preflight, github-release-publish]
     environment: homebrew-release
     permissions:
+      actions: read
+      checks: read
       contents: read
     env:
       TAP_REPO: plaid-ai/homebrew-NUV-agent-homebrew
       FORMULA_PATH: Formula/nuv-agent.rb
+      RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
+      RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+      RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+      RELEASE_AUTH_GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+      RELEASE_AUTH_GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+      RELEASE_AUTH_GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -670,6 +713,7 @@ jobs:
 
       - name: Revalidate trust immediately before Homebrew credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -682,6 +726,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Update Homebrew tap with trusted publisher
         env:
@@ -691,7 +736,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$GH_TOKEN" ] || { echo "HOMEBREW_TAP_TOKEN is not set" >&2; exit 1; }
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          git clone "https://github.com/${TAP_REPO}.git" tap
           cp "dist/$FORMULA_NAME" candidate.rb
           python3 publisher/packaging/release/verify-homebrew-promotion.py \
             --current "tap/$FORMULA_PATH" \
@@ -699,7 +744,7 @@ jobs:
             --version "$VERSION"
           cp candidate.rb "tap/$FORMULA_PATH"
           cd tap
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git"
+          [ "$(git remote get-url origin)" = "https://github.com/${TAP_REPO}.git" ]
           git config user.email "release-bot@plaidai.io"
           git config user.name "release-bot"
           git add "$FORMULA_PATH"
@@ -707,7 +752,25 @@ jobs:
             echo "Homebrew formula already matches ${VERSION}; rerun is idempotent."
           else
             git commit -m "Update nuv-agent ${VERSION}"
-            git push origin HEAD
+            umask 077
+            askpass="$(mktemp "${RUNNER_TEMP}/nuv-homebrew-askpass.XXXXXX")"
+            cleanup_askpass() {
+              rm -f -- "$askpass"
+            }
+            trap cleanup_askpass EXIT
+            cat >"$askpass" <<'ASKPASS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "${1:-}" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "${GH_TOKEN:?}" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+            chmod 0700 "$askpass"
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass" git push origin HEAD
+            cleanup_askpass
+            trap - EXIT
           fi
 
   apt-publish:
@@ -717,6 +780,8 @@ jobs:
       [release-preflight, release-build, iq9075-ota-build, github-release-publish, homebrew-publish]
     environment: apt-release
     permissions:
+      actions: read
+      checks: read
       contents: read
     outputs:
       rollback_version: ${{ steps.rollback.outputs.version }}
@@ -728,6 +793,12 @@ jobs:
       GPG_KEY_ID: E5230C3090A66BC5
       BUCKET: apt.plaidai.io
       APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime
+      RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
+      RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+      RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+      RELEASE_AUTH_GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+      RELEASE_AUTH_GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+      RELEASE_AUTH_GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -858,6 +929,7 @@ jobs:
 
       - name: Revalidate trust immediately before APT credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -870,6 +942,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Import APT signing key
         env:
@@ -904,6 +977,7 @@ jobs:
 
       - name: Revalidate trust immediately before APT GCP authentication
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -916,6 +990,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Authenticate APT-only GCP publisher
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -924,6 +999,7 @@ jobs:
 
       - name: Revalidate trust immediately before APT GCP project secret use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -936,6 +1012,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
@@ -944,6 +1021,7 @@ jobs:
 
       - name: Revalidate trust immediately before APT signing and GCS publication
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -956,6 +1034,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Publish exact deb set with trusted publisher
         env:
@@ -981,6 +1060,7 @@ jobs:
 
       - name: Revalidate trust immediately before distribution promotion credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -993,6 +1073,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Publish final distribution promotion after both live channels
         env:
@@ -1035,9 +1116,17 @@ jobs:
       group: iq9075-ota-global-publisher
       cancel-in-progress: false
     permissions:
+      actions: read
+      checks: read
       contents: read
     env:
       APT_RUNTIME_ROOT: ${{ github.workspace }}/nuv-ota-publish-runtime
+      RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
+      RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
+      RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
+      RELEASE_AUTH_GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
+      RELEASE_AUTH_GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
+      RELEASE_AUTH_GATE_WORKFLOW_SHA256: ${{ needs.release-preflight.outputs.gate_workflow_sha256 }}
     steps:
       - name: Checkout trusted publisher only
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -1132,6 +1221,7 @@ jobs:
 
       - name: Revalidate trust immediately before OTA credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1144,6 +1234,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Authenticate OTA-only GCP publisher
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -1152,6 +1243,7 @@ jobs:
 
       - name: Revalidate trust immediately before OTA GCP project secret use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1164,6 +1256,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
@@ -1172,6 +1265,7 @@ jobs:
 
       - name: Revalidate trust immediately before OTA sequence reservation credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1184,6 +1278,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Atomically reserve exact release sequence
         env:
@@ -1195,6 +1290,7 @@ jobs:
 
       - name: Revalidate trust after CAS and immediately before IQ signing key use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1207,6 +1303,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Sign exact bundle BOM with trusted signer
         env:
@@ -1219,6 +1316,7 @@ jobs:
           CONFIG_SCHEMA: ${{ needs.iq9075-ota-build.outputs.config_schema }}
           MIN_UPDATER_VERSION: ${{ needs.iq9075-ota-build.outputs.min_updater_version }}
           EXPECTED_BOM_DIGEST: ${{ steps.sequence.outputs.expected_bom_digest }}
+          PHYSICAL_BOM_SHA256: ${{ needs.release-preflight.outputs.physical_bom_sha256 }}
           RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
           RELEASE_SIGNING_KEY_ID: ${{ steps.sequence.outputs.publisher_key_id }}
         run: |
@@ -1251,6 +1349,8 @@ jobs:
             "import json; print(json.load(open('$BOM_PATH', encoding='utf-8'))['bomDigest'])")
           [ "$ACTUAL_BOM_DIGEST" = "$EXPECTED_BOM_DIGEST" ] \
             || { echo "signed BOM differs from reserved identity" >&2; exit 1; }
+          [ "$(sha256sum "$BOM_PATH" | awk '{print $1}')" = "$PHYSICAL_BOM_SHA256" ] \
+            || { echo "release BOM differs from signed IQ9075 physical evidence" >&2; exit 1; }
           unset RELEASE_SIGNING_PRIVATE_KEY NUVION_IQ9075_RELEASE_SIGNING_KEY
 
       - name: Verify signed BOM with independent public keyring
@@ -1274,6 +1374,7 @@ jobs:
 
       - name: Revalidate trust immediately before OTA bundle publication credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1286,6 +1387,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Publish verified exact bundle with trusted publisher
         env:
@@ -1306,6 +1408,7 @@ jobs:
 
       - name: Revalidate trust immediately before OTA promotion credential use
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -1318,6 +1421,7 @@ jobs:
             --attestation settings-evidence/packaging/release/release-settings-attestation.json \
             --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
             --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
 
       - name: Generate and atomically publish final OTA promotion
         env:

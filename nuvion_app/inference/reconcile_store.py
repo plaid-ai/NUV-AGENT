@@ -280,12 +280,7 @@ class DurableReconcileStore:
                 self.observation_outbox.reserve_terminal_in_transaction(
                     connection,
                     command_id=command.command_id,
-                    slots=(
-                        2
-                        if command.command_type == "CONFIG_APPLY"
-                        and command.payload.get("activation") == "RESTART"
-                        else 1
-                    ),
+                    slots=1,
                 )
             except CommandObservationError as exc:
                 return CommandEffectOutcome(
@@ -347,14 +342,9 @@ class DurableReconcileStore:
                     reported_state=superseded_state,
                 )
                 if self.observation_outbox is not None:
-                    self.observation_outbox.enqueue_in_transaction(
+                    self.observation_outbox.discard_command_in_transaction(
                         connection,
                         command_id=superseded_id,
-                        sequence=int(row["sequence"]),
-                        command_type=command.command_type,
-                        reported_state=superseded_state,
-                        terminal=True,
-                        use_reservation=True,
                     )
             connection.execute(
                 """
@@ -982,15 +972,21 @@ class DurableReconcileStore:
                 reported_state=reported_state,
             )
             if self.observation_outbox is not None:
-                self.observation_outbox.enqueue_in_transaction(
-                    connection,
-                    command_id=command.command_id,
-                    sequence=command.sequence,
-                    command_type=command.command_type,
-                    reported_state=reported_state,
-                    terminal=True,
-                    use_reservation=True,
-                )
+                if status == COMMAND_STATUS_SUCCEEDED:
+                    self.observation_outbox.enqueue_in_transaction(
+                        connection,
+                        command_id=command.command_id,
+                        sequence=command.sequence,
+                        command_type=command.command_type,
+                        reported_state=reported_state,
+                        terminal=True,
+                        use_reservation=True,
+                    )
+                else:
+                    self.observation_outbox.discard_command_in_transaction(
+                        connection,
+                        command_id=command.command_id,
+                    )
             return ack
 
     def defer_for_restart(
@@ -1036,15 +1032,6 @@ class DurableReconcileStore:
                 state=state,
                 now=now,
             )
-            if self.observation_outbox is not None:
-                self.observation_outbox.enqueue_in_transaction(
-                    connection,
-                    command_id=command.command_id,
-                    sequence=command.sequence,
-                    command_type=command.command_type,
-                    reported_state=state,
-                    use_reservation=True,
-                )
 
     def defer_for_retry(
         self,
@@ -1233,6 +1220,19 @@ class DurableReconcileStore:
             return
         state = {**command.payload, **dict(reported_state)}
         with self.inbox.transaction(immediate=True) as connection:
+            inbox_row = connection.execute(
+                "SELECT status FROM command_inbox WHERE command_id = ?",
+                (command.command_id,),
+            ).fetchone()
+            if (
+                inbox_row is None
+                or str(inbox_row["status"]) != COMMAND_STATUS_SUCCEEDED
+            ):
+                self.observation_outbox.discard_command_in_transaction(
+                    connection,
+                    command_id=command.command_id,
+                )
+                return
             self.observation_outbox.enqueue_in_transaction(
                 connection,
                 command_id=command.command_id,

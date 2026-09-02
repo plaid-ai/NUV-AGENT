@@ -11,14 +11,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
 
 RELEASE_BOM_SCHEMA_VERSION = 1
 RELEASE_BOM_V2_SCHEMA_VERSION = 2
@@ -145,6 +144,9 @@ class ReleaseKeyring:
 
     @staticmethod
     def _parse_public_key(material: bytes, key_id: str) -> Ed25519PublicKey:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
         if len(material) == 32:
             try:
                 return Ed25519PublicKey.from_public_bytes(material)
@@ -697,6 +699,8 @@ def build_release_bom_signature(
 ) -> dict[str, Any]:
     """Create a detached publisher signature for an already-digested v2 BOM."""
 
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     verified = verify_release_bom(payload)
     if verified.schema_version != RELEASE_BOM_V2_SCHEMA_VERSION:
         raise ReleaseBomValidationError("only release-bom-v2 can be signed")
@@ -724,6 +728,8 @@ def verify_signed_release_bom(
     expected_bom_digest: str | None = None,
 ) -> VerifiedReleaseBom:
     """Verify v2 structure, digest and detached publisher signature."""
+
+    from cryptography.exceptions import InvalidSignature
 
     verified = verify_release_bom(
         payload, expected_bom_digest=expected_bom_digest

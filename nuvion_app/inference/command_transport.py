@@ -154,7 +154,7 @@ def build_command_ack_payload(ack: CommandAck) -> dict[str, Any]:
     if ack.message is not None and len(ack.message) > 1000:
         raise ValueError("ACK message exceeds 1000 characters")
     if ack.reported_state is not None and not isinstance(ack.reported_state, dict):
-        raise ValueError("reportedState must be an object or null")
+        raise ValueError("reportedState must be an object")
     return {
         "ackId": _canonical_uuid(ack.ack_id, "ackId"),
         "commandId": _canonical_uuid(ack.command_id, "commandId"),
@@ -163,7 +163,10 @@ def build_command_ack_payload(ack: CommandAck) -> dict[str, Any]:
         "observedAt": observed_at,
         "code": ack.code,
         "message": ack.message,
-        "reportedState": ack.reported_state,
+        # The BE command ACK schema requires a JSON object at every lifecycle
+        # transition. Persisted RECEIVED/IN_PROGRESS rows legitimately have no
+        # readback yet, so serialize them as the empty object rather than null.
+        "reportedState": ack.reported_state if ack.reported_state is not None else {},
     }
 
 

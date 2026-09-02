@@ -575,6 +575,7 @@ class DurableCommandObservationOutbox:
                 safety_slot,
             ),
         )
+
         if consumed_reservation:
             remaining_slots = int(reservation["slots"]) - 1
             remaining_bytes = int(reservation["reserved_bytes"]) - MAX_REPORTED_STATE_BYTES
@@ -598,6 +599,40 @@ class DurableCommandObservationOutbox:
             (observation_id,),
         ).fetchone()
         return self._row_to_observation(row)
+
+    def discard_command_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        command_id: str,
+    ) -> int:
+        """Drop observations that the BE contract cannot accept.
+
+        `/app/device/command.observed` is valid only after the command reached
+        SUCCEEDED. Failed, rolled-back, expired, or still-in-progress commands
+        must use lifecycle ACKs instead.
+        """
+
+        normalized = _canonical_uuid(command_id, "commandId")
+        removed = 0
+        for statement in (
+            "DELETE FROM fleet_command_observation_reservation WHERE command_id = ?",
+            "DELETE FROM fleet_command_observation_dlq WHERE command_id = ?",
+            "DELETE FROM fleet_command_observation WHERE command_id = ?",
+        ):
+            cursor = connection.execute(
+                statement,
+                (normalized,),
+            )
+            removed += max(0, cursor.rowcount)
+        return removed
+
+    def discard_command(self, command_id: str) -> int:
+        with self.inbox.transaction(immediate=True) as connection:
+            return self.discard_command_in_transaction(
+                connection,
+                command_id=command_id,
+            )
 
     def pending(self, *, limit: int = 100) -> list[CommandObservation]:
         safe_limit = max(1, min(int(limit), 1000))

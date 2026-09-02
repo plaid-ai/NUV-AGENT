@@ -102,6 +102,19 @@ atomic_slot_link() {
 if ! id -u nuvion >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin nuvion
 fi
+if ! getent group nuvion >/dev/null 2>&1; then
+  echo "The required nuvion group is unavailable" >&2
+  exit 1
+fi
+# SocketGroup controls only control.sock, not its parent. tmpfiles.d is the
+# authoritative boot-persistent owner/mode contract for path traversal by the
+# unprivileged Agent. Apply it now as well, before the socket can be started.
+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/nuvion-updater.conf
+runtime_directory_identity="$(stat -c '%U:%G:%a' /run/nuvion-updater)"
+if [ "$runtime_directory_identity" != "root:nuvion:750" ]; then
+  echo "Unsafe updater runtime directory identity: $runtime_directory_identity" >&2
+  exit 1
+fi
 if getent group video >/dev/null 2>&1; then
   usermod -a -G video nuvion || true
 fi
@@ -290,15 +303,6 @@ elif [ "$old_current" != "bootstrap/$package_version" ]; then
 fi
 
 reload_oak_udev_rules
-if [ "$install_autostart" = true ]; then
-  systemctl enable nuv-agent.service
-  # Always restart after the docker-group audit so the process obtains a fresh
-  # supplementary-group set even when the immutable slot pointer did not move.
-  systemctl restart nuv-agent.service
-else
-  systemctl disable --now nuv-agent.service || true
-fi
-
 if [ -f /etc/nuvion-updater/device-binding.json ] \
   && [ -f /etc/nuvion-updater/command-keyring.json ] \
   && [ -f /etc/nuvion-updater/release-keyring.json ] \
@@ -307,6 +311,15 @@ if [ -f /etc/nuvion-updater/device-binding.json ] \
   systemctl try-restart nuv-agent-updater.service || true
 else
   systemctl disable --now nuv-agent-updater.socket || true
+fi
+
+if [ "$install_autostart" = true ]; then
+  systemctl enable nuv-agent.service
+  # Always restart after the docker-group audit so the process obtains a fresh
+  # supplementary-group set even when the immutable slot pointer did not move.
+  systemctl restart nuv-agent.service
+else
+  systemctl disable --now nuv-agent.service || true
 fi
 
 echo

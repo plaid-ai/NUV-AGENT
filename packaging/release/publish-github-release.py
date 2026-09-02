@@ -113,6 +113,57 @@ class GitHubApi:
             raise GitHubReleaseError("GitHub release response is invalid")
         return payload
 
+    def tag_reference(self, tag: str) -> dict[str, Any]:
+        encoded = urllib.parse.quote(tag, safe="")
+        payload = self.request(
+            "GET", f"/repos/{self.repository}/git/ref/tags/{encoded}"
+        )
+        if not isinstance(payload, dict):
+            raise GitHubReleaseError("GitHub release tag reference is invalid")
+        return payload
+
+    def annotated_tag(self, object_sha: str) -> dict[str, Any]:
+        payload = self.request(
+            "GET", f"/repos/{self.repository}/git/tags/{object_sha}"
+        )
+        if not isinstance(payload, dict):
+            raise GitHubReleaseError("GitHub annotated tag object is invalid")
+        return payload
+
+
+def verify_live_tag(
+    api: GitHubApi,
+    *,
+    tag: str,
+    tag_object_sha: str,
+    component_sha: str,
+) -> None:
+    if (
+        not TAG.fullmatch(tag)
+        or not SHA.fullmatch(tag_object_sha)
+        or not SHA.fullmatch(component_sha)
+    ):
+        raise GitHubReleaseError("release tag proof identity is invalid")
+    reference = api.tag_reference(tag)
+    reference_object = reference.get("object")
+    if (
+        reference.get("ref") != f"refs/tags/{tag}"
+        or not isinstance(reference_object, dict)
+        or reference_object.get("type") != "tag"
+        or reference_object.get("sha") != tag_object_sha
+    ):
+        raise GitHubReleaseError("live release tag reference changed after preflight")
+    annotated = api.annotated_tag(tag_object_sha)
+    target = annotated.get("object")
+    if (
+        annotated.get("sha") != tag_object_sha
+        or annotated.get("tag") != tag
+        or not isinstance(target, dict)
+        or target.get("type") != "commit"
+        or target.get("sha") != component_sha
+    ):
+        raise GitHubReleaseError("live annotated tag target changed after preflight")
+
 
 def _artifact(path: Path) -> dict[str, Any]:
     candidate = path if path.is_absolute() else Path.cwd() / path
@@ -261,11 +312,16 @@ def publish_release(
     *,
     api: GitHubApi,
     tag: str,
+    tag_object_sha: str,
     component_sha: str,
     phase: str,
     asset_paths: list[Path],
 ) -> dict[str, Any]:
-    if not TAG.fullmatch(tag) or not SHA.fullmatch(component_sha):
+    if (
+        not TAG.fullmatch(tag)
+        or not SHA.fullmatch(tag_object_sha)
+        or not SHA.fullmatch(component_sha)
+    ):
         raise GitHubReleaseError("release tag or component SHA is invalid")
     if phase not in {"stage", "finalize"}:
         raise GitHubReleaseError("release publication phase is invalid")
@@ -274,6 +330,15 @@ def publish_release(
     if len(local_by_name) != len(local_assets):
         raise GitHubReleaseError("local release asset names must be unique")
 
+    # The local signature check in preflight binds the annotated tag object's
+    # immutable SHA. Re-read the live ref immediately before the first GitHub
+    # write so an administrator retarget cannot redirect publication.
+    verify_live_tag(
+        api,
+        tag=tag,
+        tag_object_sha=tag_object_sha,
+        component_sha=component_sha,
+    )
     release = api.release(tag)
     if release is None:
         release = _create_draft(api, tag=tag, component_sha=component_sha)
@@ -307,6 +372,14 @@ def publish_release(
         raise GitHubReleaseError("draft GitHub release has an unexpected asset set")
 
     if phase == "finalize" and release["draft"]:
+        # Uploads may take minutes. Re-check again immediately before the
+        # irreversible draft-to-immutable transition.
+        verify_live_tag(
+            api,
+            tag=tag,
+            tag_object_sha=tag_object_sha,
+            component_sha=component_sha,
+        )
         release = api.request(
             "PATCH",
             f"/repos/{api.repository}/releases/{release['id']}",
@@ -339,6 +412,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag-object-sha", required=True)
     parser.add_argument("--component-sha", required=True)
     parser.add_argument("--phase", choices=("stage", "finalize"), required=True)
     parser.add_argument("--asset", action="append", type=Path, required=True)
@@ -350,6 +424,7 @@ def main() -> int:
                 arguments.repository, os.environ.get(arguments.token_env, "")
             ),
             tag=arguments.tag,
+            tag_object_sha=arguments.tag_object_sha,
             component_sha=arguments.component_sha,
             phase=arguments.phase,
             asset_paths=arguments.asset,

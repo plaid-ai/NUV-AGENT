@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -23,7 +24,18 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("/opt/nuv-agent/current/venv/bin/python", probe)
         self.assertIn('version("depthai") != "2.32.0.0"', probe)
         self.assertIn("queue.tryGet()", probe)
-        self.assertIn("timeout 30s runuser -u nuvion", probe)
+        self.assertIn(
+            "timeout --signal=TERM --kill-after=5s 60s runuser -u nuvion",
+            probe,
+        )
+        self.assertIn("depthai.Device.getAllAvailableDevices()", probe)
+        self.assertIn("stable_polls < 2", probe)
+        self.assertIn("NUVION_DEPTHAI_DEVICE_ID", probe)
+        self.assertIn("depthai.Device(pipeline, selected)", probe)
+        self.assertIn('Path("/sys/bus/usb/devices")', probe)
+        self.assertIn("IQ9075 requires exactly one attached OAK", probe)
+        self.assertIn("deadline = time.monotonic() + 45.0", probe)
+        self.assertIn("time.monotonic() + 10.0", probe)
         self.assertIn('chown nuvion:nuvion "$runtime_dir"', probe)
         self.assertNotIn("nuvion_app", probe)
         self.assertNotIn("WebRTCUplinkController", probe)
@@ -32,6 +44,54 @@ class Iq9075PackagingTest(unittest.TestCase):
             'IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"',
             runtime,
         )
+
+    def test_rollback_oak_probe_selects_only_the_configured_stable_device(
+        self,
+    ) -> None:
+        probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text(
+            encoding="utf-8"
+        )
+        embedded = probe.split("<<'PY'\n", 2)[2].rsplit("\nPY", 1)[0]
+        tree = ast.parse(embedded)
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"configured_mxid", "select_device"}
+        ]
+        namespace: dict[str, object] = {"Path": Path, "re": __import__("re")}
+        exec(  # noqa: S102 - execute only two AST-selected repository functions.
+            compile(ast.Module(body=functions, type_ignores=[]), "<probe>", "exec"),
+            namespace,
+        )
+        configured_mxid = namespace["configured_mxid"]
+        select_device = namespace["select_device"]
+
+        class DeviceInfo:
+            def __init__(self, mxid: str) -> None:
+                self.mxid = mxid
+
+            def getMxId(self) -> str:
+                return self.mxid
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "agent.env"
+            config.write_text("NUVION_DEPTHAI_DEVICE_ID=oak-b\n", encoding="utf-8")
+            self.assertEqual(configured_mxid(config), "oak-b")
+            devices = [DeviceInfo("oak-a"), DeviceInfo("oak-b")]
+            self.assertIsNone(select_device(devices, "oak-b"))
+            self.assertIsNone(select_device(devices, "missing"))
+            self.assertIsNone(select_device(devices, None))
+            self.assertIs(select_device(devices[:1], None), devices[0])
+            self.assertIsNone(select_device(devices[:1], "oak-b"))
+
+            config.write_text(
+                "NUVION_DEPTHAI_DEVICE_ID=oak-a\n"
+                "NUVION_DEPTHAI_DEVICE_ID=oak-b\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "duplicate"):
+                configured_mxid(config)
 
     def test_deb_declares_camera_and_webrtc_runtime_dependencies(self) -> None:
         build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
@@ -231,6 +291,19 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("/opt/nuv-agent/current/venv/bin/python", e2e)
         self.assertIn("NUVION_AGENT_PYTHON", e2e)
         self.assertIn("normalized root-owned executable", e2e)
+        self.assertIn("--evidence-output", e2e)
+        self.assertIn(
+            "evidence mode requires the exact BOM-addressed candidate Python", e2e
+        )
+        runbook = (
+            ROOT / "packaging/release/v0.1.121-release-runbook.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("env -u PYTHONPATH", runbook)
+        self.assertGreaterEqual(e2e.count('-C "$probe_runtime_dir"'), 2)
+        self.assertGreaterEqual(e2e.count('+=("-I")'), 2)
+        self.assertIn("OAK evidence process imported outside candidate slot", e2e)
+        self.assertIn('"runtimeIdentity"', e2e)
+        self.assertIn("physical release test requires exactly one OAK MXID", e2e)
         self.assertIn("pre-release hardware evidence only", e2e)
         self.assertIn("not path.is_absolute()", e2e)
         self.assertIn("raw != normalized", e2e)
