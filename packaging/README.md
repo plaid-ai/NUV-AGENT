@@ -133,6 +133,36 @@ nor OAK camera is attached; remove `NUVION_GST_SOURCE` before the physical-camer
 release gate. Once credentials and the selected camera test pass, enable the
 service with `sudo systemctl enable --now nuv-agent.service`.
 
+### IQ9075 Fleet E2E harness
+
+`packaging/dev/run-iq9075-fleet-e2e.py` drives the root-owned board primitive
+installed at `/usr/local/libexec/nuvion/iq9075-board-e2e.py`. It accepts only the
+pinned `iq9075-dev` command/release/health keyring schemas and the fixed
+IQ9075 device-binding tuple. Remote trust destinations cannot be supplied by a
+caller. SSH uses a single pinned host key, ignores user/system SSH config, disables
+proxy/control/forwarding, and accepts passwords only through already-open file
+descriptors.
+
+An Agent package that introduces updater `0.2.0` must first be installed with the
+explicit `bootstrap-updater` subcommand. This is an out-of-band prerequisite and
+writes `bootstrap-evidence.json` with `otaEvidence=false`; it is never counted as
+an OTA pass. The subsequent `run` subcommand performs the physical Ubuntu/arm64/
+QCS9075/OAK preflight, stops writers for a verified emergency backup, installs
+trust transactionally, proves the authenticated live updater is exactly `0.2.0`,
+and waits for either exact `COMMITTED` evidence or an exact fault-induced
+`ROLLED_BACK` tuple. Use `--help` on each subcommand for the required immutable
+release and command fields. The matching signed command must be issued through
+the authorized dev control plane while the bounded wait is active; the harness
+does not create commands or accept dashboard/API credentials.
+
+Each run uses a canonical UUIDv4 and a caller-owned `0700` output directory whose
+basename is that UUID. The resulting `immutable-manifest.json` and final
+`evidence.json` are byte-immutable. Only one persistent board run lease may exist;
+finish with the `cleanup` subcommand before starting another run. OAK fault tests
+are bound to USB path `2-1`, VID:PID `03e7:f63b`, the kernel `usb` driver, and a
+negotiated speed of at least 5 Gbps. A systemd deadman performs the same exact-port
+check before it disarms recovery.
+
 Runtime privilege boundary:
 - The Agent service runs without `docker.sock` access and without a Docker
   systemd dependency.

@@ -82,6 +82,7 @@ PKG_DIR="$BUILD_ROOT/${PKG_NAME}_${VERSION}_${ARCH}"
 mkdir -p "$PKG_DIR/DEBIAN" \
          "$PKG_DIR/opt/nuv-agent" \
          "$PKG_DIR/usr/bin" \
+         "$PKG_DIR/usr/local/libexec/nuvion" \
          "$PKG_DIR/usr/lib/udev/rules.d" \
          "$PKG_DIR/lib/systemd/system" \
          "$PKG_DIR/etc/nuv-agent" \
@@ -122,6 +123,9 @@ find "$PKG_DIR/usr/lib/nuvion-updater" -depth -type d \
 install -m 0755 \
   "$ROOT_DIR/packaging/dev/test-iq9075.sh" \
   "$PKG_DIR/usr/lib/nuvion-updater/test-iq9075.sh"
+install -m 0755 \
+  "$ROOT_DIR/packaging/dev/iq9075-board-e2e.py" \
+  "$PKG_DIR/usr/local/libexec/nuvion/iq9075-board-e2e.py"
 
 cp "$ROOT_DIR/nuvion_app/config_template.env" "$PKG_DIR/opt/nuv-agent/share/agent.env.example"
 bundle_path="${BOOTSTRAP_BUNDLE_PATH:-}"

@@ -1,0 +1,2035 @@
+#!/usr/bin/env python3
+"""Strict-host IQ9075 Fleet E2E runner with immutable run manifests."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+PROTOCOL_VERSION = "iq9075-fleet-e2e-v2"
+DEFAULT_HOST = "iq9075"
+DEFAULT_USER = "plaid"
+DEFAULT_FINGERPRINT = "SHA256:qOaWjGEiWC+Jr5JMEbemUyFc3PkZkh3fD/7Yqx3Mx1Y"
+REMOTE_TOOL = "/usr/local/libexec/nuvion/iq9075-board-e2e.py"
+REMOTE_BOOTSTRAP_INSTALLER = "/tmp/nuvion-fleet-e2e-{run_id}-bootstrap-installer.sh"
+REMOTE_BOOTSTRAP_DEB = "/tmp/nuvion-fleet-e2e-{run_id}-bootstrap.deb"
+REQUIRED_UPDATER_VERSION = "0.2.0"
+MAX_SECRET_BYTES = 4096
+MAX_INPUT_BYTES = 64 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_BOOTSTRAP_INSTALLER_BYTES = 2 * 1024 * 1024
+MAX_BOOTSTRAP_DEB_BYTES = 4 * 1024 * 1024 * 1024
+RUN_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
+HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|[0-9a-fA-F:]+)$"
+)
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+DEVICE_ID_RE = re.compile(r"^sp-([1-9][0-9]*)-nuvion-[a-z0-9][a-z0-9-]{0,100}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMPONENT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SEMVER_RE = re.compile(
+    r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+BOARD_COMMANDS = frozenset(
+    {
+        "identity",
+        "preflight",
+        "backup",
+        "enable-fleet",
+        "discard-staging",
+        "arm-oak-fault",
+        "evidence",
+        "cleanup",
+    }
+)
+FIXED_DESTINATIONS = {
+    "agentCommand": "/etc/nuv-agent/fleet-command-keyring.json",
+    "updaterCommand": "/etc/nuvion-updater/command-keyring.json",
+    "release": "/etc/nuvion-updater/release-keyring.json",
+    "health": "/etc/nuvion-updater/health-attestation-keyring.json",
+    "binding": "/etc/nuvion-updater/device-binding.json",
+}
+SECRET_KEY_RE = re.compile(
+    r"(?:password|passwd|secret|private|credential|compactjws|access.?token|"
+    r"refresh.?token|authorization|raw.?config|sqlite|sdp|ice.?candidate)",
+    re.IGNORECASE,
+)
+SECRET_VALUE_RES = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\b(?:authorization|password|passwd|token)\s*[:=]"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"(?im)^v=0\r?$.*^m=(?:audio|video)\s"),
+    re.compile(r"(?i)\bcandidate:[0-9]+\s"),
+)
+
+BOOTSTRAP_REMOTE_PROGRAM = r"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+run_id, installer_source, deb_source, installer_sha, deb_sha, version, board_user = sys.argv[1:]
+uuid4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
+sha256 = re.compile(r"[0-9a-f]{64}\Z")
+semver = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z")
+user_re = re.compile(r"[a-z_][a-z0-9_-]{0,31}\Z")
+expected_installer = f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap-installer.sh"
+expected_deb = f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap.deb"
+if not uuid4.fullmatch(run_id) or not sha256.fullmatch(installer_sha) or not sha256.fullmatch(deb_sha):
+    raise SystemExit("invalid bootstrap identity")
+if not semver.fullmatch(version) or not user_re.fullmatch(board_user):
+    raise SystemExit("invalid bootstrap package identity")
+if installer_source != expected_installer or deb_source != expected_deb:
+    raise SystemExit("bootstrap paths are not fixed")
+
+bootstrap_root = Path("/var/lib/nuvion-fleet-e2e/bootstrap")
+private = bootstrap_root / run_id
+private_installer = private / "install-iq9075.sh"
+private_deb = private / "nuv-agent.deb"
+
+def safe_unlink(path):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("bootstrap staging target is a directory")
+    os.unlink(path)
+
+def safe_rmtree(path):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("private bootstrap staging is unsafe")
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise SystemExit("private bootstrap staging ownership is unsafe")
+    shutil.rmtree(path)
+
+def ensure_root_directory(path, mode):
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("bootstrap root is unsafe")
+    if metadata.st_uid != 0:
+        raise SystemExit("bootstrap root is not root-owned")
+    os.chmod(path, mode)
+
+def copy_verified(source, destination, expected, maximum):
+    before = os.lstat(source)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit("bootstrap input is not a regular file")
+    if before.st_nlink != 1 or before.st_size > maximum or stat.S_IMODE(before.st_mode) & 0o022:
+        raise SystemExit("bootstrap input metadata is unsafe")
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        opened = os.fstat(source_fd)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+            raise SystemExit("bootstrap input changed while opening")
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise SystemExit("bootstrap input exceeds size limit")
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise SystemExit("bootstrap copy made no progress")
+                view = view[written:]
+        after = os.fstat(source_fd)
+        if (after.st_dev, after.st_ino, after.st_size) != (opened.st_dev, opened.st_ino, opened.st_size):
+            raise SystemExit("bootstrap input changed while reading")
+        if digest.hexdigest() != expected:
+            raise SystemExit("bootstrap input digest mismatch")
+        os.fchmod(destination_fd, 0o600)
+        os.fsync(destination_fd)
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+def query_package_version():
+    result = subprocess.run(["/usr/bin/dpkg-query", "-W", "-f=${Version}", "nuv-agent"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=False, text=True)
+    return result.stdout.strip()[:128] if result.returncode == 0 else None
+
+def control(field):
+    result = subprocess.run(["/usr/bin/dpkg-deb", "-f", str(private_deb), field], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=False, text=True)
+    if result.returncode != 0:
+        raise SystemExit("cannot inspect bootstrap package")
+    return result.stdout.strip()
+
+ensure_root_directory(bootstrap_root.parent, 0o700)
+ensure_root_directory(bootstrap_root, 0o700)
+safe_rmtree(private)
+private.mkdir(mode=0o700)
+previous_version = query_package_version()
+try:
+    copy_verified(installer_source, private_installer, installer_sha, 2 * 1024 * 1024)
+    copy_verified(deb_source, private_deb, deb_sha, 4 * 1024 * 1024 * 1024)
+    if control("Package") != "nuv-agent" or control("Architecture") != "arm64" or control("Version") != version:
+        raise SystemExit("bootstrap package metadata mismatch")
+    environment = {
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "SUDO_USER": board_user,
+    }
+    installed = subprocess.run(
+        ["/bin/bash", str(private_installer), str(private_deb), "--expected-version", version, "--expected-sha256", deb_sha, "--camera", "oak"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=1800,
+        check=False,
+    )
+    if installed.returncode != 0:
+        raise SystemExit("out-of-band updater bootstrap failed")
+    for command in (
+        ["/usr/bin/systemctl", "disable", "--now", "nuv-agent.service"],
+        ["/usr/bin/systemctl", "disable", "--now", "nuv-agent-updater.socket"],
+        ["/usr/bin/systemctl", "stop", "nuv-agent-updater.service"],
+    ):
+        if subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False).returncode != 0:
+            raise SystemExit("cannot leave bootstrap runtime safely stopped")
+    installed_version = query_package_version()
+    if installed_version != version:
+        raise SystemExit("installed package version mismatch")
+    sys.path.insert(0, "/usr/lib/nuvion-updater")
+    from nuvion_updater.version import UPDATER_VERSION
+    if UPDATER_VERSION != "0.2.0":
+        raise SystemExit("bootstrap did not install updater 0.2.0")
+    tool = Path("/usr/local/libexec/nuvion/iq9075-board-e2e.py")
+    tool_metadata = tool.lstat()
+    if not stat.S_ISREG(tool_metadata.st_mode) or stat.S_ISLNK(tool_metadata.st_mode) or tool_metadata.st_uid != 0 or stat.S_IMODE(tool_metadata.st_mode) != 0o755:
+        raise SystemExit("packaged board tool identity is unsafe")
+    tool_sha = hashlib.sha256(tool.read_bytes()).hexdigest()
+    current = Path("/opt/nuv-agent/current")
+    current_metadata = current.lstat()
+    if not stat.S_ISLNK(current_metadata.st_mode):
+        raise SystemExit("bootstrap current slot is not a symlink")
+    current_slot = os.readlink(current)
+    if re.fullmatch(r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})", current_slot) is None:
+        raise SystemExit("bootstrap current slot is invalid")
+    inactive = all(
+        subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", unit], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False).returncode != 0
+        for unit in ("nuv-agent.service", "nuv-agent-updater.service", "nuv-agent-updater.socket")
+    )
+    if not inactive:
+        raise SystemExit("bootstrap left a runtime unit active")
+    print(json.dumps({
+        "schemaVersion": 1,
+        "protocolVersion": "iq9075-fleet-e2e-v2",
+        "runId": run_id,
+        "outOfBandBootstrap": True,
+        "otaEvidence": False,
+        "previousPackageVersion": previous_version,
+        "installedPackageVersion": installed_version,
+        "packageSha256": deb_sha,
+        "installerSha256": installer_sha,
+        "updaterCodeVersion": UPDATER_VERSION,
+        "boardToolSha256": tool_sha,
+        "currentSlot": current_slot,
+        "servicesInactive": True,
+    }, sort_keys=True, separators=(",", ":")))
+finally:
+    safe_unlink(installer_source)
+    safe_unlink(deb_source)
+    safe_rmtree(private)
+""".strip()
+
+BOOTSTRAP_CLEANUP_PROGRAM = r"""
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+run_id, installer, package = sys.argv[1:]
+if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", run_id) is None:
+    raise SystemExit("invalid bootstrap cleanup identity")
+if installer != f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap-installer.sh" or package != f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap.deb":
+    raise SystemExit("bootstrap cleanup paths are not fixed")
+for path in (installer, package):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit("bootstrap cleanup target is a directory")
+    os.unlink(path)
+private = Path("/var/lib/nuvion-fleet-e2e/bootstrap") / run_id
+try:
+    metadata = private.lstat()
+except FileNotFoundError:
+    pass
+else:
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise SystemExit("private bootstrap cleanup target is unsafe")
+    shutil.rmtree(private)
+print(json.dumps({"schemaVersion": 1, "runId": run_id, "complete": True}, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
+class RunnerError(RuntimeError):
+    """Stable host-side failure without remote output or credential material."""
+
+
+def strict_json(payload: bytes | str, *, label: str) -> dict[str, Any]:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise RunnerError(f"{label} contains duplicate JSON members")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        text = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+        value = json.loads(
+            text,
+            object_pairs_hook=unique,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RunnerError(f"{label} is not strict UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise RunnerError(f"{label} root is not an object")
+    return value
+
+
+def _askpass_entrypoint() -> bool:
+    endpoint = os.environ.get("NUVION_E2E_ASKPASS_SOCKET")
+    if not endpoint:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2.0)
+            connection.connect(endpoint)
+            payload = bytearray()
+            while len(payload) <= MAX_SECRET_BYTES:
+                chunk = connection.recv(MAX_SECRET_BYTES + 1 - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+        if not payload or len(payload) > MAX_SECRET_BYTES:
+            return True
+        sys.stdout.buffer.write(bytes(payload).rstrip(b"\r\n") + b"\n")
+        sys.stdout.buffer.flush()
+        for index in range(len(payload)):
+            payload[index] = 0
+    except OSError:
+        return True
+    return True
+
+
+def utc_now() -> str:
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+
+
+def canonical_run_id(value: str) -> str:
+    try:
+        normalized = str(uuid.UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise RunnerError("runId must be a canonical UUIDv4") from exc
+    if normalized != value or not RUN_ID_RE.fullmatch(normalized):
+        raise RunnerError("runId must be a canonical UUIDv4")
+    return normalized
+
+
+def read_secret_fd(descriptor: int) -> bytearray:
+    if descriptor < 0:
+        raise RunnerError("credential FD must be non-negative")
+    result = bytearray()
+    while len(result) <= MAX_SECRET_BYTES:
+        chunk = os.read(descriptor, min(1024, MAX_SECRET_BYTES + 1 - len(result)))
+        if not chunk:
+            break
+        result.extend(chunk)
+    result = bytearray(result.rstrip(b"\r\n"))
+    if not result or len(result) > MAX_SECRET_BYTES or b"\x00" in result:
+        raise RunnerError("credential FD is empty or invalid")
+    return result
+
+
+def zero_secret(value: bytearray | None) -> None:
+    if value is not None:
+        for index in range(len(value)):
+            value[index] = 0
+
+
+def read_regular(path: Path, maximum: int) -> bytes:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RunnerError(f"unsafe regular file: {path.name}")
+    if metadata.st_size > maximum:
+        raise RunnerError(f"file exceeds size limit: {path.name}")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RunnerError(f"file changed while opening: {path.name}")
+        result = bytearray()
+        while len(result) <= maximum:
+            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+        after = os.fstat(descriptor)
+        if len(result) > maximum or (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ) != (opened.st_dev, opened.st_ino, opened.st_size):
+            raise RunnerError(f"file changed or exceeded limit: {path.name}")
+        return bytes(result)
+    finally:
+        os.close(descriptor)
+
+
+def sha256_regular(path: Path, maximum: int) -> str:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RunnerError(f"unsafe regular file: {path.name}")
+    if metadata.st_size > maximum:
+        raise RunnerError(f"file exceeds size limit: {path.name}")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+        ):
+            raise RunnerError(f"file changed while opening: {path.name}")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise RunnerError(f"file exceeds size limit: {path.name}")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+        ):
+            raise RunnerError(f"file changed while hashing: {path.name}")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def assert_no_secret_material(value: object) -> None:
+    def visit(item: object) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if SECRET_KEY_RE.search(str(key)):
+                    raise RunnerError("output contains a forbidden field")
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        elif isinstance(item, str) and any(
+            pattern.search(item) for pattern in SECRET_VALUE_RES
+        ):
+            raise RunnerError("output contains secret or session material")
+
+    visit(value)
+
+
+def atomic_json(
+    path: Path, value: Mapping[str, Any], *, immutable: bool = False
+) -> None:
+    payload = (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.lstat()
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise RunnerError("output directory is unsafe")
+    if path.exists() or path.is_symlink():
+        existing = read_regular(path, MAX_OUTPUT_BYTES)
+        if immutable:
+            if existing != payload:
+                raise RunnerError(
+                    "immutable run artifact already exists with other bytes"
+                )
+            return
+        metadata = path.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RunnerError("existing run artifact mode is unsafe")
+    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RunnerError("atomic JSON write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o600)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def prepare_output_dir(path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_symlink():
+        raise RunnerError("run output directory must not be a symlink")
+    output = candidate.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    metadata = output.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RunnerError("run output directory is unsafe")
+    if metadata.st_uid != os.getuid():
+        raise RunnerError("run output directory is not owned by the caller")
+    os.chmod(output, 0o700)
+    return output
+
+
+def known_host_entry(
+    known_hosts: str | Path, *, host: str, port: int, expected: str
+) -> tuple[str, str]:
+    if not HOST_RE.fullmatch(host) or not 1 <= port <= 65535:
+        raise RunnerError("SSH host or port is invalid")
+    if not FINGERPRINT_RE.fullmatch(expected):
+        raise RunnerError("expected SSH fingerprint is invalid")
+    payload = read_regular(Path(known_hosts), 1024 * 1024)
+    token = host if port == 22 else f"[{host}]:{port}"
+    matches: list[tuple[str, str]] = []
+    for raw_line in payload.decode("utf-8", errors="strict").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if fields[0].startswith("@") or len(fields) < 3:
+            continue
+        patterns, _key_type, encoded = fields[:3]
+        host_patterns = patterns.split(",")
+        if token not in host_patterns:
+            continue
+        if any(
+            item.startswith("|") or "*" in item or "?" in item for item in host_patterns
+        ):
+            raise RunnerError("hashed or wildcard board host entries are not accepted")
+        try:
+            key_blob = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise RunnerError("known_hosts key is invalid base64") from exc
+        fingerprint = "SHA256:" + base64.b64encode(
+            hashlib.sha256(key_blob).digest()
+        ).decode("ascii").rstrip("=")
+        if fingerprint == expected:
+            matches.append((line, fingerprint))
+    if len(matches) != 1:
+        raise RunnerError("known_hosts does not contain exactly one pinned board key")
+    return matches[0]
+
+
+def create_pinned_known_hosts(
+    source: str | Path,
+    destination: Path,
+    *,
+    host: str,
+    port: int,
+    expected: str,
+) -> str:
+    line, fingerprint = known_host_entry(
+        source, host=host, port=port, expected=expected
+    )
+    if destination.exists():
+        metadata = destination.lstat()
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RunnerError("run-pinned known_hosts ownership or mode is unsafe")
+        payload = read_regular(destination, 16 * 1024)
+        if payload != (line + "\n").encode("utf-8"):
+            raise RunnerError("run-pinned known_hosts bytes changed")
+        return fingerprint
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.write(descriptor, (line + "\n").encode("utf-8"))
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    return fingerprint
+
+
+@dataclass(frozen=True)
+class ProcessResult:
+    returncode: int
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+
+class LocalProcessRunner:
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        input_bytes: bytes | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> ProcessResult:
+        if isinstance(argv, (str, bytes)) or not argv:
+            raise TypeError("argv must be a non-empty sequence")
+        try:
+            completed = subprocess.run(
+                list(argv),
+                input=input_bytes,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=dict(env) if env is not None else None,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError("bounded SSH operation timed out") from exc
+        return ProcessResult(
+            completed.returncode,
+            completed.stdout[:MAX_OUTPUT_BYTES],
+            completed.stderr[: 32 * 1024],
+        )
+
+
+class _OneShotAskpass:
+    def __init__(self, secret: bytearray, directory: str | Path) -> None:
+        self.secret = secret
+        self.path = Path(directory) / "askpass.sock"
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.settimeout(10.0)
+        self.server.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.server.listen(1)
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self.server.accept()
+            with connection:
+                connection.sendall(bytes(self.secret))
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the caller.
+            self.error = exc
+        finally:
+            self.server.close()
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def finish(self) -> None:
+        self.thread.join(timeout=12)
+        if self.thread.is_alive():
+            self.server.close()
+            raise RunnerError("SSH askpass did not consume its one allowed prompt")
+        if self.error is not None:
+            raise RunnerError(
+                "SSH askpass failed before authentication"
+            ) from self.error
+
+
+class OpenSshTransport:
+    def __init__(
+        self,
+        *,
+        host: str,
+        user: str,
+        port: int,
+        pinned_known_hosts: str | Path,
+        expected_fingerprint: str,
+        ssh_password: bytearray | None = None,
+        sudo_password: bytearray | None = None,
+        process_runner: LocalProcessRunner | None = None,
+        askpass_program: str | Path | None = None,
+    ) -> None:
+        if not HOST_RE.fullmatch(host) or not USER_RE.fullmatch(user):
+            raise RunnerError("SSH host or username is invalid")
+        line, fingerprint = known_host_entry(
+            pinned_known_hosts, host=host, port=port, expected=expected_fingerprint
+        )
+        del line
+        self.host = host
+        self.user = user
+        self.port = port
+        self.known_hosts = Path(pinned_known_hosts)
+        self.fingerprint = fingerprint
+        self.ssh_password = ssh_password
+        self.sudo_password = sudo_password
+        self.process_runner = process_runner or LocalProcessRunner()
+        self.askpass_program = Path(askpass_program or __file__).resolve()
+        self.base_options = [
+            "-F",
+            "/dev/null",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={self.known_hosts}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "CheckHostIP=yes",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "RequestTTY=no",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+        if ssh_password is None:
+            self.base_options.extend(["-o", "BatchMode=yes"])
+        else:
+            self.base_options.extend(
+                [
+                    "-o",
+                    "BatchMode=no",
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "HostbasedAuthentication=no",
+                    "-o",
+                    "GSSAPIAuthentication=no",
+                    "-o",
+                    "KbdInteractiveAuthentication=no",
+                    "-o",
+                    "ChallengeResponseAuthentication=no",
+                    "-o",
+                    "PasswordAuthentication=yes",
+                    "-o",
+                    "PreferredAuthentications=password",
+                ]
+            )
+
+    @staticmethod
+    def _parse_result(result: ProcessResult, *, operation: str) -> dict[str, Any]:
+        if result.returncode != 0:
+            raise RunnerError(f"remote operation failed: {operation}")
+        lines = [
+            line
+            for line in result.stdout.decode("utf-8", errors="strict").splitlines()
+            if line
+        ]
+        if not lines:
+            raise RunnerError(f"remote operation returned no JSON: {operation}")
+        payload = strict_json(lines[-1], label=f"remote operation {operation}")
+        assert_no_secret_material(payload)
+        return payload
+
+    def _run_with_auth(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        input_bytes: bytes | None = None,
+    ) -> ProcessResult:
+        if self.ssh_password is None:
+            return self.process_runner.run(
+                argv, timeout=timeout, input_bytes=input_bytes
+            )
+        metadata = self.askpass_program.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise RunnerError("SSH askpass program is unsafe")
+        with tempfile.TemporaryDirectory(prefix="nuvion-e2e-askpass-") as directory:
+            os.chmod(directory, 0o700)
+            broker = _OneShotAskpass(self.ssh_password, directory)
+            broker.start()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "DISPLAY": "nuvion-e2e:0",
+                    "SSH_ASKPASS": str(self.askpass_program),
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "NUVION_E2E_ASKPASS_SOCKET": str(broker.path),
+                }
+            )
+            try:
+                result = self.process_runner.run(
+                    argv,
+                    timeout=timeout,
+                    input_bytes=input_bytes,
+                    env=environment,
+                )
+            finally:
+                broker.finish()
+            return result
+
+    def invoke_board(
+        self,
+        command: str,
+        arguments: Sequence[str] = (),
+        *,
+        timeout: float = 90,
+    ) -> dict[str, Any]:
+        if command not in BOARD_COMMANDS:
+            raise RunnerError("board primitive is outside the typed allowlist")
+        if any(
+            "\x00" in value or "\n" in value or "\r" in value for value in arguments
+        ):
+            raise RunnerError("board primitive argument contains a control character")
+        remote = ["/usr/bin/python3", "-I", REMOTE_TOOL, command, *arguments]
+        if self.sudo_password is None:
+            remote = ["/usr/bin/sudo", "-n", "--", *remote]
+            input_bytes = None
+        else:
+            remote = ["/usr/bin/sudo", "-S", "-p", "", "--", *remote]
+            input_bytes = bytes(self.sudo_password) + b"\n"
+        result = self._run_with_auth(
+            [
+                "/usr/bin/ssh",
+                *self.base_options,
+                "-p",
+                str(self.port),
+                f"{self.user}@{self.host}",
+                shlex.join(remote),
+            ],
+            timeout=timeout,
+            input_bytes=input_bytes,
+        )
+        return self._parse_result(result, operation=command)
+
+    def _invoke_root_python(
+        self,
+        program: str,
+        arguments: Sequence[str],
+        *,
+        operation: str,
+        timeout: float,
+    ) -> dict[str, Any]:
+        if any(
+            "\x00" in value or "\n" in value or "\r" in value for value in arguments
+        ):
+            raise RunnerError("root operation argument contains a control character")
+        remote = ["/usr/bin/python3", "-I", "-c", program, *arguments]
+        if self.sudo_password is None:
+            remote = ["/usr/bin/sudo", "-n", "--", *remote]
+            input_bytes = None
+        else:
+            remote = ["/usr/bin/sudo", "-S", "-p", "", "--", *remote]
+            input_bytes = bytes(self.sudo_password) + b"\n"
+        result = self._run_with_auth(
+            [
+                "/usr/bin/ssh",
+                *self.base_options,
+                "-p",
+                str(self.port),
+                f"{self.user}@{self.host}",
+                shlex.join(remote),
+            ],
+            timeout=timeout,
+            input_bytes=input_bytes,
+        )
+        return self._parse_result(result, operation=operation)
+
+    def copy_input(self, source: Path, *, run_id: str, role: str) -> str:
+        canonical_run_id(run_id)
+        if role not in {"command", "release", "health", "binding", "manifest"}:
+            raise RunnerError("staging role is invalid")
+        destination = f"/tmp/nuvion-fleet-e2e-{run_id}-{role}.json"
+        result = self._run_with_auth(
+            [
+                "/usr/bin/scp",
+                *self.base_options,
+                "-P",
+                str(self.port),
+                "--",
+                str(source),
+                f"{self.user}@{self.host}:{destination}",
+            ],
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RunnerError(f"staging upload failed: {role}")
+        return destination
+
+    def copy_bootstrap_artifact(self, source: Path, *, run_id: str, role: str) -> str:
+        canonical_run_id(run_id)
+        if role == "installer":
+            destination = REMOTE_BOOTSTRAP_INSTALLER.format(run_id=run_id)
+        elif role == "package":
+            destination = REMOTE_BOOTSTRAP_DEB.format(run_id=run_id)
+        else:
+            raise RunnerError("bootstrap staging role is invalid")
+        result = self._run_with_auth(
+            [
+                "/usr/bin/scp",
+                *self.base_options,
+                "-P",
+                str(self.port),
+                "--",
+                str(source),
+                f"{self.user}@{self.host}:{destination}",
+            ],
+            timeout=180,
+        )
+        if result.returncode != 0:
+            raise RunnerError(f"bootstrap staging upload failed: {role}")
+        return destination
+
+    def bootstrap_updater(
+        self,
+        *,
+        run_id: str,
+        installer_path: str,
+        package_path: str,
+        installer_sha256: str,
+        package_sha256: str,
+        expected_version: str,
+    ) -> dict[str, Any]:
+        canonical_run_id(run_id)
+        if installer_path != REMOTE_BOOTSTRAP_INSTALLER.format(
+            run_id=run_id
+        ) or package_path != REMOTE_BOOTSTRAP_DEB.format(run_id=run_id):
+            raise RunnerError("bootstrap staging paths are not fixed")
+        if not SHA256_RE.fullmatch(installer_sha256) or not SHA256_RE.fullmatch(
+            package_sha256
+        ):
+            raise RunnerError("bootstrap digest is invalid")
+        if not SEMVER_RE.fullmatch(expected_version):
+            raise RunnerError("bootstrap version is invalid")
+        return self._invoke_root_python(
+            BOOTSTRAP_REMOTE_PROGRAM,
+            [
+                run_id,
+                installer_path,
+                package_path,
+                installer_sha256,
+                package_sha256,
+                expected_version,
+                self.user,
+            ],
+            operation="out-of-band-updater-bootstrap",
+            timeout=1900,
+        )
+
+    def discard_bootstrap_staging(self, *, run_id: str) -> dict[str, Any]:
+        canonical_run_id(run_id)
+        return self._invoke_root_python(
+            BOOTSTRAP_CLEANUP_PROGRAM,
+            [
+                run_id,
+                REMOTE_BOOTSTRAP_INSTALLER.format(run_id=run_id),
+                REMOTE_BOOTSTRAP_DEB.format(run_id=run_id),
+            ],
+            operation="bootstrap-staging-cleanup",
+            timeout=60,
+        )
+
+
+class HostJournal:
+    def __init__(self, path: Path, *, run_id: str, host: str, fingerprint: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        if path.exists():
+            value = strict_json(
+                read_regular(path, MAX_OUTPUT_BYTES), label="host journal"
+            )
+            if (
+                set(value)
+                != {
+                    "schemaVersion",
+                    "runId",
+                    "host",
+                    "hostKeyFingerprint",
+                    "createdAt",
+                    "steps",
+                }
+                or not isinstance(value.get("steps"), dict)
+                or (
+                    value.get("schemaVersion"),
+                    value.get("runId"),
+                    value.get("host"),
+                    value.get("hostKeyFingerprint"),
+                )
+                != (1, run_id, host, fingerprint)
+            ):
+                raise RunnerError("host journal identity mismatch")
+            for step, raw in value["steps"].items():
+                if (
+                    not isinstance(step, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", step) is None
+                    or not isinstance(raw, dict)
+                    or set(raw) != {"status", "attempt", "updatedAt"}
+                    or raw.get("status") not in {"RUNNING", "COMPLETE", "FAILED"}
+                    or isinstance(raw.get("attempt"), bool)
+                    or not isinstance(raw.get("attempt"), int)
+                    or raw.get("attempt") < 0
+                    or not isinstance(raw.get("updatedAt"), str)
+                ):
+                    raise RunnerError("host journal step is invalid")
+            self.state = value
+        else:
+            self.state = {
+                "schemaVersion": 1,
+                "runId": run_id,
+                "host": host,
+                "hostKeyFingerprint": fingerprint,
+                "createdAt": utc_now(),
+                "steps": {},
+            }
+            atomic_json(path, self.state)
+
+    def mark(self, step: str, status: str) -> None:
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", step) is None or status not in {
+            "RUNNING",
+            "COMPLETE",
+            "FAILED",
+        }:
+            raise RunnerError("journal status is invalid")
+        current = self.state["steps"].get(step, {})
+        attempt = int(current.get("attempt", 0)) + (1 if status == "RUNNING" else 0)
+        self.state["steps"][step] = {
+            "status": status,
+            "attempt": attempt,
+            "updatedAt": utc_now(),
+        }
+        atomic_json(self.path, self.state)
+
+
+def validate_paths_distinct(output_dir: Path, inputs: Sequence[Path]) -> None:
+    output_paths = {
+        output_dir / "journal.json",
+        output_dir / "immutable-manifest.json",
+        output_dir / "evidence.json",
+        output_dir / "bootstrap-evidence.json",
+        output_dir / "known_hosts",
+    }
+    resolved_inputs = {path.resolve() for path in inputs}
+    if len(resolved_inputs) != len(inputs):
+        raise RunnerError("trust input paths must be distinct")
+    identities: set[tuple[int, int]] = set()
+    for path in inputs:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RunnerError("run input must be a regular non-symlink file")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in identities:
+            raise RunnerError("run input files must have distinct inodes")
+        identities.add(identity)
+    if output_paths & resolved_inputs:
+        raise RunnerError("trust inputs and run outputs must be distinct")
+
+
+def build_manifest(
+    *,
+    run_id: str,
+    tool_sha256: str,
+    input_digests: Mapping[str, str],
+    identity: Mapping[str, object],
+    scenario_type: str,
+    expected_command_id: str,
+    expected_bom_digest: str,
+    expected_candidate_slot: str,
+    expected_previous_slot: str,
+    expected_previous_version: str,
+    hold_seconds: int,
+    release: Mapping[str, object],
+) -> dict[str, object]:
+    canonical_run_id(run_id)
+    try:
+        command_id = str(uuid.UUID(expected_command_id))
+    except ValueError as exc:
+        raise RunnerError("expected commandId is invalid") from exc
+    if command_id != expected_command_id:
+        raise RunnerError("expected commandId is not canonical")
+    if not SHA256_RE.fullmatch(tool_sha256) or set(input_digests) != {
+        "commandSha256",
+        "releaseSha256",
+        "healthSha256",
+        "bindingSha256",
+    }:
+        raise RunnerError("tool/input digest set is invalid")
+    if not all(SHA256_RE.fullmatch(item) for item in input_digests.values()):
+        raise RunnerError("input digest is invalid")
+    if scenario_type not in {"commit", "oak-fault-rollback"}:
+        raise RunnerError("scenario type is invalid")
+    if (
+        isinstance(hold_seconds, bool)
+        or (scenario_type == "commit" and hold_seconds != 0)
+        or (scenario_type == "oak-fault-rollback" and not 0 <= hold_seconds <= 60)
+    ):
+        raise RunnerError("scenario hold is invalid")
+    if not DIGEST_RE.fullmatch(expected_bom_digest):
+        raise RunnerError("expected BOM digest is invalid")
+    if expected_candidate_slot != f"/opt/nuv-agent/releases/{expected_bom_digest[7:]}":
+        raise RunnerError("expected candidate slot is not BOM-addressed")
+    if (
+        re.fullmatch(
+            r"(?:releases/[0-9a-f]{64}|bootstrap/[0-9A-Za-z.+-]{1,64})",
+            expected_previous_slot,
+        )
+        is None
+    ):
+        raise RunnerError("expected previous slot is invalid")
+    if not SEMVER_RE.fullmatch(expected_previous_version):
+        raise RunnerError("expected previous Agent version is invalid")
+    expected_identity = {
+        "productModel": "IQ9075_DEV",
+        "platformProfile": "iq9075_dev",
+        "hardwareRevision": "QCS9075-EVK",
+        "architecture": "aarch64",
+        "dockerRequired": False,
+    }
+    device_match = DEVICE_ID_RE.fullmatch(str(identity.get("deviceId") or ""))
+    if (
+        set(identity) != {"deviceId", "spaceId", *expected_identity}
+        or isinstance(identity.get("spaceId"), bool)
+        or not isinstance(identity.get("spaceId"), int)
+        or device_match is None
+        or int(device_match.group(1)) != identity.get("spaceId")
+        or any(identity.get(key) != value for key, value in expected_identity.items())
+    ):
+        raise RunnerError("IQ9075 identity tuple is invalid")
+    if set(release) != {
+        "agentVersion",
+        "releaseSequence",
+        "artifactDigest",
+        "componentSha",
+        "configSchema",
+        "publisherKeyId",
+    }:
+        raise RunnerError("release identity fields are invalid")
+    if (
+        not SEMVER_RE.fullmatch(str(release["agentVersion"]))
+        or isinstance(release["releaseSequence"], bool)
+        or not isinstance(release["releaseSequence"], int)
+        or int(release["releaseSequence"]) < 1
+        or not DIGEST_RE.fullmatch(str(release["artifactDigest"]))
+        or not COMPONENT_RE.fullmatch(str(release["componentSha"]))
+        or re.fullmatch(r"[1-9][0-9]*", str(release["configSchema"])) is None
+        or KEY_ID_RE.fullmatch(str(release["publisherKeyId"])) is None
+    ):
+        raise RunnerError("release identity value is invalid")
+    return {
+        "schemaVersion": 1,
+        "protocolVersion": PROTOCOL_VERSION,
+        "runId": run_id,
+        "toolSha256": tool_sha256,
+        "inputs": dict(input_digests),
+        "destinations": FIXED_DESTINATIONS,
+        "identity": dict(identity),
+        "scenario": {
+            "type": scenario_type,
+            "expectedCommandId": expected_command_id,
+            "expectedBomDigest": expected_bom_digest,
+            "expectedCandidateSlot": expected_candidate_slot,
+            "expectedPreviousSlot": expected_previous_slot,
+            "expectedPreviousVersion": expected_previous_version,
+            "holdSeconds": hold_seconds,
+            "release": dict(release),
+        },
+    }
+
+
+def validate_final_evidence(
+    evidence: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> None:
+    if (
+        evidence.get("schemaVersion") != 1
+        or evidence.get("protocolVersion") != PROTOCOL_VERSION
+        or evidence.get("runId") != manifest.get("runId")
+        or evidence.get("scenario") != manifest["scenario"]["type"]
+        or evidence.get("complete") is not True
+    ):
+        raise RunnerError("final evidence is not complete for the immutable run")
+    gates = evidence.get("gates")
+    if (
+        not isinstance(gates, dict)
+        or set(gates)
+        != {
+            "foundation",
+            "backup",
+            "trust",
+            "updater2",
+            "oak",
+            "services",
+            "scenario",
+        }
+        or any(value is not True for value in gates.values())
+    ):
+        raise RunnerError("final evidence contains a false or missing gate")
+    updater = evidence.get("updater")
+    if not isinstance(updater, dict) or updater.get("updaterVersion") != "0.2.0":
+        raise RunnerError("final evidence is missing updater 0.2.0 proof")
+    update = updater.get("update")
+    scenario = manifest["scenario"]
+    release = scenario["release"]
+    expected_candidate_relative = "releases/" + scenario["expectedBomDigest"][7:]
+    if not isinstance(update, dict) or any(
+        (
+            update.get("commandId") != scenario["expectedCommandId"],
+            update.get("bomDigest") != scenario["expectedBomDigest"],
+            update.get("targetVersion") != release["agentVersion"],
+            update.get("candidateSlot") != scenario["expectedCandidateSlot"],
+            update.get("previousSlot") != scenario["expectedPreviousSlot"],
+            update.get("previousVersion") != scenario["expectedPreviousVersion"],
+            update.get("releaseSequence") != release["releaseSequence"],
+            update.get("artifactDigest") != release["artifactDigest"],
+            update.get("componentSha") != release["componentSha"],
+            update.get("configSchema") != release["configSchema"],
+            update.get("publisherKeyId") != release["publisherKeyId"],
+            update.get("bomVerificationStatus") != "VERIFIED",
+        )
+    ):
+        raise RunnerError("final updater identity does not match the manifest")
+    slots = evidence.get("slots")
+    if not isinstance(slots, dict):
+        raise RunnerError("final evidence is missing live slot proof")
+    if scenario["type"] == "commit":
+        expected_marker = {
+            "schemaVersion": 2,
+            "bomDigest": scenario["expectedBomDigest"],
+            **release,
+        }
+        if any(
+            (
+                update.get("phase") != "COMMITTED",
+                update.get("slot") != expected_candidate_relative,
+                update.get("health") != "FUNCTIONAL_HEALTHY",
+                update.get("functionalHealth") != "FUNCTIONAL_HEALTHY",
+                slots.get("current") != expected_candidate_relative,
+                slots.get("previous") != scenario["expectedPreviousSlot"],
+                slots.get("currentVersion") != release["agentVersion"],
+                slots.get("release") != expected_marker,
+            )
+        ):
+            raise RunnerError("commit scenario did not reach COMMITTED")
+    else:
+        expected_previous = scenario["expectedPreviousSlot"]
+        marker = slots.get("release")
+        marker_valid = marker is None
+        if expected_previous.startswith("releases/"):
+            marker_valid = (
+                isinstance(marker, dict)
+                and marker.get("schemaVersion") == 2
+                and marker.get("bomDigest") == "sha256:" + expected_previous[9:]
+                and marker.get("agentVersion") == scenario["expectedPreviousVersion"]
+            )
+        if any(
+            (
+                update.get("phase") != "ROLLED_BACK",
+                update.get("slot") != expected_previous,
+                update.get("rollbackSlot") != expected_previous,
+                update.get("rollbackVersion") != scenario["expectedPreviousVersion"],
+                update.get("errorCode") != "ROLLED_BACK",
+                update.get("health") != "LKG_RESTORED",
+                update.get("functionalHealth") != "FUNCTIONAL_UNHEALTHY",
+                slots.get("current") != expected_previous,
+                slots.get("previous") != expected_candidate_relative,
+                slots.get("currentVersion") != scenario["expectedPreviousVersion"],
+                slots.get("previousRelease")
+                != {
+                    "schemaVersion": 2,
+                    "bomDigest": scenario["expectedBomDigest"],
+                    **release,
+                },
+                not marker_valid,
+            )
+        ):
+            raise RunnerError("rollback scenario lacks exact rollback/error proof")
+    assert_no_secret_material(evidence)
+
+
+class FleetRunner:
+    def __init__(
+        self,
+        *,
+        transport: OpenSshTransport,
+        journal: HostJournal,
+        output_dir: Path,
+        run_id: str,
+        monotonic: Any = time.monotonic,
+        sleeper: Any = time.sleep,
+    ) -> None:
+        self.transport = transport
+        self.journal = journal
+        self.output_dir = output_dir
+        self.run_id = run_id
+        self.monotonic = monotonic
+        self.sleeper = sleeper
+
+    def _call(
+        self,
+        step: str,
+        command: str,
+        arguments: Sequence[str] = (),
+        *,
+        timeout: float = 90,
+    ) -> dict[str, Any]:
+        # Never skip a board call from a stale host journal. Every primitive
+        # performs a live, idempotent reconcile and returns current proof.
+        self.journal.mark(step, "RUNNING")
+        try:
+            result = self.transport.invoke_board(command, arguments, timeout=timeout)
+        except BaseException:
+            self.journal.mark(step, "FAILED")
+            raise
+        self.journal.mark(step, "COMPLETE")
+        return result
+
+    def bootstrap(
+        self,
+        *,
+        installer: Path,
+        package: Path,
+        local_tool: Path,
+        expected_version: str,
+        expected_package_sha256: str,
+    ) -> dict[str, object]:
+        if not SEMVER_RE.fullmatch(expected_version) or not SHA256_RE.fullmatch(
+            expected_package_sha256
+        ):
+            raise RunnerError("bootstrap version or package digest is invalid")
+        installer_sha = sha256_regular(installer, MAX_BOOTSTRAP_INSTALLER_BYTES)
+        package_sha = sha256_regular(package, MAX_BOOTSTRAP_DEB_BYTES)
+        local_tool_sha = sha256_regular(local_tool, MAX_OUTPUT_BYTES)
+        if package_sha != expected_package_sha256:
+            raise RunnerError("local bootstrap package digest mismatch")
+        self.journal.mark("bootstrap-staging", "RUNNING")
+        try:
+            installer_remote = self.transport.copy_bootstrap_artifact(
+                installer, run_id=self.run_id, role="installer"
+            )
+            package_remote = self.transport.copy_bootstrap_artifact(
+                package, run_id=self.run_id, role="package"
+            )
+            self.journal.mark("bootstrap-staging", "COMPLETE")
+            self.journal.mark("out-of-band-bootstrap", "RUNNING")
+            remote = self.transport.bootstrap_updater(
+                run_id=self.run_id,
+                installer_path=installer_remote,
+                package_path=package_remote,
+                installer_sha256=installer_sha,
+                package_sha256=package_sha,
+                expected_version=expected_version,
+            )
+            self.journal.mark("out-of-band-bootstrap", "COMPLETE")
+        except BaseException:
+            if (
+                self.journal.state["steps"].get("bootstrap-staging", {}).get("status")
+                == "RUNNING"
+            ):
+                self.journal.mark("bootstrap-staging", "FAILED")
+            if (
+                self.journal.state["steps"]
+                .get("out-of-band-bootstrap", {})
+                .get("status")
+                == "RUNNING"
+            ):
+                self.journal.mark("out-of-band-bootstrap", "FAILED")
+            raise
+        finally:
+            self.journal.mark("bootstrap-staging-cleanup", "RUNNING")
+            try:
+                self.transport.discard_bootstrap_staging(run_id=self.run_id)
+            except BaseException:
+                self.journal.mark("bootstrap-staging-cleanup", "FAILED")
+                raise
+            else:
+                self.journal.mark("bootstrap-staging-cleanup", "COMPLETE")
+        expected_fields = {
+            "schemaVersion",
+            "protocolVersion",
+            "runId",
+            "outOfBandBootstrap",
+            "otaEvidence",
+            "previousPackageVersion",
+            "installedPackageVersion",
+            "packageSha256",
+            "installerSha256",
+            "updaterCodeVersion",
+            "boardToolSha256",
+            "currentSlot",
+            "servicesInactive",
+        }
+        if set(remote) != expected_fields or any(
+            (
+                remote.get("schemaVersion") != 1,
+                remote.get("protocolVersion") != PROTOCOL_VERSION,
+                remote.get("runId") != self.run_id,
+                remote.get("outOfBandBootstrap") is not True,
+                remote.get("otaEvidence") is not False,
+                remote.get("installedPackageVersion") != expected_version,
+                remote.get("packageSha256") != package_sha,
+                remote.get("installerSha256") != installer_sha,
+                remote.get("updaterCodeVersion") != REQUIRED_UPDATER_VERSION,
+                remote.get("boardToolSha256") != local_tool_sha,
+                remote.get("servicesInactive") is not True,
+                re.fullmatch(
+                    r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})",
+                    str(remote.get("currentSlot") or ""),
+                )
+                is None,
+            )
+        ):
+            raise RunnerError("out-of-band bootstrap evidence is invalid")
+        previous_version = remote.get("previousPackageVersion")
+        if previous_version is not None and (
+            not isinstance(previous_version, str)
+            or not previous_version
+            or len(previous_version) > 128
+        ):
+            raise RunnerError("previous bootstrap package version is invalid")
+        identity = self._call("bootstrap-tool-identity", "identity")
+        if any(
+            (
+                identity.get("protocolVersion") != PROTOCOL_VERSION,
+                identity.get("toolPath") != REMOTE_TOOL,
+                identity.get("toolSha256") != local_tool_sha,
+                identity.get("rootOwned") is not True,
+                identity.get("mode") != "0755",
+            )
+        ):
+            raise RunnerError(
+                "bootstrap board tool identity does not match the package"
+            )
+        evidence = {
+            **remote,
+            "boardToolIdentityVerified": True,
+        }
+        assert_no_secret_material(evidence)
+        evidence_path = self.output_dir / "bootstrap-evidence.json"
+        if evidence_path.exists() or evidence_path.is_symlink():
+            persisted = strict_json(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                label="bootstrap evidence",
+            )
+        else:
+            atomic_json(evidence_path, evidence, immutable=True)
+            persisted = strict_json(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                label="bootstrap evidence",
+            )
+        if set(persisted) != {*expected_fields, "boardToolIdentityVerified"} or any(
+            (
+                persisted.get("schemaVersion") != 1,
+                persisted.get("protocolVersion") != PROTOCOL_VERSION,
+                persisted.get("runId") != self.run_id,
+                persisted.get("outOfBandBootstrap") is not True,
+                persisted.get("otaEvidence") is not False,
+                persisted.get("installedPackageVersion") != expected_version,
+                persisted.get("packageSha256") != package_sha,
+                persisted.get("installerSha256") != installer_sha,
+                persisted.get("updaterCodeVersion") != REQUIRED_UPDATER_VERSION,
+                persisted.get("boardToolSha256") != local_tool_sha,
+                persisted.get("boardToolIdentityVerified") is not True,
+                persisted.get("servicesInactive") is not True,
+                re.fullmatch(
+                    r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})",
+                    str(persisted.get("currentSlot") or ""),
+                )
+                is None,
+            )
+        ):
+            raise RunnerError("persisted bootstrap evidence is invalid")
+        persisted_previous = persisted.get("previousPackageVersion")
+        if persisted_previous is not None and (
+            not isinstance(persisted_previous, str)
+            or not persisted_previous
+            or len(persisted_previous) > 128
+        ):
+            raise RunnerError("persisted previous package version is invalid")
+        assert_no_secret_material(persisted)
+        return {
+            "schemaVersion": 1,
+            "runId": self.run_id,
+            "bootstrapComplete": True,
+            "outOfBandBootstrap": True,
+            "otaEvidence": False,
+            "bootstrapEvidenceSha256": hashlib.sha256(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES)
+            ).hexdigest(),
+        }
+
+    def run(
+        self,
+        *,
+        local_tool: Path,
+        command_keyring: Path,
+        release_keyring: Path,
+        health_keyring: Path,
+        device_binding: Path,
+        manifest_arguments: Mapping[str, Any],
+        wait_seconds: int,
+        poll_seconds: float,
+    ) -> dict[str, object]:
+        if (
+            isinstance(wait_seconds, bool)
+            or not isinstance(wait_seconds, int)
+            or not 30 <= wait_seconds <= 7200
+            or isinstance(poll_seconds, bool)
+            or not isinstance(poll_seconds, (int, float))
+            or not 0.5 <= float(poll_seconds) <= 30
+        ):
+            raise RunnerError("E2E wait/poll bounds are invalid")
+        identity = self._call("identity", "identity")
+        local_tool_sha = hashlib.sha256(
+            read_regular(local_tool, MAX_OUTPUT_BYTES)
+        ).hexdigest()
+        if (
+            identity.get("protocolVersion") != PROTOCOL_VERSION
+            or identity.get("toolSha256") != local_tool_sha
+            or identity.get("toolPath") != REMOTE_TOOL
+            or identity.get("rootOwned") is not True
+            or identity.get("mode") != "0755"
+        ):
+            raise RunnerError(
+                "packaged board tool identity does not match local source"
+            )
+        sources = {
+            "command": command_keyring,
+            "release": release_keyring,
+            "health": health_keyring,
+            "binding": device_binding,
+        }
+        payloads = {
+            role: read_regular(path, MAX_INPUT_BYTES) for role, path in sources.items()
+        }
+        digests = {
+            role: hashlib.sha256(payload).hexdigest()
+            for role, payload in payloads.items()
+        }
+        manifest_path = self.output_dir / "immutable-manifest.json"
+        manifest_exists = manifest_path.exists() or manifest_path.is_symlink()
+        persisted_manifest = (
+            strict_json(
+                read_regular(manifest_path, MAX_INPUT_BYTES),
+                label="immutable manifest",
+            )
+            if manifest_exists
+            else None
+        )
+        foundation = self._call("foundation", "preflight", ["--run-id", self.run_id])
+        live_foundation = foundation.get("foundation")
+        live_slots = (
+            live_foundation.get("slots")
+            if isinstance(live_foundation, Mapping)
+            else None
+        )
+        recorded_baseline = foundation.get("recordedBaseline")
+        if (
+            foundation.get("verified") is not True
+            or not isinstance(live_slots, Mapping)
+            or not isinstance(live_slots.get("current"), str)
+            or not isinstance(live_slots.get("currentVersion"), str)
+            or not isinstance(recorded_baseline, Mapping)
+            or not isinstance(recorded_baseline.get("slot"), str)
+            or not isinstance(recorded_baseline.get("version"), str)
+            or not isinstance(foundation.get("transactionPresent"), bool)
+        ):
+            raise RunnerError("physical foundation response is invalid")
+        resolved_manifest_arguments = dict(manifest_arguments)
+        if persisted_manifest is None:
+            if (
+                live_slots.get("current")
+                != manifest_arguments.get("expected_previous_slot")
+                or recorded_baseline.get("slot") != live_slots.get("current")
+                or recorded_baseline.get("version") != live_slots.get("currentVersion")
+                or foundation.get("transactionPresent") is not False
+            ):
+                raise RunnerError(
+                    "live baseline slot does not match the requested immutable run"
+                )
+            resolved_manifest_arguments["expected_previous_version"] = live_slots[
+                "currentVersion"
+            ]
+        else:
+            scenario = persisted_manifest.get("scenario")
+            if not isinstance(scenario, Mapping) or not isinstance(
+                scenario.get("expectedPreviousVersion"), str
+            ):
+                raise RunnerError("persisted immutable manifest baseline is invalid")
+            resolved_manifest_arguments["expected_previous_version"] = scenario[
+                "expectedPreviousVersion"
+            ]
+        expected_manifest = build_manifest(
+            run_id=self.run_id,
+            tool_sha256=local_tool_sha,
+            input_digests={
+                "commandSha256": digests["command"],
+                "releaseSha256": digests["release"],
+                "healthSha256": digests["health"],
+                "bindingSha256": digests["binding"],
+            },
+            **resolved_manifest_arguments,
+        )
+        if persisted_manifest is None:
+            manifest = expected_manifest
+            atomic_json(manifest_path, manifest, immutable=True)
+        else:
+            manifest = persisted_manifest
+            scenario = manifest["scenario"]
+            if manifest != expected_manifest or (
+                recorded_baseline.get("slot") != scenario["expectedPreviousSlot"]
+                or recorded_baseline.get("version")
+                != scenario["expectedPreviousVersion"]
+                or (
+                    foundation.get("transactionPresent") is False
+                    and (
+                        live_slots.get("current") != scenario["expectedPreviousSlot"]
+                        or live_slots.get("currentVersion")
+                        != scenario["expectedPreviousVersion"]
+                    )
+                )
+            ):
+                raise RunnerError(
+                    "persisted immutable manifest does not match live run ownership"
+                )
+        manifest_payload = read_regular(manifest_path, MAX_INPUT_BYTES)
+        manifest_sha = hashlib.sha256(manifest_payload).hexdigest()
+        self._call("backup", "backup", ["--run-id", self.run_id], timeout=1800)
+        remote_paths: dict[str, str] = {}
+        try:
+            for role, source in {**sources, "manifest": manifest_path}.items():
+                remote_paths[role] = self.transport.copy_input(
+                    source, run_id=self.run_id, role=role
+                )
+            self._call(
+                "trust",
+                "enable-fleet",
+                [
+                    "--run-id",
+                    self.run_id,
+                    "--command-keyring",
+                    remote_paths["command"],
+                    "--command-sha256",
+                    digests["command"],
+                    "--release-keyring",
+                    remote_paths["release"],
+                    "--release-sha256",
+                    digests["release"],
+                    "--health-keyring",
+                    remote_paths["health"],
+                    "--health-sha256",
+                    digests["health"],
+                    "--device-binding",
+                    remote_paths["binding"],
+                    "--binding-sha256",
+                    digests["binding"],
+                    "--manifest",
+                    remote_paths["manifest"],
+                    "--manifest-sha256",
+                    manifest_sha,
+                ],
+                timeout=180,
+            )
+        finally:
+            self._call(
+                "discard-staging",
+                "discard-staging",
+                [
+                    "--run-id",
+                    self.run_id,
+                    "--command-sha256",
+                    digests["command"],
+                    "--release-sha256",
+                    digests["release"],
+                    "--health-sha256",
+                    digests["health"],
+                    "--binding-sha256",
+                    digests["binding"],
+                    "--manifest-sha256",
+                    manifest_sha,
+                ],
+            )
+        scenario = manifest["scenario"]
+        deadline = self.monotonic() + wait_seconds
+        if scenario["type"] == "oak-fault-rollback":
+            expected_candidate = "releases/" + scenario["expectedBomDigest"][7:]
+            rollback_already_complete = False
+            while True:
+                readiness = self._call(
+                    "fault-readiness", "evidence", ["--run-id", self.run_id]
+                )
+                if readiness.get("complete") is True:
+                    validate_final_evidence(readiness, manifest)
+                    rollback_already_complete = True
+                    break
+                update = (
+                    readiness.get("updater", {}).get("update")
+                    if isinstance(readiness.get("updater"), Mapping)
+                    else None
+                )
+                slots = readiness.get("slots")
+                gates = readiness.get("gates")
+                faultable = (
+                    isinstance(update, Mapping)
+                    and isinstance(slots, Mapping)
+                    and isinstance(gates, Mapping)
+                    and all(
+                        gates.get(name) is True
+                        for name in (
+                            "foundation",
+                            "backup",
+                            "trust",
+                            "updater2",
+                            "oak",
+                            "services",
+                        )
+                    )
+                    and update.get("commandId") == scenario["expectedCommandId"]
+                    and update.get("bomDigest") == scenario["expectedBomDigest"]
+                    and update.get("candidateSlot") == scenario["expectedCandidateSlot"]
+                    and update.get("phase")
+                    in {
+                        "ACTIVATING",
+                        "BOOT_HEALTHY",
+                        "FUNCTIONAL_HEALTHY",
+                        "COMMIT_GATE",
+                    }
+                    and slots.get("current") == expected_candidate
+                )
+                if faultable:
+                    break
+                if self.monotonic() >= deadline:
+                    raise RunnerError(
+                        "timed out waiting for the exact OTA candidate fault window"
+                    )
+                self.sleeper(float(poll_seconds))
+            if not rollback_already_complete:
+                self._call(
+                    "oak-fault",
+                    "arm-oak-fault",
+                    ["--run-id", self.run_id],
+                    timeout=int(scenario["holdSeconds"]) + 90,
+                )
+        while True:
+            evidence = self._call("evidence", "evidence", ["--run-id", self.run_id])
+            if evidence.get("complete") is True:
+                validate_final_evidence(evidence, manifest)
+                break
+            if self.monotonic() >= deadline:
+                raise RunnerError("timed out waiting for exact final OTA evidence")
+            self.sleeper(float(poll_seconds))
+        evidence_path = self.output_dir / "evidence.json"
+        created_evidence = False
+        try:
+            if evidence_path.exists() or evidence_path.is_symlink():
+                persisted_evidence = strict_json(
+                    read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                    label="final evidence",
+                )
+            else:
+                atomic_json(evidence_path, evidence, immutable=True)
+                created_evidence = True
+                persisted_evidence = strict_json(
+                    read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                    label="final evidence",
+                )
+            # A resumed run still obtains fresh live proof above. Preserve an
+            # already-written immutable historical artifact when it proves the
+            # exact same manifest, even if generatedAt/PIDs have advanced.
+            validate_final_evidence(persisted_evidence, manifest)
+        except BaseException:
+            if created_evidence:
+                try:
+                    evidence_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+        return {
+            "schemaVersion": 1,
+            "runId": self.run_id,
+            "complete": True,
+            "scenario": scenario["type"],
+            "evidenceSha256": hashlib.sha256(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES)
+            ).hexdigest(),
+        }
+
+    def cleanup(self) -> dict[str, Any]:
+        return self._call("cleanup", "cleanup", ["--run-id", self.run_id], timeout=180)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the IQ9075 Fleet E2E harness")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--user", default=DEFAULT_USER)
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--known-hosts", required=True)
+    parser.add_argument("--host-key-sha256", default=DEFAULT_FINGERPRINT)
+    parser.add_argument("--ssh-password-fd", type=int)
+    parser.add_argument("--sudo-password-fd", type=int)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--output-dir", required=True)
+    subcommands = parser.add_subparsers(dest="command", required=True)
+    run = subcommands.add_parser("run")
+    run.add_argument(
+        "--local-board-tool",
+        default=str(Path(__file__).with_name("iq9075-board-e2e.py")),
+    )
+    run.add_argument("--command-keyring", required=True)
+    run.add_argument("--release-keyring", required=True)
+    run.add_argument("--health-keyring", required=True)
+    run.add_argument("--device-binding", required=True)
+    run.add_argument(
+        "--scenario", choices=("commit", "oak-fault-rollback"), required=True
+    )
+    run.add_argument("--expected-command-id", required=True)
+    run.add_argument("--expected-bom-digest", required=True)
+    run.add_argument("--expected-candidate-slot", required=True)
+    run.add_argument("--expected-previous-slot", required=True)
+    run.add_argument("--hold-seconds", type=int, default=0)
+    run.add_argument("--device-id", required=True)
+    run.add_argument("--space-id", type=int, required=True)
+    run.add_argument("--agent-version", required=True)
+    run.add_argument("--release-sequence", type=int, required=True)
+    run.add_argument("--artifact-digest", required=True)
+    run.add_argument("--component-sha", required=True)
+    run.add_argument("--config-schema", required=True)
+    run.add_argument("--publisher-key-id", required=True)
+    run.add_argument("--wait-seconds", type=int, default=900)
+    run.add_argument("--poll-seconds", type=float, default=2.0)
+    bootstrap = subcommands.add_parser("bootstrap-updater")
+    bootstrap.add_argument(
+        "--local-board-tool",
+        default=str(Path(__file__).with_name("iq9075-board-e2e.py")),
+    )
+    bootstrap.add_argument(
+        "--installer",
+        default=str(Path(__file__).with_name("install-iq9075.sh")),
+    )
+    bootstrap.add_argument("--package", required=True)
+    bootstrap.add_argument("--expected-version", required=True)
+    bootstrap.add_argument("--expected-sha256", required=True)
+    subcommands.add_parser("cleanup")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = build_parser().parse_args(argv)
+    ssh_password: bytearray | None = None
+    sudo_password: bytearray | None = None
+    try:
+        run_id = canonical_run_id(arguments.run_id)
+        output_dir = prepare_output_dir(arguments.output_dir)
+        if output_dir.name != run_id:
+            raise RunnerError("run output directory basename must equal runId")
+        if arguments.ssh_password_fd is not None:
+            ssh_password = read_secret_fd(arguments.ssh_password_fd)
+        if arguments.sudo_password_fd is not None:
+            if (
+                arguments.sudo_password_fd == arguments.ssh_password_fd
+                and ssh_password is not None
+            ):
+                sudo_password = bytearray(ssh_password)
+            else:
+                sudo_password = read_secret_fd(arguments.sudo_password_fd)
+        pinned = output_dir / "known_hosts"
+        fingerprint = create_pinned_known_hosts(
+            arguments.known_hosts,
+            pinned,
+            host=arguments.host,
+            port=arguments.port,
+            expected=arguments.host_key_sha256,
+        )
+        transport = OpenSshTransport(
+            host=arguments.host,
+            user=arguments.user,
+            port=arguments.port,
+            pinned_known_hosts=pinned,
+            expected_fingerprint=fingerprint,
+            ssh_password=ssh_password,
+            sudo_password=sudo_password,
+        )
+        journal = HostJournal(
+            output_dir / "journal.json",
+            run_id=run_id,
+            host=arguments.host,
+            fingerprint=fingerprint,
+        )
+        runner = FleetRunner(
+            transport=transport,
+            journal=journal,
+            output_dir=output_dir,
+            run_id=run_id,
+        )
+        if arguments.command == "cleanup":
+            result = runner.cleanup()
+        elif arguments.command == "bootstrap-updater":
+            inputs = [
+                Path(arguments.local_board_tool),
+                Path(arguments.installer),
+                Path(arguments.package),
+            ]
+            validate_paths_distinct(output_dir, inputs)
+            result = runner.bootstrap(
+                local_tool=inputs[0],
+                installer=inputs[1],
+                package=inputs[2],
+                expected_version=arguments.expected_version,
+                expected_package_sha256=arguments.expected_sha256,
+            )
+        else:
+            inputs = [
+                Path(arguments.local_board_tool),
+                Path(arguments.command_keyring),
+                Path(arguments.release_keyring),
+                Path(arguments.health_keyring),
+                Path(arguments.device_binding),
+            ]
+            validate_paths_distinct(output_dir, inputs)
+            result = runner.run(
+                local_tool=inputs[0],
+                command_keyring=inputs[1],
+                release_keyring=inputs[2],
+                health_keyring=inputs[3],
+                device_binding=inputs[4],
+                wait_seconds=arguments.wait_seconds,
+                poll_seconds=arguments.poll_seconds,
+                manifest_arguments={
+                    "identity": {
+                        "deviceId": arguments.device_id,
+                        "spaceId": arguments.space_id,
+                        "productModel": "IQ9075_DEV",
+                        "platformProfile": "iq9075_dev",
+                        "hardwareRevision": "QCS9075-EVK",
+                        "architecture": "aarch64",
+                        "dockerRequired": False,
+                    },
+                    "scenario_type": arguments.scenario,
+                    "expected_command_id": arguments.expected_command_id,
+                    "expected_bom_digest": arguments.expected_bom_digest,
+                    "expected_candidate_slot": arguments.expected_candidate_slot,
+                    "expected_previous_slot": arguments.expected_previous_slot,
+                    "hold_seconds": arguments.hold_seconds,
+                    "release": {
+                        "agentVersion": arguments.agent_version,
+                        "releaseSequence": arguments.release_sequence,
+                        "artifactDigest": arguments.artifact_digest,
+                        "componentSha": arguments.component_sha,
+                        "configSchema": arguments.config_schema,
+                        "publisherKeyId": arguments.publisher_key_id,
+                    },
+                },
+            )
+        assert_no_secret_material(result)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (RunnerError, OSError, ValueError, UnicodeError) as exc:
+        print(f"run-iq9075-fleet-e2e: {exc}", file=sys.stderr)
+        return 1
+    except Exception:  # noqa: BLE001 - credentials must never enter a traceback.
+        print("run-iq9075-fleet-e2e: unexpected internal failure", file=sys.stderr)
+        return 1
+    finally:
+        zero_secret(ssh_password)
+        zero_secret(sudo_password)
+
+
+if __name__ == "__main__":
+    if _askpass_entrypoint():
+        raise SystemExit(0)
+    raise SystemExit(main())
