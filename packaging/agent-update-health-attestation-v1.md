@@ -131,6 +131,7 @@ The signed claims contain exactly:
   "challenge": "<43-char canonical unpadded base64url>",
   "deviceId": "<device id>",
   "commandId": "<canonical UUID>",
+  "commandExpiresAt": "2026-09-02T10:05:00Z",
   "bomDigest": "sha256:<64 lowercase hex>",
   "componentSha": "<40 or 64 lowercase hex>",
   "releaseSequence": 2,
@@ -144,8 +145,10 @@ The signed claims contain exactly:
 }
 ```
 
-The TTL is positive and at most 60 seconds. Times are RFC3339 UTC. The updater
-permits at most five seconds of clock skew.
+The TTL is positive and at most 60 seconds, and `expiresAt` MUST NOT be later
+than the exact accepted command's `commandExpiresAt`. Times are RFC3339 UTC.
+Immediately before atomic commit, the updater requires wall-clock time to be
+strictly before both expiries and permits at most five seconds of clock skew.
 
 ## Commit request and replay rule
 

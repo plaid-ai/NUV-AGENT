@@ -2585,14 +2585,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     self.assertEqual(nonisolated.returncode, 2)
                     self.assertIn("requires Python isolated mode", nonisolated.stderr)
 
-    def test_iq9075_runbook_uses_canonical_candidate_soak_and_isolates_tools(
+    def test_iq9075_runbook_keeps_optional_candidate_soak_isolated(
         self,
     ) -> None:
         runbook = (
             ROOT / "packaging/release/v0.1.121-release-runbook.md"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "The reviewed `candidate-soak` primitive is the only authorized way",
+            "When a release explicitly claims OAK media stability, use the reviewed",
+            runbook,
+        )
+        self.assertIn("Camera frame continuity is a separate media", runbook)
+        self.assertIn(
+            "qualification and is not part of this Fleet Runtime release decision",
             runbook,
         )
         rollback_call = runbook.index("--scenario oak-fault-rollback")
@@ -2795,13 +2800,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("  agent-release-gate:\n    name: agent-release-gate", gate)
         self.assertIn("runs-on: ubuntu-24.04-arm", gate)
         self.assertIn(
-            "needs: [arm64-release-prerequisite, macos-cpu-reference, macos-arm64-release-prerequisite]",
+            "needs: [arm64-release-prerequisite]",
             gate,
         )
         self.assertIn("if: always()", gate)
         self.assertIn("needs.arm64-release-prerequisite.result", gate)
-        self.assertIn("needs.macos-cpu-reference.result", gate)
-        self.assertIn("needs.macos-arm64-release-prerequisite.result", gate)
+        self.assertNotIn("macos-cpu-reference", gate)
+        self.assertNotIn("macos-arm64-release-prerequisite", gate)
+        self.assertNotIn("self-hosted", gate)
         self.assertIn("requirements-agent-bundle-arm64.txt", gate)
         self.assertIn("packaging/release/run-isolated-tests.py", gate)
         self.assertIn("actionlint", gate)

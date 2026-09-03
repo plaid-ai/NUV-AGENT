@@ -227,51 +227,35 @@ class ReleaseGateTest(unittest.TestCase):
 
         self.assertEqual(
             workflow.count("- name: Stamp exact checked-out candidate identity"),
-            3,
+            1,
         )
-        self.assertEqual(workflow.count('CANDIDATE_SHA="$(git rev-parse HEAD)"'), 3)
+        self.assertEqual(workflow.count('CANDIDATE_SHA="$(git rev-parse HEAD)"'), 1)
         self.assertEqual(
             workflow.count(
                 '[ "$(git status --porcelain --untracked-files=all)" = '
                 '" M nuvion_app/build_info.py" ]'
             ),
-            3,
+            1,
         )
         self.assertEqual(
             workflow.count(
                 '--sha "$CANDIDATE_SHA" --version "$CANDIDATE_VERSION"'
             ),
-            3,
+            1,
         )
         self.assertGreaterEqual(
             workflow.count(
                 'build_info.COMPONENT_SHA == os.environ["CANDIDATE_SHA"]'
             ),
-            4,
+            1,
         )
-        self.assertGreaterEqual(workflow.count('cd "$RUNNER_TEMP"'), 3)
-        self.assertIn(
-            'PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I -',
-            workflow,
-        )
-        self.assertIn(
-            'PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -',
-            workflow,
-        )
+        self.assertGreaterEqual(workflow.count('cd "$RUNNER_TEMP"'), 1)
         self.assertIn(
             "package_path.is_relative_to(Path(sys.prefix).resolve())",
             workflow,
         )
         self.assertIn(
             'not package_path.is_relative_to(Path(os.environ["GITHUB_WORKSPACE"]).resolve())',
-            workflow,
-        )
-        self.assertIn(
-            'reference["componentSha"] == os.environ["CANDIDATE_SHA"]',
-            workflow,
-        )
-        self.assertIn(
-            'reference["agentVersion"] == os.environ["CANDIDATE_VERSION"]',
             workflow,
         )
         self.assertNotIn('CANDIDATE_SHA="$GITHUB_SHA"', workflow)
@@ -341,88 +325,31 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertNotIn("transformers", iq_lock)
         self.assertNotIn("torch", iq_lock)
 
-    def test_macos_arm64_formula_and_fixed_revision_mps_gate_is_fail_closed(self) -> None:
+    def test_product_gate_has_no_macos_or_self_hosted_dependency(self) -> None:
         gate = (ROOT / ".github/workflows/agent-release-gate.yml").read_text(
             encoding="utf-8"
         )
-        oracle = gate.split("  macos-cpu-reference:", maxsplit=1)[1].split(
-            "  macos-arm64-release-prerequisite:", maxsplit=1
-        )[0]
-        macos = gate.split(
-            "  macos-arm64-release-prerequisite:", maxsplit=1
-        )[1].split("  agent-release-gate:", maxsplit=1)[0]
-        self.assertIn("runs-on: macos-14", oracle)
-        self.assertIn("reference-sha256:", oracle)
-        self.assertIn("reference_outputs.logits_per_image", oracle)
-        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", oracle)
-        self.assertIn("actions/upload-artifact@", oracle)
-        self.assertIn("compression-level: 0", oracle)
-        self.assertIn('cd "$RUNNER_TEMP"', oracle)
+        aggregate = gate.split("  agent-release-gate:", maxsplit=1)[1]
+
+        self.assertIn("runs-on: ubuntu-24.04-arm", gate)
+        self.assertIn("needs: [arm64-release-prerequisite]", aggregate)
         self.assertIn(
-            'MODEL_PATH=$(PYTHONNOUSERSITE=1 "$ORACLE_VENV/bin/python" -I -',
-            oracle,
+            "ARM64_RESULT: ${{ needs.arm64-release-prerequisite.result }}",
+            aggregate,
         )
-        self.assertIn("huggingface_hub imported outside CPU oracle venv", oracle)
-        self.assertIn('wc -c < "$REFERENCE_PATH"', oracle)
-        self.assertIn(
-            "runs-on: [self-hosted, macOS, ARM64, macos-14-xlarge]", macos
-        )
-        self.assertIn(
-            "if: github.event_name != 'pull_request' || "
-            "github.event.pull_request.head.repo.full_name == github.repository",
-            macos,
-        )
-        self.assertIn("needs: macos-cpu-reference", macos)
-        self.assertIn('brew tap-new --no-git "$TAP_NAME"', macos)
-        self.assertIn('brew trust --formula "$FORMULA_NAME"', macos)
-        self.assertIn(
-            "brew untrust --formula nuvion/release-gate/nuv-agent", macos
-        )
-        self.assertIn('$TAP_ROOT/Formula/nuv-agent.rb', macos)
-        self.assertNotIn(
-            'brew install --formula --build-from-source "${RUNNER_TEMP}/nuv-agent.rb"',
-            macos,
-        )
-        self.assertIn("brew install --formula --build-from-source", macos)
-        self.assertIn('platform.machine() == "arm64"', macos)
-        self.assertIn("torch.backends.mps.is_available()", macos)
-        self.assertIn("assert physical_memory >= 12 * 1024**3", macos)
-        self.assertIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0", macos)
-        self.assertEqual(macos.count("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"), 1)
-        self.assertIn(
-            'os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.0"',
-            macos,
-        )
-        self.assertIn("detector._inference_dtype == torch.float16", macos)
-        self.assertIn(
-            'detector._model.__class__.__name__ == "SiglipVisionModel"', macos
-        )
-        self.assertIn('not hasattr(detector._model, "text_model")', macos)
-        self.assertIn(
-            'getattr(detector._model, "vision_model", detector._model)', macos
-        )
-        self.assertIn(
-            "torch.mps.current_allocated_memory() < 512 * 1024**2", macos
-        )
-        self.assertIn('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -', macos)
-        self.assertEqual(
-            macos.count('PYTHONNOUSERSITE=1 "$FORMULA_PYTHON" -I -'), 3
-        )
-        self.assertIn("huggingface_hub imported outside Formula libexec", macos)
-        self.assertIn('cd "$RUNNER_TEMP"', macos)
-        self.assertIn('package_path.is_relative_to(formula_prefix / "libexec")', macos)
-        self.assertNotIn("reference_outputs.logits_per_image", macos)
-        self.assertIn("observed_scores, reference_scores", macos)
-        self.assertIn("actions/download-artifact@", macos)
-        self.assertIn("needs.macos-cpu-reference.outputs.reference-sha256", macos)
-        self.assertIn('shasum -a 256 "$REFERENCE_PATH"', macos)
-        self.assertIn('wc -c < "$REFERENCE_PATH"', macos)
-        self.assertIn('stat.S_IMODE(reference_stat.st_mode) == 0o600', macos)
-        self.assertIn('type(reference["schemaVersion"]) is int', macos)
-        self.assertIn("and 0.0 <= score <= 1.0", macos)
-        self.assertIn("for _ in range(16):", macos)
-        self.assertIn("stable_bytes + 16 * 1024**2", macos)
-        self.assertIn("sudo purge", macos)
+        self.assertIn('[ "$ARM64_RESULT" = "success" ]', aggregate)
+        self.assertIn("packaging/release/run-isolated-tests.py", aggregate)
+        for forbidden in (
+            "macos-cpu-reference",
+            "macos-arm64-release-prerequisite",
+            "macos-14",
+            "self-hosted",
+            "CPU_REFERENCE_RESULT",
+            "MACOS_RESULT",
+        ):
+            self.assertNotIn(forbidden, gate)
+
+    def test_macos_dev_runtime_remains_pinned_for_local_qualification(self) -> None:
         zero_shot = (
             ROOT / "nuvion_app" / "inference" / "zero_shot.py"
         ).read_text(encoding="utf-8")
@@ -432,6 +359,7 @@ class ReleaseGateTest(unittest.TestCase):
         safetensors_io = (
             ROOT / "nuvion_app" / "inference" / "_safetensors_io.py"
         ).read_text(encoding="utf-8")
+
         self.assertIn("dtype=torch.float16", text_worker)
         self.assertIn('with torch.device("meta"):', text_worker)
         self.assertIn('model.to_empty(device="cpu")', text_worker)
@@ -441,36 +369,14 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn('with torch.device("meta"):', zero_shot)
         self.assertIn('vision_model.to_empty(device=self._device)', zero_shot)
         self.assertIn("open_safetensors_for_sequential_load", zero_shot)
-        self.assertIn('getattr(fcntl, "F_NOCACHE", None)', safetensors_io)
-        self.assertIn('f"/dev/fd/{descriptor}"', safetensors_io)
-        self.assertIn('from safetensors import safe_open', safetensors_io)
+        self.assertIn('[sys.executable, "-I", str(worker_path)]', zero_shot)
         self.assertNotIn(
             "torch.arange(position_ids.shape[1], device=self._device)",
             zero_shot,
         )
-        self.assertIn('[sys.executable, "-I", str(worker_path)]', zero_shot)
-        self.assertIn(
-            "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2", macos
-        )
-        self.assertIn("local_files_only=True", macos)
-        self.assertIn("HF_HUB_OFFLINE", macos)
-        self.assertIn("ZeroShotAnomalyDetector", macos)
-        for identity in (
-            '"torch": "2.10.0"',
-            '"numpy": "2.4.2"',
-            '"transformers": "5.16.1"',
-            '"huggingface-hub": "1.29.0"',
-            '"hf-xet": "1.6.0"',
-            '"tokenizers": "0.23.1"',
-            '"safetensors": "0.8.0"',
-            '"Pillow": "12.1.0"',
-            '"sentencepiece": "0.2.2"',
-            '"protobuf": "7.36.1"',
-        ):
-            self.assertIn(identity, macos)
-        aggregator = gate.split("  agent-release-gate:", maxsplit=1)[1]
-        self.assertIn("macos-arm64-release-prerequisite", aggregator)
-        self.assertIn("needs.macos-arm64-release-prerequisite.result", aggregator)
+        self.assertIn('getattr(fcntl, "F_NOCACHE", None)', safetensors_io)
+        self.assertIn('f"/dev/fd/{descriptor}"', safetensors_io)
+        self.assertIn("from safetensors import safe_open", safetensors_io)
 
     def test_debian_bootstrap_is_prebuilt_and_excludes_checkout_source(self) -> None:
         deb = (ROOT / "packaging" / "deb" / "build-deb.sh").read_text(encoding="utf-8")

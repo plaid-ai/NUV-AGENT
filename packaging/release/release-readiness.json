@@ -5,10 +5,7 @@
       "status": "BLOCKED",
       "blockers": [
         {
-          "id": "MACOS-MPS-TRUSTED-RUNNER"
-        },
-        {
-          "id": "IQ9075-PHYSICAL-OAK-SOAK"
+          "id": "IQ9075-FLEET-RUNTIME-OTA-ROLLBACK-EVIDENCE"
         }
       ],
       "evidence": null
