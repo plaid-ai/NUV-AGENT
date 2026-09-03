@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -51,7 +52,8 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("SOURCE_DATE_EPOCH", self.build)
         self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", self.build)
         self.assertNotIn("environment:", self.build)
-        self.assertIn("environment: iq9075-release", self.sign)
+        self.assertIn("environment: iq9075-candidate-sign", self.sign)
+        self.assertIn("environment: iq9075-candidate-stage", self.stage)
         self.assertEqual(
             self.sign.count("secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY"), 1
         )
@@ -64,12 +66,24 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertNotIn("GCP_PROJECT_ID", self.sign)
         self.assertEqual(self.stage.count("secrets.GCP_SA_KEY"), 1)
         self.assertEqual(self.stage.count("secrets.GCP_PROJECT_ID"), 1)
+        self.assertNotIn("actions/upload-artifact", self.stage)
+        isolated_sign = self.sign.split(
+            "- name: Sign exact canonical BOM with the isolated key", maxsplit=1
+        )[1].split("- name: Verify the signed candidate", maxsplit=1)[0]
+        self.assertNotIn("GH_TOKEN", isolated_sign)
+        self.assertNotIn("gh api", isolated_sign)
+        self.assertEqual(isolated_sign.count("python3 "), 1)
+        credentialed_stage = self.stage.split(
+            "- name: Authenticate content-addressed OTA stager", maxsplit=1
+        )[1]
+        self.assertNotIn("GH_TOKEN", credentialed_stage)
+        self.assertNotIn("gh api", credentialed_stage)
 
     def test_signing_is_bound_to_policy_key_and_downloaded_artifact(self) -> None:
         revalidate = self.sign.index(
             "Revalidate source and artifact before signer access"
         )
-        signer = self.sign.index("Sign exact canonical BOM")
+        signer = self.sign.index("Sign exact canonical BOM with the isolated key")
         self.assertLess(revalidate, signer)
         self.assertIn("generate-release-bom.py", self.sign)
         self.assertIn("--schema-version 2", self.sign)
@@ -207,12 +221,14 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             binary = root / "bin"
             remote = root / "remote"
             public = root / "public"
+            gcloud_log = root / "gcloud.log"
             binary.mkdir()
             remote.mkdir()
             fake_gcloud = binary / "gcloud"
             fake_gcloud.write_text(
                 """#!/usr/bin/env bash
 set -euo pipefail
+echo "$*" >> "$FAKE_GCLOUD_LOG"
 [ "$1" = storage ]
 args=("$@")
 remote_arg="${args[${#args[@]}-1]}"
@@ -235,6 +251,7 @@ esac
                 **os.environ,
                 "PATH": f"{binary}:{Path(sys.executable).parent}:{os.environ['PATH']}",
                 "FAKE_GCLOUD_REMOTE": str(remote),
+                "FAKE_GCLOUD_LOG": str(gcloud_log),
                 "VERSION": "0.1.121",
                 "BUCKET": "test-bucket",
                 "SKIP_APT_PUBLISH": "true",
@@ -243,6 +260,17 @@ esac
                 "APT_RUNTIME_ROOT": str(root / "runtime"),
                 "RELEASE_KEYRING_PATH": str(keyring),
                 "RELEASE_TRUST_DOMAIN": "test-iq9075",
+                "EXPECTED_OTA_COMPONENT_SHA": "a" * 40,
+                "EXPECTED_OTA_RELEASE_SEQUENCE": "2",
+                "EXPECTED_OTA_ARTIFACT_SHA256": hashlib.sha256(
+                    artifact.read_bytes()
+                ).hexdigest(),
+                "EXPECTED_OTA_BOM_SHA256": hashlib.sha256(
+                    bom.read_bytes()
+                ).hexdigest(),
+                "EXPECTED_OTA_SIGNATURE_SHA256": hashlib.sha256(
+                    signature.read_bytes()
+                ).hexdigest(),
             }
             command = [
                 str(ROOT / "packaging/apt/publish-gcs.sh"),
@@ -275,6 +303,66 @@ esac
                 },
             )
             self.assertFalse((remote / "releases/0.1.121").exists())
+            copy_calls = [
+                line
+                for line in gcloud_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("storage cp ")
+            ]
+            self.assertTrue(copy_calls)
+            self.assertTrue(
+                all("--if-generation-match=0" in call for call in copy_calls)
+            )
+            cat_calls = [
+                line
+                for line in gcloud_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("storage cat ")
+            ]
+            self.assertGreaterEqual(len(cat_calls), 6)
+            for expected_object in objects:
+                self.assertGreaterEqual(
+                    sum(expected_object in call for call in cat_calls), 2
+                )
+
+            remote_bom = remote / prefix / "release-bom.json"
+            remote_bom.write_bytes(b"different immutable bytes\n")
+            collision = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(collision.returncode, 0)
+            self.assertIn("Refusing to overwrite", collision.stderr)
+
+            linked_artifact = root / "linked-agent-bundle.tar.gz"
+            linked_artifact.symlink_to(artifact)
+            linked = subprocess.run(
+                [
+                    str(ROOT / "packaging/apt/publish-gcs.sh"),
+                    str(linked_artifact),
+                    str(bom),
+                    str(signature),
+                    str(linked_artifact),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(linked.returncode, 0)
+            self.assertIn("symbolic link", linked.stderr)
+
+            wrong_component = {**environment, "EXPECTED_OTA_COMPONENT_SHA": "b" * 40}
+            mismatched = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=wrong_component,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertIn("exact candidate identity", mismatched.stderr)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,41 @@ JSON
     die "temporary environment has unexpected deployment branch policies"
   fi
 
+  local candidate_environment candidate_policies candidate_secrets
+  for candidate_environment in iq9075-candidate-sign iq9075-candidate-stage; do
+    GH_TOKEN="$admin_token" gh api --method PUT \
+      "repos/${REPOSITORY}/environments/${candidate_environment}" \
+      --input - >/dev/null <<'JSON'
+{
+  "wait_timer": 0,
+  "prevent_self_review": false,
+  "reviewers": [],
+  "deployment_branch_policy": {
+    "protected_branches": false,
+    "custom_branch_policies": true
+  }
+}
+JSON
+    candidate_policies="$(GH_TOKEN="$admin_token" gh api --paginate \
+      "repos/${REPOSITORY}/environments/${candidate_environment}/deployment-branch-policies?per_page=100" \
+      --jq '.branch_policies[] | [.name,.type] | @tsv')"
+    if [ -z "$candidate_policies" ]; then
+      GH_TOKEN="$admin_token" gh api --method POST \
+        "repos/${REPOSITORY}/environments/${candidate_environment}/deployment-branch-policies" \
+        -f name=main -f type=branch >/dev/null
+    elif [ "$candidate_policies" != $'main\tbranch' ]; then
+      die "candidate environment has unexpected deployment branch policies"
+    fi
+    candidate_secrets="$(GH_TOKEN="$admin_token" gh api --paginate \
+      "repos/${REPOSITORY}/environments/${candidate_environment}/secrets?per_page=100" \
+      --jq '.secrets[].name' | LC_ALL=C sort)"
+    case "$candidate_environment:$candidate_secrets" in
+      iq9075-candidate-sign:|iq9075-candidate-sign:IQ9075_RELEASE_SIGNING_PRIVATE_KEY) ;;
+      iq9075-candidate-stage:|$'iq9075-candidate-stage:GCP_PROJECT_ID\nGCP_SA_KEY') ;;
+      *) die "candidate environment already contains unexpected secrets" ;;
+    esac
+  done
+
   local existing
   existing="$(GH_TOKEN="$admin_token" gh api --paginate \
     "repos/${REPOSITORY}/environments/${MIGRATION_ENVIRONMENT}/secrets?per_page=100" \

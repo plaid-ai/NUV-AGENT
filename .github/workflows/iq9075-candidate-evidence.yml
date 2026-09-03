@@ -171,7 +171,7 @@ jobs:
     if: needs.build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: iq9075-release
+    environment: iq9075-candidate-sign
     permissions:
       contents: read
     steps:
@@ -254,28 +254,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-cryptography
 
-      - name: Sign exact canonical BOM and verify with tracked public keyring
+      - name: Recheck exact source immediately before signer access
+        id: signer-preflight
         env:
-          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          EXECUTING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$EXECUTING_WORKFLOW_SHA" = "$COMPONENT_SHA" ]
+          live_main_sha="$(env -i PATH="$PATH" HOME="$HOME" GH_TOKEN="$GH_TOKEN" \
+            GH_PROMPT_DISABLED=1 gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate signing" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          signing_key_id="$(jq -er .iq9075.publisherKeyId packaging/release/release-security-policy.json)"
+          echo "signing_key_id=$signing_key_id" >> "$GITHUB_OUTPUT"
+
+      - name: Sign exact canonical BOM with the isolated key
+        env:
+          NUVION_IQ9075_RELEASE_SIGNING_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
           COMPONENT_SHA: ${{ inputs.component_sha }}
           VERSION: ${{ inputs.version }}
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
           BUILT_AT: ${{ needs.build.outputs.built_at }}
           BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
-          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
           CONFIG_SCHEMA: ${{ needs.build.outputs.config_schema }}
           MIN_UPDATER_VERSION: ${{ needs.build.outputs.min_updater_version }}
+          SIGNING_KEY_ID: ${{ steps.signer-preflight.outputs.signing_key_id }}
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "$RELEASE_SIGNING_PRIVATE_KEY" ] \
+          [ -n "$NUVION_IQ9075_RELEASE_SIGNING_KEY" ] \
             || { echo "IQ9075 candidate signer is unavailable" >&2; exit 1; }
           bundle_path="dist/$BUNDLE_NAME"
-          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
-          signing_key_id="$(jq -er .iq9075.publisherKeyId packaging/release/release-security-policy.json)"
           bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
           signature_path="$bom_path.sig"
-          NUVION_IQ9075_RELEASE_SIGNING_KEY="$RELEASE_SIGNING_PRIVATE_KEY" \
           PYTHONPATH=. python3 packaging/release/generate-release-bom.py \
             --schema-version 2 \
             --bom-id "nuv-agent-${VERSION}-iq9075-aarch64" \
@@ -290,8 +309,21 @@ jobs:
             --built-at "$BUILT_AT" \
             --output "$bom_path" \
             --signature-output "$signature_path" \
-            --signing-key-id "$signing_key_id" \
+            --signing-key-id "$SIGNING_KEY_ID" \
             --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+
+      - name: Verify the signed candidate without signing material
+        env:
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
           RELEASE_KEYRING_PATH=packaging/release/trusted-release-keyrings/iq9075-dev.json \
           PYTHONPATH=. python3 - "$bom_path" "$signature_path" "$bundle_path" \
             "$COMPONENT_SHA" "$VERSION" "$RELEASE_SEQUENCE" <<'PY'
@@ -319,7 +351,6 @@ jobs:
           ):
               raise SystemExit("signed candidate BOM identity is invalid")
           PY
-          unset RELEASE_SIGNING_PRIVATE_KEY NUVION_IQ9075_RELEASE_SIGNING_KEY
 
       - name: Assemble secret-free download manifest
         env:
@@ -363,7 +394,7 @@ jobs:
       - name: Transfer signed candidate without cloud credentials
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: iq9075-signed-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/${{ needs.build.outputs.bundle_name }}
             dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
@@ -379,7 +410,7 @@ jobs:
     if: needs.sign.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: iq9075-release
+    environment: iq9075-candidate-stage
     permissions:
       contents: read
     steps:
@@ -393,7 +424,7 @@ jobs:
       - name: Download signed candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: iq9075-signed-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
 
       - name: Install verifier runtime before cloud credentials
@@ -404,6 +435,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3-cryptography
 
       - name: Revalidate source and signed bytes before cloud credentials
+        id: signed-inputs
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
@@ -456,6 +488,10 @@ jobs:
           ):
               raise SystemExit("staged candidate identity is invalid")
           PY
+          {
+            echo "bom_sha256=$(sha256sum "$bom_path" | awk '{print $1}')"
+            echo "signature_sha256=$(sha256sum "$signature_path" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Authenticate content-addressed OTA stager
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -470,7 +506,12 @@ jobs:
       - name: Create only content-addressed OTA objects
         env:
           VERSION: ${{ inputs.version }}
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
           BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          BOM_SHA256: ${{ steps.signed-inputs.outputs.bom_sha256 }}
+          SIGNATURE_SHA256: ${{ steps.signed-inputs.outputs.signature_sha256 }}
           APT_RUNTIME_ROOT: ${{ runner.temp }}/iq9075-candidate-stage-${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
         run: |
@@ -480,20 +521,12 @@ jobs:
           OTA_CONTENT_ONLY=true \
           SKIP_APT_PUBLISH=true \
           BUCKET=apt.plaidai.io \
+          EXPECTED_OTA_COMPONENT_SHA="$COMPONENT_SHA" \
+          EXPECTED_OTA_RELEASE_SEQUENCE="$RELEASE_SEQUENCE" \
+          EXPECTED_OTA_ARTIFACT_SHA256="$BUNDLE_SHA256" \
+          EXPECTED_OTA_BOM_SHA256="$BOM_SHA256" \
+          EXPECTED_OTA_SIGNATURE_SHA256="$SIGNATURE_SHA256" \
           RELEASE_KEYRING_PATH=packaging/release/trusted-release-keyrings/iq9075-dev.json \
           RELEASE_TRUST_DOMAIN=iq9075-dev \
             packaging/apt/publish-gcs.sh \
               "$bundle_path" "$bom_path" "$bom_path.sig" "$bundle_path"
-
-      - name: Upload successfully staged evidence candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/${{ needs.build.outputs.bundle_name }}
-            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
-            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json.sig
-            dist/candidate-evidence-manifest.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 2

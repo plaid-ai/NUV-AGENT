@@ -21,6 +21,31 @@ class MaterialError(RuntimeError):
     """Secret material does not match the committed release trust policy."""
 
 
+_SAFE_SUBPROCESS_ENVIRONMENT = (
+    "CLOUDSDK_PYTHON",
+    "CLOUDSDK_PYTHON_ARGS",
+    "CLOUDSDK_PYTHON_SITEPACKAGES",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "TMPDIR",
+)
+
+
+def _subprocess_environment(**overrides: str) -> dict[str, str]:
+    """Build a capability-minimal child environment without source secrets."""
+
+    environment = {
+        name: os.environ[name]
+        for name in _SAFE_SUBPROCESS_ENVIRONMENT
+        if name in os.environ
+    }
+    environment.update(overrides)
+    return environment
+
+
 def _secret(name: str) -> str:
     value = os.environ.get(name, "")
     if not value:
@@ -70,11 +95,10 @@ def verify_gcp_auth(key_environment: str, project_environment: str) -> None:
         credential_path = root / "credential.json"
         credential_path.write_text(credential, encoding="utf-8")
         credential_path.chmod(0o600)
-        environment = {
-            **os.environ,
-            "CLOUDSDK_CONFIG": str(root / "gcloud"),
-            "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
-        }
+        environment = _subprocess_environment(
+            CLOUDSDK_CONFIG=str(root / "gcloud"),
+            CLOUDSDK_CORE_DISABLE_PROMPTS="1",
+        )
         activated = subprocess.run(
             [
                 "gcloud",
@@ -124,7 +148,7 @@ def verify_apt_gpg(
         passphrase_path.write_text(_secret(passphrase_environment), encoding="utf-8")
         key_path.chmod(0o600)
         passphrase_path.chmod(0o600)
-        environment = {**os.environ, "GNUPGHOME": str(root)}
+        environment = _subprocess_environment(GNUPGHOME=str(root))
         imported = subprocess.run(
             ["gpg", "--batch", "--import", str(key_path)],
             env=environment,
@@ -217,6 +241,7 @@ def verify_iq_signing_key(private_key_environment: str, policy_path: Path) -> No
         command.extend(["-in", str(private_path), "-pubout", "-outform", "DER"])
         public_key = subprocess.run(
             command,
+            env=_subprocess_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,

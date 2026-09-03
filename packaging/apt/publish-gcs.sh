@@ -7,6 +7,10 @@ if [ $# -lt 1 ] || [ $# -gt 4 ]; then
 fi
 
 DEB_PATH="$1"
+if [ -L "$DEB_PATH" ]; then
+  echo "Deb path must not be a symbolic link" >&2
+  exit 1
+fi
 DEB_PATH="$(realpath "$DEB_PATH")"
 if [ ! -f "$DEB_PATH" ]; then
   echo "Deb not found: $DEB_PATH" >&2
@@ -14,6 +18,10 @@ if [ ! -f "$DEB_PATH" ]; then
 fi
 ROLLBACK_DEB_PATH="${APT_PREVIOUS_DEB_PATH:-}"
 if [ -n "$ROLLBACK_DEB_PATH" ]; then
+  if [ -L "$ROLLBACK_DEB_PATH" ]; then
+    echo "Previous rollback Deb must not be a symbolic link" >&2
+    exit 1
+  fi
   ROLLBACK_DEB_PATH="$(realpath "$ROLLBACK_DEB_PATH")"
   if [ ! -f "$ROLLBACK_DEB_PATH" ] || [ "$ROLLBACK_DEB_PATH" = "$DEB_PATH" ]; then
     echo "Previous rollback Deb is missing or aliases the current Deb" >&2
@@ -24,6 +32,10 @@ BOM_PATH="${2:-}"
 SIGNATURE_PATH="${3:-}"
 BOM_ARTIFACT_PATH="${4:-$DEB_PATH}"
 if [ -n "$BOM_PATH" ]; then
+  if [ -L "$BOM_PATH" ]; then
+    echo "Release BOM path must not be a symbolic link" >&2
+    exit 1
+  fi
   BOM_PATH="$(realpath "$BOM_PATH")"
   if [ ! -f "$BOM_PATH" ]; then
     echo "Release BOM not found: $BOM_PATH" >&2
@@ -33,11 +45,19 @@ if [ -n "$BOM_PATH" ]; then
     SIGNATURE_PATH="$BOM_PATH.sig"
   fi
   if [ -n "$SIGNATURE_PATH" ]; then
+    if [ -L "$SIGNATURE_PATH" ]; then
+      echo "Release BOM signature path must not be a symbolic link" >&2
+      exit 1
+    fi
     SIGNATURE_PATH="$(realpath "$SIGNATURE_PATH")"
     if [ ! -f "$SIGNATURE_PATH" ]; then
       echo "Release BOM signature not found: $SIGNATURE_PATH" >&2
       exit 1
     fi
+  fi
+  if [ -L "$BOM_ARTIFACT_PATH" ]; then
+    echo "Release BOM artifact path must not be a symbolic link" >&2
+    exit 1
   fi
   BOM_ARTIFACT_PATH="$(realpath "$BOM_ARTIFACT_PATH")"
   if [ ! -f "$BOM_ARTIFACT_PATH" ]; then
@@ -86,6 +106,22 @@ esac
 if [ "$OTA_CONTENT_ONLY" = true ] && [ "$SKIP_APT_PUBLISH" != true ]; then
   echo "OTA_CONTENT_ONLY requires SKIP_APT_PUBLISH=true" >&2
   exit 2
+fi
+if [ "$OTA_CONTENT_ONLY" = true ]; then
+  : "${EXPECTED_OTA_COMPONENT_SHA:?required for OTA_CONTENT_ONLY}"
+  : "${EXPECTED_OTA_RELEASE_SEQUENCE:?required for OTA_CONTENT_ONLY}"
+  : "${EXPECTED_OTA_ARTIFACT_SHA256:?required for OTA_CONTENT_ONLY}"
+  : "${EXPECTED_OTA_BOM_SHA256:?required for OTA_CONTENT_ONLY}"
+  : "${EXPECTED_OTA_SIGNATURE_SHA256:?required for OTA_CONTENT_ONLY}"
+  [[ "$EXPECTED_OTA_COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$EXPECTED_OTA_RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+  [[ "$EXPECTED_OTA_ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$EXPECTED_OTA_BOM_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$EXPECTED_OTA_SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [ -n "$BOM_PATH" ] && [ -n "$SIGNATURE_PATH" ]
+  [ "$(sha256sum "$BOM_ARTIFACT_PATH" | awk '{print $1}')" = "$EXPECTED_OTA_ARTIFACT_SHA256" ]
+  [ "$(sha256sum "$BOM_PATH" | awk '{print $1}')" = "$EXPECTED_OTA_BOM_SHA256" ]
+  [ "$(sha256sum "$SIGNATURE_PATH" | awk '{print $1}')" = "$EXPECTED_OTA_SIGNATURE_SHA256" ]
 fi
 APTLY_PASSPHRASE_FILE="${APTLY_PASSPHRASE_FILE:-}"
 
@@ -178,12 +214,23 @@ from nuvion_app.runtime.release_bom import load_release_bom, verify_release_arti
 
 bom = load_release_bom(Path(sys.argv[1]))
 verify_release_artifact(bom, Path(sys.argv[2]))
-print(f"{bom.bom_digest}\t{bom.agent_version}\t{bom.schema_version}")
+print(
+    f"{bom.bom_digest}\t{bom.agent_version}\t{bom.schema_version}"
+    f"\t{bom.component_sha}\t{bom.release_sequence}"
+)
 PY
   )
-  IFS=$'\t' read -r BOM_DIGEST BOM_VERSION BOM_SCHEMA <<< "$BOM_METADATA"
+  IFS=$'\t' read -r BOM_DIGEST BOM_VERSION BOM_SCHEMA BOM_COMPONENT BOM_SEQUENCE <<< "$BOM_METADATA"
   if [ "$BOM_VERSION" != "$VERSION" ]; then
     echo "Release BOM version does not match VERSION" >&2
+    exit 1
+  fi
+  if [ "$OTA_CONTENT_ONLY" = true ] && {
+    [ "$BOM_SCHEMA" != 2 ] \
+      || [ "$BOM_COMPONENT" != "$EXPECTED_OTA_COMPONENT_SHA" ] \
+      || [ "$BOM_SEQUENCE" != "$EXPECTED_OTA_RELEASE_SEQUENCE" ];
+  }; then
+    echo "content-only BOM differs from the exact candidate identity" >&2
     exit 1
   fi
 
@@ -268,6 +315,12 @@ PY
   install_immutable_release_file "$BOM_PATH" "$content_bom"
   CONTENT_RELEASE_PATHS+=("$content_bom")
 
+  if [ "$OTA_CONTENT_ONLY" = true ]; then
+    [ "$(sha256sum "$content_artifact" | awk '{print $1}')" = "$EXPECTED_OTA_ARTIFACT_SHA256" ]
+    [ "$(sha256sum "$content_bom" | awk '{print $1}')" = "$EXPECTED_OTA_BOM_SHA256" ]
+    [ "$(sha256sum "$content_signature" | awk '{print $1}')" = "$EXPECTED_OTA_SIGNATURE_SHA256" ]
+  fi
+
   if [ "$OTA_CONTENT_ONLY" = false ]; then
     VERSION_DISCOVERY_PATH="$VERSION_BOM_DIR/release-bom.json"
     install_immutable_release_file "$BOM_PATH" "$VERSION_DISCOVERY_PATH"
@@ -331,6 +384,17 @@ upload_immutable_release() {
   local published_release="$1"
   local relative_path="${published_release#"$PUBLIC_DIR/"}"
   local remote_path="gs://$BUCKET/$relative_path"
+  local expected_sha256=""
+  if [ "$OTA_CONTENT_ONLY" = true ]; then
+    case "$(basename "$published_release")" in
+      "$(basename "$BOM_ARTIFACT_PATH")") expected_sha256="$EXPECTED_OTA_ARTIFACT_SHA256" ;;
+      release-bom.json) expected_sha256="$EXPECTED_OTA_BOM_SHA256" ;;
+      release-bom.json.sig) expected_sha256="$EXPECTED_OTA_SIGNATURE_SHA256" ;;
+      *) echo "Unexpected content-only upload path" >&2; exit 1 ;;
+    esac
+    [ "$(sha256sum "$published_release" | awk '{print $1}')" = "$expected_sha256" ] \
+      || { echo "Content-only upload bytes changed before CAS" >&2; exit 1; }
+  fi
   # generation-match=0 is the Cloud Storage atomic create-only CAS. A 412 from
   # an existing/concurrent writer is idempotent only when its bytes are exact.
   if ! gcloud storage cp \
@@ -339,6 +403,19 @@ upload_immutable_release() {
     "$published_release" "$remote_path"; then
     if ! gcloud storage cat "$remote_path" | cmp -s - "$published_release"; then
       echo "Refusing to overwrite existing immutable release bytes: $remote_path" >&2
+      exit 1
+    fi
+  fi
+  if [ "$OTA_CONTENT_ONLY" = true ] && \
+    [ "$(sha256sum "$published_release" | awk '{print $1}')" != "$expected_sha256" ]; then
+    echo "Content-only upload bytes changed during CAS" >&2
+    exit 1
+  fi
+  if [ "$OTA_CONTENT_ONLY" = true ]; then
+    local remote_sha256
+    remote_sha256="$(gcloud storage cat "$remote_path" | sha256sum | awk '{print $1}')"
+    if [ "$remote_sha256" != "$expected_sha256" ]; then
+      echo "Content-only remote bytes differ after CAS: $remote_path" >&2
       exit 1
     fi
   fi

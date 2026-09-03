@@ -382,6 +382,8 @@ def verify_settings(
             "GCP_SA_KEY",
             "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
         ],
+        "iq9075-candidate-sign": ["IQ9075_RELEASE_SIGNING_PRIVATE_KEY"],
+        "iq9075-candidate-stage": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     if (

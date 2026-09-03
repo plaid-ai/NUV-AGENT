@@ -66,6 +66,49 @@
         "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
       ]
     },
+    "iq9075-candidate-sign": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
+      "requiredSecrets": [
+        "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+      ]
+    },
+    "iq9075-candidate-stage": {
+      "requireReviewers": false,
+      "preventSelfReview": false,
+      "reviewerTeamId": null,
+      "deploymentBranchPolicy": {
+        "protectedBranches": false,
+        "customBranchPolicies": true
+      },
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
+      "requiredSecrets": [
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY"
+      ]
+    },
     "face-artifacts-release": {
       "requireReviewers": false,
       "preventSelfReview": false,

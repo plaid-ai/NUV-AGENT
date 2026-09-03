@@ -4284,6 +4284,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "homebrew-release",
                 "apt-release",
                 "iq9075-release",
+                "iq9075-candidate-sign",
+                "iq9075-candidate-stage",
                 "face-artifacts-release",
             },
         )
@@ -4419,6 +4421,8 @@ class SettingsPolicyTest(unittest.TestCase):
             "homebrew-release",
             "apt-release",
             "iq9075-release",
+            "iq9075-candidate-sign",
+            "iq9075-candidate-stage",
             "face-artifacts-release",
         ):
             responses[f"/repos/plaid-ai/NUV-AGENT/environments/{name}"] = {
