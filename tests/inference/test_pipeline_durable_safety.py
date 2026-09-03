@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import signal
 import sys
 import tempfile
 import threading
@@ -743,6 +744,75 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(len(callbacks), 1)
         callbacks[0]()
         self.assertEqual(shutdown_calls, ["shutdown"])
+
+    def test_sigterm_quits_main_loop_and_runs_graceful_shutdown(self) -> None:
+        class _Loop:
+            def __init__(self) -> None:
+                self.running = True
+                self.quit_calls = 0
+
+            def run(self) -> None:
+                installed["handler"](signal.SIGTERM, None)
+
+            def is_running(self) -> bool:
+                return self.running
+
+            def quit(self) -> None:
+                self.quit_calls += 1
+                self.running = False
+
+        success = object()
+        failure = object()
+        installed: dict[str, object] = {}
+        signal_calls: list[tuple[object, object]] = []
+        previous_handler = object()
+        loop = _Loop()
+        app = object.__new__(pipeline.GStreamerInferenceApp)
+        app.pipeline = types.SimpleNamespace(set_state=lambda _state: success)
+        app.depthai_bridge = None
+        app.loop = loop
+        app.shutdown = mock.Mock()
+
+        def set_signal_handler(signum, handler):
+            signal_calls.append((signum, handler))
+            if handler is not previous_handler:
+                installed["handler"] = handler
+
+        with (
+            mock.patch.object(pipeline, "LOCAL_DISPLAY", False),
+            mock.patch.object(pipeline.signal, "getsignal", return_value=previous_handler),
+            mock.patch.object(pipeline.signal, "signal", side_effect=set_signal_handler),
+            mock.patch.object(
+                pipeline.GLib,
+                "idle_add",
+                side_effect=lambda callback: callback() or 1,
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.Gst,
+                "State",
+                types.SimpleNamespace(PLAYING=object()),
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.Gst,
+                "StateChangeReturn",
+                types.SimpleNamespace(FAILURE=failure),
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.threading,
+                "Thread",
+                return_value=types.SimpleNamespace(start=lambda: None),
+            ),
+            mock.patch.object(pipeline, "get_device_state_coordinator"),
+        ):
+            app.run()
+
+        self.assertEqual(loop.quit_calls, 1)
+        app.shutdown.assert_called_once_with()
+        self.assertEqual(signal_calls[0][0], signal.SIGTERM)
+        self.assertIs(signal_calls[-1][1], previous_handler)
 
     def test_unavailable_outbox_retains_anomaly_in_gate_and_enters_stop(self) -> None:
         gate = CriticalEventSafetyGate(max_attempts=1, retry_delay_seconds=0)

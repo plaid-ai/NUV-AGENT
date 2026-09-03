@@ -11,6 +11,7 @@ import time
 import queue
 import warnings
 import random
+import signal
 import string
 import asyncio
 import logging
@@ -3840,6 +3841,31 @@ class GStreamerInferenceApp:
         return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
 
     def run(self):
+        previous_sigterm_handler = None
+        sigterm_handler = None
+
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+            def _handle_sigterm(signum, _frame):
+                signal_name = signal.Signals(signum).name
+                log.info("%s received; requesting graceful shutdown.", signal_name)
+
+                def _quit_main_loop():
+                    if self.loop and self.loop.is_running():
+                        self.loop.quit()
+                    return False
+
+                try:
+                    source_id = GLib.idle_add(_quit_main_loop)
+                except Exception:  # noqa: BLE001 - last-resort process shutdown.
+                    source_id = 0
+                if not source_id and self.loop:
+                    self.loop.quit()
+
+            sigterm_handler = _handle_sigterm
+            signal.signal(signal.SIGTERM, sigterm_handler)
+
         def _start():
             log.info("Starting GStreamer main loop...")
             try:
@@ -3866,14 +3892,20 @@ class GStreamerInferenceApp:
             finally:
                 self.shutdown()
 
-        if LOCAL_DISPLAY and sys.platform == "darwin":
-            log.info("Using Gst.macos_main() for local display on macOS...")
-            def _macos_main(_argc, _argv, _data):
+        try:
+            if LOCAL_DISPLAY and sys.platform == "darwin":
+                log.info("Using Gst.macos_main() for local display on macOS...")
+
+                def _macos_main(_argc, _argv, _data):
+                    _start()
+                    return 0
+
+                Gst.macos_main(_macos_main, sys.argv, "")
+            else:
                 _start()
-                return 0
-            Gst.macos_main(_macos_main, sys.argv, "")
-        else:
-            _start()
+        finally:
+            if sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
     def shutdown(self):
         self.user_data.running = False
