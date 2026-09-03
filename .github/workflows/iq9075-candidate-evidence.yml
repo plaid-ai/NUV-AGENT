@@ -493,40 +493,91 @@ jobs:
             echo "signature_sha256=$(sha256sum "$signature_path" | awk '{print $1}')"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate content-addressed OTA stager
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up gcloud for the pinned project
+      - name: Set up gcloud before cloud credentials
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Create only content-addressed OTA objects
+      - name: Authenticate source GCP credential for downscoping
+        id: candidate-source-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Mint prefix-bound token and destroy broad ADC
         env:
-          VERSION: ${{ inputs.version }}
-          COMPONENT_SHA: ${{ inputs.component_sha }}
-          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
-          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
-          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
-          BOM_SHA256: ${{ steps.signed-inputs.outputs.bom_sha256 }}
-          SIGNATURE_SHA256: ${{ steps.signed-inputs.outputs.signature_sha256 }}
-          APT_RUNTIME_ROOT: ${{ runner.temp }}/iq9075-candidate-stage-${{ github.run_id }}-${{ github.run_attempt }}
+          SOURCE_CREDENTIAL_PATH: ${{ steps.candidate-source-auth.outputs.credentials_file_path }}
+          CAB_POLICY_PATH: ${{ github.workspace }}/packaging/release/iq9075-candidate-gcs-cab.json
+          CAB_TOKEN_DIRECTORY: ${{ runner.temp }}/iq9075-candidate-cab-${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
         run: |
           set -euo pipefail
-          bundle_path="dist/$BUNDLE_NAME"
-          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
-          OTA_CONTENT_ONLY=true \
-          SKIP_APT_PUBLISH=true \
-          BUCKET=apt.plaidai.io \
-          EXPECTED_OTA_COMPONENT_SHA="$COMPONENT_SHA" \
-          EXPECTED_OTA_RELEASE_SEQUENCE="$RELEASE_SEQUENCE" \
-          EXPECTED_OTA_ARTIFACT_SHA256="$BUNDLE_SHA256" \
-          EXPECTED_OTA_BOM_SHA256="$BOM_SHA256" \
-          EXPECTED_OTA_SIGNATURE_SHA256="$SIGNATURE_SHA256" \
-          RELEASE_KEYRING_PATH=packaging/release/trusted-release-keyrings/iq9075-dev.json \
-          RELEASE_TRUST_DOMAIN=iq9075-dev \
-            packaging/apt/publish-gcs.sh \
-              "$bundle_path" "$bom_path" "$bom_path.sig" "$bundle_path"
+          umask 077
+          source_credential="$(realpath "$SOURCE_CREDENTIAL_PATH")"
+          case "$source_credential" in
+            "$GITHUB_WORKSPACE"/gha-creds*.json) ;;
+            *) echo "source credential path is outside the expected workspace boundary" >&2; exit 1 ;;
+          esac
+          [ "$GOOGLE_APPLICATION_CREDENTIALS" = "$source_credential" ]
+          [ "$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" = "$source_credential" ]
+          [ "$GOOGLE_GHA_CREDS_PATH" = "$source_credential" ]
+          [ -f "$source_credential" ] && [ ! -L "$source_credential" ]
+          chmod 0600 "$source_credential"
+          mkdir -m 0700 "$CAB_TOKEN_DIRECTORY"
+          cab_token="$CAB_TOKEN_DIRECTORY/cab-token"
+          cleanup_candidate_credentials() {
+            rm -f -- "$cab_token"
+            if [ -f "$source_credential" ] || [ -L "$source_credential" ]; then
+              rm -f -- "$source_credential"
+            fi
+          }
+          trap cleanup_candidate_credentials EXIT INT TERM
+          env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+          python3 packaging/release/mint-candidate-gcs-cab-token.py \
+            --credential "$source_credential" \
+            --policy "$CAB_POLICY_PATH" \
+            --output-token "$cab_token"
+          [ ! -e "$source_credential" ] && [ ! -L "$source_credential" ]
+          [ -f "$cab_token" ] && [ ! -L "$cab_token" ]
+          [ "$(stat -c %a "$cab_token")" = 600 ]
+          {
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_GHA_CREDS_PATH="
+            echo "CANDIDATE_CAB_TOKEN_FILE=$cab_token"
+          } >> "$GITHUB_ENV"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          unset CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
+          unset GOOGLE_GHA_CREDS_PATH
+          trap - EXIT INT TERM
+
+      - name: Publish exact candidate objects with downscoped token
+        env:
+          VERSION: ${{ inputs.version }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]
+          [ -z "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ]
+          [ -z "${GOOGLE_GHA_CREDS_PATH:-}" ]
+          token_path="$CANDIDATE_CAB_TOKEN_FILE"
+          cleanup_downscoped_token() { rm -f -- "$token_path"; }
+          trap cleanup_downscoped_token EXIT INT TERM
+          [ -f "$token_path" ] && [ ! -L "$token_path" ]
+          [ "$(stat -c %a "$token_path")" = 600 ]
+          bundle_path="$(realpath "dist/$BUNDLE_NAME")"
+          bom_path="$(realpath "dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json")"
+          signature_path="$(realpath "$bom_path.sig")"
+          manifest_path="$(realpath dist/candidate-evidence-manifest.json)"
+          env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+          python3 packaging/release/publish-iq9075-candidate-gcs.py \
+            --token-file "$token_path" \
+            --manifest "$manifest_path" \
+            --artifact "$bundle_path" \
+            --bom "$bom_path" \
+            --signature "$signature_path"
+          [ ! -e "$token_path" ] && [ ! -L "$token_path" ]
+          trap - EXIT INT TERM

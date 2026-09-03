@@ -74,7 +74,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertNotIn("gh api", isolated_sign)
         self.assertEqual(isolated_sign.count("python3 "), 1)
         credentialed_stage = self.stage.split(
-            "- name: Authenticate content-addressed OTA stager", maxsplit=1
+            "- name: Authenticate source GCP credential for downscoping", maxsplit=1
         )[1]
         self.assertNotIn("GH_TOKEN", credentialed_stage)
         self.assertNotIn("gh api", credentialed_stage)
@@ -109,12 +109,38 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         for token in forbidden:
             with self.subTest(token=token):
                 self.assertNotIn(token, self.workflow)
-        self.assertIn("OTA_CONTENT_ONLY=true", self.stage)
-        self.assertIn("SKIP_APT_PUBLISH=true", self.stage)
-        self.assertIn("packaging/apt/publish-gcs.sh", self.stage)
+        self.assertIn("mint-candidate-gcs-cab-token.py", self.stage)
+        self.assertIn("publish-iq9075-candidate-gcs.py", self.stage)
+        self.assertIn("iq9075-candidate-gcs-cab.json", self.stage)
+        self.assertNotIn("packaging/apt/publish-gcs.sh", self.stage)
+        self.assertNotIn("gcloud storage", self.stage)
+        self.assertIn("ifGenerationMatch=0", (ROOT / "packaging/release/publish-iq9075-candidate-gcs.py").read_text(encoding="utf-8"))
         self.assertIn("releases/by-bom-sha256/", self.sign)
         self.assertIn("retention-days: 2", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
+
+    def test_stage_destroys_broad_adc_before_direct_json_api_publisher(self) -> None:
+        setup = self.stage.index("Set up gcloud before cloud credentials")
+        authenticate = self.stage.index("Authenticate source GCP credential for downscoping")
+        mint = self.stage.index("Mint prefix-bound token and destroy broad ADC")
+        publish = self.stage.index("Publish exact candidate objects with downscoped token")
+        self.assertLess(setup, authenticate)
+        self.assertLess(authenticate, mint)
+        self.assertLess(mint, publish)
+        mint_step = self.stage[mint:publish]
+        for variable in (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            "GOOGLE_GHA_CREDS_PATH",
+        ):
+            self.assertIn(variable, mint_step)
+            self.assertIn(f"{variable}=", mint_step)
+        publish_step = self.stage[publish:]
+        self.assertNotIn("secrets.GCP_SA_KEY", publish_step)
+        self.assertNotIn("google-github-actions", publish_step)
+        self.assertIn("CANDIDATE_CAB_TOKEN_FILE", publish_step)
+        self.assertIn('env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1', mint_step)
+        self.assertIn('env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1', publish_step)
 
     def test_every_external_action_is_full_sha_pinned(self) -> None:
         uses = re.findall(r"^\s+uses:\s+([^\s]+)", self.workflow, flags=re.MULTILINE)
@@ -131,6 +157,13 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("CANDIDATE_BOM_SIGNATURE", runbook)
         self.assertIn("load_signed_release_bom", runbook)
         self.assertIn("verify_release_artifact", runbook)
+        self.assertIn("Credential Access Boundary", runbook)
+        self.assertIn("storage.objects.create", runbook)
+        self.assertIn("storage.objects.get", runbook)
+        self.assertIn("ifGenerationMatch=0", runbook)
+        self.assertIn("broad legacy service-account", runbook)
+        self.assertIn("Workload Identity Federation", runbook)
+        self.assertIn("same descriptors", runbook)
 
     def test_content_only_staging_never_creates_version_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
