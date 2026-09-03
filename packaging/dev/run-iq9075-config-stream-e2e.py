@@ -690,6 +690,13 @@ def prepare(rid, manifest_sha):
         raise Failure("Fleet trust transaction is not live and release-bound")
     if work.exists() or work.is_symlink() or runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
         raise Failure("config-stream workspace already exists")
+    runtime_parent_existed = runtime.parent.exists()
+    dropin_parent_existed = dropin.parent.exists()
+    for parent in (runtime.parent, dropin.parent):
+        if parent.exists():
+            meta = parent.lstat()
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
+                raise Failure("config-stream parent path is unsafe")
     was_active = service_active()
     if not was_active:
         raise Failure("Agent service must be active before config-stream E2E")
@@ -714,6 +721,8 @@ def prepare(rid, manifest_sha):
             "configBeforeSha256": sha(config_raw),
             "configTestSha256": sha(test_config),
             "dropinSha256": None,
+            "runtimeParentExisted": runtime_parent_existed,
+            "dropinParentExisted": dropin_parent_existed,
         }
         atomic(work / "state.json", canonical(state))
         atomic(CONFIG, test_config, stat.S_IMODE(config_meta.st_mode), config_meta.st_uid, config_meta.st_gid)
@@ -809,6 +818,20 @@ def restore(rid, internal=False):
         if runtime.is_symlink() or not runtime.is_dir():
             raise Failure("config-stream runtime path is unsafe")
         shutil.rmtree(runtime)
+    for parent, existed in (
+        (runtime.parent, state.get("runtimeParentExisted")),
+        (dropin.parent, state.get("dropinParentExisted")),
+    ):
+        if type(existed) is not bool:
+            raise Failure("config-stream parent snapshot is invalid")
+        if not existed and parent.exists():
+            meta = parent.lstat()
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
+                raise Failure("config-stream parent restore path is unsafe")
+            try:
+                parent.rmdir()
+            except OSError as exc:
+                raise Failure("config-stream parent is not empty after cleanup") from exc
     systemctl("daemon-reload")
     exact = verify_restored(state["snapshots"])
     if not exact:
