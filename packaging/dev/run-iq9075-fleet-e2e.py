@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shlex
+import signal
 import socket
 import stat
 import subprocess
@@ -21,7 +23,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 PROTOCOL_VERSION = "iq9075-fleet-e2e-v2"
@@ -37,6 +39,7 @@ MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_BOOTSTRAP_INSTALLER_BYTES = 2 * 1024 * 1024
 MAX_BOOTSTRAP_DEB_BYTES = 4 * 1024 * 1024 * 1024
+MAX_CANDIDATE_BUNDLE_BYTES = 4 * 1024 * 1024 * 1024
 RUN_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -69,8 +72,52 @@ BOARD_COMMANDS = frozenset(
         "arm-oak-fault",
         "evidence",
         "cleanup",
+        "candidate-soak",
+        "discard-candidate-staging",
     }
 )
+CANDIDATE_PERSISTENT_PATHS = (
+    "/etc/nuv-agent",
+    "/etc/nuvion-updater",
+    "/var/lib/nuv-agent",
+    "/var/lib/nuvion-updater",
+)
+CANDIDATE_TMPFS_LIMITS = {
+    "/tmp": {"bytes": 256 * 1024 * 1024, "inodes": 8192},
+    "/var/tmp": {"bytes": 64 * 1024 * 1024, "inodes": 4096},
+    "/dev/shm": {"bytes": 256 * 1024 * 1024, "inodes": 8192},
+}
+CANDIDATE_INACCESSIBLE_PATHS = ("/run/user",)
+CANDIDATE_SYSTEMD_EXPECTED_PROPERTIES = {
+    "CPUQuotaPerSecUSec": "3s",
+    "CPUQuotaPeriodUSec": "1s",
+    "KillMode": "control-group",
+    "LimitCORE": "0",
+    "LimitFSIZE": "8388608",
+    "LockPersonality": "yes",
+    "MemoryHigh": "805306368",
+    "MemoryMax": "1073741824",
+    "MemorySwapMax": "0",
+    "NoNewPrivileges": "yes",
+    "ProtectControlGroups": "yes",
+    "ProtectHome": "yes",
+    "ProtectKernelModules": "yes",
+    "ProtectKernelTunables": "yes",
+    "ProtectProc": "invisible",
+    "ProtectSystem": "strict",
+    "ProcSubset": "pid",
+    "RemainAfterExit": "yes",
+    "RestrictNamespaces": "yes",
+    "RestrictRealtime": "yes",
+    "RestrictSUIDSGID": "yes",
+    "RuntimeMaxUSec": "12min",
+    "SendSIGKILL": "yes",
+    "StandardError": "null",
+    "StandardOutput": "null",
+    "TasksMax": "256",
+    "TimeoutStopUSec": "30s",
+    "Type": "exec",
+}
 FIXED_DESTINATIONS = {
     "agentCommand": "/etc/nuv-agent/fleet-command-keyring.json",
     "updaterCommand": "/etc/nuvion-updater/command-keyring.json",
@@ -78,6 +125,21 @@ FIXED_DESTINATIONS = {
     "health": "/etc/nuvion-updater/health-attestation-keyring.json",
     "binding": "/etc/nuvion-updater/device-binding.json",
 }
+PRODUCTION_TRANSACTION_FILES = frozenset(
+    {"/etc/nuv-agent/agent.env", *FIXED_DESTINATIONS.values()}
+)
+PRODUCTION_TRANSACTION_DIRECTORIES = frozenset(
+    {"/etc/nuv-agent", "/etc/nuvion-updater"}
+)
+PRODUCTION_UNITS = frozenset(
+    {
+        "nuv-agent.service",
+        "nuv-agent-updater.service",
+        "nuv-agent-updater.socket",
+    }
+)
+CANDIDATE_REQUIRED_SOAK_SECONDS = 120
+CANDIDATE_UID_SCAN_INTERVAL_SECONDS = 0.05
 SECRET_KEY_RE = re.compile(
     r"(?:password|passwd|secret|private|credential|compactjws|access.?token|"
     r"refresh.?token|authorization|raw.?config|sqlite|sdp|ice.?candidate)",
@@ -91,6 +153,7 @@ SECRET_VALUE_RES = (
     re.compile(r"(?im)^v=0\r?$.*^m=(?:audio|video)\s"),
     re.compile(r"(?i)\bcandidate:[0-9]+\s"),
 )
+SAFE_SECRET_LIKE_FIELDS = frozenset({"offerSdpHadPinnedProfile"})
 
 BOOTSTRAP_REMOTE_PROGRAM = r"""
 import hashlib
@@ -376,6 +439,15 @@ class RunnerError(RuntimeError):
     """Stable host-side failure without remote output or credential material."""
 
 
+def disable_core_dumps() -> None:
+    """Fail closed before credentials can enter this process."""
+
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError) as exc:
+        raise RunnerError("cannot disable core dumps") from exc
+
+
 def strict_json(payload: bytes | str, *, label: str) -> dict[str, Any]:
     def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -406,6 +478,9 @@ def _askpass_entrypoint() -> bool:
     endpoint = os.environ.get("NUVION_E2E_ASKPASS_SOCKET")
     if not endpoint:
         return False
+    # A failure propagates to the dedicated bottom-level handler and produces
+    # a nonzero askpass exit without reading or printing the password.
+    disable_core_dumps()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(2.0)
@@ -540,7 +615,14 @@ def assert_no_secret_material(value: object) -> None:
     def visit(item: object) -> None:
         if isinstance(item, Mapping):
             for key, child in item.items():
-                if SECRET_KEY_RE.search(str(key)):
+                if str(key) in SAFE_SECRET_LIKE_FIELDS and not isinstance(
+                    child, bool
+                ):
+                    raise RunnerError("output contains an invalid safe evidence field")
+                if (
+                    str(key) not in SAFE_SECRET_LIKE_FIELDS
+                    and SECRET_KEY_RE.search(str(key))
+                ):
                     raise RunnerError("output contains a forbidden field")
                 visit(child)
         elif isinstance(item, list):
@@ -717,21 +799,102 @@ class LocalProcessRunner:
     ) -> ProcessResult:
         if isinstance(argv, (str, bytes)) or not argv:
             raise TypeError("argv must be a non-empty sequence")
+        process = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(env) if env is not None else None,
+            start_new_session=True,
+        )
+        if process.stdout is None or process.stderr is None:
+            raise RunnerError("bounded subprocess pipes are unavailable")
+        stdout = bytearray()
+        stderr = bytearray()
+        output_limit = threading.Event()
+        drain_errors: list[BaseException] = []
+        kill_lock = threading.Lock()
+
+        def kill_process_group() -> None:
+            with kill_lock:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+
+        def drain(stream: Any, destination: bytearray, maximum: int) -> None:
+            try:
+                total = 0
+                while True:
+                    chunk = stream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    remaining = maximum - len(destination)
+                    if remaining > 0:
+                        destination.extend(chunk[:remaining])
+                    if total > maximum and not output_limit.is_set():
+                        output_limit.set()
+                        kill_process_group()
+            except BaseException as exc:
+                drain_errors.append(exc)
+                kill_process_group()
+            finally:
+                stream.close()
+
+        readers = [
+            threading.Thread(
+                target=drain,
+                args=(process.stdout, stdout, MAX_OUTPUT_BYTES),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=drain,
+                args=(process.stderr, stderr, 32 * 1024),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        if process.stdin is not None:
+            try:
+                process.stdin.write(input_bytes or b"")
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+        timed_out = False
         try:
-            completed = subprocess.run(
-                list(argv),
-                input=input_bytes,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                env=dict(env) if env is not None else None,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RunnerError("bounded SSH operation timed out") from exc
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            kill_process_group()
+            returncode = process.wait(timeout=10)
+        for reader in readers:
+            reader.join(timeout=10)
+        if any(reader.is_alive() for reader in readers):
+            kill_process_group()
+            for stream in (process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            for reader in readers:
+                reader.join(timeout=1)
+        if timed_out:
+            raise RunnerError("bounded SSH operation timed out")
+        if output_limit.is_set():
+            raise RunnerError("bounded SSH operation exceeded output limit")
+        if drain_errors or any(reader.is_alive() for reader in readers):
+            raise RunnerError("bounded SSH output drain failed")
         return ProcessResult(
-            completed.returncode,
-            completed.stdout[:MAX_OUTPUT_BYTES],
-            completed.stderr[: 32 * 1024],
+            returncode,
+            bytes(stdout),
+            bytes(stderr),
         )
 
 
@@ -1049,6 +1212,32 @@ class OpenSshTransport:
             raise RunnerError(f"bootstrap staging upload failed: {role}")
         return destination
 
+    def copy_candidate_input(self, source: Path, *, run_id: str, role: str) -> str:
+        canonical_run_id(run_id)
+        suffixes = {
+            "candidate-bundle": "candidate-bundle.tar.gz",
+            "candidate-bom": "candidate-bom.json",
+            "oak-harness": "oak-harness.sh",
+        }
+        if role not in suffixes:
+            raise RunnerError("candidate staging role is invalid")
+        destination = f"/tmp/nuvion-fleet-e2e-{run_id}-{suffixes[role]}"
+        result = self._run_with_auth(
+            [
+                "/usr/bin/scp",
+                *self.base_options,
+                "-P",
+                str(self.port),
+                "--",
+                str(source),
+                f"{self.user}@{self.host}:{destination}",
+            ],
+            timeout=300 if role == "candidate-bundle" else 30,
+        )
+        if result.returncode != 0:
+            raise RunnerError(f"candidate staging upload failed: {role}")
+        return destination
+
     def bootstrap_updater(
         self,
         *,
@@ -1171,11 +1360,17 @@ class HostJournal:
 
 def validate_paths_distinct(output_dir: Path, inputs: Sequence[Path]) -> None:
     output_paths = {
-        output_dir / "journal.json",
-        output_dir / "immutable-manifest.json",
-        output_dir / "evidence.json",
-        output_dir / "bootstrap-evidence.json",
-        output_dir / "known_hosts",
+        (output_dir / name).resolve(strict=False)
+        for name in (
+            "journal.json",
+            "immutable-manifest.json",
+            "evidence.json",
+            "bootstrap-evidence.json",
+            "candidate-soak-raw.json",
+            "candidate-soak-evidence.json",
+            "cleanup-evidence.json",
+            "known_hosts",
+        )
     }
     resolved_inputs = {path.resolve() for path in inputs}
     if len(resolved_inputs) != len(inputs):
@@ -1370,6 +1565,938 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, object]:
     return rebuilt
 
 
+def validate_candidate_inputs(
+    *,
+    bom_payload: bytes,
+    bundle_sha256: str,
+    bundle_size: int,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    bom = strict_json(bom_payload, label="candidate BOM")
+    expected_fields = {
+        "schemaVersion",
+        "bomId",
+        "bomDigest",
+        "releaseSequence",
+        "agentVersion",
+        "componentSha",
+        "configSchema",
+        "minUpdaterVersion",
+        "targets",
+        "artifact",
+        "builtAt",
+    }
+    scenario = manifest.get("scenario")
+    release = scenario.get("release") if isinstance(scenario, Mapping) else None
+    artifact = bom.get("artifact")
+    unsigned = dict(bom)
+    unsigned.pop("bomDigest", None)
+    canonical_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    required_target = {
+        "productModel": "IQ9075_DEV",
+        "platformProfile": "iq9075_dev",
+        "hardwareRevision": "QCS9075-EVK",
+        "architecture": "aarch64",
+    }
+    if (
+        set(bom) != expected_fields
+        or type(bom.get("schemaVersion")) is not int
+        or bom.get("schemaVersion") != 2
+        or not isinstance(scenario, Mapping)
+        or scenario.get("type") != "oak-fault-rollback"
+        or not isinstance(release, Mapping)
+        or bom.get("bomDigest") != canonical_digest
+        or bom.get("bomDigest") != scenario.get("expectedBomDigest")
+        or bom.get("agentVersion") != release.get("agentVersion")
+        or bom.get("releaseSequence") != release.get("releaseSequence")
+        or bom.get("componentSha") != release.get("componentSha")
+        or bom.get("configSchema") != release.get("configSchema")
+        or not isinstance(bom.get("targets"), list)
+        or required_target not in bom["targets"]
+        or not isinstance(artifact, Mapping)
+        or set(artifact) != {"name", "kind", "sha256", "sizeBytes"}
+        or artifact.get("kind") != "agent-bundle"
+        or artifact.get("sha256") != bundle_sha256
+        or artifact.get("sizeBytes") != bundle_size
+        or release.get("artifactDigest") != f"sha256:{bundle_sha256}"
+    ):
+        raise RunnerError("candidate bundle/BOM differs from signed rollback")
+    return bom
+
+
+def validate_candidate_soak_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    run_id: str,
+    manifest: Mapping[str, Any],
+    bundle_sha256: str,
+    bom_sha256: str,
+    harness_sha256: str,
+    fleet_evidence_sha256: str,
+    raw_evidence_sha256: str | None = None,
+    cleanup_evidence_sha256: str | None = None,
+    require_cleanup_evidence: bool = False,
+) -> None:
+    def timestamp(value: object, *, label: str) -> datetime:
+        if not isinstance(value, str) or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{3})?Z",
+            value,
+        ) is None:
+            raise RunnerError(f"candidate soak {label} is not canonical UTC")
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as exc:
+            raise RunnerError(
+                f"candidate soak {label} is not canonical UTC"
+            ) from exc
+        if parsed.tzinfo != timezone.utc:
+            raise RunnerError(f"candidate soak {label} is not canonical UTC")
+        return parsed
+
+    expected_root = {
+        "schemaVersion",
+        "kind",
+        "protocolVersion",
+        "runId",
+        "startedAt",
+        "completedAt",
+        "complete",
+        "outcome",
+        "candidate",
+        "fleetEvidenceSha256",
+        "rawEvidenceSha256",
+        "rawEvidence",
+        "executionProof",
+        "collectorProof",
+        "terminationProof",
+        "productionRestoration",
+        "pre",
+        "post",
+        "gates",
+    }
+    if require_cleanup_evidence:
+        expected_root.update({"cleanupEvidenceSha256", "cleanupEvidence"})
+    scenario = manifest["scenario"]
+    expected_slot = (
+        f"/opt/nuv-agent/candidates/{run_id}-{scenario['expectedBomDigest'][7:]}"
+    )
+    candidate = evidence.get("candidate")
+    outcome = evidence.get("outcome")
+    gates = evidence.get("gates")
+    pre = evidence.get("pre")
+    post = evidence.get("post")
+    expected_slots = {
+        "current": scenario["expectedPreviousSlot"],
+        "previous": "releases/" + scenario["expectedBomDigest"][7:],
+    }
+    if (
+        set(evidence) != expected_root
+        or evidence.get("schemaVersion") != 1
+        or evidence.get("kind") != "nuvion-iq9075-candidate-soak-evidence"
+        or evidence.get("protocolVersion") != PROTOCOL_VERSION
+        or evidence.get("runId") != run_id
+        or evidence.get("complete") is not True
+        or not isinstance(candidate, Mapping)
+        or set(candidate)
+        != {
+            "slotKind",
+            "slot",
+            "bomDigest",
+            "bundleSha256",
+            "bomSha256",
+            "harnessSha256",
+            "controlMarkerSha256",
+        }
+        or candidate.get("slotKind") != "candidate"
+        or candidate.get("slot") != expected_slot
+        or candidate.get("bomDigest") != scenario["expectedBomDigest"]
+        or candidate.get("bundleSha256") != bundle_sha256
+        or candidate.get("bomSha256") != bom_sha256
+        or candidate.get("harnessSha256") != harness_sha256
+        or not isinstance(candidate.get("controlMarkerSha256"), str)
+        or SHA256_RE.fullmatch(candidate["controlMarkerSha256"]) is None
+        or evidence.get("fleetEvidenceSha256") != fleet_evidence_sha256
+        or not isinstance(outcome, Mapping)
+        or set(outcome) != {"status", "errorCode"}
+        or outcome.get("status") not in {"passed", "failed"}
+        or not isinstance(gates, Mapping)
+        or set(gates)
+        != {
+            "signedRollbackTerminal",
+            "candidateBound",
+            "rawEvidencePreserved",
+            "slotsUnchanged",
+            "releaseTreesUnchanged",
+            "antiReplayUnchanged",
+            "oakIdentityUnchanged",
+            "freshBaselineProcess",
+            "harnessBytesPinned",
+            "harnessCopyRemoved",
+            "resourceLimitsApplied",
+            "boundedOutput",
+            "persistentStateReadOnly",
+            "persistentStateUnchanged",
+            "productionTrustRestored",
+            "trustedSoakDuration",
+            "continuousUidIsolation",
+            "cgroupTerminated",
+            "harnessPassed",
+        }
+        or not isinstance(pre, Mapping)
+        or not isinstance(post, Mapping)
+        or set(pre)
+        != {
+            "slots",
+            "antiReplay",
+            "oak",
+            "runtime",
+            "persistentState",
+            "releaseTrees",
+        }
+        or set(post)
+        != {
+            "restoredAt",
+            "slots",
+            "antiReplay",
+            "oak",
+            "runtime",
+            "persistentState",
+            "releaseTrees",
+        }
+    ):
+        raise RunnerError("candidate soak evidence schema is invalid")
+    if require_cleanup_evidence:
+        cleanup_evidence = evidence.get("cleanupEvidence")
+        if not isinstance(cleanup_evidence, Mapping):
+            raise RunnerError("candidate soak cleanup evidence is missing")
+        validate_cleanup_result(cleanup_evidence, run_id=run_id)
+        cleanup_proof = cleanup_evidence.get("proof")
+        cleanup_payload = (
+            json.dumps(
+                dict(cleanup_evidence),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        actual_cleanup_sha256 = hashlib.sha256(cleanup_payload).hexdigest()
+        if (
+            cleanup_evidence.get("phase") != "RESTORED"
+            or not isinstance(cleanup_proof, Mapping)
+            or cleanup_proof.get("transactionPhase") != "RESTORED"
+            or evidence.get("cleanupEvidenceSha256") != actual_cleanup_sha256
+            or (
+                cleanup_evidence_sha256 is not None
+                and cleanup_evidence_sha256 != actual_cleanup_sha256
+            )
+        ):
+            raise RunnerError("candidate soak cleanup evidence is not bound")
+    passed = outcome["status"] == "passed"
+    raw = evidence.get("rawEvidence")
+    pre_runtime = pre["runtime"]
+    post_runtime = post["runtime"]
+    pre_oak = pre["oak"]
+    post_oak = post["oak"]
+
+    def valid_oak(value: object) -> bool:
+        return bool(
+            isinstance(value, Mapping)
+            and set(value)
+            == {
+                "port",
+                "vendorId",
+                "productId",
+                "speedMbps",
+                "mxidSha256",
+                "attached",
+                "bound",
+            }
+            and isinstance(value.get("port"), str)
+            and re.fullmatch(r"2-1(?:\.[1-9][0-9]*)+", value["port"])
+            is not None
+            and value.get("vendorId") == "03e7"
+            and value.get("productId") == "f63b"
+            and not isinstance(value.get("speedMbps"), bool)
+            and isinstance(value.get("speedMbps"), int)
+            and value["speedMbps"] >= 5000
+            and isinstance(value.get("mxidSha256"), str)
+            and SHA256_RE.fullmatch(value["mxidSha256"]) is not None
+            and value.get("attached") is True
+            and value.get("bound") is True
+        )
+
+    def valid_persistent_state(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "roots",
+            "sha256",
+            "entries",
+            "bytes",
+        }:
+            return False
+        roots = value.get("roots")
+        if (
+            value.get("schemaVersion") != 1
+            or isinstance(value.get("schemaVersion"), bool)
+            or not isinstance(roots, Mapping)
+            or set(roots) != set(CANDIDATE_PERSISTENT_PATHS)
+            or not isinstance(value.get("sha256"), str)
+            or SHA256_RE.fullmatch(value["sha256"]) is None
+        ):
+            return False
+        total_entries = 0
+        total_bytes = 0
+        for root in roots.values():
+            if (
+                not isinstance(root, Mapping)
+                or set(root) != {"exists", "entries", "bytes", "sha256"}
+                or not isinstance(root.get("exists"), bool)
+                or isinstance(root.get("entries"), bool)
+                or not isinstance(root.get("entries"), int)
+                or root["entries"] < 0
+                or isinstance(root.get("bytes"), bool)
+                or not isinstance(root.get("bytes"), int)
+                or root["bytes"] < 0
+                or not isinstance(root.get("sha256"), str)
+                or SHA256_RE.fullmatch(root["sha256"]) is None
+                or (root["exists"] is False and (root["entries"] or root["bytes"]))
+            ):
+                return False
+            total_entries += root["entries"]
+            total_bytes += root["bytes"]
+        serialized = (
+            json.dumps(
+                dict(roots),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        return bool(
+            value.get("entries") == total_entries
+            and value.get("bytes") == total_bytes
+            and hashlib.sha256(serialized).hexdigest() == value["sha256"]
+        )
+
+    def valid_release_trees(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "slots",
+            "sha256",
+            "entries",
+            "bytes",
+        }:
+            return False
+        trees = value.get("slots")
+        if (
+            value.get("schemaVersion") != 1
+            or not isinstance(trees, Mapping)
+            or set(trees) != {"current", "previous"}
+            or not isinstance(value.get("sha256"), str)
+            or SHA256_RE.fullmatch(value["sha256"]) is None
+        ):
+            return False
+        total_entries = 0
+        total_bytes = 0
+        for role, target in expected_slots.items():
+            tree = trees.get(role)
+            if (
+                not isinstance(tree, Mapping)
+                or set(tree)
+                != {"target", "exists", "entries", "bytes", "sha256"}
+                or tree.get("target") != target
+                or tree.get("exists") is not True
+                or isinstance(tree.get("entries"), bool)
+                or not isinstance(tree.get("entries"), int)
+                or tree["entries"] < 1
+                or isinstance(tree.get("bytes"), bool)
+                or not isinstance(tree.get("bytes"), int)
+                or tree["bytes"] < 0
+                or not isinstance(tree.get("sha256"), str)
+                or SHA256_RE.fullmatch(tree["sha256"]) is None
+            ):
+                return False
+            total_entries += tree["entries"]
+            total_bytes += tree["bytes"]
+        serialized = (
+            json.dumps(
+                dict(trees),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        return bool(
+            value.get("entries") == total_entries
+            and value.get("bytes") == total_bytes
+            and hashlib.sha256(serialized).hexdigest() == value["sha256"]
+        )
+
+    def valid_execution_proof(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "unit",
+            "mainPid",
+            "controlGroup",
+            "pidControlGroup",
+            "recursivePopulated",
+            "uidIsolation",
+            "systemdProperties",
+            "mountSandbox",
+        }:
+            return False
+        unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+        control_group = "/system.slice/" + unit
+        properties = value.get("systemdProperties")
+        mounts = value.get("mountSandbox")
+        uid_isolation = value.get("uidIsolation")
+        if (
+            value.get("schemaVersion") != 1
+            or value.get("unit") != unit
+            or value.get("controlGroup") != control_group
+            or value.get("pidControlGroup") != control_group
+            or value.get("recursivePopulated") is not True
+            or type(value.get("mainPid")) is not int
+            or value["mainPid"] < 2
+            or not isinstance(properties, Mapping)
+            or dict(properties) != CANDIDATE_SYSTEMD_EXPECTED_PROPERTIES
+            or not isinstance(mounts, Mapping)
+            or not isinstance(uid_isolation, Mapping)
+            or set(uid_isolation) != {"before", "during"}
+            or set(mounts)
+            != {
+                "temporaryFilesystems",
+                "readOnlyPaths",
+                "readWritePath",
+                "inaccessiblePaths",
+                "totalTmpfsBytes",
+                "totalTmpfsInodes",
+            }
+        ):
+            return False
+        uid_before = uid_isolation.get("before")
+        uid_during = uid_isolation.get("during")
+        if (
+            not isinstance(uid_before, Mapping)
+            or not isinstance(uid_during, Mapping)
+            or set(uid_before)
+            != {"schemaVersion", "uid", "pids", "controlGroup", "stableScans"}
+            or set(uid_during)
+            != {"schemaVersion", "uid", "pids", "controlGroup", "stableScans"}
+            or uid_before.get("schemaVersion") != 1
+            or type(uid_before.get("uid")) is not int
+            or uid_before["uid"] < 1
+            or uid_before.get("pids") != []
+            or uid_before.get("controlGroup") is not None
+            or uid_before.get("stableScans") != 2
+            or uid_during.get("schemaVersion") != 1
+            or uid_during.get("uid") != uid_before.get("uid")
+            or not isinstance(uid_during.get("pids"), list)
+            or not uid_during["pids"]
+            or any(type(pid) is not int or pid < 2 for pid in uid_during["pids"])
+            or len(set(uid_during["pids"])) != len(uid_during["pids"])
+            or uid_during.get("controlGroup") != control_group
+            or uid_during.get("stableScans") != 2
+        ):
+            return False
+        temporary = mounts.get("temporaryFilesystems")
+        read_only = mounts.get("readOnlyPaths")
+        inaccessible = mounts.get("inaccessiblePaths")
+        writable = mounts.get("readWritePath")
+        if (
+            not isinstance(temporary, Mapping)
+            or set(temporary) != set(CANDIDATE_TMPFS_LIMITS)
+            or not isinstance(read_only, Mapping)
+            or set(read_only) != set(CANDIDATE_PERSISTENT_PATHS)
+            or not isinstance(inaccessible, Mapping)
+            or set(inaccessible) != set(CANDIDATE_INACCESSIBLE_PATHS)
+            or not isinstance(writable, Mapping)
+            or set(writable) != {"mountId", "mountPoint", "readOnly"}
+            or writable.get("mountPoint")
+            != f"/var/lib/nuvion-fleet-e2e/runs/{run_id}"
+            or writable.get("readOnly") is not False
+        ):
+            return False
+        mount_id_points: dict[int, str] = {}
+
+        def valid_mount_id(raw: object, mount_point: str) -> bool:
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+                return False
+            previous = mount_id_points.get(raw)
+            if previous is not None and previous != mount_point:
+                return False
+            mount_id_points[raw] = mount_point
+            return True
+
+        if not valid_mount_id(writable.get("mountId"), str(writable["mountPoint"])):
+            return False
+        total_bytes = 0
+        total_inodes = 0
+        for path, limits in CANDIDATE_TMPFS_LIMITS.items():
+            mount = temporary.get(path)
+            if (
+                not isinstance(mount, Mapping)
+                or set(mount)
+                != {"mountId", "fsType", "sizeBytes", "inodeLimit", "readOnly"}
+                or not valid_mount_id(mount.get("mountId"), path)
+                or mount.get("fsType") != "tmpfs"
+                or mount.get("readOnly") is not False
+                or isinstance(mount.get("sizeBytes"), bool)
+                or not isinstance(mount.get("sizeBytes"), int)
+                or not 0 < mount["sizeBytes"] <= limits["bytes"]
+                or isinstance(mount.get("inodeLimit"), bool)
+                or not isinstance(mount.get("inodeLimit"), int)
+                or not 0 < mount["inodeLimit"] <= limits["inodes"]
+            ):
+                return False
+            total_bytes += mount["sizeBytes"]
+            total_inodes += mount["inodeLimit"]
+        for path in CANDIDATE_PERSISTENT_PATHS:
+            mount = read_only.get(path)
+            mount_point = mount.get("mountPoint") if isinstance(mount, Mapping) else None
+            normalized_mount = (
+                isinstance(mount_point, str)
+                and PurePosixPath(mount_point).is_absolute()
+                and ".." not in PurePosixPath(mount_point).parts
+                and str(PurePosixPath(mount_point)) == mount_point
+            )
+            if (
+                not isinstance(mount, Mapping)
+                or set(mount) != {"mountId", "mountPoint", "readOnly"}
+                or not normalized_mount
+                or not valid_mount_id(mount.get("mountId"), str(mount_point))
+                or not (
+                    path == mount_point
+                    or path.startswith(str(mount_point).rstrip("/") + "/")
+                )
+                or mount.get("readOnly") is not True
+            ):
+                return False
+        for path in CANDIDATE_INACCESSIBLE_PATHS:
+            mount = inaccessible.get(path)
+            if (
+                not isinstance(mount, Mapping)
+                or set(mount) != {"mountId", "mountPoint", "mode", "readOnly"}
+                or not valid_mount_id(mount.get("mountId"), path)
+                or mount.get("mountPoint") != path
+                or mount.get("mode") != "0000"
+                or mount.get("readOnly") is not True
+            ):
+                return False
+        return bool(
+            mounts.get("totalTmpfsBytes") == total_bytes
+            and mounts.get("totalTmpfsInodes") == total_inodes
+            and total_bytes
+            <= sum(item["bytes"] for item in CANDIDATE_TMPFS_LIMITS.values())
+            and total_inodes
+            <= sum(item["inodes"] for item in CANDIDATE_TMPFS_LIMITS.values())
+        )
+
+    def valid_termination_proof(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "unit",
+            "controlGroup",
+            "initialPresent",
+            "initialPopulated",
+            "killSignals",
+            "stopSucceeded",
+            "resetPerformed",
+            "recursivePopulated",
+            "loadState",
+            "activeState",
+            "cgroupRemoved",
+        }:
+            return False
+        unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+        signals = value.get("killSignals")
+        return bool(
+            value.get("schemaVersion") == 1
+            and value.get("unit") == unit
+            and value.get("controlGroup") == "/system.slice/" + unit
+            and isinstance(value.get("initialPresent"), bool)
+            and isinstance(value.get("initialPopulated"), bool)
+            and isinstance(signals, list)
+            and signals in ([], ["SIGTERM"], ["SIGTERM", "SIGKILL"])
+            and value.get("stopSucceeded") is True
+            and isinstance(value.get("resetPerformed"), bool)
+            and value.get("recursivePopulated") is False
+            and value.get("loadState") == "not-found"
+            and value.get("activeState") == "inactive"
+            and value.get("cgroupRemoved") is True
+            and (value.get("initialPopulated") is False or bool(signals))
+        )
+
+    def valid_collector_proof(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "unit",
+            "controlGroup",
+            "requiredSeconds",
+            "elapsedSeconds",
+            "scanIntervalSeconds",
+            "sampleCount",
+            "observedPids",
+            "escapeDetected",
+            "allSamplesWithinCgroup",
+            "durationSatisfied",
+            "terminalStatus",
+            "afterTermination",
+        }:
+            return False
+        unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+        terminal = value.get("terminalStatus")
+        after = value.get("afterTermination")
+        pids = value.get("observedPids")
+        return bool(
+            value.get("schemaVersion") == 1
+            and value.get("unit") == unit
+            and value.get("controlGroup") == "/system.slice/" + unit
+            and value.get("requiredSeconds") == CANDIDATE_REQUIRED_SOAK_SECONDS
+            and type(value.get("elapsedSeconds")) in {int, float}
+            and value["elapsedSeconds"] >= CANDIDATE_REQUIRED_SOAK_SECONDS
+            and value.get("scanIntervalSeconds")
+            == CANDIDATE_UID_SCAN_INTERVAL_SECONDS
+            and type(value.get("sampleCount")) is int
+            and value["sampleCount"] >= 1
+            and isinstance(pids, list)
+            and all(type(pid) is int and pid >= 2 for pid in pids)
+            and len(pids) == len(set(pids))
+            and value.get("escapeDetected") is None
+            and value.get("allSamplesWithinCgroup") is True
+            and value.get("durationSatisfied") is True
+            and isinstance(terminal, Mapping)
+            and set(terminal)
+            == {
+                "ActiveState",
+                "ExecMainCode",
+                "ExecMainStatus",
+                "Result",
+                "SubState",
+            }
+            and terminal.get("Result") == "success"
+            and terminal.get("ExecMainCode") == "1"
+            and terminal.get("ExecMainStatus") == "0"
+            and isinstance(after, Mapping)
+            and set(after)
+            == {"schemaVersion", "uid", "pids", "controlGroup", "stableScans"}
+            and after.get("schemaVersion") == 1
+            and type(after.get("uid")) is int
+            and after["uid"] >= 1
+            and after.get("pids") == []
+            and after.get("controlGroup") is None
+            and after.get("stableScans") == 2
+        )
+
+    def valid_production_restoration(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schemaVersion",
+            "transactionPhase",
+            "manifestSha256",
+            "files",
+            "directories",
+            "units",
+            "sha256",
+        }:
+            return False
+        files = value.get("files")
+        directories = value.get("directories")
+        units = value.get("units")
+        expected_manifest_sha = hashlib.sha256(
+            (
+                json.dumps(
+                    manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode()
+        ).hexdigest()
+        if (
+            value.get("schemaVersion") != 1
+            or value.get("transactionPhase") != "RESTORED"
+            or value.get("manifestSha256") != expected_manifest_sha
+            or not isinstance(files, Mapping)
+            or set(files) != PRODUCTION_TRANSACTION_FILES
+            or not isinstance(directories, Mapping)
+            or set(directories) != PRODUCTION_TRANSACTION_DIRECTORIES
+            or not isinstance(units, Mapping)
+            or set(units) != PRODUCTION_UNITS
+            or not isinstance(value.get("sha256"), str)
+            or SHA256_RE.fullmatch(value["sha256"]) is None
+        ):
+            return False
+        for item in files.values():
+            if not isinstance(item, Mapping) or set(item) != {
+                "exists",
+                "sha256",
+                "mode",
+                "uid",
+                "gid",
+            }:
+                return False
+            exists = item.get("exists")
+            if exists is True:
+                if (
+                    not isinstance(item.get("sha256"), str)
+                    or SHA256_RE.fullmatch(item["sha256"]) is None
+                    or any(type(item.get(key)) is not int for key in ("mode", "uid", "gid"))
+                ):
+                    return False
+            elif exists is False:
+                if any(item.get(key) is not None for key in ("sha256", "mode", "uid", "gid")):
+                    return False
+            else:
+                return False
+        if any(
+            not isinstance(item, Mapping)
+            or set(item) != {"mode", "uid", "gid"}
+            or any(type(item.get(key)) is not int for key in ("mode", "uid", "gid"))
+            for item in directories.values()
+        ):
+            return False
+        if any(
+            not isinstance(item, Mapping)
+            or set(item) != {"active", "enabled", "unitFileState"}
+            or type(item.get("active")) is not bool
+            or type(item.get("enabled")) is not bool
+            or not isinstance(item.get("unitFileState"), str)
+            for item in units.values()
+        ):
+            return False
+        core = {key: value[key] for key in value if key != "sha256"}
+        serialized = (
+            json.dumps(core, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode()
+        return hashlib.sha256(serialized).hexdigest() == value["sha256"]
+
+    anti_replay = pre["antiReplay"]
+    latest_replay = (
+        anti_replay.get("latest") if isinstance(anti_replay, Mapping) else None
+    )
+    if (
+        not isinstance(anti_replay, Mapping)
+        or set(anti_replay)
+        != {
+            "schemaVersion",
+            "semanticSha256",
+            "maximumCommandSequence",
+            "currentReleaseSequence",
+            "currentBomDigest",
+            "latest",
+        }
+        or anti_replay.get("schemaVersion") != 4
+        or isinstance(anti_replay.get("schemaVersion"), bool)
+        or not isinstance(anti_replay.get("semanticSha256"), str)
+        or SHA256_RE.fullmatch(anti_replay["semanticSha256"]) is None
+        or isinstance(anti_replay.get("maximumCommandSequence"), bool)
+        or not isinstance(anti_replay.get("maximumCommandSequence"), int)
+        or anti_replay["maximumCommandSequence"] < 1
+        or not isinstance(latest_replay, Mapping)
+        or set(latest_replay)
+        != {
+            "commandId",
+            "sequence",
+            "phase",
+            "bomDigest",
+            "releaseSequence",
+            "healthDeadline",
+        }
+        or latest_replay.get("commandId") != scenario["expectedCommandId"]
+        or isinstance(latest_replay.get("sequence"), bool)
+        or not isinstance(latest_replay.get("sequence"), int)
+        or latest_replay.get("sequence")
+        != anti_replay.get("maximumCommandSequence")
+        or latest_replay.get("phase") != "ROLLED_BACK"
+        or latest_replay.get("bomDigest") != scenario["expectedBomDigest"]
+        or isinstance(latest_replay.get("releaseSequence"), bool)
+        or not isinstance(latest_replay.get("releaseSequence"), int)
+        or latest_replay.get("releaseSequence")
+        != scenario["release"]["releaseSequence"]
+        or latest_replay.get("healthDeadline") is not None
+        or (
+            anti_replay.get("currentReleaseSequence") is not None
+            and (
+                not isinstance(anti_replay.get("currentReleaseSequence"), str)
+                or re.fullmatch(
+                    r"(?:0|[1-9][0-9]*)",
+                    anti_replay["currentReleaseSequence"],
+                )
+                is None
+            )
+        )
+        or (
+            anti_replay.get("currentBomDigest") is not None
+            and (
+                not isinstance(anti_replay.get("currentBomDigest"), str)
+                or DIGEST_RE.fullmatch(anti_replay["currentBomDigest"]) is None
+            )
+        )
+    ):
+        raise RunnerError("candidate soak anti-replay proof is invalid")
+    if (
+        any(
+            gates.get(key) is not True
+            for key in (
+                "signedRollbackTerminal",
+                "candidateBound",
+                "slotsUnchanged",
+                "releaseTreesUnchanged",
+                "antiReplayUnchanged",
+                "oakIdentityUnchanged",
+                "freshBaselineProcess",
+                "harnessBytesPinned",
+                "harnessCopyRemoved",
+                "resourceLimitsApplied",
+                "boundedOutput",
+                "persistentStateReadOnly",
+                "persistentStateUnchanged",
+                "productionTrustRestored",
+                "trustedSoakDuration",
+                "continuousUidIsolation",
+                "cgroupTerminated",
+            )
+        )
+        or gates.get("harnessPassed") is not passed
+        or gates.get("rawEvidencePreserved") is not (raw is not None)
+        or (passed and outcome.get("errorCode") is not None)
+        or (
+            not passed
+            and (
+                not isinstance(outcome.get("errorCode"), str)
+                or not outcome["errorCode"]
+            )
+        )
+        or pre["slots"] != expected_slots
+        or pre["slots"] != post["slots"]
+        or not valid_release_trees(pre.get("releaseTrees"))
+        or pre.get("releaseTrees") != post.get("releaseTrees")
+        or pre["antiReplay"] != post["antiReplay"]
+        or not valid_persistent_state(pre.get("persistentState"))
+        or pre.get("persistentState") != post.get("persistentState")
+        or not valid_execution_proof(evidence.get("executionProof"))
+        or not valid_collector_proof(evidence.get("collectorProof"))
+        or not valid_termination_proof(evidence.get("terminationProof"))
+        or not valid_production_restoration(
+            evidence.get("productionRestoration")
+        )
+        or not valid_oak(pre_oak)
+        or not valid_oak(post_oak)
+        or pre_oak.get("port") != post_oak.get("port")
+        or pre_oak.get("mxidSha256") != post_oak.get("mxidSha256")
+        or not isinstance(pre_runtime, Mapping)
+        or not isinstance(post_runtime, Mapping)
+        or set(pre_runtime) != {"pid", "startTicks", "bootId", "activeSlot"}
+        or set(post_runtime) != {"pid", "startTicks", "bootId", "activeSlot"}
+        or any(
+            isinstance(runtime.get(field), bool)
+            or not isinstance(runtime.get(field), int)
+            or runtime[field] < 1
+            for runtime in (pre_runtime, post_runtime)
+            for field in ("pid", "startTicks")
+        )
+        or any(runtime["pid"] < 2 for runtime in (pre_runtime, post_runtime))
+        or pre_runtime.get("activeSlot") != expected_slots["current"]
+        or post_runtime.get("activeSlot") != expected_slots["current"]
+        or pre_runtime.get("bootId") != post_runtime.get("bootId")
+        or (
+            pre_runtime.get("pid"),
+            pre_runtime.get("startTicks"),
+        )
+        == (
+            post_runtime.get("pid"),
+            post_runtime.get("startTicks"),
+        )
+    ):
+        raise RunnerError("candidate soak restoration proof is invalid")
+    try:
+        canonical_boot_id = str(uuid.UUID(str(pre_runtime.get("bootId"))))
+    except ValueError as exc:
+        raise RunnerError("candidate soak boot identity is invalid") from exc
+    if canonical_boot_id != pre_runtime.get("bootId"):
+        raise RunnerError("candidate soak boot identity is invalid")
+    candidate_started = timestamp(evidence.get("startedAt"), label="start time")
+    restored_at = timestamp(post.get("restoredAt"), label="restore time")
+    completed_at = timestamp(evidence.get("completedAt"), label="completion time")
+    if not candidate_started <= restored_at <= completed_at:
+        raise RunnerError("candidate soak lifecycle ordering is invalid")
+    raw_digest = evidence.get("rawEvidenceSha256")
+    if raw_evidence_sha256 is not None and raw_digest != raw_evidence_sha256:
+        raise RunnerError("candidate soak supplied raw bytes digest mismatch")
+    if raw is None:
+        if passed or raw_digest is not None:
+            raise RunnerError("candidate soak raw evidence is missing")
+    else:
+        if not isinstance(raw, Mapping):
+            raise RunnerError("candidate soak raw evidence is invalid")
+        serialized = (
+            json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if hashlib.sha256(serialized).hexdigest() != raw_digest:
+            raise RunnerError("candidate soak raw evidence digest mismatch")
+        runtime_identity = raw.get("runtimeIdentity")
+        raw_outcome = raw.get("outcome")
+        if (
+            raw.get("schemaVersion") != 3
+            or raw.get("kind") != "nuvion-iq9075-oak-soak-result"
+            or raw.get("runId") != run_id
+            or raw.get("slotKind") != "candidate"
+            or not isinstance(runtime_identity, Mapping)
+            or set(runtime_identity)
+            != {
+                "agentVersion",
+                "componentSha",
+                "bomDigest",
+                "pythonPath",
+                "sitePackagesPath",
+                "buildInfoPath",
+                "releaseMarkerSha256",
+                "candidateSlot",
+                "controlMarkerSha256",
+            }
+            or runtime_identity.get("agentVersion")
+            != scenario["release"]["agentVersion"]
+            or runtime_identity.get("componentSha")
+            != scenario["release"]["componentSha"]
+            or runtime_identity.get("bomDigest")
+            != scenario["expectedBomDigest"]
+            or runtime_identity.get("pythonPath")
+            != "/usr/bin/python3"
+            or runtime_identity.get("sitePackagesPath")
+            != expected_slot + "/venv/lib/python3.12/site-packages"
+            or runtime_identity.get("buildInfoPath")
+            != expected_slot
+            + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py"
+            or not isinstance(runtime_identity.get("releaseMarkerSha256"), str)
+            or SHA256_RE.fullmatch(runtime_identity["releaseMarkerSha256"]) is None
+            or runtime_identity.get("candidateSlot") != expected_slot
+            or runtime_identity.get("controlMarkerSha256")
+            != candidate["controlMarkerSha256"]
+            or not isinstance(raw_outcome, Mapping)
+            or raw_outcome.get("status") != ("passed" if passed else "failed")
+        ):
+            raise RunnerError("candidate soak raw evidence is not bound to the run")
+        raw_started = timestamp(raw.get("startedAt"), label="raw start time")
+        if not candidate_started <= raw_started <= restored_at:
+            raise RunnerError("candidate soak lifecycle ordering is invalid")
+    assert_no_secret_material(evidence)
+
+
 def validate_release_marker(
     marker: object,
     *,
@@ -1512,8 +2639,20 @@ def validate_final_evidence(
             not isinstance(status, dict)
             or set(status) != {"active", "enabled", "unitFileState", "mainPid"}
             or status.get("active") is not True
-            or status.get("enabled") is not True
-            or status.get("unitFileState") not in {"enabled", "static", "indirect"}
+            or type(status.get("enabled")) is not bool
+            or status.get("unitFileState")
+            not in {
+                "enabled",
+                "disabled",
+                "static",
+                "indirect",
+                "masked",
+                "generated",
+                "transient",
+                "alias",
+            }
+            or status.get("enabled")
+            is not (status.get("unitFileState") in {"enabled", "static", "indirect"})
             or isinstance(status.get("mainPid"), bool)
             or not isinstance(status.get("mainPid"), int)
             or (unit.endswith(".service") and status["mainPid"] < 2)
@@ -1772,11 +2911,13 @@ def validate_final_evidence(
 def validate_cleanup_result(result: Mapping[str, Any], *, run_id: str) -> None:
     allowed = {
         "schemaVersion",
+        "kind",
         "runId",
         "complete",
         "recovered",
         "phase",
         "idempotent",
+        "proof",
     }
     if not set(result).issubset(allowed) or not {
         "schemaVersion",
@@ -1784,11 +2925,26 @@ def validate_cleanup_result(result: Mapping[str, Any], *, run_id: str) -> None:
         "complete",
         "recovered",
         "phase",
+        "kind",
+        "proof",
     }.issubset(result):
-        raise RunnerError("cleanup response fields are invalid")
+        raise RunnerError("board cleanup did not reach the exact restored state")
+    proof = result.get("proof")
+    expected_proof_fields = {
+        "schemaVersion",
+        "transactionPhase",
+        "cleanupJournalComplete",
+        "activeRunLeaseAbsent",
+        "transactionSnapshotsAbsent",
+        "recoveryArchiveAbsent",
+        "candidateArtifactsAbsent",
+        "candidateStagingAbsent",
+        "trustStagingAbsent",
+    }
     if (
         type(result.get("schemaVersion")) is not int
         or result.get("schemaVersion") != 1
+        or result.get("kind") != "nuvion-iq9075-cleanup-evidence"
         or result.get("runId") != run_id
         or result.get("complete") is not True
         or not isinstance(result.get("recovered"), bool)
@@ -1797,8 +2953,33 @@ def validate_cleanup_result(result: Mapping[str, Any], *, run_id: str) -> None:
             "idempotent" in result
             and not isinstance(result.get("idempotent"), bool)
         )
+        or not isinstance(proof, Mapping)
+        or set(proof) != expected_proof_fields
+        or type(proof.get("schemaVersion")) is not int
+        or proof.get("schemaVersion") != 1
+        or proof.get("transactionPhase") != result.get("phase")
+        or any(
+            proof.get(key) is not True
+            for key in expected_proof_fields
+            - {"schemaVersion", "transactionPhase"}
+        )
     ):
         raise RunnerError("board cleanup did not reach the exact restored state")
+
+
+def canonical_cleanup_evidence(
+    result: Mapping[str, Any], *, run_id: str
+) -> dict[str, Any]:
+    validate_cleanup_result(result, run_id=run_id)
+    return {
+        "schemaVersion": 1,
+        "kind": "nuvion-iq9075-cleanup-evidence",
+        "runId": run_id,
+        "complete": True,
+        "recovered": bool(result["recovered"]),
+        "phase": result["phase"],
+        "proof": dict(result["proof"]),
+    }
 
 
 class FleetRunner:
@@ -1830,15 +3011,32 @@ class FleetRunner:
     ) -> dict[str, Any]:
         # Never skip a board call from a stale host journal. Every primitive
         # performs a live, idempotent reconcile and returns current proof.
-        self.journal.mark(step, "RUNNING")
+        journal_failure: BaseException | None = None
+        try:
+            self.journal.mark(step, "RUNNING")
+        except BaseException as exc:
+            # The local journal is evidence, not the authority that may block
+            # a root cleanup RPC from reaching the board.
+            journal_failure = exc
         try:
             result = self.transport.invoke_board(command, arguments, timeout=timeout)
             if validate is not None:
                 validate(result)
         except BaseException:
-            self.journal.mark(step, "FAILED")
+            try:
+                self.journal.mark(step, "FAILED")
+            except BaseException:
+                # Board failure remains the primary safety signal. A corrupt
+                # host journal must not replace it or skip outer recovery.
+                pass
             raise
-        self.journal.mark(step, "COMPLETE")
+        try:
+            self.journal.mark(step, "COMPLETE")
+        except BaseException as exc:
+            if journal_failure is None:
+                journal_failure = exc
+        if journal_failure is not None:
+            raise RunnerError("host journal update failed after board call") from journal_failure
         return result
 
     def bootstrap(
@@ -2029,6 +3227,49 @@ class FleetRunner:
         wait_seconds: int,
         poll_seconds: float,
     ) -> dict[str, object]:
+        self._run_cleanup_required = False
+        try:
+            return self._run_once(
+                local_tool=local_tool,
+                command_keyring=command_keyring,
+                release_keyring=release_keyring,
+                health_keyring=health_keyring,
+                device_binding=device_binding,
+                manifest_arguments=manifest_arguments,
+                wait_seconds=wait_seconds,
+                poll_seconds=poll_seconds,
+            )
+        except BaseException as primary:
+            if not self._run_cleanup_required:
+                raise
+            try:
+                self.cleanup()
+            except BaseException as cleanup_failure:
+                try:
+                    self.journal.mark("run-recovery-pending", "FAILED")
+                except BaseException:
+                    pass
+                raise RunnerError(
+                    "Fleet run failed after preflight and full cleanup did not converge "
+                    f"(primary={type(primary).__name__}, "
+                    f"cleanup={type(cleanup_failure).__name__})"
+                ) from primary
+            raise
+        finally:
+            self._run_cleanup_required = False
+
+    def _run_once(
+        self,
+        *,
+        local_tool: Path,
+        command_keyring: Path,
+        release_keyring: Path,
+        health_keyring: Path,
+        device_binding: Path,
+        manifest_arguments: Mapping[str, Any],
+        wait_seconds: int,
+        poll_seconds: float,
+    ) -> dict[str, object]:
         if (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, int)
@@ -2077,6 +3318,10 @@ class FleetRunner:
         )
         if persisted_manifest is not None:
             validate_manifest(persisted_manifest)
+        # Board preflight claims the persistent run lease before performing
+        # hardware/foundation checks. Arm host cleanup before dispatch so a
+        # lost response or any later local error cannot strand that lease.
+        self._run_cleanup_required = True
         foundation = self._call("foundation", "preflight", ["--run-id", self.run_id])
         live_foundation = foundation.get("foundation")
         live_slots = (
@@ -2157,6 +3402,20 @@ class FleetRunner:
         manifest_sha = hashlib.sha256(manifest_payload).hexdigest()
         self._call("backup", "backup", ["--run-id", self.run_id], timeout=1800)
         remote_paths: dict[str, str] = {}
+        discard_arguments = [
+            "--run-id",
+            self.run_id,
+            "--command-sha256",
+            digests["command"],
+            "--release-sha256",
+            digests["release"],
+            "--health-sha256",
+            digests["health"],
+            "--binding-sha256",
+            digests["binding"],
+            "--manifest-sha256",
+            manifest_sha,
+        ]
         try:
             for role, source in {**sources, "manifest": manifest_path}.items():
                 remote_paths[role] = self.transport.copy_input(
@@ -2191,25 +3450,15 @@ class FleetRunner:
                 ],
                 timeout=180,
             )
-        finally:
-            self._call(
-                "discard-staging",
-                "discard-staging",
-                [
-                    "--run-id",
-                    self.run_id,
-                    "--command-sha256",
-                    digests["command"],
-                    "--release-sha256",
-                    digests["release"],
-                    "--health-sha256",
-                    digests["health"],
-                    "--binding-sha256",
-                    digests["binding"],
-                    "--manifest-sha256",
-                    manifest_sha,
-                ],
-            )
+        except BaseException:
+            try:
+                self._call(
+                    "discard-staging", "discard-staging", discard_arguments
+                )
+            except BaseException:
+                pass
+            raise
+        self._call("discard-staging", "discard-staging", discard_arguments)
         scenario = manifest["scenario"]
         deadline = self.monotonic() + wait_seconds
         if scenario["type"] == "oak-fault-rollback":
@@ -2315,8 +3564,225 @@ class FleetRunner:
             ).hexdigest(),
         }
 
+    def candidate_soak(
+        self,
+        *,
+        local_tool: Path,
+        local_harness: Path,
+        candidate_bundle: Path,
+        candidate_bom: Path,
+    ) -> dict[str, object]:
+        candidate_inputs = (
+            local_tool,
+            local_harness,
+            candidate_bundle,
+            candidate_bom,
+        )
+        if any(not path.is_absolute() or path != path.resolve() for path in candidate_inputs):
+            raise RunnerError("candidate soak inputs must be normalized absolute paths")
+        manifest_path = self.output_dir / "immutable-manifest.json"
+        fleet_evidence_path = self.output_dir / "evidence.json"
+        manifest = validate_manifest(
+            strict_json(
+                read_regular(manifest_path, MAX_INPUT_BYTES),
+                label="immutable manifest",
+            )
+        )
+        fleet_evidence_raw = read_regular(fleet_evidence_path, MAX_OUTPUT_BYTES)
+        fleet_evidence = strict_json(fleet_evidence_raw, label="Fleet evidence")
+        validate_final_evidence(fleet_evidence, manifest)
+        if manifest["scenario"]["type"] != "oak-fault-rollback":
+            raise RunnerError("candidate soak requires a completed rollback run")
+        identity = self._call("identity", "identity")
+        tool_sha256 = sha256_regular(local_tool, MAX_OUTPUT_BYTES)
+        if (
+            identity.get("protocolVersion") != PROTOCOL_VERSION
+            or identity.get("toolSha256") != tool_sha256
+            or identity.get("toolPath") != REMOTE_TOOL
+            or identity.get("rootOwned") is not True
+            or identity.get("mode") != "0755"
+        ):
+            raise RunnerError("packaged board tool identity does not match local source")
+        bundle_sha256 = sha256_regular(
+            candidate_bundle, MAX_CANDIDATE_BUNDLE_BYTES
+        )
+        bundle_size = candidate_bundle.lstat().st_size
+        bom_payload = read_regular(candidate_bom, MAX_INPUT_BYTES)
+        bom_sha256 = hashlib.sha256(bom_payload).hexdigest()
+        harness_sha256 = sha256_regular(local_harness, MAX_OUTPUT_BYTES)
+        validate_candidate_inputs(
+            bom_payload=bom_payload,
+            bundle_sha256=bundle_sha256,
+            bundle_size=bundle_size,
+            manifest=manifest,
+        )
+        digests = {
+            "bundle": bundle_sha256,
+            "bom": bom_sha256,
+            "harness": harness_sha256,
+        }
+        sources = {
+            "candidate-bundle": candidate_bundle,
+            "candidate-bom": candidate_bom,
+            "oak-harness": local_harness,
+        }
+        remote: dict[str, str] = {}
+        result: dict[str, Any] | None = None
+        primary: BaseException | None = None
+        try:
+            self.journal.mark("candidate-staging", "RUNNING")
+            for role, source in sources.items():
+                remote[role] = self.transport.copy_candidate_input(
+                    source, run_id=self.run_id, role=role
+                )
+            self.journal.mark("candidate-staging", "COMPLETE")
+            result = self._call(
+                "candidate-soak",
+                "candidate-soak",
+                [
+                    "--run-id",
+                    self.run_id,
+                    "--candidate-bundle",
+                    remote["candidate-bundle"],
+                    "--bundle-sha256",
+                    bundle_sha256,
+                    "--candidate-bom",
+                    remote["candidate-bom"],
+                    "--bom-sha256",
+                    bom_sha256,
+                    "--oak-harness",
+                    remote["oak-harness"],
+                    "--harness-sha256",
+                    harness_sha256,
+                ],
+                timeout=900,
+            )
+        except BaseException as exc:
+            primary = exc
+            try:
+                self.journal.mark("candidate-staging", "FAILED")
+            except BaseException:
+                pass
+        staging_cleanup_failure: BaseException | None = None
+        try:
+            self._call(
+                "candidate-staging-cleanup",
+                "discard-candidate-staging",
+                [
+                    "--run-id",
+                    self.run_id,
+                    "--bundle-sha256",
+                    bundle_sha256,
+                    "--bom-sha256",
+                    bom_sha256,
+                    "--harness-sha256",
+                    harness_sha256,
+                ],
+            )
+        except BaseException as exc:
+            staging_cleanup_failure = exc
+        cleanup_evidence: dict[str, Any] | None = None
+        full_cleanup_failure: BaseException | None = None
+        try:
+            # The board deadman remains armed across the candidate RPC. Always
+            # converge the full transaction even when the RPC response was
+            # lost, malformed, or reported a candidate failure.
+            cleanup_evidence = self.cleanup()
+        except BaseException as exc:
+            full_cleanup_failure = exc
+        if primary is not None:
+            raise RunnerError(
+                "candidate soak failed; staging cleanup="
+                + ("failed" if staging_cleanup_failure is not None else "complete")
+                + "; full cleanup="
+                + ("failed" if full_cleanup_failure is not None else "complete")
+            ) from primary
+        if staging_cleanup_failure is not None:
+            raise RunnerError(
+                "candidate soak staging cleanup failed; full cleanup="
+                + ("failed" if full_cleanup_failure is not None else "complete")
+            ) from staging_cleanup_failure
+        if full_cleanup_failure is not None:
+            raise RunnerError("candidate soak full cleanup failed") from full_cleanup_failure
+        if cleanup_evidence is None:
+            raise RunnerError("candidate soak cleanup returned no evidence")
+        if result is None:
+            raise RunnerError("candidate soak returned no evidence")
+        fleet_evidence_sha256 = hashlib.sha256(fleet_evidence_raw).hexdigest()
+        raw = result.get("rawEvidence")
+        persisted_raw_sha256: str | None = None
+        if isinstance(raw, Mapping):
+            raw_path = self.output_dir / "candidate-soak-raw.json"
+            if raw_path.exists() or raw_path.is_symlink():
+                raw_bytes = read_regular(raw_path, MAX_OUTPUT_BYTES)
+                persisted_raw = strict_json(
+                    raw_bytes,
+                    label="candidate soak raw evidence",
+                )
+                if persisted_raw != dict(raw):
+                    raise RunnerError("persisted candidate raw evidence differs")
+            else:
+                atomic_json(raw_path, raw, immutable=True)
+                raw_bytes = read_regular(raw_path, MAX_OUTPUT_BYTES)
+            persisted_raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            if persisted_raw_sha256 != result.get("rawEvidenceSha256"):
+                raise RunnerError("persisted candidate raw evidence bytes differ")
+        validate_candidate_soak_evidence(
+            result,
+            run_id=self.run_id,
+            manifest=manifest,
+            bundle_sha256=bundle_sha256,
+            bom_sha256=bom_sha256,
+            harness_sha256=harness_sha256,
+            fleet_evidence_sha256=fleet_evidence_sha256,
+            raw_evidence_sha256=persisted_raw_sha256,
+            require_cleanup_evidence=False,
+        )
+        cleanup_path = self.output_dir / "cleanup-evidence.json"
+        cleanup_bytes = read_regular(cleanup_path, MAX_OUTPUT_BYTES)
+        if strict_json(cleanup_bytes, label="cleanup evidence") != cleanup_evidence:
+            raise RunnerError("persisted cleanup evidence differs")
+        cleanup_sha256 = hashlib.sha256(cleanup_bytes).hexdigest()
+        result = {
+            **result,
+            "cleanupEvidenceSha256": cleanup_sha256,
+            "cleanupEvidence": cleanup_evidence,
+        }
+        validate_candidate_soak_evidence(
+            result,
+            run_id=self.run_id,
+            manifest=manifest,
+            bundle_sha256=bundle_sha256,
+            bom_sha256=bom_sha256,
+            harness_sha256=harness_sha256,
+            fleet_evidence_sha256=fleet_evidence_sha256,
+            raw_evidence_sha256=persisted_raw_sha256,
+            cleanup_evidence_sha256=cleanup_sha256,
+            require_cleanup_evidence=True,
+        )
+        evidence_path = self.output_dir / "candidate-soak-evidence.json"
+        if evidence_path.exists() or evidence_path.is_symlink():
+            persisted = strict_json(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                label="candidate soak evidence",
+            )
+            if persisted != result:
+                raise RunnerError("persisted candidate soak evidence differs")
+        else:
+            atomic_json(evidence_path, result, immutable=True)
+        return {
+            "schemaVersion": 1,
+            "runId": self.run_id,
+            "complete": True,
+            "passed": result["outcome"]["status"] == "passed",
+            "candidateSoakEvidenceSha256": hashlib.sha256(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES)
+            ).hexdigest(),
+            "rawEvidenceSha256": result.get("rawEvidenceSha256"),
+        }
+
     def cleanup(self) -> dict[str, Any]:
-        return self._call(
+        result = self._call(
             "cleanup",
             "cleanup",
             ["--run-id", self.run_id],
@@ -2326,6 +3792,31 @@ class FleetRunner:
                 run_id=self.run_id,
             ),
         )
+        evidence = canonical_cleanup_evidence(result, run_id=self.run_id)
+        evidence_path = self.output_dir / "cleanup-evidence.json"
+        if evidence_path.exists() or evidence_path.is_symlink():
+            persisted = strict_json(
+                read_regular(evidence_path, MAX_OUTPUT_BYTES),
+                label="cleanup evidence",
+            )
+            if persisted != evidence:
+                raise RunnerError("persisted cleanup evidence differs")
+        else:
+            atomic_json(evidence_path, evidence, immutable=True)
+        persisted_bytes = read_regular(evidence_path, MAX_OUTPUT_BYTES)
+        if hashlib.sha256(persisted_bytes).hexdigest() != hashlib.sha256(
+            (
+                json.dumps(
+                    evidence,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest():
+            raise RunnerError("cleanup evidence read-back digest differs")
+        return evidence
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2367,6 +3858,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--publisher-key-id", required=True)
     run.add_argument("--wait-seconds", type=int, default=900)
     run.add_argument("--poll-seconds", type=float, default=2.0)
+    candidate = subcommands.add_parser("candidate-soak")
+    candidate.add_argument(
+        "--local-board-tool",
+        default=str(Path(__file__).with_name("iq9075-board-e2e.py")),
+    )
+    candidate.add_argument(
+        "--local-oak-harness",
+        default=str(Path(__file__).with_name("test-iq9075.sh")),
+    )
+    candidate.add_argument("--candidate-bundle", required=True)
+    candidate.add_argument("--candidate-bom", required=True)
     bootstrap = subcommands.add_parser("bootstrap-updater")
     bootstrap.add_argument(
         "--local-board-tool",
@@ -2384,6 +3886,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        disable_core_dumps()
+    except RunnerError as exc:
+        print(f"run-iq9075-fleet-e2e: {exc}", file=sys.stderr)
+        return 1
     arguments = build_parser().parse_args(argv)
     ssh_password: bytearray | None = None
     sudo_password: bytearray | None = None
@@ -2447,6 +3954,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_version=arguments.expected_version,
                 expected_package_sha256=arguments.expected_sha256,
             )
+        elif arguments.command == "candidate-soak":
+            inputs = [
+                Path(arguments.local_board_tool),
+                Path(arguments.local_oak_harness),
+                Path(arguments.candidate_bundle),
+                Path(arguments.candidate_bom),
+            ]
+            validate_paths_distinct(output_dir, inputs)
+            result = runner.candidate_soak(
+                local_tool=inputs[0],
+                local_harness=inputs[1],
+                candidate_bundle=inputs[2],
+                candidate_bom=inputs[3],
+            )
         else:
             inputs = [
                 Path(arguments.local_board_tool),
@@ -2492,6 +4013,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         assert_no_secret_material(result)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        if (
+            arguments.command == "candidate-soak"
+            and result.get("passed") is not True
+        ):
+            return 1
         return 0
     except (RunnerError, OSError, ValueError, UnicodeError) as exc:
         print(f"run-iq9075-fleet-e2e: {exc}", file=sys.stderr)
@@ -2505,6 +4031,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    if _askpass_entrypoint():
-        raise SystemExit(0)
+    try:
+        if _askpass_entrypoint():
+            raise SystemExit(0)
+    except RunnerError:
+        raise SystemExit(1)
     raise SystemExit(main())

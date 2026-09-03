@@ -6,13 +6,13 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import importlib.util
 import json
 import math
 import re
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ RUN_ID = re.compile(
 RELEASE_SLOT = re.compile(r"^releases/[0-9a-f]{64}$")
 IDENTITY_TEXT = re.compile(r"^[\x20-\x7e]{1,255}$")
 MAX_EVIDENCE_BYTES = 1024 * 1024
+CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121"})
 MAX_APPSRC_BYTES = 640 * 480 * 3 * 2
 
 
@@ -209,6 +210,24 @@ def _strict_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return payload
 
 
+def _module_from_verified_source(
+    *, module_name: str, source: bytes, display_path: Path
+) -> types.ModuleType:
+    """Execute the exact bytes already checked by the release trust boundary."""
+
+    module = types.ModuleType(module_name)
+    module.__file__ = str(display_path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        code = compile(source, str(display_path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)  # noqa: S102 - exact trusted bytes only.
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 def _number(
     value: object,
     *,
@@ -310,7 +329,7 @@ def _validate_physical_documents(
     security: dict[str, Any],
     candidate_harness: Path,
 ) -> dict[str, str]:
-    if set(summary) != {
+    expected_summary_fields = {
         "schemaVersion",
         "kind",
         "agentVersion",
@@ -318,7 +337,11 @@ def _validate_physical_documents(
         "harnessManifest",
         "harnessResult",
         "physicalGate",
-    } or (
+    }
+    cleanup_summary_reference = summary.get("cleanupEvidence")
+    if cleanup_summary_reference is not None:
+        expected_summary_fields.add("cleanupEvidence")
+    if set(summary) != expected_summary_fields or (
         type(summary.get("schemaVersion")) is not int
         or summary.get("schemaVersion") != 2
         or summary.get("kind") != "nuvion-iq9075-physical-release-evidence"
@@ -340,7 +363,7 @@ def _validate_physical_documents(
     manifest = _strict_object(manifest_raw, label="IQ9075 harness manifest")
     result = _strict_object(result_raw, label="IQ9075 harness result")
 
-    if set(manifest) != {
+    expected_manifest_fields = {
         "schemaVersion",
         "kind",
         "runId",
@@ -357,7 +380,12 @@ def _validate_physical_documents(
         "oakMxidSha256",
         "startedAt",
         "expectedRollback",
-    }:
+    }
+    candidate_soak_reference = manifest.get("candidateSoak")
+    cleanup_evidence_reference = manifest.get("cleanupEvidence")
+    if candidate_soak_reference is not None:
+        expected_manifest_fields.update({"candidateSoak", "cleanupEvidence"})
+    if set(manifest) != expected_manifest_fields:
         raise ReadinessError("IQ9075 harness manifest fields are invalid")
     run_id = manifest.get("runId")
     board = manifest.get("board")
@@ -438,7 +466,7 @@ def _validate_physical_documents(
         label="IQ9075 OAK soak result",
     )
     oak_soak = _strict_object(oak_soak_raw, label="IQ9075 OAK soak result")
-    if set(oak_soak) != {
+    expected_oak_fields = {
         "schemaVersion",
         "kind",
         "startedAt",
@@ -450,14 +478,22 @@ def _validate_physical_documents(
         "soak",
         "webrtc",
         "splitmux",
-    }:
+    }
+    oak_schema = oak_soak.get("schemaVersion")
+    if oak_schema == 3:
+        expected_oak_fields.update({"runId", "slotKind"})
+    if set(oak_soak) != expected_oak_fields:
         raise ReadinessError("IQ9075 OAK soak source fields are invalid")
     runtime_identity = oak_soak.get("runtimeIdentity")
     device_identity = oak_soak.get("deviceIdentity")
     outcome = oak_soak.get("outcome")
     if (
         type(oak_soak.get("schemaVersion")) is not int
-        or oak_soak.get("schemaVersion") != 2
+        or oak_schema not in {2, 3}
+        or (
+            version in CANDIDATE_SOAK_REQUIRED_VERSIONS
+            and (oak_schema != 3 or candidate_soak_reference is None)
+        )
         or oak_soak.get("kind") != "nuvion-iq9075-oak-soak-result"
         or not isinstance(outcome, dict)
         or set(outcome) != {"status", "error", "cleanupErrors"}
@@ -474,19 +510,32 @@ def _validate_physical_documents(
         or not isinstance(device_identity.get("spaceId"), int)
         or not isinstance(runtime_identity, dict)
         or set(runtime_identity)
-        != {
+        != ({
             "agentVersion",
             "componentSha",
             "bomDigest",
             "pythonPath",
+            "sitePackagesPath",
+            "buildInfoPath",
             "releaseMarkerSha256",
-        }
+        } | ({"candidateSlot", "controlMarkerSha256"} if oak_schema == 3 else set()))
         or runtime_identity.get("agentVersion") != version
         or runtime_identity.get("componentSha") != component_sha
         or not isinstance(runtime_identity.get("bomDigest"), str)
         or not isinstance(runtime_identity.get("pythonPath"), str)
         or not isinstance(runtime_identity.get("releaseMarkerSha256"), str)
         or not SHA256.fullmatch(runtime_identity["releaseMarkerSha256"])
+        or (
+            oak_schema == 3
+            and (
+                oak_soak.get("runId") != run_id
+                or oak_soak.get("slotKind") != "candidate"
+                or candidate_soak_reference is None
+                or not isinstance(runtime_identity.get("controlMarkerSha256"), str)
+                or not SHA256.fullmatch(runtime_identity["controlMarkerSha256"])
+            )
+        )
+        or (oak_schema == 2 and candidate_soak_reference is not None)
     ):
         raise ReadinessError("IQ9075 OAK soak source identity is invalid")
     tested_artifact = _artifact_identity(
@@ -511,13 +560,24 @@ def _validate_physical_documents(
         )
     except ReleaseBomValidationError as exc:
         raise ReadinessError("IQ9075 tested BOM is invalid") from exc
+    expected_runtime_slot = (
+        f"/opt/nuv-agent/candidates/{run_id}-{verified_bom.bom_digest}"
+        if oak_schema == 3
+        else "/opt/nuv-agent/releases/"
+        + verified_bom.bom_digest
+    )
     if (
         runtime_identity["bomDigest"] != "sha256:" + verified_bom.bom_digest
-        or runtime_identity["pythonPath"]
-        != (
-            "/opt/nuv-agent/releases/"
-            + verified_bom.bom_digest
-            + "/venv/bin/python"
+        or runtime_identity["pythonPath"] != "/usr/bin/python3"
+        or runtime_identity["sitePackagesPath"]
+        != expected_runtime_slot + "/venv/lib/python3.12/site-packages"
+        or runtime_identity["buildInfoPath"]
+        != expected_runtime_slot
+        + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py"
+        or (
+            oak_schema == 3
+            and runtime_identity.get("candidateSlot")
+            != expected_runtime_slot
         )
     ):
         raise ReadinessError("IQ9075 OAK soak used a different installed release")
@@ -537,12 +597,10 @@ def _validate_physical_documents(
         Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
     )
     candidate_fleet_runner = candidate_harness.parent / "run-iq9075-fleet-e2e.py"
-    publisher_fleet_sha = hashlib.sha256(
-        _regular_bytes(publisher_fleet_runner)
-    ).hexdigest()
-    candidate_fleet_sha = hashlib.sha256(
-        _regular_bytes(candidate_fleet_runner)
-    ).hexdigest()
+    publisher_fleet_runner_raw = _regular_bytes(publisher_fleet_runner)
+    candidate_fleet_runner_raw = _regular_bytes(candidate_fleet_runner)
+    publisher_fleet_sha = hashlib.sha256(publisher_fleet_runner_raw).hexdigest()
+    candidate_fleet_sha = hashlib.sha256(candidate_fleet_runner_raw).hexdigest()
     if (
         publisher_fleet_sha != manifest["fleetRunnerSha256"]
         or candidate_fleet_sha != manifest["fleetRunnerSha256"]
@@ -582,16 +640,68 @@ def _validate_physical_documents(
             "IQ9075 board harness bytes differ from Fleet E2E manifest"
         )
     module_name = "_nuvion_trusted_iq9075_fleet_validator"
-    specification = importlib.util.spec_from_file_location(
-        module_name, publisher_fleet_runner
+    fleet_validator = _module_from_verified_source(
+        module_name=module_name,
+        source=publisher_fleet_runner_raw,
+        display_path=publisher_fleet_runner,
     )
-    if specification is None or specification.loader is None:
-        raise ReadinessError("IQ9075 Fleet E2E validator cannot be loaded")
-    fleet_validator = importlib.util.module_from_spec(specification)
-    sys.modules[module_name] = fleet_validator
     try:
-        specification.loader.exec_module(fleet_validator)
         fleet_validator.validate_final_evidence(fleet_evidence, fleet_manifest)
+        candidate_soak = None
+        if oak_schema == 3:
+            candidate_soak_raw, _candidate_soak_sha = _evidence_reference(
+                policy_path.parent,
+                candidate_soak_reference,
+                label="IQ9075 candidate soak evidence",
+            )
+            candidate_soak = _strict_object(
+                candidate_soak_raw, label="IQ9075 candidate soak evidence"
+            )
+            if (
+                cleanup_evidence_reference is None
+                or cleanup_summary_reference != cleanup_evidence_reference
+            ):
+                raise ReadinessError(
+                    "IQ9075 cleanup evidence reference is missing or unbound"
+                )
+            cleanup_evidence_raw, cleanup_evidence_sha256 = _evidence_reference(
+                policy_path.parent,
+                cleanup_evidence_reference,
+                label="IQ9075 cleanup evidence",
+            )
+            cleanup_evidence = _strict_object(
+                cleanup_evidence_raw, label="IQ9075 cleanup evidence"
+            )
+            if (
+                candidate_soak.get("cleanupEvidence") != cleanup_evidence
+                or candidate_soak.get("cleanupEvidenceSha256")
+                != cleanup_evidence_sha256
+            ):
+                raise ReadinessError(
+                    "IQ9075 candidate wrapper cleanup bytes differ"
+                )
+            fleet_validator.validate_candidate_soak_evidence(
+                candidate_soak,
+                run_id=run_id,
+                manifest=fleet_manifest,
+                bundle_sha256=tested_artifact["sha256"],
+                bom_sha256=tested_bom_sha256,
+                harness_sha256=candidate_harness_sha,
+                fleet_evidence_sha256=hashlib.sha256(fleet_evidence_raw).hexdigest(),
+                raw_evidence_sha256=hashlib.sha256(oak_soak_raw).hexdigest(),
+                cleanup_evidence_sha256=cleanup_evidence_sha256,
+                require_cleanup_evidence=True,
+            )
+            if candidate_soak.get("rawEvidence") != oak_soak:
+                raise ReadinessError(
+                    "IQ9075 candidate soak wrapper differs from raw evidence"
+                )
+            if candidate_soak.get("rawEvidenceSha256") != hashlib.sha256(
+                oak_soak_raw
+            ).hexdigest():
+                raise ReadinessError(
+                    "IQ9075 candidate soak wrapper raw bytes digest differs"
+                )
     except Exception as exc:
         raise ReadinessError("IQ9075 Fleet E2E evidence is invalid") from exc
     finally:
@@ -627,6 +737,37 @@ def _validate_physical_documents(
     fleet_generated_at = _timestamp(
         fleet_evidence.get("generatedAt"), label="IQ9075 Fleet evidence time"
     )
+    if oak_schema == 3:
+        if not isinstance(candidate_soak, dict) or not isinstance(
+            candidate_soak.get("post"), dict
+        ):
+            raise ReadinessError("IQ9075 candidate restoration proof is invalid")
+        candidate_started_at = _timestamp(
+            candidate_soak.get("startedAt"),
+            label="IQ9075 candidate operation start time",
+        )
+        candidate_restored_at = _timestamp(
+            candidate_soak["post"].get("restoredAt"),
+            label="IQ9075 candidate restoration time",
+        )
+        candidate_completed_at = _timestamp(
+            candidate_soak.get("completedAt"),
+            label="IQ9075 candidate operation completion time",
+        )
+        lifecycle_order_valid = (
+            fleet_generated_at
+            <= candidate_started_at
+            <= soak_started_at
+            <= candidate_restored_at
+            <= candidate_completed_at
+            and candidate_completed_at - fleet_generated_at
+            <= dt.timedelta(hours=24)
+        )
+    else:
+        lifecycle_order_valid = (
+            fleet_generated_at >= soak_started_at
+            and fleet_generated_at - soak_started_at <= dt.timedelta(hours=24)
+        )
     if (
         fleet_manifest.get("runId") != run_id
         or not isinstance(fleet_inputs, dict)
@@ -650,8 +791,7 @@ def _validate_physical_documents(
         or fleet_oak.get("mxidSha256") != manifest.get("oakMxidSha256")
         or fleet_oak.get("attached") is not True
         or fleet_oak.get("bound") is not True
-        or fleet_generated_at < soak_started_at
-        or fleet_generated_at - soak_started_at > dt.timedelta(hours=24)
+        or not lifecycle_order_valid
         or not isinstance(fleet_scenario, dict)
         or fleet_scenario.get("type") != "oak-fault-rollback"
         or fleet_scenario.get("expectedBomDigest")
@@ -675,7 +815,7 @@ def _validate_physical_documents(
     ):
         raise ReadinessError("IQ9075 Fleet E2E evidence differs from physical run")
 
-    if set(result) != {
+    expected_result_fields = {
         "schemaVersion",
         "kind",
         "runId",
@@ -690,9 +830,14 @@ def _validate_physical_documents(
         "webrtc",
         "splitmux",
         "rollback",
-    } or (
+    }
+    if oak_schema == 3:
+        expected_result_fields.update(
+            {"candidateRestore", "cleanupEvidenceSha256"}
+        )
+    if set(result) != expected_result_fields or (
         type(result.get("schemaVersion")) is not int
-        or result.get("schemaVersion") != 2
+        or result.get("schemaVersion") != (3 if oak_schema == 3 else 2)
         or result.get("kind") != "nuvion-iq9075-physical-result"
         or result.get("runId") != run_id
         or result.get("agentVersion") != version
@@ -703,6 +848,15 @@ def _validate_physical_documents(
         or result.get("exitCode") != 0
         or isinstance(result.get("exitCode"), bool)
         or result.get("outcome") != outcome
+        or (
+            oak_schema == 3
+            and (
+                not isinstance(candidate_soak, dict)
+                or result.get("candidateRestore") != candidate_soak.get("post")
+                or result.get("cleanupEvidenceSha256")
+                != candidate_soak.get("cleanupEvidenceSha256")
+            )
+        )
     ):
         raise ReadinessError("IQ9075 harness result identity is invalid")
 

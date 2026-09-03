@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import re
 import stat
 import sys
 import tempfile
+import types
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 MAX_JSON_BYTES = 1024 * 1024
+CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121"})
 
 
 class AssemblyError(RuntimeError):
@@ -46,6 +49,22 @@ def _reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise AssemblyError(f"duplicate JSON member: {key}")
         result[key] = value
     return result
+
+
+def _timestamp(value: object, *, label: str) -> dt.datetime:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{3})?Z",
+        value,
+    ) is None:
+        raise AssemblyError(f"{label} is not canonical UTC")
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise AssemblyError(f"{label} is not canonical UTC") from exc
+    if parsed.tzinfo != dt.timezone.utc:
+        raise AssemblyError(f"{label} is not canonical UTC")
+    return parsed
 
 
 def _regular_bytes(path: Path, *, maximum: int = MAX_JSON_BYTES) -> bytes:
@@ -166,6 +185,24 @@ def _load_readiness_validator():
     return module
 
 
+def _module_from_verified_source(
+    *, module_name: str, source: bytes, display_path: Path
+) -> types.ModuleType:
+    """Execute the already-verified source bytes without reopening their path."""
+
+    module = types.ModuleType(module_name)
+    module.__file__ = str(display_path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        code = compile(source, str(display_path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)  # noqa: S102 - bytes are trusted and exact-compared.
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 def _assemble_into(
     *,
     soak_result_path: Path,
@@ -180,6 +217,7 @@ def _assemble_into(
     output_directory: Path,
     version: str,
     component_sha: str,
+    candidate_soak_evidence_path: Path | None = None,
 ) -> dict[str, str]:
     if SEMVER.fullmatch(version) is None or SHA.fullmatch(component_sha) is None:
         raise AssemblyError("release version or component SHA is invalid")
@@ -194,6 +232,17 @@ def _assemble_into(
     security, _security_raw = _object(
         security_policy_path, label="release security policy"
     )
+    candidate_soak: dict[str, Any] | None = None
+    candidate_soak_raw: bytes | None = None
+    cleanup_evidence_raw: bytes | None = None
+    if candidate_soak_evidence_path is not None:
+        candidate_soak, candidate_soak_raw = _object(
+            candidate_soak_evidence_path, label="candidate soak evidence"
+        )
+    if version in CANDIDATE_SOAK_REQUIRED_VERSIONS and candidate_soak is None:
+        raise AssemblyError(
+            f"v{version} requires schema-v3 candidate soak evidence"
+        )
     try:
         verified_bom = verify_release_bom(bom)
     except ReleaseBomValidationError as exc:
@@ -239,11 +288,17 @@ def _assemble_into(
         "webrtc",
         "splitmux",
     }
+    soak_schema = soak.get("schemaVersion")
+    if soak_schema == 3:
+        expected_soak_keys.update({"runId", "slotKind"})
     if (
         set(soak) != expected_soak_keys
         or type(soak.get("schemaVersion")) is not int
-        or soak.get("schemaVersion") != 2
+        or soak_schema not in {2, 3}
         or soak.get("kind") != "nuvion-iq9075-oak-soak-result"
+        or (version in CANDIDATE_SOAK_REQUIRED_VERSIONS and soak_schema != 3)
+        or (soak_schema == 3 and candidate_soak is None)
+        or (soak_schema == 2 and candidate_soak is not None)
     ):
         raise AssemblyError("OAK soak result schema is invalid")
     outcome = soak.get("outcome")
@@ -266,6 +321,11 @@ def _assemble_into(
         "result": f"iq9075-v{version}-harness-result.json",
         "summary": f"iq9075-v{version}-physical-evidence.json",
     }
+    if candidate_soak is not None:
+        names["candidate_soak"] = (
+            f"iq9075-v{version}-candidate-soak-evidence.json"
+        )
+        names["cleanup_evidence"] = f"iq9075-v{version}-cleanup-evidence.json"
     paths = {key: _safe_output(output_directory, name) for key, name in names.items()}
     for source, key, raw in (
         (soak_result_path, "oak", soak_raw),
@@ -274,12 +334,84 @@ def _assemble_into(
         (bom_path, "bom", bom_raw),
     ):
         _copy_input(source, paths[key], raw)
+    if candidate_soak_evidence_path is not None and candidate_soak_raw is not None:
+        _copy_input(
+            candidate_soak_evidence_path,
+            paths["candidate_soak"],
+            candidate_soak_raw,
+        )
 
     harness_sha = _digest(_regular_bytes(candidate_harness))
-    fleet_runner_sha = _digest(_regular_bytes(candidate_fleet_runner))
+    candidate_fleet_runner_raw = _regular_bytes(candidate_fleet_runner)
+    publisher_fleet_runner = (
+        Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
+    )
+    publisher_fleet_runner_raw = _regular_bytes(publisher_fleet_runner)
+    if candidate_fleet_runner_raw != publisher_fleet_runner_raw:
+        raise AssemblyError(
+            "candidate Fleet runner bytes differ from trusted publisher runner"
+        )
+    fleet_runner_sha = _digest(publisher_fleet_runner_raw)
     board_tool_sha = _digest(_regular_bytes(candidate_board_tool))
     if fleet_manifest.get("toolSha256") != board_tool_sha:
         raise AssemblyError("Fleet manifest does not bind the candidate board tool")
+    if candidate_soak is not None:
+        module_name = "_nuvion_candidate_soak_validator"
+        try:
+            validator = _module_from_verified_source(
+                module_name=module_name,
+                source=publisher_fleet_runner_raw,
+                display_path=publisher_fleet_runner,
+            )
+            validator.validate_candidate_soak_evidence(
+                candidate_soak,
+                run_id=str(run_id),
+                manifest=fleet_manifest,
+                bundle_sha256=artifact_sha,
+                bom_sha256=_digest(bom_raw),
+                harness_sha256=harness_sha,
+                fleet_evidence_sha256=_digest(fleet_evidence_raw),
+                raw_evidence_sha256=_digest(soak_raw),
+                require_cleanup_evidence=True,
+            )
+        except Exception as exc:
+            raise AssemblyError("candidate soak evidence is invalid") from exc
+        finally:
+            sys.modules.pop(module_name, None)
+        if candidate_soak.get("rawEvidence") != soak:
+            raise AssemblyError("candidate soak wrapper differs from raw OAK evidence")
+        if candidate_soak.get("rawEvidenceSha256") != _digest(soak_raw):
+            raise AssemblyError("candidate soak wrapper raw bytes digest differs")
+        cleanup_evidence = candidate_soak.get("cleanupEvidence")
+        if not isinstance(cleanup_evidence, dict):
+            raise AssemblyError("candidate cleanup evidence is missing")
+        cleanup_evidence_raw = _canonical(cleanup_evidence)
+        if candidate_soak.get("cleanupEvidenceSha256") != _digest(
+            cleanup_evidence_raw
+        ):
+            raise AssemblyError("candidate cleanup evidence bytes differ")
+        candidate_post = candidate_soak.get("post")
+        if not isinstance(candidate_post, dict):
+            raise AssemblyError("candidate soak restoration proof is invalid")
+        fleet_at = _timestamp(
+            fleet_evidence.get("generatedAt"), label="Fleet rollback time"
+        )
+        candidate_at = _timestamp(
+            candidate_soak.get("startedAt"), label="candidate operation start time"
+        )
+        soak_at = _timestamp(soak.get("startedAt"), label="candidate soak start time")
+        restored_at = _timestamp(
+            candidate_post.get("restoredAt"), label="candidate restoration time"
+        )
+        completed_at = _timestamp(
+            candidate_soak.get("completedAt"),
+            label="candidate operation completion time",
+        )
+        if not (
+            fleet_at <= candidate_at <= soak_at <= restored_at <= completed_at
+            and completed_at - fleet_at <= dt.timedelta(hours=24)
+        ):
+            raise AssemblyError("candidate evidence lifecycle ordering is invalid")
     iq_policy = security.get("iq9075")
     baseline = (
         iq_policy.get("legacyPromotedBaseline")
@@ -320,11 +452,23 @@ def _assemble_into(
             "slot": "releases/" + str(baseline.get("bomDigest", ""))[7:],
         },
     }
+    if candidate_soak_raw is not None:
+        manifest["candidateSoak"] = {
+            "file": names["candidate_soak"],
+            "sha256": _digest(candidate_soak_raw),
+        }
+        if cleanup_evidence_raw is None:
+            raise AssemblyError("candidate cleanup evidence bytes are missing")
+        _write_new(paths["cleanup_evidence"], cleanup_evidence_raw)
+        manifest["cleanupEvidence"] = {
+            "file": names["cleanup_evidence"],
+            "sha256": _digest(cleanup_evidence_raw),
+        }
     manifest_raw = _canonical(manifest)
     _write_new(paths["manifest"], manifest_raw)
 
     result = {
-        "schemaVersion": 2,
+        "schemaVersion": 3 if candidate_soak is not None else 2,
         "kind": "nuvion-iq9075-physical-result",
         "runId": run_id,
         "agentVersion": version,
@@ -347,6 +491,10 @@ def _assemble_into(
             "oakReady": True,
         },
     }
+    if candidate_soak is not None:
+        result["candidateRestore"] = candidate_soak.get("post")
+        assert cleanup_evidence_raw is not None
+        result["cleanupEvidenceSha256"] = _digest(cleanup_evidence_raw)
     result_raw = _canonical(result)
     _write_new(paths["result"], result_raw)
 
@@ -390,6 +538,11 @@ def _assemble_into(
             "rollbackOakReady": True,
         },
     }
+    if cleanup_evidence_raw is not None:
+        summary["cleanupEvidence"] = {
+            "file": names["cleanup_evidence"],
+            "sha256": _digest(cleanup_evidence_raw),
+        }
     summary_raw = _canonical(summary)
     _write_new(paths["summary"], summary_raw)
 
@@ -429,6 +582,7 @@ def assemble(
     output_directory: Path,
     version: str,
     component_sha: str,
+    candidate_soak_evidence_path: Path | None = None,
 ) -> dict[str, str]:
     final_root = _private_output_directory(output_directory)
     with tempfile.TemporaryDirectory(
@@ -448,9 +602,10 @@ def assemble(
             output_directory=staging,
             version=version,
             component_sha=component_sha,
+            candidate_soak_evidence_path=candidate_soak_evidence_path,
         )
         staged_files = sorted(path for path in staging.iterdir() if path.is_file())
-        if len(staged_files) != 7:
+        if len(staged_files) != (9 if candidate_soak_evidence_path else 7):
             raise AssemblyError("staged IQ9075 evidence file set is incomplete")
         final_paths = [_safe_output(final_root, path.name) for path in staged_files]
         published: list[Path] = []
@@ -496,6 +651,7 @@ def main() -> int:
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--component-sha", required=True)
+    parser.add_argument("--candidate-soak-evidence", type=Path)
     arguments = parser.parse_args()
     try:
         result = assemble(
@@ -511,6 +667,7 @@ def main() -> int:
             output_directory=arguments.output_directory,
             version=arguments.version,
             component_sha=arguments.component_sha,
+            candidate_soak_evidence_path=arguments.candidate_soak_evidence,
         )
     except AssemblyError as exc:
         print(f"IQ9075 physical evidence assembly failed: {exc}", file=sys.stderr)

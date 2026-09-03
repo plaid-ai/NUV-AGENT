@@ -2,6 +2,8 @@
 Description=NUVION Agent privileged updater socket
 After=systemd-tmpfiles-setup.service
 Before=nuv-agent.service
+Requires=nuvion-fleet-e2e-reconcile.service
+After=nuvion-fleet-e2e-reconcile.service
 
 [Socket]
 ListenStream=/run/nuvion-updater/control.sock

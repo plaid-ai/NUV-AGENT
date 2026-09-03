@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import importlib.util
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -83,6 +85,240 @@ PHYSICAL_EVIDENCE = load_script(
 )
 
 
+def persistent_state_evidence() -> dict[str, object]:
+    roots = {
+        path: {
+            "exists": False,
+            "entries": 0,
+            "bytes": 0,
+            "sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        }
+        for path in FLEET_E2E.CANDIDATE_PERSISTENT_PATHS
+    }
+    serialized = (
+        json.dumps(roots, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    return {
+        "schemaVersion": 1,
+        "roots": roots,
+        "sha256": hashlib.sha256(serialized).hexdigest(),
+        "entries": 0,
+        "bytes": 0,
+    }
+
+
+def release_tree_evidence(slots: dict[str, str]) -> dict[str, object]:
+    trees = {
+        role: {
+            "target": target,
+            "exists": True,
+            "entries": 1,
+            "bytes": 0,
+            "sha256": hashlib.sha256(f"{role}:{target}".encode()).hexdigest(),
+        }
+        for role, target in slots.items()
+    }
+    serialized = (
+        json.dumps(trees, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    return {
+        "schemaVersion": 1,
+        "slots": trees,
+        "sha256": hashlib.sha256(serialized).hexdigest(),
+        "entries": len(trees),
+        "bytes": 0,
+    }
+
+
+def candidate_execution_proof(run_id: str) -> dict[str, object]:
+    unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+    control_group = "/system.slice/" + unit
+    temporary = {
+        path: {
+            "mountId": 101 + index,
+            "fsType": "tmpfs",
+            "sizeBytes": limits["bytes"],
+            "inodeLimit": limits["inodes"],
+            "readOnly": False,
+        }
+        for index, (path, limits) in enumerate(FLEET_E2E.CANDIDATE_TMPFS_LIMITS.items())
+    }
+    return {
+        "schemaVersion": 1,
+        "unit": unit,
+        "mainPid": 9001,
+        "controlGroup": control_group,
+        "pidControlGroup": control_group,
+        "recursivePopulated": True,
+        "uidIsolation": {
+            "before": {
+                "schemaVersion": 1,
+                "uid": 4242,
+                "pids": [],
+                "controlGroup": None,
+                "stableScans": 2,
+            },
+            "during": {
+                "schemaVersion": 1,
+                "uid": 4242,
+                "pids": [9001],
+                "controlGroup": control_group,
+                "stableScans": 2,
+            },
+        },
+        "systemdProperties": dict(
+            FLEET_E2E.CANDIDATE_SYSTEMD_EXPECTED_PROPERTIES
+        ),
+        "mountSandbox": {
+            "temporaryFilesystems": temporary,
+            "readOnlyPaths": {
+                path: {
+                    "mountId": 111 + index,
+                    "mountPoint": path,
+                    "readOnly": True,
+                }
+                for index, path in enumerate(FLEET_E2E.CANDIDATE_PERSISTENT_PATHS)
+            },
+            "readWritePath": {
+                "mountId": 131,
+                "mountPoint": f"/var/lib/nuvion-fleet-e2e/runs/{run_id}",
+                "readOnly": False,
+            },
+            "inaccessiblePaths": {
+                path: {
+                    "mountId": 121 + index,
+                    "mountPoint": path,
+                    "mode": "0000",
+                    "readOnly": True,
+                }
+                for index, path in enumerate(FLEET_E2E.CANDIDATE_INACCESSIBLE_PATHS)
+            },
+            "totalTmpfsBytes": sum(
+                item["sizeBytes"] for item in temporary.values()
+            ),
+            "totalTmpfsInodes": sum(
+                item["inodeLimit"] for item in temporary.values()
+            ),
+        },
+    }
+
+
+def candidate_termination_proof(run_id: str) -> dict[str, object]:
+    unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+    return {
+        "schemaVersion": 1,
+        "unit": unit,
+        "controlGroup": "/system.slice/" + unit,
+        "initialPresent": True,
+        "initialPopulated": False,
+        "killSignals": [],
+        "stopSucceeded": True,
+        "resetPerformed": True,
+        "recursivePopulated": False,
+        "loadState": "not-found",
+        "activeState": "inactive",
+        "cgroupRemoved": True,
+    }
+
+
+def candidate_collector_proof(run_id: str) -> dict[str, object]:
+    unit = f"nuvion-candidate-soak-{run_id.replace('-', '')}.service"
+    return {
+        "schemaVersion": 1,
+        "unit": unit,
+        "controlGroup": "/system.slice/" + unit,
+        "requiredSeconds": FLEET_E2E.CANDIDATE_REQUIRED_SOAK_SECONDS,
+        "elapsedSeconds": float(FLEET_E2E.CANDIDATE_REQUIRED_SOAK_SECONDS),
+        "scanIntervalSeconds": FLEET_E2E.CANDIDATE_UID_SCAN_INTERVAL_SECONDS,
+        "sampleCount": 2,
+        "observedPids": [9001],
+        "escapeDetected": None,
+        "allSamplesWithinCgroup": True,
+        "durationSatisfied": True,
+        "terminalStatus": {
+            "ActiveState": "active",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
+            "Result": "success",
+            "SubState": "exited",
+        },
+        "afterTermination": {
+            "schemaVersion": 1,
+            "uid": 4242,
+            "pids": [],
+            "controlGroup": None,
+            "stableScans": 2,
+        },
+    }
+
+
+def cleanup_evidence(run_id: str) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "kind": "nuvion-iq9075-cleanup-evidence",
+        "runId": run_id,
+        "complete": True,
+        "recovered": False,
+        "phase": "RESTORED",
+        "proof": {
+            "schemaVersion": 1,
+            "transactionPhase": "RESTORED",
+            "cleanupJournalComplete": True,
+            "activeRunLeaseAbsent": True,
+            "transactionSnapshotsAbsent": True,
+            "recoveryArchiveAbsent": True,
+            "candidateArtifactsAbsent": True,
+            "candidateStagingAbsent": True,
+            "trustStagingAbsent": True,
+        },
+    }
+
+
+def canonical_sha256(value: Mapping[str, object]) -> str:
+    payload = (
+        json.dumps(dict(value), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def production_restoration_evidence(
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schemaVersion": 1,
+        "transactionPhase": "RESTORED",
+        "manifestSha256": hashlib.sha256(
+            (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest(),
+        "files": {
+            path: {
+                "exists": False,
+                "sha256": None,
+                "mode": None,
+                "uid": None,
+                "gid": None,
+            }
+            for path in FLEET_E2E.PRODUCTION_TRANSACTION_FILES
+        },
+        "directories": {
+            path: {"mode": 0o700, "uid": 0, "gid": 0}
+            for path in FLEET_E2E.PRODUCTION_TRANSACTION_DIRECTORIES
+        },
+        "units": {
+            unit: {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+            }
+            for unit in FLEET_E2E.PRODUCTION_UNITS
+        },
+    }
+    value["sha256"] = hashlib.sha256(
+        (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    return value
+
+
 class ReleaseSecurityWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         self.publish = (
@@ -94,6 +330,32 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.face = (
             ROOT / ".github/workflows/publish-face-artifacts.yml"
         ).read_text(encoding="utf-8")
+
+    def test_fleet_validators_execute_verified_bytes_not_reopened_paths(
+        self,
+    ) -> None:
+        helpers = (
+            PHYSICAL_EVIDENCE._module_from_verified_source,
+            READINESS._module_from_verified_source,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run-iq9075-fleet-e2e.py"
+            path.write_text(
+                "raise RuntimeError('reopened untrusted path')\n", encoding="utf-8"
+            )
+            for index, helper in enumerate(helpers):
+                module_name = f"_verified_fleet_validator_regression_{index}"
+                with self.subTest(helper=helper.__module__):
+                    module = helper(
+                        module_name=module_name,
+                        source=b"VALIDATOR_ORIGIN = 'verified-bytes'\n",
+                        display_path=path,
+                    )
+                    try:
+                        self.assertEqual(module.VALIDATOR_ORIGIN, "verified-bytes")
+                        self.assertFalse((path.parent / "__pycache__").exists())
+                    finally:
+                        sys.modules.pop(module_name, None)
 
     def _job(self, name: str) -> str:
         start = self.publish.index(f"  {name}:")
@@ -472,10 +734,16 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "agentVersion": "0.1.121",
                 "componentSha": component_sha,
                 "bomDigest": bom["bomDigest"],
-                "pythonPath": (
+                "pythonPath": "/usr/bin/python3",
+                "sitePackagesPath": (
                     "/opt/nuv-agent/releases/"
                     + bom["bomDigest"][7:]
-                    + "/venv/bin/python"
+                    + "/venv/lib/python3.12/site-packages"
+                ),
+                "buildInfoPath": (
+                    "/opt/nuv-agent/releases/"
+                    + bom["bomDigest"][7:]
+                    + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py"
                 ),
                 "releaseMarkerSha256": "4" * 64,
             },
@@ -526,6 +794,195 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "rollbackOakReady": True,
             },
         }
+        return summary, manifest_path, result_path
+
+    @classmethod
+    def _candidate_physical_fixture(
+        cls, root: Path, *, component_sha: str
+    ) -> tuple[dict[str, object], Path, Path]:
+        summary, manifest_path, result_path = cls._physical_fixture(
+            root, component_sha=component_sha
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        fleet_manifest_path = root / manifest["fleetManifest"]["file"]
+        fleet_evidence_path = root / manifest["fleetEvidence"]["file"]
+        fleet_manifest = json.loads(fleet_manifest_path.read_text(encoding="utf-8"))
+        fleet_evidence = json.loads(fleet_evidence_path.read_text(encoding="utf-8"))
+        soak_path = root / manifest["oakSoak"]["file"]
+        soak = json.loads(soak_path.read_text(encoding="utf-8"))
+        run_id = fleet_manifest["runId"]
+        bom_digest = fleet_manifest["scenario"]["expectedBomDigest"]
+        candidate_slot = f"/opt/nuv-agent/candidates/{run_id}-{bom_digest[7:]}"
+        control_sha = "c" * 64
+        soak.update(
+            {"schemaVersion": 3, "runId": run_id, "slotKind": "candidate"}
+        )
+        soak["startedAt"] = "2026-09-03T10:04:00Z"
+        soak["runtimeIdentity"].update(
+            {
+                "pythonPath": "/usr/bin/python3",
+                "sitePackagesPath": candidate_slot
+                + "/venv/lib/python3.12/site-packages",
+                "buildInfoPath": candidate_slot
+                + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py",
+                "candidateSlot": candidate_slot,
+                "controlMarkerSha256": control_sha,
+            }
+        )
+        soak_path.write_text(
+            json.dumps(soak, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        artifact_path = (
+            root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+        )
+        bom_path = root / manifest["testedBom"]["file"]
+        slots = {
+            "current": fleet_evidence["slots"]["current"],
+            "previous": fleet_evidence["slots"]["previous"],
+        }
+        anti_replay = {
+            "schemaVersion": 4,
+            "semanticSha256": "0" * 64,
+            "maximumCommandSequence": 2,
+            "currentReleaseSequence": "1",
+            "currentBomDigest": fleet_evidence["slots"]["release"]["bomDigest"],
+            "latest": {
+                "commandId": fleet_manifest["scenario"]["expectedCommandId"],
+                "sequence": 2,
+                "phase": "ROLLED_BACK",
+                "bomDigest": bom_digest,
+                "releaseSequence": 2,
+                "healthDeadline": None,
+            },
+        }
+        before_runtime = {
+            "pid": 4200,
+            "startTicks": 42000,
+            "bootId": "11111111-1111-4111-8111-111111111111",
+            "activeSlot": slots["current"],
+        }
+        after_runtime = {**before_runtime, "pid": 4400, "startTicks": 44000}
+        post = {
+            "restoredAt": "2026-09-03T10:06:00Z",
+            "slots": slots,
+            "antiReplay": anti_replay,
+            "oak": fleet_evidence["oak"],
+            "runtime": after_runtime,
+        }
+        release_trees = release_tree_evidence(slots)
+        cleanup = cleanup_evidence(run_id)
+        candidate_evidence = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-candidate-soak-evidence",
+            "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+            "runId": run_id,
+            "startedAt": "2026-09-03T10:03:30Z",
+            "completedAt": "2026-09-03T10:06:30Z",
+            "complete": True,
+            "outcome": {"status": "passed", "errorCode": None},
+            "candidate": {
+                "slotKind": "candidate",
+                "slot": candidate_slot,
+                "bomDigest": bom_digest,
+                "bundleSha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                "bomSha256": hashlib.sha256(bom_path.read_bytes()).hexdigest(),
+                "harnessSha256": hashlib.sha256(
+                    (ROOT / "packaging/dev/test-iq9075.sh").read_bytes()
+                ).hexdigest(),
+                "controlMarkerSha256": control_sha,
+            },
+            "fleetEvidenceSha256": hashlib.sha256(
+                fleet_evidence_path.read_bytes()
+            ).hexdigest(),
+            "rawEvidenceSha256": hashlib.sha256(soak_path.read_bytes()).hexdigest(),
+            "rawEvidence": soak,
+            "cleanupEvidenceSha256": canonical_sha256(cleanup),
+            "cleanupEvidence": cleanup,
+            "executionProof": candidate_execution_proof(run_id),
+            "collectorProof": candidate_collector_proof(run_id),
+            "terminationProof": candidate_termination_proof(run_id),
+            "productionRestoration": production_restoration_evidence(
+                fleet_manifest
+            ),
+            "pre": {
+                "slots": slots,
+                "antiReplay": anti_replay,
+                "oak": fleet_evidence["oak"],
+                "runtime": before_runtime,
+                "persistentState": persistent_state_evidence(),
+                "releaseTrees": copy.deepcopy(release_trees),
+            },
+            "post": {
+                **post,
+                "persistentState": persistent_state_evidence(),
+                "releaseTrees": release_trees,
+            },
+            "gates": {
+                "signedRollbackTerminal": True,
+                "candidateBound": True,
+                "rawEvidencePreserved": True,
+                "slotsUnchanged": True,
+                "releaseTreesUnchanged": True,
+                "antiReplayUnchanged": True,
+                "oakIdentityUnchanged": True,
+                "freshBaselineProcess": True,
+                "harnessBytesPinned": True,
+                "harnessCopyRemoved": True,
+                "resourceLimitsApplied": True,
+                "boundedOutput": True,
+                "persistentStateReadOnly": True,
+                "persistentStateUnchanged": True,
+                "productionTrustRestored": True,
+                "trustedSoakDuration": True,
+                "continuousUidIsolation": True,
+                "cgroupTerminated": True,
+                "harnessPassed": True,
+            },
+        }
+        candidate_path = root / "iq9075-v0.1.121-candidate-soak-evidence.json"
+        candidate_path.write_text(
+            json.dumps(candidate_evidence, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        cleanup_path = root / "iq9075-v0.1.121-cleanup-evidence.json"
+        cleanup_path.write_text(
+            json.dumps(cleanup, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        manifest["oakSoak"]["sha256"] = hashlib.sha256(soak_path.read_bytes()).hexdigest()
+        manifest["candidateSoak"] = {
+            "file": candidate_path.name,
+            "sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+        }
+        manifest["cleanupEvidence"] = {
+            "file": cleanup_path.name,
+            "sha256": hashlib.sha256(cleanup_path.read_bytes()).hexdigest(),
+        }
+        manifest["startedAt"] = soak["startedAt"]
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["schemaVersion"] = 3
+        result["candidateRestore"] = candidate_evidence["post"]
+        result["cleanupEvidenceSha256"] = hashlib.sha256(
+            cleanup_path.read_bytes()
+        ).hexdigest()
+        result["manifestSha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        result_path.write_text(
+            json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        summary["harnessManifest"]["sha256"] = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
+        summary["harnessResult"]["sha256"] = hashlib.sha256(
+            result_path.read_bytes()
+        ).hexdigest()
+        summary["cleanupEvidence"] = manifest["cleanupEvidence"]
         return summary, manifest_path, result_path
 
     def test_tag_push_is_secret_zero_and_default_branch_starts_publisher(self) -> None:
@@ -976,7 +1433,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            physical_document, _manifest, _result = self._physical_fixture(
+            physical_document, _manifest, _result = self._candidate_physical_fixture(
                 root,
                 component_sha=component_sha,
             )
@@ -1183,7 +1640,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            summary, manifest_path, result_path = self._physical_fixture(
+            summary, manifest_path, result_path = self._candidate_physical_fixture(
                 root, component_sha="a" * 40
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1219,6 +1676,28 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 READINESS.ReadinessError, "OAK soak source identity"
             ):
                 validate(root, summary)
+
+        for mutation in ("omitted", "byte-drift"):
+            with self.subTest(cleanup_receipt=mutation), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                summary, _manifest_path, _result_path = (
+                    self._candidate_physical_fixture(
+                        root, component_sha="a" * 40
+                    )
+                )
+                if mutation == "omitted":
+                    summary.pop("cleanupEvidence")
+                else:
+                    cleanup_path = root / summary["cleanupEvidence"]["file"]
+                    cleanup_value = json.loads(
+                        cleanup_path.read_text(encoding="utf-8")
+                    )
+                    cleanup_path.write_text(
+                        json.dumps(cleanup_value, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                with self.assertRaises(READINESS.ReadinessError):
+                    validate(root, summary)
 
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -1265,7 +1744,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            summary, manifest_path, result_path = self._physical_fixture(
+            summary, manifest_path, result_path = self._candidate_physical_fixture(
                 root, component_sha="a" * 40
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1533,7 +2012,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     reader(victim)
                 self.assertEqual(victim.read_text(encoding="utf-8"), '{"trusted":true}\n')
 
-    def test_iq9075_physical_evidence_assembler_roundtrip_is_atomic(self) -> None:
+    def test_iq9075_legacy_physical_evidence_is_rejected_atomically(self) -> None:
         component_sha = "a" * 40
 
         def inputs(source: Path) -> dict[str, object]:
@@ -1569,43 +2048,31 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             source.mkdir(mode=0o700)
             output.mkdir(mode=0o700)
             arguments = inputs(source)
-            result = PHYSICAL_EVIDENCE.assemble(
-                **arguments, output_directory=output
+            summary, _manifest_path, _result_path = self._physical_fixture(
+                source, component_sha=component_sha
             )
-            self.assertEqual(len(list(output.iterdir())), 7)
-            summary = json.loads(Path(result["summary"]).read_text(encoding="utf-8"))
-            assembled_manifest = json.loads(
-                Path(result["manifest"]).read_text(encoding="utf-8")
-            )
-            assembled_oak = json.loads(
-                (output / assembled_manifest["oakSoak"]["file"]).read_text(
-                    encoding="utf-8"
-                )
-            )
-            assembled_result = json.loads(
-                Path(result["result"]).read_text(encoding="utf-8")
-            )
-            self.assertEqual(assembled_oak["schemaVersion"], 2)
-            self.assertEqual(
-                assembled_oak["outcome"],
-                {"status": "passed", "error": None, "cleanupErrors": []},
-            )
-            self.assertEqual(assembled_result["schemaVersion"], 2)
-            self.assertEqual(assembled_result["outcome"], assembled_oak["outcome"])
             security = json.loads(
                 arguments["security_policy_path"].read_text(encoding="utf-8")
             )
-            verified = READINESS._validate_physical_documents(
-                policy_path=output / "release-readiness.json",
-                version="0.1.121",
-                component_sha=component_sha,
-                summary=summary,
-                security=security,
-                candidate_harness=arguments["candidate_harness"],
-            )
-            self.assertEqual(
-                verified["physical_artifact_sha256"], result["artifactSha256"]
-            )
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "OAK soak source identity"
+            ):
+                READINESS._validate_physical_documents(
+                    policy_path=source / "release-readiness.json",
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    summary=summary,
+                    security=security,
+                    candidate_harness=arguments["candidate_harness"],
+                )
+            with self.assertRaisesRegex(
+                PHYSICAL_EVIDENCE.AssemblyError,
+                "requires schema-v3 candidate soak evidence",
+            ):
+                PHYSICAL_EVIDENCE.assemble(
+                    **arguments, output_directory=output
+                )
+            self.assertEqual(list(output.iterdir()), [])
 
         def corrupt_artifact(arguments: dict[str, object]) -> None:
             arguments["artifact_path"].write_bytes(b"different artifact")
@@ -1685,8 +2152,6 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     PHYSICAL_EVIDENCE.assemble(
                         **arguments, output_directory=output
                     )
-                if label == "failed-soak":
-                    self.assertIn("cannot be promoted", str(caught.exception))
                 self.assertEqual(list(output.iterdir()), [])
 
         with tempfile.TemporaryDirectory() as raw_root:
@@ -1720,6 +2185,354 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     **arguments, output_directory=output_link
                 )
             self.assertEqual(list(real_output.iterdir()), [])
+
+    def test_candidate_soak_chain_orders_rollback_before_soak_and_restore(self) -> None:
+        component_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            self._physical_fixture(source, component_sha=component_sha)
+            manifest_path = source / "iq9075-v0.1.121-harness-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            fleet_manifest_path = source / manifest["fleetManifest"]["file"]
+            fleet_evidence_path = source / manifest["fleetEvidence"]["file"]
+            fleet_manifest = json.loads(
+                fleet_manifest_path.read_text(encoding="utf-8")
+            )
+            fleet_evidence = json.loads(
+                fleet_evidence_path.read_text(encoding="utf-8")
+            )
+            soak_path = source / manifest["oakSoak"]["file"]
+            soak = json.loads(soak_path.read_text(encoding="utf-8"))
+            run_id = fleet_manifest["runId"]
+            bom_digest = fleet_manifest["scenario"]["expectedBomDigest"]
+            candidate_slot = (
+                f"/opt/nuv-agent/candidates/{run_id}-{bom_digest[7:]}"
+            )
+            control_sha = "c" * 64
+            soak.update(
+                {
+                    "schemaVersion": 3,
+                    "runId": run_id,
+                    "slotKind": "candidate",
+                    "startedAt": "2026-09-03T10:04:00Z",
+                }
+            )
+            soak["runtimeIdentity"].update(
+                {
+                    "pythonPath": "/usr/bin/python3",
+                    "sitePackagesPath": candidate_slot
+                    + "/venv/lib/python3.12/site-packages",
+                    "buildInfoPath": candidate_slot
+                    + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py",
+                    "candidateSlot": candidate_slot,
+                    "controlMarkerSha256": control_sha,
+                }
+            )
+            soak_path.write_text(
+                json.dumps(soak, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            raw_sha = hashlib.sha256(soak_path.read_bytes()).hexdigest()
+            artifact_path = (
+                source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+            )
+            bom_path = source / "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json"
+            bundle_sha = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            bom_sha = hashlib.sha256(bom_path.read_bytes()).hexdigest()
+            harness_sha = hashlib.sha256(
+                (ROOT / "packaging/dev/test-iq9075.sh").read_bytes()
+            ).hexdigest()
+            slots = {
+                "current": fleet_evidence["slots"]["current"],
+                "previous": fleet_evidence["slots"]["previous"],
+            }
+            anti_replay = {
+                "schemaVersion": 4,
+                "semanticSha256": "0" * 64,
+                "maximumCommandSequence": 2,
+                "currentReleaseSequence": "1",
+                "currentBomDigest": fleet_evidence["slots"]["release"][
+                    "bomDigest"
+                ],
+                "latest": {
+                    "commandId": fleet_manifest["scenario"]["expectedCommandId"],
+                    "sequence": 2,
+                    "phase": "ROLLED_BACK",
+                    "bomDigest": bom_digest,
+                    "releaseSequence": 2,
+                    "healthDeadline": None,
+                },
+            }
+            before_runtime = {
+                "pid": 4200,
+                "startTicks": 42000,
+                "bootId": "11111111-1111-4111-8111-111111111111",
+                "activeSlot": slots["current"],
+            }
+            after_runtime = {**before_runtime, "pid": 4400, "startTicks": 44000}
+            cleanup = cleanup_evidence(run_id)
+            candidate_evidence = {
+                "schemaVersion": 1,
+                "kind": "nuvion-iq9075-candidate-soak-evidence",
+                "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+                "runId": run_id,
+                "startedAt": "2026-09-03T10:03:30Z",
+                "completedAt": "2026-09-03T10:06:30Z",
+                "complete": True,
+                "outcome": {"status": "passed", "errorCode": None},
+                "candidate": {
+                    "slotKind": "candidate",
+                    "slot": candidate_slot,
+                    "bomDigest": bom_digest,
+                    "bundleSha256": bundle_sha,
+                    "bomSha256": bom_sha,
+                    "harnessSha256": harness_sha,
+                    "controlMarkerSha256": control_sha,
+                },
+                "fleetEvidenceSha256": hashlib.sha256(
+                    fleet_evidence_path.read_bytes()
+                ).hexdigest(),
+                "rawEvidenceSha256": raw_sha,
+                "rawEvidence": soak,
+                "cleanupEvidenceSha256": canonical_sha256(cleanup),
+                "cleanupEvidence": cleanup,
+                "executionProof": candidate_execution_proof(run_id),
+                "collectorProof": candidate_collector_proof(run_id),
+                "terminationProof": candidate_termination_proof(run_id),
+                "productionRestoration": production_restoration_evidence(
+                    fleet_manifest
+                ),
+                "pre": {
+                    "slots": slots,
+                        "antiReplay": anti_replay,
+                        "oak": fleet_evidence["oak"],
+                        "runtime": before_runtime,
+                        "persistentState": persistent_state_evidence(),
+                        "releaseTrees": release_tree_evidence(slots),
+                    },
+                    "post": {
+                    "restoredAt": "2026-09-03T10:06:00Z",
+                    "slots": slots,
+                    "antiReplay": anti_replay,
+                        "oak": fleet_evidence["oak"],
+                        "runtime": after_runtime,
+                        "persistentState": persistent_state_evidence(),
+                        "releaseTrees": release_tree_evidence(slots),
+                    },
+                "gates": {
+                    "signedRollbackTerminal": True,
+                    "candidateBound": True,
+                    "rawEvidencePreserved": True,
+                    "slotsUnchanged": True,
+                    "releaseTreesUnchanged": True,
+                    "antiReplayUnchanged": True,
+                    "oakIdentityUnchanged": True,
+                    "freshBaselineProcess": True,
+                    "harnessBytesPinned": True,
+                    "harnessCopyRemoved": True,
+                    "resourceLimitsApplied": True,
+                    "boundedOutput": True,
+                    "persistentStateReadOnly": True,
+                    "persistentStateUnchanged": True,
+                    "productionTrustRestored": True,
+                    "trustedSoakDuration": True,
+                    "continuousUidIsolation": True,
+                    "cgroupTerminated": True,
+                    "harnessPassed": True,
+                },
+            }
+            candidate_path = source / "candidate-soak-evidence.json"
+            candidate_path.write_text(
+                json.dumps(
+                    candidate_evidence, sort_keys=True, separators=(",", ":")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = PHYSICAL_EVIDENCE.assemble(
+                soak_result_path=soak_path,
+                fleet_manifest_path=fleet_manifest_path,
+                fleet_evidence_path=fleet_evidence_path,
+                artifact_path=artifact_path,
+                bom_path=bom_path,
+                candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                candidate_fleet_runner=ROOT
+                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                security_policy_path=ROOT
+                / "packaging/release/release-security-policy.json",
+                output_directory=output,
+                version="0.1.121",
+                component_sha=component_sha,
+                candidate_soak_evidence_path=candidate_path,
+            )
+            self.assertEqual(len(list(output.iterdir())), 9)
+            assembled_result = json.loads(
+                Path(result["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(assembled_result["schemaVersion"], 3)
+            self.assertEqual(
+                assembled_result["candidateRestore"], candidate_evidence["post"]
+            )
+            cleanup_mutations: list[tuple[str, dict[str, object]]] = []
+            missing_cleanup = copy.deepcopy(candidate_evidence)
+            missing_cleanup.pop("cleanupEvidence")
+            missing_cleanup.pop("cleanupEvidenceSha256")
+            cleanup_mutations.append(("omitted", missing_cleanup))
+            wrong_digest = copy.deepcopy(candidate_evidence)
+            wrong_digest["cleanupEvidenceSha256"] = "0" * 64
+            cleanup_mutations.append(("digest", wrong_digest))
+            for label, key in (
+                ("stale-run", "runId"),
+                ("lease-present", "activeRunLeaseAbsent"),
+                ("secret-snapshot-present", "transactionSnapshotsAbsent"),
+            ):
+                mutation = copy.deepcopy(candidate_evidence)
+                if key == "runId":
+                    mutation["cleanupEvidence"]["runId"] = str(uuid.uuid4())
+                else:
+                    mutation["cleanupEvidence"]["proof"][key] = False
+                mutation["cleanupEvidenceSha256"] = canonical_sha256(
+                    mutation["cleanupEvidence"]
+                )
+                cleanup_mutations.append((label, mutation))
+            for label, mutation in cleanup_mutations:
+                with self.subTest(cleanup_evidence=label):
+                    candidate_path.write_text(
+                        json.dumps(
+                            mutation, sort_keys=True, separators=(",", ":")
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    cleanup_rejected = root / f"cleanup-rejected-{label}"
+                    cleanup_rejected.mkdir(mode=0o700)
+                    with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                        PHYSICAL_EVIDENCE.assemble(
+                            soak_result_path=soak_path,
+                            fleet_manifest_path=fleet_manifest_path,
+                            fleet_evidence_path=fleet_evidence_path,
+                            artifact_path=artifact_path,
+                            bom_path=bom_path,
+                            candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                            candidate_fleet_runner=ROOT
+                            / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_board_tool=ROOT
+                            / "packaging/dev/iq9075-board-e2e.py",
+                            security_policy_path=ROOT
+                            / "packaging/release/release-security-policy.json",
+                            output_directory=cleanup_rejected,
+                            version="0.1.121",
+                            component_sha=component_sha,
+                            candidate_soak_evidence_path=candidate_path,
+                        )
+                    self.assertEqual(list(cleanup_rejected.iterdir()), [])
+            candidate_path.write_text(
+                json.dumps(
+                    candidate_evidence, sort_keys=True, separators=(",", ":")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Object equality is insufficient: the signed wrapper binds the
+            # exact raw evidence bytes, including canonical serialization.
+            soak_path.write_text(json.dumps(soak, indent=2) + "\n", encoding="utf-8")
+            byte_drift_output = root / "byte-drift-output"
+            byte_drift_output.mkdir(mode=0o700)
+            with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                PHYSICAL_EVIDENCE.assemble(
+                    soak_result_path=soak_path,
+                    fleet_manifest_path=fleet_manifest_path,
+                    fleet_evidence_path=fleet_evidence_path,
+                    artifact_path=artifact_path,
+                    bom_path=bom_path,
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                    security_policy_path=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    output_directory=byte_drift_output,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    candidate_soak_evidence_path=candidate_path,
+                )
+            self.assertEqual(list(byte_drift_output.iterdir()), [])
+            soak_path.write_text(
+                json.dumps(soak, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            invalid = copy.deepcopy(candidate_evidence)
+            invalid["post"]["restoredAt"] = "2026-09-03T10:03:59Z"
+            candidate_path.write_text(
+                json.dumps(invalid, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            rejected_output = root / "rejected-output"
+            rejected_output.mkdir(mode=0o700)
+            with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError):
+                PHYSICAL_EVIDENCE.assemble(
+                    soak_result_path=soak_path,
+                    fleet_manifest_path=fleet_manifest_path,
+                    fleet_evidence_path=fleet_evidence_path,
+                    artifact_path=artifact_path,
+                    bom_path=bom_path,
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                    security_policy_path=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    output_directory=rejected_output,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    candidate_soak_evidence_path=candidate_path,
+                )
+            self.assertEqual(list(rejected_output.iterdir()), [])
+
+            candidate_path.write_text(
+                json.dumps(
+                    candidate_evidence, sort_keys=True, separators=(",", ":")
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            execution_marker = root / "untrusted-runner-executed"
+            untrusted_runner = root / "run-iq9075-fleet-e2e.py"
+            untrusted_runner.write_text(
+                f"from pathlib import Path\nPath({str(execution_marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            untrusted_output = root / "untrusted-output"
+            untrusted_output.mkdir(mode=0o700)
+            with self.assertRaisesRegex(
+                PHYSICAL_EVIDENCE.AssemblyError,
+                "differ.*trusted publisher runner",
+            ):
+                PHYSICAL_EVIDENCE.assemble(
+                    soak_result_path=soak_path,
+                    fleet_manifest_path=fleet_manifest_path,
+                    fleet_evidence_path=fleet_evidence_path,
+                    artifact_path=artifact_path,
+                    bom_path=bom_path,
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                    candidate_fleet_runner=untrusted_runner,
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                    security_policy_path=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    output_directory=untrusted_output,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    candidate_soak_evidence_path=candidate_path,
+                )
+            self.assertFalse(execution_marker.exists())
+            self.assertEqual(list(untrusted_output.iterdir()), [])
 
     def test_physical_evidence_assembler_isolated_mode_blocks_source_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -1772,15 +2585,33 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     self.assertEqual(nonisolated.returncode, 2)
                     self.assertIn("requires Python isolated mode", nonisolated.stderr)
 
-    def test_iq9075_runbook_keeps_unsafe_capture_blocked_and_isolates_tools(self) -> None:
+    def test_iq9075_runbook_uses_canonical_candidate_soak_and_isolates_tools(
+        self,
+    ) -> None:
         runbook = (
             ROOT / "packaging/release/v0.1.121-release-runbook.md"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "The raw capture sequence below is not currently authorized to run",
+            "The reviewed `candidate-soak` primitive is the only authorized way",
             runbook,
         )
-        self.assertIn("`IQ9075-PHYSICAL-OAK-SOAK` blocked", runbook)
+        rollback_call = runbook.index("--scenario oak-fault-rollback")
+        soak_call = runbook.index(
+            '--run-id "$run_id" --output-dir "$fleet_run_dir" candidate-soak'
+        )
+        cleanup_call = runbook.index(
+            '--run-id "$run_id" --output-dir "$fleet_run_dir" cleanup',
+            soak_call,
+        )
+        self.assertLess(rollback_call, soak_call)
+        self.assertLess(soak_call, cleanup_call)
+        self.assertIn('--candidate-bundle "$candidate_bundle"', runbook)
+        self.assertIn('--candidate-bom "$candidate_bom"', runbook)
+        self.assertIn(
+            '--candidate-soak-evidence "$candidate_soak_evidence"', runbook
+        )
+        self.assertNotIn("sudo -n env -u PYTHONPATH NUVION_AGENT_PYTHON", runbook)
+        self.assertNotIn('scp -F /dev/null -P "$board_port"', runbook)
         self.assertIn(
             '"$candidate_bom" "$release_sha" <<\'PY\'', runbook
         )

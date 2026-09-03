@@ -1,0 +1,32 @@
+[Unit]
+Description=NUVION Fleet E2E crash reconciliation gate
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=nuv-agent-updater.socket nuv-agent-updater.service nuv-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/nuvion/iq9075-board-e2e.py boot-reconcile
+RemainAfterExit=yes
+User=root
+Group=root
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/nuv-agent /etc/nuvion-updater /var/lib/nuvion-fleet-e2e /opt/nuv-agent/candidates /run/lock /tmp /sys/bus/usb/drivers/usb/bind
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

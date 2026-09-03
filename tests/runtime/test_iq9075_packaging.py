@@ -171,6 +171,8 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertNotIn("pip install", postinst)
         self.assertIn("Unsupported NUVION_INSTALL_PROFILE", postinst)
         self.assertIn("systemctl disable --now nuv-agent.service", postinst)
+        self.assertIn('"$INSTALL_ROOT/candidates"', postinst)
+        self.assertIn("install -d -m 0755 -o root -g root", postinst)
 
     def test_iq9075_installer_is_board_bound_and_leaves_service_disabled(self) -> None:
         installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
@@ -290,17 +292,17 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("runuser -u nuvion", e2e)
         self.assertIn("/opt/nuv-agent/current/venv/bin/python", e2e)
         self.assertIn("NUVION_AGENT_PYTHON", e2e)
-        self.assertIn("normalized root-owned executable", e2e)
+        self.assertIn("evidence Python and site-packages identity is invalid", e2e)
         self.assertIn("--evidence-output", e2e)
         self.assertIn(
-            "evidence mode requires the exact BOM-addressed candidate Python", e2e
+            "evidence mode requires the exact BOM-addressed site-packages", e2e
         )
         runbook = (
             ROOT / "packaging/release/v0.1.121-release-runbook.md"
         ).read_text(encoding="utf-8")
         self.assertIn("env -u PYTHONPATH", runbook)
         self.assertGreaterEqual(e2e.count('-C "$probe_runtime_dir"'), 2)
-        self.assertGreaterEqual(e2e.count('+=("-I")'), 2)
+        self.assertGreaterEqual(e2e.count("/usr/bin/python3 -I -s"), 3)
         self.assertIn("OAK evidence process imported outside candidate slot", e2e)
         self.assertIn('"runtimeIdentity"', e2e)
         self.assertIn("physical release test requires exactly one OAK MXID", e2e)
@@ -312,6 +314,17 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("parent.is_relative_to(install_root)", e2e)
         self.assertIn("/usr/bin/python3 -I", e2e)
         self.assertIn('runuser -u nuvion --', e2e)
+        identity_probe = e2e.split("validate_release_identity() {", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        self.assertIn(
+            "identity_python=(/usr/sbin/runuser -u nuvion -- /usr/bin/python3 -I -s)",
+            identity_probe,
+        )
+        self.assertNotIn(
+            'NUVION_SYSTEM_PYTHON=/usr/bin/python3 "$agent_python" -s -',
+            identity_probe,
+        )
         self.assertIn('"G_DEBUG=fatal-criticals"', e2e)
         self.assertIn("mktemp -d /tmp/nuvion-iq9075-e2e.XXXXXX", e2e)
         self.assertIn('"HOME=$probe_runtime_dir/home"', e2e)
@@ -420,6 +433,17 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("Gst.MessageType.ERROR", e2e)
         self.assertIn('oak_status" -eq 3', e2e)
         self.assertIn('NUVION_GST_SOURCE must be empty', e2e)
+        self.assertIn('--expected-slot-kind)', e2e)
+        self.assertIn('--expected-slot-path)', e2e)
+        self.assertIn('--expected-control-marker-sha256)', e2e)
+        self.assertIn('evidence["schemaVersion"] = 3', e2e)
+        self.assertIn('evidence["slotKind"] = "candidate"', e2e)
+        self.assertIn('/opt/nuv-agent/candidates/${evidence_run_id}-', e2e)
+        self.assertIn("fixed 120-second soak", e2e)
+        self.assertIn("fixed 2 MiB/min RSS slope", e2e)
+        self.assertIn("fixed 32 MiB RSS range", e2e)
+        self.assertIn("candidate evidence requires the fixed system Python", e2e)
+        self.assertIn('"NUVION_SYSTEM_PYTHON=/usr/bin/python3"', e2e)
         self.assertIn('NUVION_DEMO_MODE must be false', e2e)
         self.assertIn('re.compile(r"^[12]-1(?:\\.[1-9][0-9]*)+$")', e2e)
         self.assertIn('oak_products = {"2485": "bootloader", "f63b": "runtime"}', e2e)
@@ -574,7 +598,14 @@ exec 9>&-
                     "agentVersion": "0.1.121",
                     "componentSha": "b" * 40,
                     "bomDigest": "sha256:" + "c" * 64,
-                    "pythonPath": "/opt/nuv-agent/test/venv/bin/python",
+                    "pythonPath": "/usr/bin/python3",
+                    "sitePackagesPath": (
+                        "/opt/nuv-agent/test/venv/lib/python3.12/site-packages"
+                    ),
+                    "buildInfoPath": (
+                        "/opt/nuv-agent/test/venv/lib/python3.12/site-packages/"
+                        "nuvion_app/build_info.py"
+                    ),
                     "releaseMarkerSha256": "d" * 64,
                 },
                 "soak": {

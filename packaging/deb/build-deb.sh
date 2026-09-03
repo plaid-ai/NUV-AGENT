@@ -103,11 +103,13 @@ Description: Nuvion on-device agent
 CONTROL
 
 cp "$ROOT_DIR/packaging/deb/postinst" "$PKG_DIR/DEBIAN/postinst"
+cp "$ROOT_DIR/packaging/deb/preinst" "$PKG_DIR/DEBIAN/preinst"
 cp "$ROOT_DIR/packaging/deb/prerm" "$PKG_DIR/DEBIAN/prerm"
 cp "$ROOT_DIR/packaging/deb/postrm" "$PKG_DIR/DEBIAN/postrm"
 cp "$ROOT_DIR/packaging/deb/conffiles" "$PKG_DIR/DEBIAN/conffiles"
 chmod 0755 \
   "$PKG_DIR/DEBIAN/postinst" \
+  "$PKG_DIR/DEBIAN/preinst" \
   "$PKG_DIR/DEBIAN/prerm" \
   "$PKG_DIR/DEBIAN/postrm"
 chmod 0644 "$PKG_DIR/DEBIAN/conffiles"
@@ -167,6 +169,7 @@ install -m 0644 \
 cp "$ROOT_DIR/packaging/systemd/nuv-agent.service" "$PKG_DIR/lib/systemd/system/nuv-agent.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.service" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.socket" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket"
+cp "$ROOT_DIR/packaging/systemd/nuvion-fleet-e2e-reconcile.service" "$PKG_DIR/lib/systemd/system/nuvion-fleet-e2e-reconcile.service"
 install -m 0644 \
   "$ROOT_DIR/packaging/systemd/updater.env.example" \
   "$PKG_DIR/etc/nuvion-updater/updater.env"
@@ -178,7 +181,8 @@ install -m 0755 \
 chmod 0644 \
   "$PKG_DIR/lib/systemd/system/nuv-agent.service" \
   "$PKG_DIR/lib/systemd/system/nuv-agent-updater.service" \
-  "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket"
+  "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket" \
+  "$PKG_DIR/lib/systemd/system/nuvion-fleet-e2e-reconcile.service"
 
 OUTPUT_DEB="${OUTPUT_DEB:-${ROOT_DIR}/dist/${PKG_NAME}_${VERSION}_${ARCH}.deb}"
 mkdir -p "$(dirname "$OUTPUT_DEB")"

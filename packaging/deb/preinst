@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ulimit -S -c 0
+ulimit -H -c 0
+
+readonly ACTIVE_RUN=/var/lib/nuvion-fleet-e2e/active-run.json
+readonly BOARD_TOOL=/usr/local/libexec/nuvion/iq9075-board-e2e.py
+readonly MAINTENANCE=/var/lib/nuvion-fleet-e2e/package-maintenance.json
+readonly LEGACY_BOARD_TOOL=/var/lib/nuvion-fleet-e2e/legacy-board-tool.preinst
+
+case "${1:-}" in
+  install|upgrade)
+    install -d -m 0700 -o root -g root /var/lib/nuvion-fleet-e2e
+    install -d -m 0755 -o root -g root /run/lock
+    exec {package_lock_fd}>/run/lock/nuvion-fleet-e2e.lock
+    flock --exclusive --timeout 30 "$package_lock_fd"
+    # The global lock excludes every Fleet mutation while all trust consumers
+    # are quiesced. A corrupt pre-existing marker must abort with writers down.
+    systemctl stop \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service || true
+    for protected_unit in \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service; do
+      protected_state="$(systemctl is-active "$protected_unit" 2>/dev/null || true)"
+      case "$protected_state" in
+        inactive|failed|unknown) ;;
+        *)
+          echo "Cannot quiesce protected runtime before package unpack" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [ -e "$ACTIVE_RUN" ] || [ -L "$ACTIVE_RUN" ]; then
+      echo "Active Fleet E2E recovery must be cleaned before package upgrade" >&2
+      exit 1
+    fi
+    install -d -m 0755 -o root -g root /usr/local/libexec/nuvion
+    /usr/bin/python3 -I - \
+      "$MAINTENANCE" "$MAINTENANCE.preinst.$$" \
+      "$BOARD_TOOL" "$LEGACY_BOARD_TOOL" "$BOARD_TOOL.blocker.$$" <<'PY'
+import json
+import os
+import resource
+import stat
+import sys
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+path, temporary, tool, backup, blocker_temporary = sys.argv[1:]
+blocker = (
+    b"#!/usr/bin/python3\n"
+    b"import sys\n"
+    b"sys.stderr.write('Fleet E2E is blocked during package maintenance\\n')\n"
+    b"raise SystemExit(1)\n"
+)
+
+def read_root_regular(target, *, mode, maximum):
+    metadata = os.lstat(target)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or metadata.st_size > maximum
+    ):
+        raise SystemExit("legacy Fleet recovery tool is unsafe")
+    descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        content = os.read(descriptor, maximum + 1)
+    finally:
+        os.close(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    ) or len(content) > maximum:
+        raise SystemExit("legacy Fleet recovery tool changed while reading")
+    return content
+
+backup_content = None
+if os.path.lexists(backup):
+    backup_content = read_root_regular(backup, mode=0o700, maximum=2 * 1024 * 1024)
+if os.path.lexists(tool):
+    tool_content = read_root_regular(tool, mode=0o755, maximum=2 * 1024 * 1024)
+    if tool_content != blocker:
+        if backup_content is not None and backup_content != tool_content:
+            raise SystemExit("legacy Fleet recovery backup identity changed")
+        if backup_content is None:
+            backup_temporary = backup + f".tmp-{os.getpid()}"
+            backup_fd = os.open(
+                backup_temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o700,
+            )
+            try:
+                remaining = memoryview(tool_content)
+                while remaining:
+                    written = os.write(backup_fd, remaining)
+                    if written <= 0:
+                        raise SystemExit("legacy Fleet recovery backup write failed")
+                    remaining = remaining[written:]
+                os.fchmod(backup_fd, 0o700)
+                os.fsync(backup_fd)
+            finally:
+                os.close(backup_fd)
+            os.replace(backup_temporary, backup)
+            backup_directory = os.open(
+                os.path.dirname(backup),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                os.fsync(backup_directory)
+            finally:
+                os.close(backup_directory)
+fd = os.open(
+    blocker_temporary,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+    0o755,
+)
+try:
+    remaining = memoryview(blocker)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise SystemExit("Fleet maintenance blocker write failed")
+        remaining = remaining[written:]
+    os.fchmod(fd, 0o755)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(blocker_temporary, tool)
+tool_directory = os.open(
+    os.path.dirname(tool), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+)
+try:
+    os.fsync(tool_directory)
+finally:
+    os.close(tool_directory)
+
+# Only publish the maintenance marker after the legacy fixed path is already
+# a durable fail-closed blocker. A power loss at either side of this boundary
+# can never expose a marker-blind helper during package replacement.
+payload = (json.dumps({
+    "schemaVersion": 1,
+    "kind": "nuvion-package-maintenance",
+    "active": True,
+}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if os.path.lexists(path):
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 4096
+    ):
+        raise SystemExit("existing package maintenance marker is unsafe")
+    existing_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(existing_fd)
+        existing = os.read(existing_fd, 4097)
+    finally:
+        os.close(existing_fd)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    ) or existing != payload:
+        raise SystemExit("existing package maintenance marker is invalid")
+else:
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
+    directory = os.open(
+        os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+PY
+    flock --unlock "$package_lock_fd"
+    ;;
+esac

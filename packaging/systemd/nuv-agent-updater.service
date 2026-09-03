@@ -3,6 +3,8 @@ Description=NUVION Agent privileged release updater
 Requires=nuv-agent-updater.socket
 After=network-online.target
 Wants=network-online.target
+Requires=nuvion-fleet-e2e-reconcile.service
+After=nuvion-fleet-e2e-reconcile.service
 
 [Service]
 Type=simple
@@ -16,6 +18,7 @@ ExecStart=/usr/bin/python3 -s -m nuvion_updater.daemon --repository-base-url ${N
 StateDirectory=nuvion-updater
 StateDirectoryMode=0700
 UMask=0077
+LimitCORE=0
 NoNewPrivileges=true
 PrivateTmp=true
 # IQ9075 release gating needs physical OAK access. The fixed probe drops camera

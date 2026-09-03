@@ -7,6 +7,10 @@ evidence_output=""
 expected_version=""
 expected_component_sha=""
 expected_bom_digest=""
+evidence_run_id=""
+expected_slot_kind="release"
+expected_slot_path=""
+expected_control_marker_sha256=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --allow-no-camera)
@@ -52,6 +56,26 @@ while [ "$#" -gt 0 ]; do
       expected_bom_digest="$2"
       shift 2
       ;;
+    --run-id)
+      [ "$#" -ge 2 ] || exit 2
+      evidence_run_id="$2"
+      shift 2
+      ;;
+    --expected-slot-kind)
+      [ "$#" -ge 2 ] || exit 2
+      expected_slot_kind="$2"
+      shift 2
+      ;;
+    --expected-slot-path)
+      [ "$#" -ge 2 ] || exit 2
+      expected_slot_path="$2"
+      shift 2
+      ;;
+    --expected-control-marker-sha256)
+      [ "$#" -ge 2 ] || exit 2
+      expected_control_marker_sha256="$2"
+      shift 2
+      ;;
     *)
       echo "Usage: $0 [--camera oak|uvc] [--allow-no-camera] [--evidence-output PATH]" >&2
       exit 2
@@ -75,11 +99,40 @@ die() {
 if [ -n "$evidence_output" ]; then
   [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
     die "--expected-version is required for evidence mode"
-  [[ "$expected_component_sha" =~ ^[0-9a-f]{40}$ ]] || \
+  [[ "$expected_component_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || \
     die "--expected-component-sha is required for evidence mode"
   [[ "$expected_bom_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || \
     die "--expected-bom-digest is required for evidence mode"
   [ -z "${PYTHONPATH:-}" ] || die "PYTHONPATH is forbidden in evidence mode"
+  case "$expected_slot_kind" in
+    release)
+      [ -z "$evidence_run_id" ] || die "release evidence must not claim a candidate runId"
+      [ -z "$expected_control_marker_sha256" ] || \
+        die "release evidence must not claim a candidate control marker"
+      canonical_release_slot="/opt/nuv-agent/releases/${expected_bom_digest#sha256:}"
+      [ -z "$expected_slot_path" ] || [ "$expected_slot_path" = "$canonical_release_slot" ] || \
+        die "release evidence slot path is not BOM-addressed"
+      expected_slot_path="$canonical_release_slot"
+      ;;
+    candidate)
+      [[ "$evidence_run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || \
+        die "candidate evidence requires a canonical UUIDv4 runId"
+      canonical_candidate_slot="/opt/nuv-agent/candidates/${evidence_run_id}-${expected_bom_digest#sha256:}"
+      [ "$expected_slot_path" = "$canonical_candidate_slot" ] || \
+        die "candidate evidence slot path is not run/BOM-addressed"
+      [[ "$expected_control_marker_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+        die "candidate evidence requires its control marker digest"
+      [ "${NUVION_IQ9075_OAK_SOAK_SECONDS:-}" = 120 ] || \
+        die "candidate evidence requires the fixed 120-second soak"
+      [ "${NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN:-}" = 2 ] || \
+        die "candidate evidence requires the fixed 2 MiB/min RSS slope"
+      [ "${NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB:-}" = 32 ] || \
+        die "candidate evidence requires the fixed 32 MiB RSS range"
+      [ "${NUVION_SYSTEM_PYTHON:-}" = /usr/bin/python3 ] || \
+        die "candidate evidence requires the fixed system Python"
+      ;;
+    *) die "--expected-slot-kind must be release or candidate" ;;
+  esac
 fi
 
 for command in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl timeout python3 readlink \
@@ -123,45 +176,79 @@ timeout 20s gst-launch-1.0 -q \
 default_agent_python=/opt/nuv-agent/current/venv/bin/python
 requested_agent_python="${NUVION_AGENT_PYTHON:-$default_agent_python}"
 if [ -n "$evidence_output" ]; then
-  expected_agent_python="/opt/nuv-agent/releases/${expected_bom_digest#sha256:}/venv/bin/python"
-  [ "$requested_agent_python" = "$expected_agent_python" ] || \
-    die "evidence mode requires the exact BOM-addressed candidate Python"
+  [ "$requested_agent_python" = /usr/bin/python3 ] || \
+    die "evidence mode requires the fixed system Python"
+  requested_site_packages="${NUVION_AGENT_SITE_PACKAGES:-}"
+  expected_site_packages="$expected_slot_path/venv/lib/python3.12/site-packages"
+  [ "$requested_site_packages" = "$expected_site_packages" ] || \
+    die "evidence mode requires the exact BOM-addressed site-packages"
+else
+  requested_site_packages=""
 fi
 set +e
-agent_python="$(/usr/bin/python3 -I - "$requested_agent_python" <<'PY'
+runtime_paths="$(/usr/bin/python3 -I - "$requested_agent_python" "$requested_site_packages" "$expected_slot_path" <<'PY'
 import os
 import stat
 import sys
 from pathlib import Path
 
-raw = sys.argv[1]
-path = Path(raw)
-normalized = os.path.normpath(raw)
-install_root = Path("/opt/nuv-agent").resolve(strict=True)
-if (
-    not path.is_absolute()
-    or raw != normalized
-    or not raw.startswith("/opt/nuv-agent/")
-    or path.name != "python"
-):
-    raise SystemExit(2)
-metadata = path.stat()
-parent = path.parent.resolve(strict=True)
-if (
-    not stat.S_ISREG(metadata.st_mode)
-    or metadata.st_uid != 0
-    or metadata.st_mode & 0o022
-    or not os.access(path, os.X_OK)
-    or not parent.is_relative_to(install_root)
-):
-    raise SystemExit(2)
-print(path)
+python_raw, site_raw, slot_raw = sys.argv[1:]
+if site_raw:
+    python_path = Path(python_raw)
+    site = Path(site_raw)
+    slot = Path(slot_raw)
+    expected = slot / "venv/lib/python3.12/site-packages"
+    interpreter = Path("/usr/bin/python3")
+    interpreter_target = interpreter.resolve(strict=True)
+    metadata = interpreter_target.stat()
+    if (
+        python_path != interpreter
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not os.access(interpreter, os.X_OK)
+        or not site.is_absolute()
+        or os.path.normpath(site_raw) != site_raw
+        or site != expected
+    ):
+        raise SystemExit(2)
+    site_metadata = site.lstat()
+    if (
+        stat.S_ISLNK(site_metadata.st_mode)
+        or not stat.S_ISDIR(site_metadata.st_mode)
+        or site_metadata.st_uid != 0
+        or site_metadata.st_mode & 0o022
+    ):
+        raise SystemExit(2)
+    print(interpreter)
+    print(site)
+else:
+    path = Path(python_raw)
+    normalized = os.path.normpath(python_raw)
+    install_root = Path("/opt/nuv-agent").resolve(strict=True)
+    metadata = path.stat()
+    parent = path.parent.resolve(strict=True)
+    if (
+        not path.is_absolute()
+        or python_raw != normalized
+        or not python_raw.startswith("/opt/nuv-agent/")
+        or path.name != "python"
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+        or not parent.is_relative_to(install_root)
+    ):
+        raise SystemExit(2)
+    print(path)
 PY
 )"
 python_status=$?
 set -e
-[ "$python_status" -eq 0 ] && [ -n "$agent_python" ] || \
-  die "NUVION_AGENT_PYTHON must be a normalized root-owned executable /opt/nuv-agent/.../bin/python"
+[ "$python_status" -eq 0 ] && [ -n "$runtime_paths" ] || \
+  die "evidence Python and site-packages identity is invalid"
+agent_python="$(printf '%s\n' "$runtime_paths" | sed -n '1p')"
+agent_site_packages="$(printf '%s\n' "$runtime_paths" | sed -n '2p')"
 if [ "$agent_python" != "$default_agent_python" ] || [ -n "${PYTHONPATH:-}" ]; then
   echo "[iq9075-e2e] candidate Python/source override: pre-release hardware evidence only"
 fi
@@ -207,20 +294,58 @@ else
 fi
 
 validate_release_identity() {
+  identity_python=(/usr/bin/python3 -I -s)
+  if [ "$(id -u)" -eq 0 ]; then
+    [ -x /usr/sbin/runuser ] || \
+      die "/usr/sbin/runuser is required for non-root identity validation"
+    identity_python=(/usr/sbin/runuser -u nuvion -- /usr/bin/python3 -I -s)
+  fi
   (
     cd "$probe_runtime_dir"
-    PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
-      "$agent_python" -I - \
-      "$expected_version" "$expected_component_sha" "$expected_bom_digest" <<'PY'
+    PYTHONPATH='' PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+      "${identity_python[@]}" - "$agent_site_packages" \
+      "$expected_version" "$expected_component_sha" "$expected_bom_digest" \
+      "$expected_slot_kind" "$expected_slot_path" "$evidence_run_id" \
+      "$expected_control_marker_sha256" <<'PY'
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from pathlib import Path
 
-version, component_sha, bom_digest = sys.argv[1:]
-slot = Path("/opt/nuv-agent/releases") / bom_digest.removeprefix("sha256:")
+site_packages = Path(sys.argv[1])
+if not os.path.samefile(sys.executable, "/usr/bin/python3"):
+    raise SystemExit("candidate evidence interpreter is not fixed")
+sys.path.insert(0, str(site_packages))
+(
+    version,
+    component_sha,
+    bom_digest,
+    slot_kind,
+    slot_path,
+    run_id,
+    expected_control_sha256,
+) = sys.argv[2:]
+slot = Path(slot_path)
+if (
+    not slot.is_absolute()
+    or os.path.normpath(slot_path) != slot_path
+    or slot_kind not in {"release", "candidate"}
+):
+    raise SystemExit("candidate slot identity is invalid")
+expected_release = Path("/opt/nuv-agent/releases") / bom_digest.removeprefix("sha256:")
+expected_candidate = (
+    Path("/opt/nuv-agent/candidates")
+    / f"{run_id}-{bom_digest.removeprefix('sha256:')}"
+)
+if (slot_kind == "release" and slot != expected_release) or (
+    slot_kind == "candidate" and slot != expected_candidate
+):
+    raise SystemExit("candidate slot identity is not fixed")
+if site_packages != slot / "venv/lib/python3.12/site-packages":
+    raise SystemExit("candidate site-packages identity is not slot-bound")
 marker = slot / ".nuvion/release.json"
 before = marker.lstat()
 if (
@@ -253,11 +378,39 @@ if (
     or value.get("bomDigest") != bom_digest
 ):
     raise SystemExit("candidate release marker identity mismatch")
+if slot_kind == "candidate":
+    control = slot / ".nuvion/candidate-soak.json"
+    control_before = control.lstat()
+    if (
+        stat.S_ISLNK(control_before.st_mode)
+        or not stat.S_ISREG(control_before.st_mode)
+        or control_before.st_uid != 0
+        or control_before.st_mode & 0o022
+    ):
+        raise SystemExit("candidate control marker metadata is unsafe")
+    control_raw = control.read_bytes()
+    control_after = control.lstat()
+    if identity(control_before) != identity(control_after):
+        raise SystemExit("candidate control marker changed while reading")
+    if hashlib.sha256(control_raw).hexdigest() != expected_control_sha256:
+        raise SystemExit("candidate control marker digest mismatch")
+    try:
+        control_value = json.loads(control_raw)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit("candidate control marker is invalid") from error
+    if (
+        control_value.get("runId") != run_id
+        or control_value.get("slotKind") != "candidate"
+        or control_value.get("candidateSlot") != slot_path
+        or control_value.get("bomDigest") != bom_digest
+        or control_value.get("componentSha") != component_sha
+    ):
+        raise SystemExit("candidate control marker identity mismatch")
 from nuvion_app import build_info
 
 module_path = Path(build_info.__file__).resolve(strict=True)
 if (
-    not module_path.is_relative_to(slot.resolve(strict=True))
+    not module_path.is_relative_to(site_packages.resolve(strict=True))
     or build_info.AGENT_VERSION != version
     or build_info.COMPONENT_SHA != component_sha
 ):
@@ -279,22 +432,30 @@ probe_environment=(
   "XDG_CACHE_HOME=$probe_runtime_dir/cache"
   "XDG_CONFIG_HOME=$probe_runtime_dir/config"
   "XDG_RUNTIME_DIR=$probe_runtime_dir/runtime"
+  "NUVION_IQ9075_EVIDENCE_RUN_ID=$evidence_run_id"
+  "NUVION_IQ9075_EXPECTED_SLOT_KIND=$expected_slot_kind"
+  "NUVION_IQ9075_EXPECTED_SLOT_PATH=$expected_slot_path"
+  "NUVION_IQ9075_CONTROL_MARKER_SHA256=$expected_control_marker_sha256"
+  "NUVION_AGENT_SITE_PACKAGES=$agent_site_packages"
+  "NUVION_SYSTEM_PYTHON=/usr/bin/python3"
 )
+
+webrtc_interpreter=("$agent_python")
+if [ -n "$evidence_output" ]; then
+  webrtc_interpreter=(/usr/bin/python3 -I -s -)
+fi
 
 webrtc_python=(
   /usr/bin/env
   -C "$probe_runtime_dir"
   "${probe_environment[@]}"
-  "PYTHONPATH=${PYTHONPATH:-}"
+  "PYTHONPATH="
   "PYTHONNOUSERSITE=1"
   "PYTHONDONTWRITEBYTECODE=1"
   "NUVION_IQ9075_EXPECTED_BOM_DIGEST=$expected_bom_digest"
   "G_DEBUG=fatal-criticals"
-  "$agent_python"
+  "${webrtc_interpreter[@]}"
 )
-if [ -n "$evidence_output" ]; then
-  webrtc_python+=("-I")
-fi
 if [ "$(id -u)" -eq 0 ]; then
   command -v runuser >/dev/null 2>&1 || die "runuser is required for non-root Agent probes"
   webrtc_python=(
@@ -305,9 +466,17 @@ fi
 
 echo "[iq9075-e2e] checking disposable WebRTC branches across signaling resets"
 G_DEBUG=fatal-criticals timeout 20s "${webrtc_python[@]}" <<'PY'
-import gi
 import os
+import sys
 from pathlib import Path
+
+site_packages = os.environ.get("NUVION_AGENT_SITE_PACKAGES", "")
+if site_packages:
+    if not os.path.samefile(sys.executable, "/usr/bin/python3"):
+        raise RuntimeError("WebRTC evidence interpreter is not fixed")
+    sys.path.insert(0, site_packages)
+
+import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstWebRTC", "1.0")
@@ -321,11 +490,18 @@ import nuvion_app.inference.webrtc_uplink as installed_webrtc_module
 Gst.init(None)
 expected_bom_digest = os.environ.get("NUVION_IQ9075_EXPECTED_BOM_DIGEST", "")
 if expected_bom_digest:
-    expected_slot = (
-        Path("/opt/nuv-agent/releases") / expected_bom_digest.removeprefix("sha256:")
+    expected_slot = Path(
+        os.environ["NUVION_IQ9075_EXPECTED_SLOT_PATH"]
     ).resolve(strict=True)
+    expected_site_packages = Path(
+        os.environ["NUVION_AGENT_SITE_PACKAGES"]
+    ).resolve(strict=True)
+    if expected_site_packages != expected_slot / "venv/lib/python3.12/site-packages":
+        raise SystemExit("WebRTC evidence site-packages path is not slot-bound")
     for module in (installed_build_info, installed_webrtc_module):
-        if not Path(module.__file__).resolve(strict=True).is_relative_to(expected_slot):
+        if not Path(module.__file__).resolve(strict=True).is_relative_to(
+            expected_site_packages
+        ):
             raise RuntimeError("WebRTC evidence probe imported outside candidate slot")
 pipeline = Gst.parse_launch(
     "videotestsrc is-live=true ! "
@@ -468,11 +644,15 @@ if [ "$camera_mode" = "oak" ]; then
   # description as stdout+stderr; never perform a privileged O_TRUNC redirect
   # through a user-writable pathname.
   exec 9<>"$oak_native_capture"
+  oak_interpreter=("$agent_python")
+  if [ -n "$evidence_output" ]; then
+    oak_interpreter=(/usr/bin/python3 -I -s -)
+  fi
   oak_python=(
     /usr/bin/env
     -C "$probe_runtime_dir"
     "${probe_environment[@]}"
-    "PYTHONPATH=${PYTHONPATH:-}"
+    "PYTHONPATH="
     "PYTHONNOUSERSITE=1"
     "PYTHONDONTWRITEBYTECODE=1"
     "DEPTHAI_CRASHDUMP=$oak_crash_dump"
@@ -487,11 +667,8 @@ if [ "$camera_mode" = "oak" ]; then
     "NUVION_IQ9075_EXPECTED_BOM_DIGEST=$expected_bom_digest"
     "NUVION_IQ9075_RELEASE_MARKER_SHA256=$release_marker_sha"
     "NUVION_AGENT_PYTHON=$agent_python"
-    "$agent_python"
+    "${oak_interpreter[@]}"
   )
-  if [ -n "$evidence_output" ]; then
-    oak_python+=("-I")
-  fi
   if [ "$(id -u)" -eq 0 ]; then
     command -v runuser >/dev/null 2>&1 || die "runuser is required for the non-root OAK access check"
     oak_python=(
@@ -523,6 +700,12 @@ import sys
 import threading
 import time
 import weakref
+
+site_packages = os.environ.get("NUVION_AGENT_SITE_PACKAGES", "")
+if site_packages:
+    if not os.path.samefile(sys.executable, "/usr/bin/python3"):
+        raise RuntimeError("OAK evidence interpreter is not fixed")
+    sys.path.insert(0, site_packages)
 
 import depthai
 import numpy as np
@@ -592,16 +775,20 @@ MIN_RAW_FPS = 27.0
 MAX_APPSRC_BYTES = 2 * WIDTH * HEIGHT * 3
 started_at = (
     datetime.now(timezone.utc)
-    .replace(microsecond=0)
-    .isoformat()
+    .isoformat(timespec="milliseconds")
     .replace("+00:00", "Z")
 )
 
 expected_bom_digest = os.environ.get("NUVION_IQ9075_EXPECTED_BOM_DIGEST", "")
 if expected_bom_digest:
-    expected_slot = (
-        Path("/opt/nuv-agent/releases") / expected_bom_digest.removeprefix("sha256:")
+    expected_slot = Path(
+        os.environ["NUVION_IQ9075_EXPECTED_SLOT_PATH"]
     ).resolve(strict=True)
+    expected_site_packages = Path(
+        os.environ["NUVION_AGENT_SITE_PACKAGES"]
+    ).resolve(strict=True)
+    if expected_site_packages != expected_slot / "venv/lib/python3.12/site-packages":
+        raise SystemExit("OAK evidence site-packages path is not slot-bound")
     expected_version = os.environ["NUVION_IQ9075_EXPECTED_VERSION"]
     expected_component_sha = os.environ["NUVION_IQ9075_EXPECTED_COMPONENT_SHA"]
     if (
@@ -616,7 +803,9 @@ if expected_bom_digest:
         installed_pipeline_module,
         installed_webrtc_module,
     ):
-        if not Path(module.__file__).resolve(strict=True).is_relative_to(expected_slot):
+        if not Path(module.__file__).resolve(strict=True).is_relative_to(
+            expected_site_packages
+        ):
             raise SystemExit("OAK evidence process imported outside candidate slot")
 
 expected_version = "2.32.0.0"
@@ -1432,6 +1621,7 @@ finally:
 evidence_path = Path(os.environ["NUVION_IQ9075_OAK_EVIDENCE_OUTPUT"])
 if evidence_path.parent.resolve(strict=True) != runtime_root or evidence_path.name != "oak-soak-result.json":
     raise SystemExit("OAK evidence output escaped the private runtime root")
+slot_kind = os.environ.get("NUVION_IQ9075_EXPECTED_SLOT_KIND", "release")
 evidence = {
     "schemaVersion": 2,
     "kind": "nuvion-iq9075-oak-soak-result",
@@ -1461,7 +1651,9 @@ evidence = {
         "agentVersion": os.environ["NUVION_IQ9075_EXPECTED_VERSION"],
         "componentSha": os.environ["NUVION_IQ9075_EXPECTED_COMPONENT_SHA"],
         "bomDigest": os.environ["NUVION_IQ9075_EXPECTED_BOM_DIGEST"],
-        "pythonPath": str(Path(os.environ.get("NUVION_AGENT_PYTHON", "/opt/nuv-agent/current/venv/bin/python"))),
+        "pythonPath": "/usr/bin/python3",
+        "sitePackagesPath": os.environ["NUVION_AGENT_SITE_PACKAGES"],
+        "buildInfoPath": str(Path(installed_build_info.__file__).resolve(strict=True)),
         "releaseMarkerSha256": os.environ["NUVION_IQ9075_RELEASE_MARKER_SHA256"],
     },
     "soak": {
@@ -1498,6 +1690,18 @@ evidence = {
         ),
     },
 }
+if slot_kind == "candidate":
+    evidence["schemaVersion"] = 3
+    evidence["runId"] = os.environ["NUVION_IQ9075_EVIDENCE_RUN_ID"]
+    evidence["slotKind"] = "candidate"
+    evidence["runtimeIdentity"].update(
+        {
+            "candidateSlot": os.environ["NUVION_IQ9075_EXPECTED_SLOT_PATH"],
+            "controlMarkerSha256": os.environ[
+                "NUVION_IQ9075_CONTROL_MARKER_SHA256"
+            ],
+        }
+    )
 serialized = (json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 temporary_evidence_path = evidence_path.with_name(
     f".{evidence_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
@@ -1635,6 +1839,7 @@ PY
       "$(id -u)" "$oak_status" <<'PY'
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -1701,8 +1906,12 @@ board_keys = {
 }
 runtime_keys = {
     "agentVersion", "componentSha", "bomDigest", "pythonPath",
-    "releaseMarkerSha256",
+    "sitePackagesPath", "buildInfoPath", "releaseMarkerSha256",
 }
+schema_version = payload.get("schemaVersion") if isinstance(payload, dict) else None
+if schema_version == 3:
+    root_keys.update({"runId", "slotKind"})
+    runtime_keys.update({"candidateSlot", "controlMarkerSha256"})
 soak_keys = {
     "durationSeconds", "targetFps", "rawSamples", "rssAnonSamples",
     "rssAnonSlopeMiBPerMin", "rssAnonRangeMiB", "gstreamerErrors",
@@ -1723,10 +1932,23 @@ if (
     not isinstance(payload, dict)
     or set(payload) != root_keys
     or type(payload.get("schemaVersion")) is not int
-    or payload.get("schemaVersion") != 2
+    or schema_version not in {2, 3}
     or payload.get("kind") != "nuvion-iq9075-oak-soak-result"
 ):
     raise SystemExit("IQ9075 evidence source root schema is invalid")
+if schema_version == 3:
+    run_id = payload.get("runId")
+    slot_kind = payload.get("slotKind")
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            run_id,
+        )
+        is None
+        or slot_kind != "candidate"
+    ):
+        raise SystemExit("candidate evidence run/slot identity is invalid")
 outcome = payload.get("outcome")
 cleanup_errors = outcome.get("cleanupErrors") if isinstance(outcome, dict) else None
 if (
@@ -1781,6 +2003,27 @@ if (
     or set(splitmux) != splitmux_keys
 ):
     raise SystemExit("IQ9075 evidence nested object fields are invalid")
+if schema_version == 3:
+    expected_candidate_slot = (
+        f"/opt/nuv-agent/candidates/{payload['runId']}-"
+        f"{runtime_identity.get('bomDigest', '').removeprefix('sha256:')}"
+    )
+    if (
+        runtime_identity.get("candidateSlot") != expected_candidate_slot
+        or runtime_identity.get("pythonPath")
+        != "/usr/bin/python3"
+        or runtime_identity.get("sitePackagesPath")
+        != expected_candidate_slot + "/venv/lib/python3.12/site-packages"
+        or runtime_identity.get("buildInfoPath")
+        != expected_candidate_slot
+        + "/venv/lib/python3.12/site-packages/nuvion_app/build_info.py"
+        or not isinstance(runtime_identity.get("controlMarkerSha256"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", runtime_identity["controlMarkerSha256"]
+        )
+        is None
+    ):
+        raise SystemExit("candidate evidence control binding is invalid")
 
 rss_samples = soak.get("rssAnonSamples")
 errors = soak.get("gstreamerErrors")

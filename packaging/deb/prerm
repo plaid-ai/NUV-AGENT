@@ -1,14 +1,91 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ulimit -S -c 0
+ulimit -H -c 0
+
+readonly MAINTENANCE=/var/lib/nuvion-fleet-e2e/package-maintenance.json
 
 case "${1:-}" in
-  remove|deconfigure)
-    systemctl disable --now nuv-agent.service || true
-    systemctl disable --now nuv-agent-updater.socket || true
+  remove|deconfigure|upgrade|failed-upgrade)
+    install -d -m 0700 -o root -g root /var/lib/nuvion-fleet-e2e
+    install -d -m 0755 -o root -g root /run/lock
+    exec {package_lock_fd}>/run/lock/nuvion-fleet-e2e.lock
+    flock --exclusive --timeout 30 "$package_lock_fd"
+    # Keep corrupt-marker failures fail-closed while the package recovery
+    # authority is still installed and every Fleet writer is excluded.
+    systemctl stop \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service
+    /usr/bin/python3 -I - "$MAINTENANCE" "$MAINTENANCE.prerm.$$" <<'PY'
+import json
+import os
+import resource
+import stat
+import sys
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+path, temporary = sys.argv[1:]
+payload = (json.dumps({
+    "schemaVersion": 1,
+    "kind": "nuvion-package-maintenance",
+    "active": True,
+}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if os.path.lexists(path):
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 4096
+    ):
+        raise SystemExit("existing package maintenance marker is unsafe")
+    existing_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(existing_fd)
+        existing = os.read(existing_fd, 4097)
+    finally:
+        os.close(existing_fd)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    ) or existing != payload:
+        raise SystemExit("existing package maintenance marker is invalid")
+    raise SystemExit(0)
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+try:
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(temporary, path)
+directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+    flock --unlock "$package_lock_fd"
     ;;
-  upgrade|failed-upgrade)
-    # Keep the current immutable slot running until the new package has staged
-    # its bootstrap replacement. postinst owns the atomic switch/restart.
+esac
+
+case "${1:-}" in
+  remove|deconfigure|upgrade|failed-upgrade)
+    # Never replace/remove the fixed root recovery authority while a secret
+    # archive, trust snapshot, or development keyring can remain live.
+    /usr/bin/python3 -I \
+      /usr/local/libexec/nuvion/iq9075-board-e2e.py \
+      boot-reconcile --package-maintenance
+    test ! -e /var/lib/nuvion-fleet-e2e/active-run.json
+    ;;
+esac
+case "${1:-}" in
+  remove|deconfigure)
+    systemctl disable nuv-agent.service
+    systemctl disable nuv-agent-updater.socket
+    systemctl disable nuvion-fleet-e2e-reconcile.service
     ;;
 esac
 systemctl daemon-reload || true
