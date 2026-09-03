@@ -352,6 +352,84 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
 
         self.assertEqual(len(_FakeGLib.calls), 1)
 
+    def test_managed_uplink_disables_libnice_upnp_by_default(self) -> None:
+        controller, _pipeline = self._controller()
+
+        with mock.patch.object(
+            self.module,
+            "_disable_libnice_upnp",
+            return_value=True,
+        ) as disable_upnp:
+            self._start(controller, "session-1")
+
+        disable_upnp.assert_called_once_with(controller._branch.webrtcbin)
+
+    def test_explicit_upnp_enable_skips_managed_disable(self) -> None:
+        controller, _pipeline = self._controller(enable_upnp=True)
+
+        with mock.patch.object(self.module, "_disable_libnice_upnp") as disable_upnp:
+            self._start(controller, "session-1")
+
+        disable_upnp.assert_not_called()
+
+    def test_native_upnp_disable_releases_owned_gobject_references(self) -> None:
+        ctypes = self.module.ctypes
+        unref_calls: list[int] = []
+        set_calls: list[tuple[int, bytes, int]] = []
+
+        class _CFunction:
+            def __init__(self, callback: Any) -> None:
+                self.callback = callback
+                self.restype = None
+                self.argtypes = None
+
+            def __call__(self, *args: object) -> object:
+                return self.callback(*args)
+
+        def g_object_get(
+            obj: Any,
+            name: Any,
+            output: Any,
+            _sentinel: Any,
+        ) -> None:
+            if name.value == b"ice-agent":
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0x2000
+            elif name.value == b"agent":
+                self.assertEqual(obj.value, 0x2000)
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = 0x3000
+            elif name.value == b"upnp":
+                self.assertEqual(obj.value, 0x3000)
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = 0
+            else:
+                self.fail(f"unexpected property: {name.value!r}")
+
+        def g_object_set(
+            obj: Any,
+            name: Any,
+            value: Any,
+            _sentinel: Any,
+        ) -> None:
+            set_calls.append((obj.value, name.value, value.value))
+
+        fake_library = types.SimpleNamespace(
+            g_object_get=_CFunction(g_object_get),
+            g_object_set=_CFunction(g_object_set),
+            g_object_unref=_CFunction(lambda obj: unref_calls.append(obj.value)),
+        )
+
+        class _NativeElement:
+            __gtype__ = object()
+
+            @staticmethod
+            def __hash__() -> int:
+                return 0x1000
+
+        with mock.patch.object(ctypes, "CDLL", return_value=fake_library):
+            self.assertTrue(self.module._disable_libnice_upnp(_NativeElement()))
+
+        self.assertEqual(set_calls, [(0x3000, b"upnp", 0)])
+        self.assertEqual(unref_calls, [0x3000, 0x2000])
+
     def test_on_ice_candidate_skips_empty_candidate(self) -> None:
         sent_messages: list[tuple[str, dict[str, object], bool, object]] = []
 

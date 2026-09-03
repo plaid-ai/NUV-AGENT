@@ -317,6 +317,7 @@ DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
 WEBRTC_FORCE_RELAY = is_truthy(os.getenv("NUVION_WEBRTC_FORCE_RELAY", "false"))
+WEBRTC_UPNP_ENABLED = is_truthy(os.getenv("NUVION_WEBRTC_UPNP_ENABLED", "false"))
 RTP_SSRC_ENV = os.getenv("NUVION_RTP_SSRC", None)
 H264_PROFILE_LEVEL_ID_ENV = os.getenv("NUVION_H264_PROFILE_LEVEL_ID", "42e01f")
 H264_PROFILE_ENV = os.getenv("NUVION_H264_PROFILE", "constrained-baseline")
@@ -3411,6 +3412,7 @@ class GStreamerInferenceApp:
             h264_packetization_mode=H264_PACKETIZATION_MODE_ENV,
             h264_level_asymmetry_allowed=H264_LEVEL_ASYMMETRY_ALLOWED_ENV,
             on_fatal_cleanup=self._on_webrtc_cleanup_failure,
+            enable_upnp=WEBRTC_UPNP_ENABLED,
         )
 
         self.pipeline = None

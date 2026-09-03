@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import logging
 import math
@@ -35,6 +37,96 @@ log = logging.getLogger(__name__)
 
 _BRANCH_CLEANUP_MAX_ATTEMPTS = 4
 _BRANCH_CLEANUP_RETRY_INTERVAL_MS = 100
+
+
+def _disable_libnice_upnp(webrtcbin: Gst.Element) -> bool | None:
+    """Disable libnice UPnP without creating unsafe transfer-none GI wrappers.
+
+    Qualcomm's Ubuntu 24.04 GStreamer/libnice build continuously grows native
+    heap while GUPnP discovery is active on a multi-interface edge host.  The
+    control plane already supplies explicit STUN/TURN servers, so UPnP is not
+    required for the managed uplink.
+
+    PyGObject 3.48 incorrectly releases the transfer-none ``ice-agent``/``agent``
+    wrappers on this image and can invalidate webrtcbin.  Use the GObject C API,
+    which gives us explicit owned references that are released before returning.
+    """
+
+    if getattr(webrtcbin, "__gtype__", None) is None:
+        # Unit-test doubles and non-GObject implementations cannot expose the
+        # native NiceAgent.  Their behavior is covered at the controller seam.
+        return None
+
+    ice_agent = ctypes.c_void_p()
+    nice_agent = ctypes.c_void_p()
+    gobject: Any | None = None
+    try:
+        library_candidates = (
+            None,
+            ctypes.util.find_library("gobject-2.0"),
+            "libgobject-2.0.so.0",
+            "libgobject-2.0.dylib",
+        )
+        load_errors: list[str] = []
+        for library_name in dict.fromkeys(library_candidates):
+            if library_name is None and load_errors:
+                continue
+            try:
+                candidate = ctypes.CDLL(library_name)
+                candidate.g_object_get
+                candidate.g_object_set
+                candidate.g_object_unref
+                gobject = candidate
+                break
+            except (AttributeError, OSError) as exc:
+                load_errors.append(f"{library_name or 'process'}: {exc}")
+        if gobject is None:
+            raise OSError("; ".join(load_errors))
+        gobject.g_object_get.restype = None
+        gobject.g_object_set.restype = None
+        gobject.g_object_unref.argtypes = (ctypes.c_void_p,)
+        gobject.g_object_unref.restype = None
+
+        gobject.g_object_get(
+            ctypes.c_void_p(
+                hash(webrtcbin) & ((1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1)
+            ),
+            ctypes.c_char_p(b"ice-agent"),
+            ctypes.byref(ice_agent),
+            ctypes.c_void_p(),
+        )
+        if not ice_agent.value:
+            return False
+        gobject.g_object_get(
+            ice_agent,
+            ctypes.c_char_p(b"agent"),
+            ctypes.byref(nice_agent),
+            ctypes.c_void_p(),
+        )
+        if not nice_agent.value:
+            return False
+        gobject.g_object_set(
+            nice_agent,
+            ctypes.c_char_p(b"upnp"),
+            ctypes.c_int(0),
+            ctypes.c_void_p(),
+        )
+        enabled = ctypes.c_int(1)
+        gobject.g_object_get(
+            nice_agent,
+            ctypes.c_char_p(b"upnp"),
+            ctypes.byref(enabled),
+            ctypes.c_void_p(),
+        )
+        return enabled.value == 0
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        log.warning("[WEBRTC-UPLINK] could not disable libnice UPnP: %s", exc)
+        return False
+    finally:
+        if gobject is not None and nice_agent.value:
+            gobject.g_object_unref(nice_agent)
+        if gobject is not None and ice_agent.value:
+            gobject.g_object_unref(ice_agent)
 
 
 def _structure_to_mapping(value: Any) -> Any:
@@ -267,6 +359,7 @@ class WebRTCUplinkController:
         offer_answer_timeout_sec: float = 15.0,
         connection_timeout_sec: float = 20.0,
         on_fatal_cleanup: Callable[[str], bool] | None = None,
+        enable_upnp: bool = False,
     ) -> None:
         self._send_message = send_message
         self._default_force_relay = default_force_relay
@@ -296,6 +389,7 @@ class WebRTCUplinkController:
         ):
             raise ValueError("WebRTC connection timeout must be in [1, 120] seconds")
         self._on_fatal_cleanup = on_fatal_cleanup
+        self._enable_upnp = bool(enable_upnp)
         self._pipeline: Gst.Pipeline | None = None
         self._uplink_tee: Gst.Element | None = None
         self._branch: _WebRTCBranch | None = None
@@ -1067,6 +1161,16 @@ class WebRTCUplinkController:
             pipeline.add(webrtcbin)
             if webrtcbin.get_parent() is not pipeline:
                 raise RuntimeError("failed to add webrtcbin to pipeline")
+
+            if not self._enable_upnp:
+                upnp_disabled = _disable_libnice_upnp(webrtcbin)
+                if upnp_disabled:
+                    log.info("[WEBRTC-UPLINK] libnice UPnP discovery disabled")
+                elif upnp_disabled is False:
+                    log.warning(
+                        "[WEBRTC-UPLINK] libnice UPnP disable was unavailable; "
+                        "cgroup memory limits remain the fallback guard"
+                    )
 
             stun_server, turn_servers = to_gst_ice_server_config(session.ice_servers)
             webrtcbin.set_property("stun-server", stun_server or "")

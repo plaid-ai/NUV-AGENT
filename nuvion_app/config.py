@@ -366,6 +366,7 @@ def _field_note(key: str) -> str:
         "NUVION_MOTOR_PAN_INVERT": "Invert left/right commands when motor wiring is reversed.",
         "NUVION_MOTOR_TILT_INVERT": "Invert up/down commands when motor wiring is reversed.",
         "NUVION_WEBRTC_FORCE_RELAY": "Fallback only. Live sessions can be overridden by the backend, so most users should leave this as-is.",
+        "NUVION_WEBRTC_UPNP_ENABLED": "Keep Off for managed fleets using explicit STUN/TURN. Enable only for an isolated local-network experiment.",
         "NUVION_CLIP_ENABLED": "Stores short video evidence around anomaly events. Disable only when debugging clip-related issues.",
     }
     return notes.get(key, "")
