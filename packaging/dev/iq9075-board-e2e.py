@@ -87,6 +87,7 @@ CANDIDATE_UID_SCAN_INTERVAL_SECONDS = 0.05
 TOOL_DESTINATION = Path("/usr/local/libexec/nuvion/iq9075-board-e2e.py")
 CANDIDATE_HARNESS = Path("/usr/lib/nuvion-updater/test-iq9075.sh")
 UPDATER_STATE_DB = Path("/var/lib/nuvion-updater/updater.sqlite3")
+BOOT_RECONCILE_UNIT = "nuvion-fleet-e2e-reconcile.service"
 
 
 def disable_core_dumps() -> None:
@@ -433,6 +434,7 @@ class BoardPaths:
     global_fleet_lock: Path
     global_usb_lock: Path
     active_run: Path
+    config_stream_active: Path
     package_maintenance: Path
     candidate_root: Path
     updater_state_db: Path
@@ -463,6 +465,9 @@ class BoardPaths:
             global_fleet_lock=p("/run/lock/nuvion-fleet-e2e.lock"),
             global_usb_lock=p("/run/lock/nuvion-oak-e2e.lock"),
             active_run=p("/var/lib/nuvion-fleet-e2e/active-run.json"),
+            config_stream_active=p(
+                "/var/lib/nuvion-fleet-e2e/config-stream-active.json"
+            ),
             package_maintenance=p(
                 "/var/lib/nuvion-fleet-e2e/package-maintenance.json"
             ),
@@ -1564,6 +1569,10 @@ class BoardHarness:
         ):
             raise HarnessError("package maintenance blocks Fleet E2E claims")
         self._assert_active_run(run_id, allow_unclaimed=True)
+        if self._existing_config_stream_run_id() is not None:
+            raise HarnessError(
+                "unfinished config-stream recovery blocks a new Fleet E2E claim"
+            )
         if self.paths.active_run.exists():
             return
         # Lease absence is not sufficient ownership proof: a crash can occur
@@ -8104,6 +8113,25 @@ class BoardHarness:
             raise HarnessError("Fleet E2E board lease is corrupt")
         return canonical_run_id(lease["runId"])
 
+    def _existing_config_stream_run_id(self) -> str | None:
+        path = self.paths.config_stream_active
+        if not path.exists() and not path.is_symlink():
+            return None
+        payload, metadata = read_regular(path, maximum=4096)
+        if metadata.st_uid != self.root_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise HarnessError(
+                "config-stream lease ownership or mode is unsafe"
+            )
+        lease = strict_json(payload, label="config-stream board lease")
+        if (
+            set(lease) != {"schemaVersion", "runId"}
+            or type(lease.get("schemaVersion")) is not int
+            or lease.get("schemaVersion") != 1
+            or not isinstance(lease.get("runId"), str)
+        ):
+            raise HarnessError("config-stream board lease is corrupt")
+        return canonical_run_id(lease["runId"])
+
     def _package_maintenance_is_active(self) -> bool:
         path = self.paths.package_maintenance
         if not path.exists() and not path.is_symlink():
@@ -8250,6 +8278,15 @@ class BoardHarness:
                 raise HarnessError("incomplete package maintenance blocks runtime")
             self._package_maintenance_authorized = True
         active_run = self._existing_active_run_id()
+        config_stream_run = self._existing_config_stream_run_id()
+        if config_stream_run is not None:
+            if active_run != config_stream_run:
+                raise HarnessError(
+                    "config-stream recovery lease is detached from its Fleet run"
+                )
+            raise HarnessError(
+                "active config-stream transaction requires explicit recovery"
+            )
         states = self._scan_existing_runs()
         for run_id, state in states.items():
             self._validate_existing_recovery_state(run_id, state)
@@ -8342,6 +8379,39 @@ class BoardHarness:
             "runId": active_run,
             "recovered": True,
             "complete": True,
+        }
+
+    def resume_boot_gate(self) -> dict[str, object]:
+        """Finish offline parent recovery and clear a failed systemd boot gate."""
+
+        result = self.boot_reconcile()
+        if result.get("complete") is not True:
+            raise HarnessError("Fleet boot reconciliation did not complete")
+        for action in ("reset-failed", "start"):
+            completed = self.runner.run(
+                ["/usr/bin/systemctl", action, BOOT_RECONCILE_UNIT],
+                timeout=180,
+            )
+            if completed.returncode != 0:
+                raise HarnessError("Fleet boot reconciliation gate did not resume")
+        active = self.runner.run(
+            ["/usr/bin/systemctl", "is-active", "--quiet", BOOT_RECONCILE_UNIT],
+            timeout=30,
+        )
+        if active.returncode != 0:
+            raise HarnessError("Fleet boot reconciliation gate is not active")
+        if self._existing_active_run_id() is not None:
+            raise HarnessError("Fleet boot reconciliation retained the board lease")
+        if self._existing_config_stream_run_id() is not None:
+            raise HarnessError("Fleet boot reconciliation retained config-stream state")
+        return {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-boot-gate-resumption",
+            "complete": True,
+            "gateActive": True,
+            "protectedUnitsStopped": all(
+                self._unit_status(unit)["active"] is False for unit in UNITS
+            ),
         }
 
     def _transaction_deadman_cleanup(
@@ -8516,6 +8586,16 @@ class BoardHarness:
         )
         if selected_deadmen > 1:
             raise HarnessError("cleanup deadman mode is ambiguous")
+        config_stream_run = self._existing_config_stream_run_id()
+        if config_stream_run is not None:
+            if config_stream_run != run_id:
+                raise HarnessError(
+                    "config-stream recovery lease belongs to another Fleet run"
+                )
+            self._stop_writers()
+            raise HarnessError(
+                "active config-stream transaction requires explicit recovery"
+            )
         if transaction_deadman_only:
             if transaction_deadman_epoch is None or transaction_controller is None:
                 raise HarnessError("transaction guard invocation identity is incomplete")
@@ -9098,6 +9178,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="IQ9075 Fleet E2E board primitives")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("identity")
+    commands.add_parser("resume-boot-gate")
     boot_reconcile = commands.add_parser("boot-reconcile")
     boot_reconcile.add_argument(
         "--package-maintenance", action="store_true", help=argparse.SUPPRESS
@@ -9176,6 +9257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         harness = BoardHarness()
         if arguments.command == "identity":
             result = harness.identity()
+        elif arguments.command == "resume-boot-gate":
+            result = harness.resume_boot_gate()
         elif arguments.command == "boot-reconcile":
             result = harness.boot_reconcile(
                 package_maintenance=arguments.package_maintenance

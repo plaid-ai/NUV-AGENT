@@ -203,8 +203,10 @@ class _Board:
         return {
             "schemaVersion": 1,
             "runId": run_id,
+            "completedAt": "2026-09-03T00:00:01.000Z",
             "restored": True,
             "idempotent": False,
+            "noMutation": False,
             "exactRestoration": True,
             "runtimeRestarted": True,
             "configSha256": "b" * 64,
@@ -262,6 +264,7 @@ class _Api:
                 "sequence": command.sequence,
                 "type": command.command_type,
                 "status": "SUCCEEDED",
+                "issuedAt": "2026-09-03T00:00:00.000Z",
             }
             for command in reversed(self.issued)
         ]
@@ -272,6 +275,7 @@ class _Api:
                     "sequence": 3,
                     "type": "STREAM_POLICY",
                     "status": "EXPIRED",
+                    "issuedAt": "2026-09-01T23:59:00.000Z",
                     "expiresAt": "2026-09-02T00:00:00.000Z",
                 }
             )
@@ -281,6 +285,7 @@ class _Api:
                 "sequence": 4,
                 "type": "AGENT_UPDATE",
                 "status": "ROLLED_BACK",
+                "issuedAt": "2026-09-02T23:58:00.000Z",
                 "expiresAt": "2026-09-03T00:01:00.000Z",
             }
         )
@@ -290,6 +295,7 @@ class _Api:
                 "sequence": 5,
                 "type": "AGENT_UPDATE",
                 "status": "SUCCEEDED",
+                "issuedAt": "2026-09-02T23:59:00.000Z",
                 "expiresAt": "2026-09-03T00:02:00.000Z",
             }
         )
@@ -371,18 +377,26 @@ def _manifest() -> dict:
 def _runtime_identity(*, service_pid: int) -> dict:
     scenario = _manifest()["scenario"]
     relative_slot = "releases/" + scenario["expectedBomDigest"].removeprefix("sha256:")
+    marker = {
+        "schemaVersion": 2,
+        "bomDigest": scenario["expectedBomDigest"],
+        **scenario["release"],
+    }
+    build_info = (
+        '"""Generated release identity. Do not edit in release artifacts."""\n\n'
+        f'AGENT_VERSION = "{scenario["release"]["agentVersion"]}"\n'
+        f'COMPONENT_SHA = "{scenario["release"]["componentSha"]}"\n'
+    ).encode("utf-8")
     return {
         "activeSlot": relative_slot,
         "processActiveSlot": relative_slot,
         "processExpectedBomDigest": scenario["expectedBomDigest"],
         "servicePid": service_pid,
-        "releaseMarkerSha256": "f" * 64,
-        "buildInfoSha256": "9" * 64,
-        "release": {
-            "schemaVersion": 2,
-            "bomDigest": scenario["expectedBomDigest"],
-            **scenario["release"],
-        },
+        "releaseMarkerSha256": hashlib.sha256(
+            MODULE.canonical_json(marker)
+        ).hexdigest(),
+        "buildInfoSha256": hashlib.sha256(build_info).hexdigest(),
+        "release": marker,
     }
 
 
@@ -418,6 +432,7 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
                 "sequence": 5,
                 "type": "AGENT_UPDATE",
                 "status": "SUCCEEDED",
+                "issuedAt": "2026-09-02T23:59:00.000Z",
             },
         )
         self.assertEqual(
@@ -427,6 +442,7 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
                 "sequence": 4,
                 "type": "AGENT_UPDATE",
                 "status": "ROLLED_BACK",
+                "issuedAt": "2026-09-02T23:58:00.000Z",
             },
         )
         self.assertEqual(
@@ -445,6 +461,10 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
         self.assertEqual(
             evidence["source"]["runtimeIdentity"]["release"],
             _runtime_identity(service_pid=101)["release"],
+        )
+        self.assertEqual(
+            evidence["source"]["apiOrigin"],
+            "https://api.nuvion-dev.plaidlabs.ai",
         )
         for issued in api.issued[:2]:
             payload = board.commands[issued.command_id]["payload"]
@@ -484,6 +504,15 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             evidence["stream"]["recoveredGood"]["policyRevision"],
             evidence["stream"]["poor"]["policyRevision"],
         )
+        for name in ("initialGood", "poor", "recoveredGood"):
+            self.assertEqual(
+                evidence["stream"][name]["commandId"],
+                evidence["stream"]["adaptiveCommand"]["commandId"],
+            )
+            self.assertEqual(
+                evidence["stream"][name]["sequence"],
+                evidence["stream"]["adaptiveCommand"]["sequence"],
+            )
         MODULE.FLEET.assert_no_secret_material(evidence)
         with tempfile.TemporaryDirectory() as raw_directory:
             evidence_path = Path(raw_directory) / "config-stream-evidence.json"
@@ -716,6 +745,14 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
         self.assertEqual(MODULE.twin_domain(projection, "settings"), single)
         self.assertEqual(MODULE.projection_shape(projection, "settings"), "single")
 
+    def test_qualification_api_rejects_alternate_https_origin(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.ConfigStreamError, "authoritative Nuvion dev API"
+        ):
+            MODULE.FleetApi(
+                "https://relay.example.invalid", bytearray(b"opaque-token")
+            )
+
     def test_release_identity_mismatch_fails_closed_and_restores(self) -> None:
         class WrongReleaseBoard(_Board):
             def prepare(self, *, run_id: str, manifest_sha256: str) -> dict:
@@ -825,9 +862,15 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
         self.assertIn("nuvion-config-stream-deadman-", program)
         self.assertIn("/run/lock/nuvion-fleet-e2e.lock", program)
         self.assertIn("/var/lib/nuvion-fleet-e2e/active-run.json", program)
+        self.assertIn("config-stream-active.json", program)
+        self.assertIn("def reboot_restore(rid):", program)
+        self.assertIn('action == "reboot-restore"', program)
         self.assertNotIn("os.chmod(runtime.parent", program)
         restore_program = program[
             program.index("def restore(") : program.index("\ndef main()")
+        ]
+        reboot_program = program[
+            program.index("def reboot_restore(") : program.index("\ndef main()")
         ]
         prepare_program = program[
             program.index("def prepare(") : program.index("\ndef shlex_quote")
@@ -851,6 +894,46 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             restored_index,
             restore_program.index("purge_snapshots(work)", restored_index),
         )
+        reboot_restored = reboot_program.index('"phase": "RESTORED"')
+        reboot_purge = reboot_program.index("purge_snapshots(work)", reboot_restored)
+        reboot_release = reboot_program.index(
+            "release_config_lease(rid)", reboot_purge
+        )
+        reboot_deadman = reboot_program.index(
+            "complete_deadman_cleanup", reboot_release
+        )
+        reboot_response = reboot_program.index(
+            "return restoration_response", reboot_deadman
+        )
+        self.assertLess(reboot_restored, reboot_purge)
+        self.assertLess(reboot_purge, reboot_release)
+        self.assertLess(reboot_release, reboot_deadman)
+        self.assertLess(reboot_deadman, reboot_response)
+        self.assertNotIn('systemctl("start", "nuv-agent.service")', reboot_program)
+        self.assertNotIn("runtime_identity(", reboot_program)
+
+    def test_reboot_recovery_validator_requires_offline_exact_restoration(self) -> None:
+        recovery = _Board().restore(run_id=RUN_ID)
+        recovery.update(
+            {
+                "runtimeRestarted": False,
+                "runtimeIdentity": None,
+            }
+        )
+
+        self.assertEqual(
+            MODULE.validate_reboot_recovery(recovery, run_id=RUN_ID), recovery
+        )
+        for field, invalid in (
+            ("runtimeRestarted", True),
+            ("runtimeIdentity", _runtime_identity(service_pid=303)),
+            ("idempotent", "false"),
+            ("exclusiveLeaseReleased", False),
+        ):
+            with self.subTest(field=field):
+                candidate = {**recovery, field: invalid}
+                with self.assertRaises(MODULE.ConfigStreamError):
+                    MODULE.validate_reboot_recovery(candidate, run_id=RUN_ID)
 
     def test_restored_targets_verify_after_snapshot_payloads_are_purged(self) -> None:
         definitions = MODULE.BOARD_PROGRAM.split("\ntry:\n    main()", 1)[0]

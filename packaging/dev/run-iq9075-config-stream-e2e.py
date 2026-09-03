@@ -99,6 +99,8 @@ class BoardPort(Protocol):
 
     def restore(self, *, run_id: str) -> dict[str, Any]: ...
 
+    def recover_after_reboot(self, *, run_id: str) -> dict[str, Any]: ...
+
 
 class ApiPort(Protocol):
     def issue(
@@ -140,8 +142,11 @@ class FleetApi:
             or parsed.query
             or parsed.fragment
             or parsed.path not in {"", "/"}
+            or base_url.rstrip("/") != DEFAULT_API_BASE_URL
         ):
-            raise ConfigStreamError("Fleet API base URL must be an HTTPS origin")
+            raise ConfigStreamError(
+                "Fleet API origin must be the authoritative Nuvion dev API"
+            )
         if (access_token is None) == (cookie_jar is None):
             raise ConfigStreamError("exactly one Fleet API credential source is required")
         token: str | None = None
@@ -322,6 +327,7 @@ import subprocess
 import sys
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_FILE = 64 * 1024 * 1024
@@ -372,6 +378,9 @@ def canonical(value):
 
 def sha(payload):
     return hashlib.sha256(payload).hexdigest()
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 def read_regular(path, maximum=MAX_FILE):
     meta = path.lstat()
@@ -685,13 +694,16 @@ def runtime_identity(run_root, manifest_sha):
     marker_path = slot / ".nuvion/release.json"
     marker_raw, marker_meta = read_regular(marker_path, 64 * 1024)
     marker = json.loads(marker_raw.decode("utf-8"))
-    if marker_meta.st_uid != 0 or marker_meta.st_mode & 0o022 or marker != expected_release:
+    expected_marker_raw = canonical(expected_release)
+    if marker_meta.st_uid != 0 or marker_meta.st_mode & 0o022 or marker_raw != expected_marker_raw or marker != expected_release:
         raise Failure("active release marker differs from the commit manifest")
     build_info_raw, build_info_meta = read_regular(slot / "venv/lib/python3.12/site-packages/nuvion_app/build_info.py", 64 * 1024)
-    build_info_text = build_info_raw.decode("utf-8")
-    versions = re.findall(r'^AGENT_VERSION\s*=.*$', build_info_text, re.MULTILINE)
-    components = re.findall(r'^COMPONENT_SHA\s*=.*$', build_info_text, re.MULTILINE)
-    if build_info_meta.st_uid != 0 or build_info_meta.st_mode & 0o022 or versions != ['AGENT_VERSION = "' + str(release.get("agentVersion")) + '"'] or components != ['COMPONENT_SHA = "' + str(release.get("componentSha")) + '"']:
+    expected_build_info_raw = (
+        '"""Generated release identity. Do not edit in release artifacts."""\n\n'
+        'AGENT_VERSION = "' + str(release.get("agentVersion")) + '"\n'
+        'COMPONENT_SHA = "' + str(release.get("componentSha")) + '"\n'
+    ).encode("utf-8")
+    if build_info_meta.st_uid != 0 or build_info_meta.st_mode & 0o022 or build_info_raw != expected_build_info_raw:
         raise Failure("active Agent build info differs from the commit manifest")
     pid = service_pid()
     environment_raw, _ = read_regular(Path("/proc") / str(pid) / "environ", MAX_PROCESS_ENV)
@@ -1102,9 +1114,12 @@ def complete_deadman_cleanup(rid, state, work, *, deadman):
     atomic(work / "state.json", canonical(state))
 
 def restoration_response(state, rid, work, restored_settings, identity, *, idempotent, no_mutation):
+    if not isinstance(state.get("restoredCompletedAt"), str):
+        state["restoredCompletedAt"] = utc_now()
+        atomic(work / "state.json", canonical(state))
     cached = state.get("restorationResponse")
     if isinstance(cached, dict):
-        if cached.get("schemaVersion") != 1 or cached.get("runId") != rid or cached.get("restored") is not True or cached.get("exactRestoration") is not True or cached.get("noMutation") is not no_mutation or cached.get("exclusiveLeaseReleased") is not True or cached.get("deadmanDisarmed") is not True:
+        if cached.get("schemaVersion") != 1 or cached.get("runId") != rid or not isinstance(cached.get("completedAt"), str) or cached.get("completedAt") != state.get("restoredCompletedAt") or cached.get("restored") is not True or cached.get("exactRestoration") is not True or cached.get("noMutation") is not no_mutation or cached.get("exclusiveLeaseReleased") is not True or cached.get("deadmanDisarmed") is not True:
             raise Failure("sealed config-stream restoration response is invalid")
         cached_settings = cached.get("settings")
         if isinstance(cached_settings, dict) and sha(canonical(cached_settings)) != cached.get("settingsSha256"):
@@ -1115,11 +1130,12 @@ def restoration_response(state, rid, work, restored_settings, identity, *, idemp
     response = {
         "schemaVersion": 1,
         "runId": rid,
+        "completedAt": state.get("restoredCompletedAt"),
         "restored": True,
         "idempotent": idempotent,
         "noMutation": no_mutation,
         "exactRestoration": True,
-        "runtimeRestarted": not no_mutation,
+        "runtimeRestarted": state.get("runtimeRestarted", not no_mutation),
         "configSha256": state.get("configBeforeSha256"),
         "settings": restored_settings,
         "settingsSha256": sha(canonical(restored_settings)) if isinstance(restored_settings, dict) else None,
@@ -1139,7 +1155,7 @@ def restore(rid, internal=False, deadman=False):
             raise Failure("config-stream lease exists without a recovery journal")
         if not deadman:
             disarm_deadman(rid)
-        return {"schemaVersion": 1, "runId": rid, "restored": True, "idempotent": True, "noMutation": True, "exactRestoration": True, "runtimeRestarted": False, "configSha256": None, "settings": None, "settingsSha256": None, "encoderStartupBitrateKbps": None, "runtimeIdentity": None, "exclusiveLeaseReleased": True, "deadmanDisarmed": True}
+        return {"schemaVersion": 1, "runId": rid, "completedAt": utc_now(), "restored": True, "idempotent": True, "noMutation": True, "exactRestoration": True, "runtimeRestarted": False, "configSha256": None, "settings": None, "settingsSha256": None, "encoderStartupBitrateKbps": None, "runtimeIdentity": None, "exclusiveLeaseReleased": True, "deadmanDisarmed": True}
     work_meta = work.lstat()
     state_meta = (work / "state.json").lstat()
     if stat.S_ISLNK(work_meta.st_mode) or not stat.S_ISDIR(work_meta.st_mode) or work_meta.st_uid != 0 or stat.S_IMODE(work_meta.st_mode) != 0o700 or stat.S_ISLNK(state_meta.st_mode) or not stat.S_ISREG(state_meta.st_mode) or state_meta.st_uid != 0 or stat.S_IMODE(state_meta.st_mode) != 0o600:
@@ -1160,7 +1176,7 @@ def restore(rid, internal=False, deadman=False):
         if not service_active():
             raise Failure("Agent service did not recover from pre-mutation state")
         identity = runtime_identity(run_root, state["manifestSha256"])
-        state.update({"phase": "RESTORED", "restoredExact": True, "restoredServicePid": identity["servicePid"], "noMutation": True})
+        state.update({"phase": "RESTORED", "restoredExact": True, "restoredServicePid": identity["servicePid"], "runtimeRestarted": False, "noMutation": True})
         atomic(work / "state.json", canonical(state))
         purge_snapshots(work)
         release_config_lease(rid)
@@ -1201,6 +1217,7 @@ def restore(rid, internal=False, deadman=False):
             "restoredSettings": restored_settings,
             "restoredSettingsSha256": sha(canonical(restored_settings)),
             "restoredRuntimeIdentity": identity,
+            "runtimeRestarted": True,
             "noMutation": False,
         })
         # The durable RESTORED journal must precede deletion of the only
@@ -1223,6 +1240,82 @@ def restore(rid, internal=False, deadman=False):
     complete_deadman_cleanup(rid, state, work, deadman=deadman)
     return restoration_response(state, rid, work, restored_settings, identity, idempotent=phase == "RESTORED", no_mutation=False)
 
+def reboot_restore(rid):
+    run_root, work, runtime, dropin = work_paths(rid)
+    del run_root
+    if not work.exists() and not work.is_symlink():
+        raise Failure("config-stream reboot recovery journal is unavailable")
+    work_meta = work.lstat()
+    state_meta = (work / "state.json").lstat()
+    if stat.S_ISLNK(work_meta.st_mode) or not stat.S_ISDIR(work_meta.st_mode) or work_meta.st_uid != 0 or stat.S_IMODE(work_meta.st_mode) != 0o700 or stat.S_ISLNK(state_meta.st_mode) or not stat.S_ISREG(state_meta.st_mode) or state_meta.st_uid != 0 or stat.S_IMODE(state_meta.st_mode) != 0o600:
+        raise Failure("config-stream reboot recovery journal metadata is unsafe")
+    state = load_json(work / "state.json")
+    if state.get("runId") != rid or state.get("schemaVersion") != 1 or SHA_RE.fullmatch(str(state.get("manifestSha256") or "")) is None:
+        raise Failure("config-stream reboot recovery identity is invalid")
+    lease_present = CONFIG_LEASE.exists() or CONFIG_LEASE.is_symlink()
+    if lease_present:
+        validate_config_lease(rid)
+    cached_response = state.get("restorationResponse")
+    if isinstance(cached_response, dict):
+        if lease_present or state.get("rebootRecovery") is not True:
+            raise Failure("completed config-stream restoration retained unsafe state")
+        return restoration_response(
+            state,
+            rid,
+            work,
+            state.get("restoredSettings"),
+            None,
+            idempotent=True,
+            no_mutation=state.get("noMutation") is True,
+        )
+    parents = parent_snapshots(state, runtime, dropin)
+    phase = state.get("phase")
+    if phase not in {"ARMING", "ARMED", "PREPARED", "ACTIVE", "RESTORING", "RESTORED"}:
+        raise Failure("config-stream reboot recovery phase is invalid")
+    if not lease_present and phase != "RESTORED":
+        raise Failure("config-stream reboot recovery lease is absent")
+    no_mutation = phase in {"ARMING", "ARMED"} or (phase == "RESTORED" and state.get("noMutation") is True)
+    systemctl("stop", "nuv-agent.service", check=False)
+    if no_mutation:
+        if runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
+            raise Failure("config-stream mutation exists without snapshots")
+        restored_settings = None
+    else:
+        records = validate_snapshot_records(state.get("snapshots"))
+        if phase != "RESTORED":
+            state["phase"] = "RESTORING"
+            atomic(work / "state.json", canonical(state))
+            restore_snapshots(work, records)
+            remove_runtime_artifacts(state, runtime, dropin)
+            systemctl("daemon-reload")
+        elif runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
+            raise Failure("restored config-stream artifacts remain after reboot")
+        if not verify_restored(records):
+            raise Failure("config-stream reboot byte restoration failed")
+        restored_settings = baseline(False, state.get("baseline", {}).get("model"))
+        if restored_settings != state.get("baseline"):
+            raise Failure("config-stream reboot settings restoration failed")
+        restore_parent(runtime.parent, parents[str(runtime.parent)])
+        restore_parent(dropin.parent, parents[str(dropin.parent)])
+        if not verify_restored(records):
+            raise Failure("config-stream reboot restoration changed")
+    state.update({
+        "phase": "RESTORED",
+        "restoredExact": True,
+        "restoredServicePid": None,
+        "restoredSettings": restored_settings,
+        "restoredSettingsSha256": sha(canonical(restored_settings)) if isinstance(restored_settings, dict) else None,
+        "restoredRuntimeIdentity": None,
+        "runtimeRestarted": False,
+        "rebootRecovery": True,
+        "noMutation": no_mutation,
+    })
+    atomic(work / "state.json", canonical(state))
+    purge_snapshots(work)
+    release_config_lease(rid)
+    complete_deadman_cleanup(rid, state, work, deadman=False)
+    return restoration_response(state, rid, work, restored_settings, None, idempotent=False, no_mutation=no_mutation)
+
 def main():
     if os.geteuid() != 0:
         raise Failure("root privileges are required")
@@ -1241,6 +1334,8 @@ def main():
             result = restore(rid)
         elif action == "deadman-restore" and len(sys.argv) == 3:
             result = restore(rid, internal=True, deadman=True)
+        elif action == "reboot-restore" and len(sys.argv) == 3:
+            result = reboot_restore(rid)
         else:
             raise Failure("action is outside the typed allowlist")
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
@@ -1254,7 +1349,9 @@ except (Failure, OSError, ValueError, KeyError, sqlite3.Error, subprocess.Subpro
 
 
 class RemoteBoard:
-    ACTIONS = frozenset({"prepare", "set-link", "inspect", "restore"})
+    ACTIONS = frozenset(
+        {"prepare", "set-link", "inspect", "restore", "reboot-restore"}
+    )
 
     def __init__(self, transport: Any) -> None:
         self.transport = transport
@@ -1290,7 +1387,9 @@ class RemoteBoard:
                 f"{self.transport.user}@{self.transport.host}",
                 shlex.join(remote),
             ],
-            timeout=360 if action in {"prepare", "restore"} else 120,
+            timeout=360
+            if action in {"prepare", "restore", "reboot-restore"}
+            else 120,
             input_bytes=input_bytes,
         )
         return self.transport._parse_result(result, operation="config-stream-" + action)
@@ -1306,6 +1405,9 @@ class RemoteBoard:
 
     def restore(self, *, run_id: str) -> dict[str, Any]:
         return self._invoke("restore", run_id)
+
+    def recover_after_reboot(self, *, run_id: str) -> dict[str, Any]:
+        return self._invoke("reboot-restore", run_id)
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
@@ -1450,6 +1552,14 @@ def validate_runtime_identity(
         "bomDigest": expected_bom,
         **dict(release),
     }
+    expected_marker_sha256 = hashlib.sha256(canonical_json(marker)).hexdigest()
+    expected_build_info_sha256 = hashlib.sha256(
+        (
+            '"""Generated release identity. Do not edit in release artifacts."""\n\n'
+            f'AGENT_VERSION = "{release.get("agentVersion")}"\n'
+            f'COMPONENT_SHA = "{release.get("componentSha")}"\n'
+        ).encode("utf-8")
+    ).hexdigest()
     if (
         set(release)
         != {
@@ -1475,10 +1585,8 @@ def validate_runtime_identity(
         or identity.get("processExpectedBomDigest") != expected_bom
         or type(identity.get("servicePid")) is not int
         or identity["servicePid"] < 2
-        or not isinstance(identity.get("releaseMarkerSha256"), str)
-        or SHA256_RE.fullmatch(identity["releaseMarkerSha256"]) is None
-        or not isinstance(identity.get("buildInfoSha256"), str)
-        or SHA256_RE.fullmatch(identity["buildInfoSha256"]) is None
+        or identity.get("releaseMarkerSha256") != expected_marker_sha256
+        or identity.get("buildInfoSha256") != expected_build_info_sha256
         or identity.get("release") != marker
         or not isinstance(release.get("agentVersion"), str)
         or type(release.get("releaseSequence")) is not int
@@ -1680,6 +1788,8 @@ class ConfigStreamOrchestrator:
                     pass
                 else:
                     return {
+                        "commandId": issued.command_id,
+                        "sequence": issued.sequence,
                         "policyRevision": int(observation["revision"]),
                         "appliedBitrateKbps": int(reported["appliedBitrateKbps"]),
                         "lastAdjustmentReason": str(
@@ -1788,6 +1898,7 @@ class ConfigStreamOrchestrator:
                     "sequence": sequence,
                     "type": command_type,
                     "status": status,
+                    "issuedAt": item.get("issuedAt"),
                     "expiresAt": item.get("expiresAt"),
                 }
                 if command_id == expected_release_command_id:
@@ -1803,6 +1914,7 @@ class ConfigStreamOrchestrator:
                         "sequence": sequence,
                         "type": "AGENT_UPDATE",
                         "status": "SUCCEEDED",
+                        "issuedAt": item.get("issuedAt"),
                     }
             if release_command is None:
                 raise ConfigStreamError("commit Fleet command is absent from the journal")
@@ -1824,8 +1936,20 @@ class ConfigStreamOrchestrator:
                 )
             prior_rollback_command = {
                 key: prior_rollback_raw[key]
-                for key in ("commandId", "sequence", "type", "status")
+                for key in ("commandId", "sequence", "type", "status", "issuedAt")
             }
+            release_issued_at = _utc_timestamp(
+                release_command.get("issuedAt"), "commit command issuedAt"
+            )
+            rollback_issued_at = _utc_timestamp(
+                prior_rollback_command.get("issuedAt"),
+                "prior rollback command issuedAt",
+            )
+            if (
+                rollback_issued_at > release_issued_at
+                or release_issued_at > self.wall_clock()
+            ):
+                raise ConfigStreamError("release command issue ordering is invalid")
             historical = [
                 item
                 for sequence, item in journal_by_sequence.items()
@@ -1964,6 +2088,8 @@ class ConfigStreamOrchestrator:
                 deadline=deadline,
             )
             initial_state = {
+                "commandId": issued_adaptive.command_id,
+                "sequence": issued_adaptive.sequence,
                 "policyRevision": adaptive["reportedRevision"],
                 "appliedBitrateKbps": adaptive["reportedState"].get(
                     "appliedBitrateKbps"
@@ -2058,10 +2184,13 @@ class ConfigStreamOrchestrator:
                 "schemaVersion": SCHEMA_VERSION,
                 "kind": KIND,
                 "runId": run_id,
-                "generatedAt": utc_now(),
+                "generatedAt": self.wall_clock()
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
                 "source": {
                     "manifestSha256": manifest_sha256,
                     "otaEvidenceSha256": ota_evidence_sha256,
+                    "apiOrigin": DEFAULT_API_BASE_URL,
                     "agentVersion": release.get("agentVersion"),
                     "componentSha": release.get("componentSha"),
                     "bomDigest": scenario.get("expectedBomDigest"),
@@ -2152,6 +2281,8 @@ class ConfigStreamOrchestrator:
                     valid_restoration = (
                         restored.get("schemaVersion") != 1
                         or restored.get("runId") != run_id
+                        or type(restored.get("idempotent")) is not bool
+                        or not isinstance(restored.get("completedAt"), str)
                         or restored.get("restored") is not True
                         or restored.get("exactRestoration") is not True
                         or restored.get("exclusiveLeaseReleased") is not True
@@ -2163,6 +2294,17 @@ class ConfigStreamOrchestrator:
                             or restored.get("runtimeRestarted") is not True
                             or restored.get("configSha256")
                             != prep.get("configBeforeSha256")
+                            or (
+                                result is not None
+                                and _utc_timestamp(
+                                    restored.get("completedAt"),
+                                    "config-stream cleanup completedAt",
+                                )
+                                < _utc_timestamp(
+                                    result.get("generatedAt"),
+                                    "config-stream generatedAt",
+                                )
+                            )
                         )
                     elif not no_mutation:
                         valid_restoration = valid_restoration or (
@@ -2238,6 +2380,65 @@ def validate_manifest_binding(
     )
 
 
+def validate_reboot_recovery(value: Any, *, run_id: str) -> dict[str, Any]:
+    recovery = _mapping(value, "config-stream reboot recovery")
+    expected = {
+        "schemaVersion",
+        "runId",
+        "completedAt",
+        "restored",
+        "idempotent",
+        "noMutation",
+        "exactRestoration",
+        "runtimeRestarted",
+        "configSha256",
+        "settings",
+        "settingsSha256",
+        "encoderStartupBitrateKbps",
+        "runtimeIdentity",
+        "exclusiveLeaseReleased",
+        "deadmanDisarmed",
+    }
+    if (
+        set(recovery) != expected
+        or recovery.get("schemaVersion") != 1
+        or recovery.get("runId") != run_id
+        or recovery.get("restored") is not True
+        or type(recovery.get("idempotent")) is not bool
+        or type(recovery.get("noMutation")) is not bool
+        or recovery.get("exactRestoration") is not True
+        or recovery.get("runtimeRestarted") is not False
+        or recovery.get("runtimeIdentity") is not None
+        or recovery.get("exclusiveLeaseReleased") is not True
+        or recovery.get("deadmanDisarmed") is not True
+    ):
+        raise ConfigStreamError("config-stream reboot recovery is incomplete")
+    _utc_timestamp(recovery.get("completedAt"), "reboot recovery completedAt")
+    if recovery["noMutation"] is True:
+        if any(
+            recovery.get(name) is not None
+            for name in (
+                "configSha256",
+                "settings",
+                "settingsSha256",
+                "encoderStartupBitrateKbps",
+            )
+        ):
+            raise ConfigStreamError("no-mutation reboot recovery proof is invalid")
+    else:
+        settings = validate_baseline(recovery.get("settings"))
+        settings_sha = recovery.get("settingsSha256")
+        if (
+            not SHA256_RE.fullmatch(str(recovery.get("configSha256") or ""))
+            or not SHA256_RE.fullmatch(str(settings_sha or ""))
+            or hashlib.sha256(canonical_json(settings)).hexdigest() != settings_sha
+            or recovery.get("encoderStartupBitrateKbps")
+            != settings["video"]["bitrateKbps"]
+        ):
+            raise ConfigStreamError("mutated reboot recovery proof is invalid")
+    return dict(recovery)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run camera-independent IQ9075 CONFIG_APPLY/adaptive-streaming E2E"
@@ -2249,13 +2450,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-key-sha256", default=FLEET.DEFAULT_FINGERPRINT)
     parser.add_argument("--ssh-password-fd", type=int)
     parser.add_argument("--sudo-password-fd", type=int)
-    credentials = parser.add_mutually_exclusive_group(required=True)
+    credentials = parser.add_mutually_exclusive_group()
     credentials.add_argument("--api-access-token-fd", type=int)
     credentials.add_argument("--api-cookie-jar")
     parser.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--wait-seconds", type=int, default=420)
+    parser.add_argument("--recover-after-reboot", action="store_true")
     return parser
 
 
@@ -2266,6 +2468,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         FLEET.disable_core_dumps()
         arguments = build_parser().parse_args(argv)
+        if arguments.api_base_url.rstrip("/") != DEFAULT_API_BASE_URL:
+            raise ConfigStreamError(
+                "qualification evidence requires the authoritative Nuvion dev API"
+            )
+        has_api_credential = (
+            arguments.api_access_token_fd is not None
+            or arguments.api_cookie_jar is not None
+        )
+        if arguments.recover_after_reboot and has_api_credential:
+            raise ConfigStreamError(
+                "reboot recovery does not accept Fleet API credentials"
+            )
+        if not arguments.recover_after_reboot and not has_api_credential:
+            raise ConfigStreamError(
+                "exactly one Fleet API credential source is required"
+            )
         run_id = FLEET.canonical_run_id(arguments.run_id)
         output_dir = FLEET.prepare_output_dir(arguments.output_dir)
         if output_dir.name != run_id:
@@ -2308,13 +2526,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             sudo_password=sudo_password,
             askpass_program=Path(__file__).with_name("run-iq9075-fleet-e2e.py"),
         )
+        board = RemoteBoard(transport)
+        if arguments.recover_after_reboot:
+            recovery = validate_reboot_recovery(
+                board.recover_after_reboot(run_id=run_id), run_id=run_id
+            )
+            recovery_document = {
+                "schemaVersion": 1,
+                "kind": "nuvion-iq9075-config-stream-reboot-recovery",
+                "runId": run_id,
+                "generatedAt": recovery["completedAt"],
+                "recovery": recovery,
+            }
+            FLEET.assert_no_secret_material(recovery_document)
+            recovery_path = output_dir / "config-stream-reboot-recovery.json"
+            FLEET.atomic_json(recovery_path, recovery_document, immutable=True)
+            persisted = FLEET.read_regular(
+                recovery_path, FLEET.MAX_OUTPUT_BYTES
+            )
+            if persisted != canonical_json(recovery_document):
+                raise ConfigStreamError(
+                    "persisted reboot recovery evidence bytes differ"
+                )
+            print(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "runId": run_id,
+                        "recovered": True,
+                        "evidenceSha256": hashlib.sha256(persisted).hexdigest(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
         orchestrator = ConfigStreamOrchestrator(
             api=FleetApi(
                 arguments.api_base_url,
                 api_token,
                 cookie_jar=arguments.api_cookie_jar,
             ),
-            board=RemoteBoard(transport),
+            board=board,
         )
         evidence = orchestrator.run(
             run_id=run_id,

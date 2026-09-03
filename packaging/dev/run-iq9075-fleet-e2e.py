@@ -65,6 +65,7 @@ BOOTSTRAP_FAILURE_RE = re.compile(
 BOARD_COMMANDS = frozenset(
     {
         "identity",
+        "resume-boot-gate",
         "preflight",
         "backup",
         "enable-fleet",
@@ -4093,6 +4094,25 @@ class FleetRunner:
             raise RunnerError("cleanup evidence read-back digest differs")
         return evidence
 
+    def resume_boot_gate(self) -> dict[str, Any]:
+        result = self.transport.invoke_board(
+            "resume-boot-gate", timeout=600
+        )
+        expected = {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-boot-gate-resumption",
+            "complete": True,
+            "gateActive": True,
+            "protectedUnitsStopped": True,
+        }
+        if result != expected:
+            raise RunnerError("board boot reconciliation gate did not resume")
+        output = self.output_dir / "boot-gate-recovery.json"
+        atomic_json(output, result, immutable=True)
+        if read_regular(output, MAX_OUTPUT_BYTES) != canonical_json_bytes(result):
+            raise RunnerError("boot gate recovery evidence read-back differs")
+        return result
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the IQ9075 Fleet E2E harness")
@@ -4157,6 +4177,7 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--expected-version", required=True)
     bootstrap.add_argument("--expected-sha256", required=True)
     subcommands.add_parser("cleanup")
+    subcommands.add_parser("resume-boot-gate")
     return parser
 
 
@@ -4213,7 +4234,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=output_dir,
             run_id=run_id,
         )
-        if arguments.command == "cleanup":
+        if arguments.command == "resume-boot-gate":
+            result = runner.resume_boot_gate()
+        elif arguments.command == "cleanup":
             result = runner.cleanup()
         elif arguments.command == "bootstrap-updater":
             inputs = [

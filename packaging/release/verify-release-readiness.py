@@ -39,6 +39,8 @@ RELEASE_SLOT = re.compile(r"^releases/[0-9a-f]{64}$")
 IDENTITY_TEXT = re.compile(r"^[\x20-\x7e]{1,255}$")
 MAX_EVIDENCE_BYTES = 1024 * 1024
 CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121"})
+FLEET_RUNTIME_REQUIRED_FROM = (0, 1, 121)
+IQ9075_QUALIFICATION_API_ORIGIN = "https://api.nuvion-dev.plaidlabs.ai"
 MAX_APPSRC_BYTES = 640 * 480 * 3 * 2
 
 
@@ -573,16 +575,27 @@ def _validated_config_stream_gate(
                 )
             slot = "releases/" + bom_digest[7:]
             marker = {"schemaVersion": 2, "bomDigest": bom_digest, **release}
+            expected_marker_sha256 = hashlib.sha256(
+                canonical_config(marker)
+            ).hexdigest()
+            expected_build_info = (
+                '"""Generated release identity. Do not edit in release artifacts."""\n\n'
+                f'AGENT_VERSION = "{release.get("agentVersion")}"\n'
+                f'COMPONENT_SHA = "{release.get("componentSha")}"\n'
+            ).encode("utf-8")
+            expected_build_info_sha256 = hashlib.sha256(
+                expected_build_info
+            ).hexdigest()
             if (
                 item.get("activeSlot") != slot
                 or item.get("processActiveSlot") != slot
                 or item.get("processExpectedBomDigest") != bom_digest
                 or type(item.get("servicePid")) is not int
                 or item["servicePid"] < 2
-                or not isinstance(item.get("releaseMarkerSha256"), str)
-                or SHA256.fullmatch(item["releaseMarkerSha256"]) is None
-                or not isinstance(item.get("buildInfoSha256"), str)
-                or SHA256.fullmatch(item["buildInfoSha256"]) is None
+                or item.get("releaseMarkerSha256")
+                != expected_marker_sha256
+                or item.get("buildInfoSha256")
+                != expected_build_info_sha256
                 or item.get("release") != marker
             ):
                 raise ReadinessError(
@@ -677,6 +690,7 @@ def _validated_config_stream_gate(
             {
                 "manifestSha256",
                 "otaEvidenceSha256",
+                "apiOrigin",
                 "agentVersion",
                 "componentSha",
                 "bomDigest",
@@ -691,6 +705,7 @@ def _validated_config_stream_gate(
         expected_source = {
             "manifestSha256": hashlib.sha256(fleet_manifest_raw).hexdigest(),
             "otaEvidenceSha256": hashlib.sha256(fleet_evidence_raw).hexdigest(),
+            "apiOrigin": IQ9075_QUALIFICATION_API_ORIGIN,
             "agentVersion": release.get("agentVersion")
             if isinstance(release, dict)
             else None,
@@ -772,7 +787,7 @@ def _validated_config_stream_gate(
         ) -> dict[str, Any]:
             item = exact(
                 value,
-                {"commandId", "sequence", "type", "status"},
+                {"commandId", "sequence", "type", "status", "issuedAt"},
                 label,
             )
             try:
@@ -817,6 +832,30 @@ def _validated_config_stream_gate(
             if isinstance(rollback_updater, dict)
             else None
         )
+        release_issued = _timestamp(
+            release_command.get("issuedAt"),
+            label="IQ9075 committed release command issue",
+        )
+        prior_rollback_issued = _timestamp(
+            prior_rollback_command.get("issuedAt"),
+            label="IQ9075 rollback release command issue",
+        )
+        rollback_updated = _timestamp(
+            rollback_update.get("updatedAt")
+            if isinstance(rollback_update, dict)
+            else None,
+            label="IQ9075 rollback update completion",
+        )
+        rollback_generated = _timestamp(
+            rollback_evidence.get("generatedAt"),
+            label="IQ9075 rollback result generation",
+        )
+        commit_updated = _timestamp(
+            commit_update.get("updatedAt")
+            if isinstance(commit_update, dict)
+            else None,
+            label="IQ9075 commit update completion",
+        )
         if (
             not isinstance(commit_scenario, dict)
             or not isinstance(commit_update, dict)
@@ -834,6 +873,11 @@ def _validated_config_stream_gate(
             != rollback_update.get("sequence")
             or prior_rollback_command["sequence"] + 1
             != release_command["sequence"]
+            or prior_rollback_issued > rollback_updated
+            or rollback_updated > rollback_generated
+            or release_issued > commit_updated
+            or commit_updated > fleet_generated
+            or release_issued > fleet_generated
         ):
             raise ReadinessError(
                 "IQ9075 config-stream release command chain is invalid"
@@ -974,6 +1018,8 @@ def _validated_config_stream_gate(
         initial = exact(
             stream.get("initialGood"),
             {
+                "commandId",
+                "sequence",
                 "policyRevision",
                 "appliedBitrateKbps",
                 "health",
@@ -989,6 +1035,8 @@ def _validated_config_stream_gate(
             item = exact(
                 value,
                 {
+                    "commandId",
+                    "sequence",
                     "policyRevision",
                     "appliedBitrateKbps",
                     "lastAdjustmentReason",
@@ -1010,6 +1058,8 @@ def _validated_config_stream_gate(
                 or item.get("encoder") != "x264enc"
                 or item.get("projectionShape")
                 != document.get("projectionShape")
+                or item.get("commandId") != adaptive.get("commandId")
+                or item.get("sequence") != adaptive.get("sequence")
             ):
                 raise ReadinessError(
                     f"IQ9075 config-stream {label} is invalid"
@@ -1022,6 +1072,7 @@ def _validated_config_stream_gate(
             stream.get("recoveredGood"), "recovered GOOD observation"
         )
         disabled = command(stream.get("disabled"), "STREAM_POLICY")
+        poor_reason_tokens = poor["lastAdjustmentReason"].split(",")
         if (
             adaptive_id != adaptive.get("commandId")
             or type(adaptive.get("sequence")) is not int
@@ -1036,6 +1087,8 @@ def _validated_config_stream_gate(
             or initial.get("health") != "STREAM_CONTINUOUS"
             or initial.get("encoder") != "x264enc"
             or initial.get("lastAdjustmentReason") != "policy_activated"
+            or initial.get("commandId") != adaptive.get("commandId")
+            or initial.get("sequence") != adaptive.get("sequence")
             or initial.get("projectionShape")
             != document.get("projectionShape")
             or not (
@@ -1048,7 +1101,8 @@ def _validated_config_stream_gate(
                 and recovered["appliedBitrateKbps"]
                 > poor["appliedBitrateKbps"]
             )
-            or "connectivity_poor" not in poor["lastAdjustmentReason"]
+            or any(not token or token != token.strip() for token in poor_reason_tokens)
+            or "connectivity_poor" not in poor_reason_tokens
             or recovered["lastAdjustmentReason"] != "healthy_recovery"
             or disabled["reportedState"].get("mode") != "DISABLED"
             or disabled["reportedState"].get("encoder") != "x264enc"
@@ -1181,6 +1235,7 @@ def _validated_config_stream_gate(
             {
                 "schemaVersion",
                 "runId",
+                "completedAt",
                 "restored",
                 "idempotent",
                 "noMutation",
@@ -1197,6 +1252,10 @@ def _validated_config_stream_gate(
             "exact restoration",
         )
         cleanup_settings = baseline(cleanup.get("settings"))
+        cleanup_completed = _timestamp(
+            cleanup.get("completedAt"),
+            label="IQ9075 config-stream cleanup completion",
+        )
         cleanup_settings_sha = cleanup.get("settingsSha256")
         restored_runtime_identity = runtime_identity(
             cleanup.get("runtimeIdentity"),
@@ -1218,7 +1277,7 @@ def _validated_config_stream_gate(
             or cleanup.get("schemaVersion") != 1
             or cleanup.get("runId") != document["runId"]
             or cleanup.get("restored") is not True
-            or cleanup.get("idempotent") is not False
+            or type(cleanup.get("idempotent")) is not bool
             or cleanup.get("noMutation") is not False
             or cleanup.get("exactRestoration") is not True
             or cleanup.get("runtimeRestarted") is not True
@@ -1237,6 +1296,9 @@ def _validated_config_stream_gate(
             or restored_identity_without_pid != initial_identity_without_pid
             or restored_runtime_identity["servicePid"]
             == initial_runtime_identity["servicePid"]
+            or not config_generated
+            <= cleanup_completed
+            <= fleet_cleanup_completed
         ):
             raise ReadinessError(
                 "IQ9075 config-stream exact restoration proof is invalid"
@@ -1601,6 +1663,14 @@ def _validate_fleet_runtime_documents(
             candidate_config_stream_runner=candidate_config_stream_runner,
         )
     )
+    committed_release_issued = _timestamp(
+        config_stream_gate["releaseCommand"].get("issuedAt"),
+        label="IQ9075 committed release command issue",
+    )
+    if rollback_cleanup_completed > committed_release_issued:
+        raise ReadinessError(
+            "IQ9075 committed release command precedes rollback cleanup"
+        )
     if (
         summary.get("configStreamRunnerSha256")
         != config_stream_runner_sha256
@@ -2642,6 +2712,10 @@ def _validate_ready_evidence(
     common_fields = {"componentSha", "agentReleaseGate"}
     runtime_fields = common_fields | {"iq9075FleetRuntime"}
     legacy_fields = common_fields | {"iq9075Physical"}
+    try:
+        version_tuple = tuple(int(part) for part in version.split("."))
+    except ValueError as exc:
+        raise ReadinessError("release version is invalid") from exc
     if (
         not isinstance(decision, dict)
         or frozenset(decision)
@@ -2650,6 +2724,10 @@ def _validate_ready_evidence(
         or not SHA.fullmatch(component_sha)
         or decision.get("componentSha") != component_sha
         or gate_evidence is None
+        or (
+            version_tuple >= FLEET_RUNTIME_REQUIRED_FROM
+            and frozenset(decision) != frozenset(runtime_fields)
+        )
     ):
         raise ReadinessError("READY release lacks exact component evidence")
     expected_gate_keys = {

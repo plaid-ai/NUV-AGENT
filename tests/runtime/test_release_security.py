@@ -918,13 +918,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "bomDigest": scenario["expectedBomDigest"],
             **release,
         }
+        build_info = (
+            '"""Generated release identity. Do not edit in release artifacts."""\n\n'
+            f'AGENT_VERSION = "{release["agentVersion"]}"\n'
+            f'COMPONENT_SHA = "{release["componentSha"]}"\n'
+        ).encode("utf-8")
         runtime_identity = {
             "activeSlot": relative_slot,
             "processActiveSlot": relative_slot,
             "processExpectedBomDigest": scenario["expectedBomDigest"],
             "servicePid": 4400,
-            "releaseMarkerSha256": "d" * 64,
-            "buildInfoSha256": "9" * 64,
+            "releaseMarkerSha256": hashlib.sha256(
+                canonical_bytes(runtime_release)
+            ).hexdigest(),
+            "buildInfoSha256": hashlib.sha256(build_info).hexdigest(),
             "release": runtime_release,
         }
         gates = {
@@ -953,6 +960,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "otaEvidenceSha256": hashlib.sha256(
                     canonical_bytes(fleet_evidence)
                 ).hexdigest(),
+                "apiOrigin": "https://api.nuvion-dev.plaidlabs.ai",
                 "agentVersion": release["agentVersion"],
                 "componentSha": release["componentSha"],
                 "bomDigest": scenario["expectedBomDigest"],
@@ -968,12 +976,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "sequence": release_update["sequence"],
                 "type": "AGENT_UPDATE",
                 "status": "SUCCEEDED",
+                "issuedAt": "2026-09-03T10:04:30Z",
             },
             "priorRollbackCommand": {
                 "commandId": rollback_scenario["expectedCommandId"],
                 "sequence": rollback_update["sequence"],
                 "type": "AGENT_UPDATE",
                 "status": "ROLLED_BACK",
+                "issuedAt": "2026-09-03T10:01:00Z",
             },
             "expiredPredecessors": [
                 {
@@ -1031,6 +1041,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "effectPhase": "APPLIED",
                 },
                 "initialGood": {
+                    "commandId": "66666666-6666-4666-8666-666666666666",
+                    "sequence": 6,
                     "policyRevision": 1,
                     "appliedBitrateKbps": 1000,
                     "health": "STREAM_CONTINUOUS",
@@ -1040,6 +1052,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "queue": dict(queue),
                 },
                 "poor": {
+                    "commandId": "66666666-6666-4666-8666-666666666666",
+                    "sequence": 6,
                     "policyRevision": 2,
                     "appliedBitrateKbps": 500,
                     "lastAdjustmentReason": "connectivity_poor",
@@ -1049,6 +1063,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "queue": dict(queue),
                 },
                 "recoveredGood": {
+                    "commandId": "66666666-6666-4666-8666-666666666666",
+                    "sequence": 6,
                     "policyRevision": 3,
                     "appliedBitrateKbps": 700,
                     "lastAdjustmentReason": "healthy_recovery",
@@ -1087,6 +1103,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "cleanup": {
                 "schemaVersion": 1,
                 "runId": run_id,
+                "completedAt": "2026-09-03T10:06:30Z",
                 "restored": True,
                 "idempotent": False,
                 "noMutation": False,
@@ -2236,7 +2253,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(option, script)
 
-    def test_ready_decision_requires_signed_physical_and_live_gate_evidence(self) -> None:
+    def test_v0121_ready_decision_rejects_legacy_physical_evidence(self) -> None:
         component_sha = "a" * 40
         fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
         gate_evidence = {
@@ -2301,47 +2318,23 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "_verify_detached_signature",
                 return_value=fingerprint,
             ) as verify_signature:
-                verified = READINESS.verify_readiness(
-                    readiness,
-                    version="0.1.121",
-                    component_sha=component_sha,
-                    gate_evidence=gate_evidence,
-                    security_policy=(
-                        ROOT / "packaging/release/release-security-policy.json"
-                    ),
-                    signer_directory=(
-                        ROOT / "packaging/release/trusted-tag-signers"
-                    ),
-                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
-                )
-            self.assertEqual(
-                verified["physical_artifact_sha256"],
-                json.loads(_result.read_text(encoding="utf-8"))["artifactSha256"],
-            )
-            self.assertEqual(
-                verified["physical_bom_sha256"],
-                json.loads(_result.read_text(encoding="utf-8"))["bomSha256"],
-            )
-            verify_signature.assert_called_once()
-
-            mismatched_gate = {**gate_evidence, "workflowRunId": 999}
-            with self.assertRaisesRegex(
-                READINESS.ReadinessError,
-                "does not match live GitHub proof",
-            ):
-                READINESS.verify_readiness(
-                    readiness,
-                    version="0.1.121",
-                    component_sha=component_sha,
-                    gate_evidence=mismatched_gate,
-                    security_policy=(
-                        ROOT / "packaging/release/release-security-policy.json"
-                    ),
-                    signer_directory=(
-                        ROOT / "packaging/release/trusted-tag-signers"
-                    ),
-                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
-                )
+                with self.assertRaisesRegex(
+                    READINESS.ReadinessError, "exact component evidence"
+                ):
+                    READINESS.verify_readiness(
+                        readiness,
+                        version="0.1.121",
+                        component_sha=component_sha,
+                        gate_evidence=gate_evidence,
+                        security_policy=(
+                            ROOT / "packaging/release/release-security-policy.json"
+                        ),
+                        signer_directory=(
+                            ROOT / "packaging/release/trusted-tag-signers"
+                        ),
+                        candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                    )
+            verify_signature.assert_not_called()
 
     def test_fleet_runtime_assembler_needs_no_media_soak_evidence(self) -> None:
         component_sha = "a" * 40
@@ -2349,6 +2342,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             root = Path(raw_root)
             inputs = self._fleet_runtime_fixture(
                 root, component_sha=component_sha
+            )
+            config_stream = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            config_stream["cleanup"]["idempotent"] = True
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(config_stream)
             )
             output = root / "output"
             output.mkdir(mode=0o700)
@@ -2429,6 +2429,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 component_sha,
             )
             self.assertTrue(all(gate["configStream"]["gates"].values()))
+            self.assertTrue(config_stream["cleanup"]["idempotent"])
             serialized = json.dumps(summary, sort_keys=True)
             for forbidden in (
                 "oakSoak",
@@ -2981,6 +2982,15 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 canonical_bytes(evidence)
             )
 
+        def mutate_config_api_origin(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["source"]["apiOrigin"] = "https://relay.example.invalid"
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
         def mutate_prior_rollback_command(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
@@ -3050,6 +3060,62 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["source"]["runtimeIdentity"]["buildInfoSha256"] = "0" * 64
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_coordinated_runtime_identity(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            for location in (
+                evidence["source"]["runtimeIdentity"],
+                evidence["cleanup"]["runtimeIdentity"],
+            ):
+                location["buildInfoSha256"] = "0" * 64
+                location["releaseMarkerSha256"] = "1" * 64
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_adaptive_command_binding(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["stream"]["adaptiveCommand"]["commandId"] = (
+                "88888888-8888-4888-8888-888888888888"
+            )
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_adaptive_reason_substring(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["stream"]["poor"]["lastAdjustmentReason"] = (
+                "not_connectivity_poor"
+            )
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_commit_issue_before_rollback_cleanup(
+            inputs: dict[str, Path],
+        ) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["releaseCommand"]["issuedAt"] = "2026-09-03T10:03:59Z"
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_cleanup_after_parent(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["cleanup"]["completedAt"] = "2026-09-03T10:07:01Z"
             inputs["config_stream_evidence"].write_bytes(
                 canonical_bytes(evidence)
             )
@@ -3140,6 +3206,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ("config-order", mutate_config_order),
             ("config-ack", mutate_config_ack),
             ("config-source", mutate_config_source),
+            ("config-api-origin", mutate_config_api_origin),
             ("prior-rollback-command", mutate_prior_rollback_command),
             ("release-command-status", mutate_release_command_status),
             ("expired-predecessor-time", mutate_expired_predecessor_time),
@@ -3147,6 +3214,17 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ("config-sequence-gap", mutate_config_sequence_gap),
             ("config-projection-shape", mutate_config_projection_shape),
             ("config-runtime-identity", mutate_config_runtime_identity),
+            (
+                "config-coordinated-runtime-identity",
+                mutate_coordinated_runtime_identity,
+            ),
+            ("adaptive-command-binding", mutate_adaptive_command_binding),
+            ("adaptive-reason-substring", mutate_adaptive_reason_substring),
+            (
+                "commit-issue-before-rollback-cleanup",
+                mutate_commit_issue_before_rollback_cleanup,
+            ),
+            ("config-cleanup-after-parent", mutate_config_cleanup_after_parent),
             ("config-cleanup-no-restart", mutate_config_cleanup_no_restart),
             ("commit-does-not-prove-rollback", mutate_to_valid_commit),
         ):
@@ -4480,6 +4558,17 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("--device-id sp-3-nuvion-iq9075 --space-id 3", runbook)
         self.assertIn('--device-id "$device_id" --space-id "$space_id"', runbook)
+        reboot_recovery = runbook.index("--recover-after-reboot")
+        parent_gate_resume = runbook.index("resume-boot-gate", reboot_recovery)
+        recovered_parent_cleanup = runbook.index(
+            '--run-id "$commit_run_id" --output-dir "$commit_run_dir" cleanup',
+            parent_gate_resume,
+        )
+        self.assertLess(reboot_recovery, parent_gate_resume)
+        self.assertLess(parent_gate_resume, recovered_parent_cleanup)
+        self.assertIn("do not create a new\ndirectory or supply", runbook)
+        self.assertIn("The interrupted R/C/config chain is not\npromotable", runbook)
+        self.assertIn("reset/restart the failed\n# systemd boot gate", runbook)
         self.assertGreaterEqual(
             runbook.count("env -u PYTHONPATH PYTHONNOUSERSITE=1"), 4
         )

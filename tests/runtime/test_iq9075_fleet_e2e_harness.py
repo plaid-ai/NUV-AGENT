@@ -3792,6 +3792,78 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_boot_and_parent_cleanup_preserve_active_config_stream_recovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision()
+                fixture.paths.config_stream_active.write_text(
+                    json.dumps(
+                        {"schemaVersion": 1, "runId": fixture.run_id},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                fixture.paths.config_stream_active.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    BOARD.HarnessError, "requires explicit recovery"
+                ):
+                    fixture.harness.boot_reconcile()
+                self.assertTrue(fixture.paths.active_run.exists())
+                self.assertTrue(fixture.paths.config_stream_active.exists())
+                self.assertEqual(
+                    fixture.harness._load_state(fixture.run_id)[
+                        "trustTransaction"
+                    ]["phase"],
+                    "APPLIED",
+                )
+                self.assertTrue(
+                    all(
+                        unit["active"] is False
+                        for unit in fixture.runner.units.values()
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    BOARD.HarnessError, "requires explicit recovery"
+                ):
+                    fixture.harness.cleanup(fixture.run_id)
+                self.assertTrue(fixture.paths.active_run.exists())
+                self.assertTrue(fixture.paths.config_stream_active.exists())
+
+                # The child recovery owns removal of its lease. Only then may
+                # the parent reconcile offline and restart the failed gate.
+                fixture.paths.config_stream_active.unlink()
+                fixture.runner.units[BOARD.BOOT_RECONCILE_UNIT] = {
+                    "active": False,
+                    "enabled": True,
+                    "pid": 0,
+                }
+                resumed = fixture.harness.resume_boot_gate()
+                self.assertEqual(
+                    resumed,
+                    {
+                        "schemaVersion": 1,
+                        "kind": "nuvion-iq9075-boot-gate-resumption",
+                        "complete": True,
+                        "gateActive": True,
+                        "protectedUnitsStopped": True,
+                    },
+                )
+                self.assertFalse(fixture.paths.active_run.exists())
+                gate_status = fixture.runner._status(BOARD.BOOT_RECONCILE_UNIT)
+                self.assertTrue(gate_status["active"])
+                normal = fixture.harness.cleanup(fixture.run_id)
+                self.assertTrue(normal["complete"])
+                self.assertTrue(fixture.runner.units["nuv-agent.service"]["active"])
+            finally:
+                fixture.close()
+
     def test_boot_candidate_recovery_does_not_cancel_queued_runtime_starts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
@@ -5593,6 +5665,57 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             self.assertEqual(
                 runner.journal.state["steps"]["cleanup"]["status"],
                 "FAILED",
+            )
+
+    def test_host_resume_boot_gate_uses_typed_board_action_and_seals_receipt(
+        self,
+    ) -> None:
+        class ResumeTransport(FakeTransport):
+            def invoke_board(
+                self,
+                command: str,
+                arguments: Sequence[str] = (),
+                *,
+                timeout: float = 90,
+            ) -> dict[str, Any]:
+                del arguments, timeout
+                self.calls += 1
+                self.command = command
+                return {
+                    "schemaVersion": 1,
+                    "kind": "nuvion-iq9075-boot-gate-resumption",
+                    "complete": True,
+                    "gateActive": True,
+                    "protectedUnitsStopped": True,
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = str(uuid.uuid4())
+            output = Path(directory) / run_id
+            output.mkdir()
+            transport = ResumeTransport()
+            runner = HOST.FleetRunner(
+                transport=transport,
+                journal=HOST.HostJournal(
+                    output / "journal.json",
+                    run_id=run_id,
+                    host="iq9075",
+                    fingerprint=HOST.DEFAULT_FINGERPRINT,
+                ),
+                output_dir=output,
+                run_id=run_id,
+            )
+
+            result = runner.resume_boot_gate()
+
+            self.assertTrue(result["complete"])
+            self.assertEqual(transport.command, "resume-boot-gate")
+            self.assertEqual(
+                HOST.strict_json(
+                    (output / "boot-gate-recovery.json").read_bytes(),
+                    label="boot gate recovery",
+                ),
+                result,
             )
 
     def test_host_cleanup_binds_exact_manifest_evidence_identity_and_time(
