@@ -147,7 +147,8 @@ import stomper
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gst, GLib, GLibUnix
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.inference.video_source import build_video_source_pipeline
@@ -3841,33 +3842,24 @@ class GStreamerInferenceApp:
         return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
 
     def run(self):
-        previous_sigterm_handler = None
-        sigterm_handler = None
-
-        if threading.current_thread() is threading.main_thread():
-            previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
-
-            def _handle_sigterm(signum, _frame):
-                signal_name = signal.Signals(signum).name
-                log.info("%s received; requesting graceful shutdown.", signal_name)
-
-                def _quit_main_loop():
-                    if self.loop and self.loop.is_running():
-                        self.loop.quit()
-                    return False
-
-                try:
-                    source_id = GLib.idle_add(_quit_main_loop)
-                except Exception:  # noqa: BLE001 - last-resort process shutdown.
-                    source_id = 0
-                if not source_id and self.loop:
-                    self.loop.quit()
-
-            sigterm_handler = _handle_sigterm
-            signal.signal(signal.SIGTERM, sigterm_handler)
-
         def _start():
             log.info("Starting GStreamer main loop...")
+            sigterm_source = GLibUnix.signal_source_new(signal.SIGTERM)
+            if sigterm_source is None:
+                raise RuntimeError("GLib SIGTERM source is unavailable")
+
+            def _handle_sigterm(*_args):
+                log.info("SIGTERM received; requesting graceful shutdown.")
+                if self.loop:
+                    self.loop.quit()
+                # Keep consuming SIGTERM until shutdown has released the camera.
+                return True
+
+            sigterm_source.set_callback(_handle_sigterm)
+            source_id = sigterm_source.attach(self.loop.get_context())
+            if not source_id:
+                sigterm_source.destroy()
+                raise RuntimeError("GLib SIGTERM source could not be attached")
             try:
                 state_result = self.pipeline.set_state(Gst.State.PLAYING)
                 if state_result == Gst.StateChangeReturn.FAILURE:
@@ -3890,22 +3882,21 @@ class GStreamerInferenceApp:
                 get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
                 raise
             finally:
-                self.shutdown()
+                try:
+                    self.shutdown()
+                finally:
+                    sigterm_source.destroy()
 
-        try:
-            if LOCAL_DISPLAY and sys.platform == "darwin":
-                log.info("Using Gst.macos_main() for local display on macOS...")
+        if LOCAL_DISPLAY and sys.platform == "darwin":
+            log.info("Using Gst.macos_main() for local display on macOS...")
 
-                def _macos_main(_argc, _argv, _data):
-                    _start()
-                    return 0
-
-                Gst.macos_main(_macos_main, sys.argv, "")
-            else:
+            def _macos_main(_argc, _argv, _data):
                 _start()
-        finally:
-            if sigterm_handler is not None:
-                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+                return 0
+
+            Gst.macos_main(_macos_main, sys.argv, "")
+        else:
+            _start()
 
     def shutdown(self):
         self.user_data.running = False

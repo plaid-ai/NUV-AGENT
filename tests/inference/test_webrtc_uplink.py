@@ -271,6 +271,7 @@ def _install_fake_gi() -> None:
 
     repository = types.ModuleType("gi.repository")
     repository.GLib = _FakeGLib
+    repository.GLibUnix = types.SimpleNamespace()
     repository.Gst = types.SimpleNamespace(
         Pipeline=object,
         Element=object,

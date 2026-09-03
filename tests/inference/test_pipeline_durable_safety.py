@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import signal
 import sys
 import tempfile
 import threading
@@ -26,6 +25,7 @@ def _install_gi_stub_when_native_bindings_are_unavailable() -> None:
     gi.require_version = lambda *_args, **_kwargs: None
     repository = types.ModuleType("gi.repository")
     repository.GLib = types.SimpleNamespace()
+    repository.GLibUnix = types.SimpleNamespace()
     repository.Gst = types.SimpleNamespace(
         Pipeline=object,
         Element=object,
@@ -746,13 +746,30 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(shutdown_calls, ["shutdown"])
 
     def test_sigterm_quits_main_loop_and_runs_graceful_shutdown(self) -> None:
+        class _SignalSource:
+            def __init__(self) -> None:
+                self.callback = None
+                self.context = None
+                self.destroy_calls = 0
+
+            def set_callback(self, callback) -> None:
+                self.callback = callback
+
+            def attach(self, context) -> int:
+                self.context = context
+                return 7
+
+            def destroy(self) -> None:
+                self.destroy_calls += 1
+
         class _Loop:
             def __init__(self) -> None:
                 self.running = True
                 self.quit_calls = 0
 
             def run(self) -> None:
-                installed["handler"](signal.SIGTERM, None)
+                self.running = True
+                self.source_callback_result = source.callback()
 
             def is_running(self) -> bool:
                 return self.running
@@ -761,11 +778,13 @@ class PipelineDurableSafetyTest(unittest.TestCase):
                 self.quit_calls += 1
                 self.running = False
 
+            def get_context(self):
+                return context
+
         success = object()
         failure = object()
-        installed: dict[str, object] = {}
-        signal_calls: list[tuple[object, object]] = []
-        previous_handler = object()
+        context = object()
+        source = _SignalSource()
         loop = _Loop()
         app = object.__new__(pipeline.GStreamerInferenceApp)
         app.pipeline = types.SimpleNamespace(set_state=lambda _state: success)
@@ -773,19 +792,12 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         app.loop = loop
         app.shutdown = mock.Mock()
 
-        def set_signal_handler(signum, handler):
-            signal_calls.append((signum, handler))
-            if handler is not previous_handler:
-                installed["handler"] = handler
-
         with (
             mock.patch.object(pipeline, "LOCAL_DISPLAY", False),
-            mock.patch.object(pipeline.signal, "getsignal", return_value=previous_handler),
-            mock.patch.object(pipeline.signal, "signal", side_effect=set_signal_handler),
             mock.patch.object(
-                pipeline.GLib,
-                "idle_add",
-                side_effect=lambda callback: callback() or 1,
+                pipeline.GLibUnix,
+                "signal_source_new",
+                return_value=source,
                 create=True,
             ),
             mock.patch.object(
@@ -810,9 +822,10 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             app.run()
 
         self.assertEqual(loop.quit_calls, 1)
+        self.assertTrue(loop.source_callback_result)
+        self.assertIs(source.context, context)
+        self.assertEqual(source.destroy_calls, 1)
         app.shutdown.assert_called_once_with()
-        self.assertEqual(signal_calls[0][0], signal.SIGTERM)
-        self.assertIs(signal_calls[-1][1], previous_handler)
 
     def test_unavailable_outbox_retains_anomaly_in_gate_and_enters_stop(self) -> None:
         gate = CriticalEventSafetyGate(max_attempts=1, retry_delay_seconds=0)
