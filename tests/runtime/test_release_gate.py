@@ -364,7 +364,14 @@ class ReleaseGateTest(unittest.TestCase):
         )
         self.assertIn("huggingface_hub imported outside CPU oracle venv", oracle)
         self.assertIn('wc -c < "$REFERENCE_PATH"', oracle)
-        self.assertIn("runs-on: macos-14", macos)
+        self.assertIn(
+            "runs-on: [self-hosted, macOS, ARM64, macos-14-xlarge]", macos
+        )
+        self.assertIn(
+            "if: github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            macos,
+        )
         self.assertIn("needs: macos-cpu-reference", macos)
         self.assertIn('brew tap-new --no-git "$TAP_NAME"', macos)
         self.assertIn('brew trust --formula "$FORMULA_NAME"', macos)
@@ -379,6 +386,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("brew install --formula --build-from-source", macos)
         self.assertIn('platform.machine() == "arm64"', macos)
         self.assertIn("torch.backends.mps.is_available()", macos)
+        self.assertIn("assert physical_memory >= 12 * 1024**3", macos)
         self.assertIn("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0", macos)
         self.assertEqual(macos.count("PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0"), 1)
         self.assertIn(

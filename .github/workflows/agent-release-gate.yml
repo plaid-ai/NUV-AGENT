@@ -257,8 +257,14 @@ jobs:
   macos-arm64-release-prerequisite:
     name: macos-arm64-release-prerequisite
     # The real SigLIP MPS proof requires at least 12 GiB of unified memory.
-    # GitHub's standard arm64 image has 7 GiB; XLarge provides 14 GiB.
-    runs-on: macos-14-xlarge
+    # Route only to an explicitly trusted, ephemeral self-hosted Apple Silicon
+    # runner. The capability label intentionally accompanies `self-hosted` so
+    # GitHub does not interpret it as a billable hosted larger-runner request.
+    runs-on: [self-hosted, macOS, ARM64, macos-14-xlarge]
+    # This repository is public. Never execute fork-provided code on a
+    # self-hosted runner; the aggregate release gate treats this skip as a
+    # failure and therefore remains fail-closed.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     needs: macos-cpu-reference
     timeout-minutes: 90
     permissions:
