@@ -83,6 +83,10 @@ PHYSICAL_EVIDENCE = load_script(
     "assemble_iq9075_physical_evidence",
     "packaging/release/assemble-iq9075-physical-evidence.py",
 )
+FLEET_RUNTIME_EVIDENCE = load_script(
+    "assemble_iq9075_fleet_runtime_evidence",
+    "packaging/release/assemble-iq9075-fleet-runtime-evidence.py",
+)
 
 
 def persistent_state_evidence() -> dict[str, object]:
@@ -795,6 +799,226 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             },
         }
         return summary, manifest_path, result_path
+
+    @staticmethod
+    def _fleet_runtime_fixture(
+        root: Path, *, component_sha: str
+    ) -> dict[str, Path]:
+        source = root / "source"
+        source.mkdir(mode=0o700)
+        run_id = "12345678-1234-4abc-8def-123456789abc"
+        artifact_path = (
+            source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+        )
+        artifact_path.write_bytes(b"exact deterministic candidate bundle")
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        bom_path = source / "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json"
+        bom = build_release_bom_v2_payload(
+            bom_id="nuv-agent-0.1.121-iq9075-aarch64",
+            release_sequence=2,
+            agent_version="0.1.121",
+            component_sha=component_sha,
+            config_schema="12",
+            min_updater_version="0.2.0",
+            targets=[
+                ReleaseTarget(
+                    product_model="IQ9075_DEV",
+                    platform_profile="iq9075_dev",
+                    hardware_revision="QCS9075-EVK",
+                    architecture="aarch64",
+                )
+            ],
+            artifact_path=artifact_path,
+            artifact_kind="agent-bundle",
+            built_at="2026-09-03T09:00:00Z",
+        )
+        bom_path.write_text(canonical_release_bom_json(bom), encoding="utf-8")
+        baseline_digest = (
+            "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
+        )
+        baseline_slot = "releases/" + baseline_digest
+        candidate_slot = "releases/" + bom["bomDigest"][7:]
+        fleet_release = {
+            "agentVersion": "0.1.121",
+            "releaseSequence": 2,
+            "artifactDigest": "sha256:" + artifact_sha256,
+            "componentSha": component_sha,
+            "configSchema": "12",
+            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+        }
+        fleet_manifest = FLEET_E2E.build_manifest(
+            run_id=run_id,
+            tool_sha256=hashlib.sha256(
+                (ROOT / "packaging/dev/iq9075-board-e2e.py").read_bytes()
+            ).hexdigest(),
+            input_digests={
+                "commandSha256": "6" * 64,
+                "releaseSha256": (
+                    "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
+                ),
+                "healthSha256": "8" * 64,
+                "bindingSha256": "9" * 64,
+            },
+            identity={
+                "deviceId": "sp-3-nuvion-runtime",
+                "spaceId": 3,
+                "productModel": "IQ9075_DEV",
+                "platformProfile": "iq9075_dev",
+                "hardwareRevision": "QCS9075-EVK",
+                "architecture": "aarch64",
+                "dockerRequired": False,
+            },
+            scenario_type="oak-fault-rollback",
+            expected_command_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            expected_bom_digest=bom["bomDigest"],
+            expected_candidate_slot="/opt/nuv-agent/releases/" + bom["bomDigest"][7:],
+            expected_previous_slot=baseline_slot,
+            expected_previous_version="0.1.120",
+            hold_seconds=10,
+            release=fleet_release,
+        )
+        fleet_manifest_path = source / "immutable-manifest.json"
+        fleet_manifest_path.write_text(
+            json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        services = {
+            "nuv-agent.service": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 4200,
+            },
+            "nuv-agent-updater.service": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 4300,
+            },
+            "nuv-agent-updater.socket": {
+                "active": True,
+                "enabled": True,
+                "unitFileState": "enabled",
+                "mainPid": 0,
+            },
+        }
+        update = {
+            "commandId": fleet_manifest["scenario"]["expectedCommandId"],
+            "sequence": 2,
+            "targetVersion": "0.1.121",
+            "bomDigest": bom["bomDigest"],
+            "phase": "ROLLED_BACK",
+            "updatePhase": "ROLLED_BACK",
+            "updatedAt": "2026-09-03T10:02:00Z",
+            "commandExpiresAt": "2026-09-03T11:00:00Z",
+            "candidateSlot": fleet_manifest["scenario"]["expectedCandidateSlot"],
+            "previousSlot": baseline_slot,
+            "previousVersion": "0.1.120",
+            "releaseSequence": 2,
+            "artifactDigest": "sha256:" + artifact_sha256,
+            "componentSha": component_sha,
+            "configSchema": "12",
+            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+            "bomVerificationStatus": "VERIFIED",
+            "slot": baseline_slot,
+            "rollbackSlot": baseline_slot,
+            "rollbackVersion": "0.1.120",
+            "errorCode": "ROLLED_BACK",
+            "health": "LKG_RESTORED",
+            "functionalHealth": "FUNCTIONAL_UNHEALTHY",
+        }
+        fleet_evidence = {
+            "schemaVersion": 2,
+            "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+            "runId": run_id,
+            "generatedAt": "2026-09-03T10:03:00Z",
+            "scenario": "oak-fault-rollback",
+            "complete": True,
+            "gates": {
+                "foundation": True,
+                "backup": True,
+                "trust": True,
+                "updater2": True,
+                "oak": True,
+                "services": True,
+                "scenario": True,
+            },
+            "oak": {
+                "port": "2-1.1",
+                "vendorId": "03e7",
+                "productId": "f63b",
+                "speedMbps": 5000,
+                "mxidSha256": "3" * 64,
+                "attached": True,
+                "bound": True,
+            },
+            "services": services,
+            "runtimePids": {"candidate": 4100, "restored": 4200},
+            "slots": {
+                "current": baseline_slot,
+                "previous": candidate_slot,
+                "currentVersion": "0.1.120",
+                "release": {
+                    "schemaVersion": 2,
+                    "bomDigest": "sha256:" + baseline_digest,
+                    "agentVersion": "0.1.120",
+                    "releaseSequence": 1,
+                    "artifactDigest": "sha256:" + "e" * 64,
+                    "componentSha": "f" * 40,
+                    "configSchema": "12",
+                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                },
+                "previousRelease": {
+                    "schemaVersion": 2,
+                    "bomDigest": bom["bomDigest"],
+                    **fleet_release,
+                },
+            },
+            "updater": {
+                "capabilityAvailable": True,
+                "authenticatedHelper": True,
+                "reason": "READY",
+                "updaterVersion": "0.2.0",
+                "update": update,
+            },
+            "antiReplay": {
+                "schemaVersion": 4,
+                "semanticSha256": "0" * 64,
+                "maximumCommandSequence": 2,
+                "currentReleaseSequence": "1",
+                "currentBomDigest": "sha256:" + baseline_digest,
+                "latest": {
+                    "commandId": update["commandId"],
+                    "sequence": 2,
+                    "phase": "ROLLED_BACK",
+                    "bomDigest": bom["bomDigest"],
+                    "releaseSequence": 2,
+                    "healthDeadline": None,
+                },
+            },
+        }
+        fleet_evidence_path = source / "evidence.json"
+        fleet_evidence_path.write_text(
+            json.dumps(fleet_evidence, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        cleanup_path = source / "cleanup-evidence.json"
+        cleanup_path.write_text(
+            json.dumps(
+                cleanup_evidence(fleet_manifest["runId"]),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "fleet_manifest": fleet_manifest_path,
+            "fleet_evidence": fleet_evidence_path,
+            "cleanup_evidence": cleanup_path,
+            "artifact": artifact_path,
+            "bom": bom_path,
+        }
 
     @classmethod
     def _candidate_physical_fixture(
@@ -1522,6 +1746,360 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     signer_directory=(
                         ROOT / "packaging/release/trusted-tag-signers"
                     ),
+                    candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
+                )
+
+    def test_fleet_runtime_assembler_needs_no_media_soak_evidence(self) -> None:
+        component_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            inputs = self._fleet_runtime_fixture(
+                root, component_sha=component_sha
+            )
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            assembled = FLEET_RUNTIME_EVIDENCE.assemble(
+                fleet_manifest_path=inputs["fleet_manifest"],
+                fleet_evidence_path=inputs["fleet_evidence"],
+                cleanup_evidence_path=inputs["cleanup_evidence"],
+                artifact_path=inputs["artifact"],
+                bom_path=inputs["bom"],
+                candidate_fleet_runner=ROOT
+                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                security_policy_path=ROOT
+                / "packaging/release/release-security-policy.json",
+                output_directory=output,
+                version="0.1.121",
+                component_sha=component_sha,
+            )
+            self.assertEqual(len(list(output.iterdir())), 5)
+            summary_path = Path(assembled["summary"])
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            gate = summary["runtimeGate"]
+            self.assertEqual(gate["terminalPhase"], "ROLLED_BACK")
+            self.assertEqual(gate["antiReplay"]["maximumCommandSequence"], 2)
+            self.assertEqual(
+                gate["antiReplay"]["currentReleaseSequence"], "1"
+            )
+            self.assertEqual(
+                gate["healthDecision"]["health"], "LKG_RESTORED"
+            )
+            self.assertEqual(gate["cleanup"]["phase"], "RESTORED")
+            serialized = json.dumps(summary, sort_keys=True)
+            for forbidden in (
+                "oakSoak",
+                "candidateSoak",
+                "durationSeconds",
+                "gstreamer",
+                "webrtc",
+                "splitmux",
+            ):
+                self.assertNotIn(forbidden, serialized)
+            security = json.loads(
+                (ROOT / "packaging/release/release-security-policy.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            verified = READINESS._validate_fleet_runtime_documents(
+                policy_path=output / "release-readiness.json",
+                version="0.1.121",
+                component_sha=component_sha,
+                summary=summary,
+                security=security,
+                candidate_fleet_runner=ROOT
+                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+            )
+            self.assertEqual(
+                verified["runtime_artifact_sha256"], assembled["artifactSha256"]
+            )
+            self.assertEqual(verified["runtime_bom_sha256"], assembled["bomSha256"])
+            tampered_summary = copy.deepcopy(summary)
+            tampered_summary["runtimeGate"]["antiReplay"][
+                "maximumCommandSequence"
+            ] = 999
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "differs from raw evidence"
+            ):
+                READINESS._validate_fleet_runtime_documents(
+                    policy_path=output / "release-readiness.json",
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    summary=tampered_summary,
+                    security=security,
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                )
+
+    def test_fleet_runtime_assembler_fails_closed_on_runtime_or_cleanup_drift(
+        self,
+    ) -> None:
+        component_sha = "a" * 40
+
+        def mutate_cleanup(inputs: dict[str, Path]) -> None:
+            cleanup = json.loads(inputs["cleanup_evidence"].read_text(encoding="utf-8"))
+            cleanup["proof"]["trustStagingAbsent"] = False
+            inputs["cleanup_evidence"].write_text(
+                json.dumps(cleanup, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def mutate_sequence(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence["updater"]["update"]["sequence"] = False
+            inputs["fleet_evidence"].write_text(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def mutate_anti_replay_snapshot(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence["antiReplay"]["maximumCommandSequence"] = 999
+            inputs["fleet_evidence"].write_text(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def mutate_service(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence["services"]["nuv-agent.service"]["active"] = False
+            inputs["fleet_evidence"].write_text(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def mutate_slot(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence["slots"]["current"] = evidence["slots"]["previous"]
+            inputs["fleet_evidence"].write_text(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        def mutate_artifact(inputs: dict[str, Path]) -> None:
+            inputs["artifact"].write_bytes(b"different candidate artifact")
+
+        def mutate_to_valid_commit(inputs: dict[str, Path]) -> None:
+            manifest = json.loads(inputs["fleet_manifest"].read_text(encoding="utf-8"))
+            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            scenario = manifest["scenario"]
+            scenario["type"] = "commit"
+            scenario["holdSeconds"] = 0
+            evidence["scenario"] = "commit"
+            evidence["runtimePids"] = None
+            evidence["slots"]["release"], evidence["slots"]["previousRelease"] = (
+                evidence["slots"]["previousRelease"],
+                evidence["slots"]["release"],
+            )
+            evidence["slots"].update(
+                {
+                    "current": "releases/" + scenario["expectedBomDigest"][7:],
+                    "previous": scenario["expectedPreviousSlot"],
+                    "currentVersion": scenario["release"]["agentVersion"],
+                }
+            )
+            update = evidence["updater"]["update"]
+            for field in ("errorCode", "rollbackSlot", "rollbackVersion"):
+                update.pop(field)
+            update.update(
+                {
+                    "phase": "COMMITTED",
+                    "updatePhase": "COMMITTED",
+                    "slot": "releases/" + scenario["expectedBomDigest"][7:],
+                    "health": "FUNCTIONAL_HEALTHY",
+                    "functionalHealth": "FUNCTIONAL_HEALTHY",
+                }
+            )
+            evidence["antiReplay"].update(
+                {
+                    "currentReleaseSequence": "2",
+                    "currentBomDigest": scenario["expectedBomDigest"],
+                    "latest": {
+                        "commandId": update["commandId"],
+                        "sequence": update["sequence"],
+                        "phase": "COMMITTED",
+                        "bomDigest": update["bomDigest"],
+                        "releaseSequence": update["releaseSequence"],
+                        "healthDeadline": None,
+                    },
+                }
+            )
+            for path, value in (
+                (inputs["fleet_manifest"], manifest),
+                (inputs["fleet_evidence"], evidence),
+            ):
+                path.write_text(
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+
+        for label, mutation in (
+            ("cleanup", mutate_cleanup),
+            ("anti-replay", mutate_sequence),
+            ("anti-replay-snapshot", mutate_anti_replay_snapshot),
+            ("service", mutate_service),
+            ("slot", mutate_slot),
+            ("artifact", mutate_artifact),
+            ("commit-does-not-prove-rollback", mutate_to_valid_commit),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                inputs = self._fleet_runtime_fixture(
+                    root, component_sha=component_sha
+                )
+                mutation(inputs)
+                if label == "commit-does-not-prove-rollback":
+                    FLEET_E2E.validate_final_evidence(
+                        json.loads(
+                            inputs["fleet_evidence"].read_text(encoding="utf-8")
+                        ),
+                        json.loads(
+                            inputs["fleet_manifest"].read_text(encoding="utf-8")
+                        ),
+                    )
+                output = root / "output"
+                output.mkdir(mode=0o700)
+                with self.assertRaises(
+                    FLEET_RUNTIME_EVIDENCE.AssemblyError
+                ) as caught:
+                    FLEET_RUNTIME_EVIDENCE.assemble(
+                        fleet_manifest_path=inputs["fleet_manifest"],
+                        fleet_evidence_path=inputs["fleet_evidence"],
+                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        artifact_path=inputs["artifact"],
+                        bom_path=inputs["bom"],
+                        candidate_fleet_runner=ROOT
+                        / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_board_tool=ROOT
+                        / "packaging/dev/iq9075-board-e2e.py",
+                        security_policy_path=ROOT
+                        / "packaging/release/release-security-policy.json",
+                        output_directory=output,
+                        version="0.1.121",
+                        component_sha=component_sha,
+                    )
+                if label == "commit-does-not-prove-rollback":
+                    self.assertIn(
+                        "does not prove terminal rollback",
+                        str(caught.exception.__cause__),
+                    )
+                self.assertEqual(list(output.iterdir()), [])
+
+    def test_ready_decision_accepts_signed_fleet_runtime_evidence(self) -> None:
+        component_sha = "a" * 40
+        fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+        gate_evidence = {
+            "componentSha": component_sha,
+            "workflow": ".github/workflows/agent-release-gate.yml",
+            "workflowSha256": "b" * 64,
+            "workflowRunId": 101,
+            "checkRunId": 102,
+            "checkSuiteId": 103,
+            "context": "agent-release-gate",
+            "integrationId": 15368,
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            inputs = self._fleet_runtime_fixture(
+                root, component_sha=component_sha
+            )
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            assembled = FLEET_RUNTIME_EVIDENCE.assemble(
+                fleet_manifest_path=inputs["fleet_manifest"],
+                fleet_evidence_path=inputs["fleet_evidence"],
+                cleanup_evidence_path=inputs["cleanup_evidence"],
+                artifact_path=inputs["artifact"],
+                bom_path=inputs["bom"],
+                candidate_fleet_runner=ROOT
+                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                security_policy_path=ROOT
+                / "packaging/release/release-security-policy.json",
+                output_directory=output,
+                version="0.1.121",
+                component_sha=component_sha,
+            )
+            evidence = Path(assembled["summary"])
+            signature = output / f"{evidence.name}.asc"
+            signature.write_text("detached-signature\n", encoding="utf-8")
+            signed_identity = {
+                "evidenceFile": evidence.name,
+                "evidenceSha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                "signatureFile": signature.name,
+                "signatureSha256": hashlib.sha256(signature.read_bytes()).hexdigest(),
+                "signerFingerprint": fingerprint,
+            }
+            readiness = output / "release-readiness.json"
+            readiness.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 2,
+                        "releases": {
+                            "0.1.121": {
+                                "status": "READY",
+                                "blockers": [],
+                                "evidence": {
+                                    "componentSha": component_sha,
+                                    "agentReleaseGate": gate_evidence,
+                                    "iq9075FleetRuntime": signed_identity,
+                                },
+                            }
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                READINESS,
+                "_verify_detached_signature",
+                return_value=fingerprint,
+            ):
+                verified = READINESS.verify_readiness(
+                    readiness,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    gate_evidence=gate_evidence,
+                    security_policy=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    signer_directory=ROOT
+                    / "packaging/release/trusted-tag-signers",
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                )
+            self.assertEqual(
+                verified["runtime_artifact_sha256"], assembled["artifactSha256"]
+            )
+
+            readiness_payload = json.loads(readiness.read_text(encoding="utf-8"))
+            readiness_payload["releases"]["0.1.121"]["evidence"][
+                "iq9075Physical"
+            ] = signed_identity
+            readiness.write_text(
+                json.dumps(readiness_payload, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "lacks exact component evidence"
+            ):
+                READINESS.verify_readiness(
+                    readiness,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    gate_evidence=gate_evidence,
+                    security_policy=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    signer_directory=ROOT
+                    / "packaging/release/trusted-tag-signers",
                     candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                 )
 
@@ -2565,6 +3143,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             for script in (
                 "assemble-iq9075-physical-evidence.py",
+                "assemble-iq9075-fleet-runtime-evidence.py",
                 "verify-release-readiness.py",
             ):
                 with self.subTest(script=script):

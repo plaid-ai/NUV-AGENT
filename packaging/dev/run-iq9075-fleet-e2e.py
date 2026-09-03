@@ -2542,11 +2542,67 @@ def validate_release_marker(
         raise RunnerError("release marker differs from the expected release")
 
 
+def validate_anti_replay_evidence(
+    snapshot: object,
+    *,
+    update: Mapping[str, Any],
+    slots: Mapping[str, Any],
+) -> None:
+    """Bind the live updater journal snapshot to its terminal public state."""
+
+    latest = snapshot.get("latest") if isinstance(snapshot, Mapping) else None
+    current_marker = slots.get("release")
+    current_release_sequence = (
+        str(current_marker.get("releaseSequence"))
+        if isinstance(current_marker, Mapping)
+        else None
+    )
+    current_bom_digest = (
+        current_marker.get("bomDigest")
+        if isinstance(current_marker, Mapping)
+        else None
+    )
+    expected_latest = {
+        "commandId": update.get("commandId"),
+        "sequence": update.get("sequence"),
+        "phase": update.get("phase"),
+        "bomDigest": update.get("bomDigest"),
+        "releaseSequence": update.get("releaseSequence"),
+        "healthDeadline": None,
+    }
+    if (
+        not isinstance(snapshot, Mapping)
+        or set(snapshot)
+        != {
+            "schemaVersion",
+            "semanticSha256",
+            "maximumCommandSequence",
+            "currentReleaseSequence",
+            "currentBomDigest",
+            "latest",
+        }
+        or type(snapshot.get("schemaVersion")) is not int
+        or snapshot.get("schemaVersion") != 4
+        or not isinstance(snapshot.get("semanticSha256"), str)
+        or SHA256_RE.fullmatch(snapshot["semanticSha256"]) is None
+        or isinstance(snapshot.get("maximumCommandSequence"), bool)
+        or not isinstance(snapshot.get("maximumCommandSequence"), int)
+        or snapshot.get("maximumCommandSequence") != update.get("sequence")
+        or not isinstance(latest, Mapping)
+        or dict(latest) != expected_latest
+        or snapshot.get("currentReleaseSequence") != current_release_sequence
+        or snapshot.get("currentBomDigest") != current_bom_digest
+    ):
+        raise RunnerError(
+            "final updater anti-replay snapshot differs from terminal state"
+        )
+
+
 def validate_final_evidence(
     evidence: Mapping[str, Any], manifest: Mapping[str, Any]
 ) -> None:
     validate_manifest(manifest)
-    if set(evidence) != {
+    evidence_fields = {
         "schemaVersion",
         "protocolVersion",
         "runId",
@@ -2559,7 +2615,11 @@ def validate_final_evidence(
         "runtimePids",
         "slots",
         "updater",
-    }:
+    }
+    schema_version = evidence.get("schemaVersion")
+    if schema_version == 2:
+        evidence_fields.add("antiReplay")
+    if set(evidence) != evidence_fields:
         raise RunnerError("final evidence root fields are invalid")
     generated_at = evidence.get("generatedAt")
     if not isinstance(generated_at, str) or re.fullmatch(
@@ -2575,8 +2635,8 @@ def validate_final_evidence(
     except ValueError as exc:
         raise RunnerError("final evidence generatedAt is invalid") from exc
     if (
-        type(evidence.get("schemaVersion")) is not int
-        or evidence.get("schemaVersion") != 1
+        type(schema_version) is not int
+        or schema_version not in {1, 2}
         or evidence.get("protocolVersion") != PROTOCOL_VERSION
         or evidence.get("runId") != manifest.get("runId")
         or evidence.get("scenario") != manifest["scenario"]["type"]
@@ -2905,6 +2965,10 @@ def validate_final_evidence(
             )
         ):
             raise RunnerError("rollback scenario lacks exact rollback/error proof")
+    if schema_version == 2:
+        validate_anti_replay_evidence(
+            evidence.get("antiReplay"), update=update, slots=slots
+        )
     assert_no_secret_material(evidence)
 
 

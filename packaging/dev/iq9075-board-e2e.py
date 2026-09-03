@@ -8928,6 +8928,37 @@ class BoardHarness:
                         "candidate": candidate_pid,
                         "restored": restored_pid,
                     }
+            anti_replay: dict[str, object] | None = None
+            if scenario_gate and isinstance(updater.get("update"), Mapping):
+                try:
+                    snapshot = self._anti_replay_snapshot()
+                    update = updater["update"]
+                    terminal = {
+                        "commandId": update.get("commandId"),
+                        "sequence": update.get("sequence"),
+                        "phase": update.get("phase"),
+                        "bomDigest": update.get("bomDigest"),
+                        "releaseSequence": update.get("releaseSequence"),
+                        "healthDeadline": None,
+                    }
+                    self._validate_candidate_anti_replay(snapshot, terminal)
+                    current_release_sequence = (
+                        str(marker.get("releaseSequence")) if marker else None
+                    )
+                    current_bom_digest = marker.get("bomDigest") if marker else None
+                    if (
+                        snapshot.get("currentReleaseSequence")
+                        != current_release_sequence
+                        or snapshot.get("currentBomDigest") != current_bom_digest
+                    ):
+                        raise HarnessError(
+                            "updater anti-replay journal differs from current slot"
+                        )
+                    anti_replay = snapshot
+                except (HarnessError, OSError):
+                    # Schema v1 remains readable for historical physical evidence.
+                    # New Fleet Runtime release evidence requires the v2 snapshot.
+                    anti_replay = None
             gates = {
                 "foundation": state.get("foundation", {}).get("verified") is True
                 and foundation_live,
@@ -8940,7 +8971,7 @@ class BoardHarness:
             }
             complete = all(gates.values())
             result: dict[str, object] = {
-                "schemaVersion": 1,
+                "schemaVersion": 2 if anti_replay is not None else 1,
                 "protocolVersion": PROTOCOL_VERSION,
                 "runId": run_id,
                 "generatedAt": self.clock(),
@@ -8959,6 +8990,8 @@ class BoardHarness:
                 },
                 "updater": updater,
             }
+            if anti_replay is not None:
+                result["antiReplay"] = anti_replay
             # Scan the freshly generated envelope before any complete evidence
             # bytes become durable. A persisted retry is scanned again below.
             assert_no_secret_material(result)

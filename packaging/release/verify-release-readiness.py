@@ -320,6 +320,345 @@ def _evidence_reference(
     return raw, observed
 
 
+def _fleet_runtime_gate(
+    fleet_evidence: dict[str, Any],
+    cleanup_evidence: dict[str, Any],
+    fleet_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the exact security-relevant Fleet outcome bound by the summary."""
+
+    updater = fleet_evidence.get("updater")
+    update = updater.get("update") if isinstance(updater, dict) else None
+    services = fleet_evidence.get("services")
+    slots = fleet_evidence.get("slots")
+    anti_replay = fleet_evidence.get("antiReplay")
+    trust_inputs = fleet_manifest.get("inputs")
+    if (
+        not isinstance(updater, dict)
+        or not isinstance(update, dict)
+        or not isinstance(services, dict)
+        or not isinstance(slots, dict)
+        or not isinstance(anti_replay, dict)
+        or not isinstance(trust_inputs, dict)
+    ):
+        raise ReadinessError("IQ9075 Fleet Runtime result is incomplete")
+    return {
+        "runId": fleet_manifest.get("runId"),
+        "scenario": fleet_evidence.get("scenario"),
+        # The detached summary signature transitively signs these immutable
+        # command/release/health/device-binding keyring digests.
+        "trustInputs": trust_inputs,
+        "terminalPhase": update.get("phase"),
+        "stagedActivation": {
+            "candidateSlot": update.get("candidateSlot"),
+            "previousSlot": update.get("previousSlot"),
+            "previousVersion": update.get("previousVersion"),
+        },
+        "signedRelease": {
+            "bomDigest": update.get("bomDigest"),
+            "artifactDigest": update.get("artifactDigest"),
+            "componentSha": update.get("componentSha"),
+            "publisherKeyId": update.get("publisherKeyId"),
+            "verificationStatus": update.get("bomVerificationStatus"),
+        },
+        "healthDecision": {
+            "updaterPeerAuthenticated": updater.get("authenticatedHelper"),
+            "health": update.get("health"),
+            "functionalHealth": update.get("functionalHealth"),
+        },
+        "antiReplay": anti_replay,
+        "runtimePids": fleet_evidence.get("runtimePids"),
+        "services": services,
+        "slots": slots,
+        "cleanup": {
+            "complete": cleanup_evidence.get("complete"),
+            "recovered": cleanup_evidence.get("recovered"),
+            "phase": cleanup_evidence.get("phase"),
+            "proof": cleanup_evidence.get("proof"),
+        },
+    }
+
+
+def _validate_fleet_runtime_documents(
+    *,
+    policy_path: Path,
+    version: str,
+    component_sha: str,
+    summary: dict[str, Any],
+    security: dict[str, Any],
+    candidate_fleet_runner: Path,
+    candidate_board_tool: Path,
+) -> dict[str, str]:
+    """Validate camera-independent OTA/rollback evidence for IQ9075."""
+
+    expected_summary_fields = {
+        "schemaVersion",
+        "kind",
+        "agentVersion",
+        "componentSha",
+        "fleetRunnerSha256",
+        "boardToolSha256",
+        "fleetManifest",
+        "fleetEvidence",
+        "cleanupEvidence",
+        "testedArtifact",
+        "testedBom",
+        "runtimeGate",
+    }
+    if set(summary) != expected_summary_fields or (
+        type(summary.get("schemaVersion")) is not int
+        or summary.get("schemaVersion") != 1
+        or summary.get("kind")
+        != "nuvion-iq9075-fleet-runtime-release-evidence"
+        or summary.get("agentVersion") != version
+        or summary.get("componentSha") != component_sha
+        or not isinstance(summary.get("fleetRunnerSha256"), str)
+        or not SHA256.fullmatch(summary["fleetRunnerSha256"])
+        or not isinstance(summary.get("boardToolSha256"), str)
+        or not SHA256.fullmatch(summary["boardToolSha256"])
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime evidence does not match schema v1"
+        )
+
+    manifest_raw, _manifest_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("fleetManifest"),
+        label="IQ9075 Fleet Runtime manifest",
+    )
+    evidence_raw, _evidence_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("fleetEvidence"),
+        label="IQ9075 Fleet Runtime result",
+    )
+    cleanup_raw, _cleanup_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("cleanupEvidence"),
+        label="IQ9075 Fleet Runtime cleanup evidence",
+    )
+    bom_raw, tested_bom_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("testedBom"),
+        label="IQ9075 Fleet Runtime tested BOM",
+    )
+    manifest = _strict_object(
+        manifest_raw, label="IQ9075 Fleet Runtime manifest"
+    )
+    fleet_evidence = _strict_object(
+        evidence_raw, label="IQ9075 Fleet Runtime result"
+    )
+    cleanup_evidence = _strict_object(
+        cleanup_raw, label="IQ9075 Fleet Runtime cleanup evidence"
+    )
+    bom = _strict_object(bom_raw, label="IQ9075 Fleet Runtime tested BOM")
+
+    publisher_fleet_runner = (
+        Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
+    )
+    publisher_board_tool = (
+        Path(__file__).resolve().parents[1] / "dev/iq9075-board-e2e.py"
+    )
+    publisher_fleet_runner_raw = _regular_bytes(publisher_fleet_runner)
+    candidate_fleet_runner_raw = _regular_bytes(candidate_fleet_runner)
+    publisher_board_tool_raw = _regular_bytes(publisher_board_tool)
+    candidate_board_tool_raw = _regular_bytes(candidate_board_tool)
+    fleet_runner_sha256 = hashlib.sha256(publisher_fleet_runner_raw).hexdigest()
+    board_tool_sha256 = hashlib.sha256(publisher_board_tool_raw).hexdigest()
+    if (
+        candidate_fleet_runner_raw != publisher_fleet_runner_raw
+        or summary.get("fleetRunnerSha256") != fleet_runner_sha256
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime runner differs from signed evidence"
+        )
+    if (
+        candidate_board_tool_raw != publisher_board_tool_raw
+        or summary.get("boardToolSha256") != board_tool_sha256
+        or manifest.get("toolSha256") != board_tool_sha256
+    ):
+        raise ReadinessError(
+            "IQ9075 board tool differs from Fleet Runtime manifest"
+        )
+
+    module_name = "_nuvion_trusted_iq9075_fleet_runtime_validator"
+    fleet_validator = _module_from_verified_source(
+        module_name=module_name,
+        source=publisher_fleet_runner_raw,
+        display_path=publisher_fleet_runner,
+    )
+    try:
+        validated_manifest = fleet_validator.validate_manifest(manifest)
+        fleet_validator.validate_final_evidence(fleet_evidence, validated_manifest)
+        fleet_validator.validate_cleanup_result(
+            cleanup_evidence, run_id=str(validated_manifest["runId"])
+        )
+        canonical_cleanup = fleet_validator.canonical_cleanup_evidence(
+            cleanup_evidence, run_id=str(validated_manifest["runId"])
+        )
+    except Exception as exc:
+        raise ReadinessError("IQ9075 Fleet Runtime evidence is invalid") from exc
+    finally:
+        sys.modules.pop(module_name, None)
+    if (
+        fleet_evidence.get("schemaVersion") != 2
+        or not isinstance(fleet_evidence.get("antiReplay"), dict)
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime evidence lacks persisted anti-replay proof"
+        )
+    if (
+        cleanup_evidence != canonical_cleanup
+        or cleanup_evidence.get("phase") != "RESTORED"
+        or cleanup_evidence.get("proof", {}).get("transactionPhase")
+        != "RESTORED"
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime cleanup did not restore the transaction"
+        )
+
+    scenario = manifest.get("scenario")
+    updater = fleet_evidence.get("updater")
+    update = updater.get("update") if isinstance(updater, dict) else None
+    if (
+        not isinstance(scenario, dict)
+        or scenario.get("type") != "oak-fault-rollback"
+        or fleet_evidence.get("scenario") != "oak-fault-rollback"
+        or not isinstance(update, dict)
+        or update.get("phase") != "ROLLED_BACK"
+        or update.get("updatePhase") != "ROLLED_BACK"
+        or update.get("errorCode") != "ROLLED_BACK"
+        or update.get("health") != "LKG_RESTORED"
+        or update.get("functionalHealth") != "FUNCTIONAL_UNHEALTHY"
+        or "healthDeadline" in update
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime evidence does not prove terminal rollback"
+        )
+
+    try:
+        verified_bom = verify_release_bom(bom)
+    except ReleaseBomValidationError as exc:
+        raise ReadinessError("IQ9075 Fleet Runtime tested BOM is invalid") from exc
+    tested_artifact = _artifact_identity(
+        summary.get("testedArtifact"),
+        label="IQ9075 Fleet Runtime tested artifact",
+    )
+    if tested_artifact["name"] != (
+        f"nuv-agent_{version}_iq9075-aarch64.agent-bundle.tar.gz"
+    ) or summary["testedBom"]["file"] != (
+        f"nuv-agent_{version}_iq9075-aarch64.release-bom.json"
+    ):
+        raise ReadinessError("IQ9075 Fleet Runtime artifact names are invalid")
+
+    iq_policy = security.get("iq9075")
+    target_policy = iq_policy.get("target") if isinstance(iq_policy, dict) else None
+    baseline = (
+        iq_policy.get("legacyPromotedBaseline")
+        if isinstance(iq_policy, dict)
+        else None
+    )
+    if (
+        not isinstance(iq_policy, dict)
+        or not isinstance(target_policy, dict)
+        or set(target_policy)
+        != {"productModel", "platformProfile", "hardwareRevision", "architecture"}
+        or not isinstance(baseline, dict)
+        or set(baseline) != {"agentVersion", "releaseSequence", "bomDigest"}
+        or not isinstance(baseline.get("agentVersion"), str)
+        or not SEMVER.fullmatch(baseline["agentVersion"])
+        or isinstance(baseline.get("releaseSequence"), bool)
+        or not isinstance(baseline.get("releaseSequence"), int)
+        or baseline["releaseSequence"] < 1
+        or not isinstance(baseline.get("bomDigest"), str)
+        or not baseline["bomDigest"].startswith("sha256:")
+        or not SHA256.fullmatch(baseline["bomDigest"][7:])
+        or not isinstance(iq_policy.get("publicKeyringSha256"), str)
+        or not SHA256.fullmatch(iq_policy["publicKeyringSha256"])
+        or not isinstance(iq_policy.get("publisherKeyId"), str)
+    ):
+        raise ReadinessError("IQ9075 Fleet Runtime security policy is invalid")
+
+    release = scenario.get("release") if isinstance(scenario, dict) else None
+    inputs = manifest.get("inputs")
+    identity = manifest.get("identity")
+    slots = fleet_evidence.get("slots")
+    expected_bom_digest = "sha256:" + verified_bom.bom_digest
+    expected_candidate_slot = "/opt/nuv-agent/releases/" + verified_bom.bom_digest
+    expected_previous_slot = "releases/" + baseline["bomDigest"][7:]
+    baseline_marker = None
+    if isinstance(slots, dict) and isinstance(scenario, dict):
+        baseline_marker = (
+            slots.get("release")
+            if scenario.get("type") == "oak-fault-rollback"
+            else slots.get("previousRelease")
+        )
+    if (
+        verified_bom.schema_version != 2
+        or verified_bom.agent_version != version
+        or verified_bom.component_sha != component_sha
+        or verified_bom.release_sequence is None
+        or verified_bom.release_sequence <= baseline["releaseSequence"]
+        or verified_bom.min_updater_version != "0.2.0"
+        or verified_bom.artifact_kind != "agent-bundle"
+        or verified_bom.artifact_name != tested_artifact["name"]
+        or verified_bom.artifact_sha256 != tested_artifact["sha256"]
+        or verified_bom.artifact_size_bytes != tested_artifact["sizeBytes"]
+        or len(verified_bom.targets) != 1
+        or verified_bom.targets[0].to_payload() != target_policy
+        or not isinstance(inputs, dict)
+        or inputs.get("releaseSha256") != iq_policy["publicKeyringSha256"]
+        or not isinstance(identity, dict)
+        or {
+            key: identity.get(key)
+            for key in (
+                "productModel",
+                "platformProfile",
+                "hardwareRevision",
+                "architecture",
+            )
+        }
+        != target_policy
+        or not isinstance(baseline_marker, dict)
+        or baseline_marker.get("agentVersion") != baseline["agentVersion"]
+        or baseline_marker.get("releaseSequence") != baseline["releaseSequence"]
+        or baseline_marker.get("bomDigest") != baseline["bomDigest"]
+        or not isinstance(scenario, dict)
+        or scenario.get("expectedBomDigest") != expected_bom_digest
+        or scenario.get("expectedCandidateSlot") != expected_candidate_slot
+        or scenario.get("expectedPreviousSlot") != expected_previous_slot
+        or scenario.get("expectedPreviousVersion") != baseline["agentVersion"]
+        or not isinstance(release, dict)
+        or release
+        != {
+            "agentVersion": version,
+            "releaseSequence": verified_bom.release_sequence,
+            "artifactDigest": "sha256:" + verified_bom.artifact_sha256,
+            "componentSha": component_sha,
+            "configSchema": verified_bom.config_schema,
+            "publisherKeyId": iq_policy["publisherKeyId"],
+        }
+    ):
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime artifact, BOM, manifest, and policy differ"
+        )
+
+    expected_runtime_gate = _fleet_runtime_gate(
+        fleet_evidence, cleanup_evidence, manifest
+    )
+    if summary.get("runtimeGate") != expected_runtime_gate:
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime gate summary differs from raw evidence"
+        )
+    return {
+        # Preserve the established workflow output contract while exposing names
+        # that match the new evidence authority to future callers.
+        "physical_artifact_sha256": verified_bom.artifact_sha256,
+        "physical_bom_sha256": tested_bom_sha256,
+        "runtime_artifact_sha256": verified_bom.artifact_sha256,
+        "runtime_bom_sha256": tested_bom_sha256,
+    }
+
+
 def _validate_physical_documents(
     *,
     policy_path: Path,
@@ -1139,10 +1478,16 @@ def _validate_ready_evidence(
     security_policy: Path | None,
     signer_directory: Path | None,
     candidate_harness: Path | None,
+    candidate_fleet_runner: Path | None,
+    candidate_board_tool: Path | None,
 ) -> dict[str, str]:
+    common_fields = {"componentSha", "agentReleaseGate"}
+    runtime_fields = common_fields | {"iq9075FleetRuntime"}
+    legacy_fields = common_fields | {"iq9075Physical"}
     if (
         not isinstance(decision, dict)
-        or set(decision) != {"componentSha", "agentReleaseGate", "iq9075Physical"}
+        or frozenset(decision)
+        not in {frozenset(runtime_fields), frozenset(legacy_fields)}
         or component_sha is None
         or not SHA.fullmatch(component_sha)
         or decision.get("componentSha") != component_sha
@@ -1167,20 +1512,30 @@ def _validate_ready_evidence(
     ):
         raise ReadinessError("READY release gate evidence does not match live GitHub proof")
 
-    physical = decision.get("iq9075Physical")
-    if not isinstance(physical, dict) or set(physical) != {
+    evidence_key = (
+        "iq9075FleetRuntime"
+        if "iq9075FleetRuntime" in decision
+        else "iq9075Physical"
+    )
+    evidence_kind = (
+        "Fleet Runtime" if evidence_key == "iq9075FleetRuntime" else "physical"
+    )
+    signed_evidence = decision.get(evidence_key)
+    if not isinstance(signed_evidence, dict) or set(signed_evidence) != {
         "evidenceFile",
         "evidenceSha256",
         "signatureFile",
         "signatureSha256",
         "signerFingerprint",
     }:
-        raise ReadinessError("READY release physical evidence identity is invalid")
-    evidence_name = physical.get("evidenceFile")
-    signature_name = physical.get("signatureFile")
-    evidence_sha256 = physical.get("evidenceSha256")
-    signature_sha256 = physical.get("signatureSha256")
-    signer_fingerprint = physical.get("signerFingerprint")
+        raise ReadinessError(
+            f"READY release {evidence_kind} evidence identity is invalid"
+        )
+    evidence_name = signed_evidence.get("evidenceFile")
+    signature_name = signed_evidence.get("signatureFile")
+    evidence_sha256 = signed_evidence.get("evidenceSha256")
+    signature_sha256 = signed_evidence.get("signatureSha256")
+    signer_fingerprint = signed_evidence.get("signerFingerprint")
     if (
         not isinstance(evidence_name, str)
         or not SAFE_NAME.fullmatch(evidence_name)
@@ -1194,17 +1549,27 @@ def _validate_ready_evidence(
         or not FINGERPRINT.fullmatch(signer_fingerprint)
         or security_policy is None
         or signer_directory is None
-        or candidate_harness is None
+        or (
+            evidence_key == "iq9075FleetRuntime"
+            and (candidate_fleet_runner is None or candidate_board_tool is None)
+        )
+        or (evidence_key == "iq9075Physical" and candidate_harness is None)
     ):
-        raise ReadinessError("READY release physical evidence identity is invalid")
+        raise ReadinessError(
+            f"READY release {evidence_kind} evidence identity is invalid"
+        )
     evidence_path = policy_path.parent / evidence_name
     signature_path = policy_path.parent / signature_name
     evidence_raw = _regular_bytes(evidence_path)
     signature_raw = _regular_bytes(signature_path)
     if hashlib.sha256(evidence_raw).hexdigest() != evidence_sha256:
-        raise ReadinessError("physical evidence SHA-256 does not match readiness")
+        raise ReadinessError(
+            f"{evidence_kind} evidence SHA-256 does not match readiness"
+        )
     if hashlib.sha256(signature_raw).hexdigest() != signature_sha256:
-        raise ReadinessError("physical evidence signature SHA-256 does not match readiness")
+        raise ReadinessError(
+            f"{evidence_kind} evidence signature SHA-256 does not match readiness"
+        )
 
     security = _strict_object(
         _regular_bytes(security_policy),
@@ -1220,7 +1585,7 @@ def _validate_ready_evidence(
         )
         or len(set(fingerprints)) != len(fingerprints)
     ):
-        raise ReadinessError("physical evidence signer policy is invalid")
+        raise ReadinessError(f"{evidence_kind} evidence signer policy is invalid")
     verified_fingerprint = _verify_detached_signature(
         evidence_raw,
         signature_raw,
@@ -1228,9 +1593,26 @@ def _validate_ready_evidence(
         allowed_fingerprints=set(fingerprints),
     )
     if verified_fingerprint != signer_fingerprint:
-        raise ReadinessError("physical evidence signer differs from readiness")
+        raise ReadinessError(
+            f"{evidence_kind} evidence signer differs from readiness"
+        )
 
-    document = _strict_object(evidence_raw, label="IQ9075 physical evidence")
+    document = _strict_object(
+        evidence_raw, label=f"IQ9075 {evidence_kind} evidence"
+    )
+    if evidence_key == "iq9075FleetRuntime":
+        assert candidate_fleet_runner is not None
+        assert candidate_board_tool is not None
+        return _validate_fleet_runtime_documents(
+            policy_path=policy_path,
+            version=version,
+            component_sha=component_sha,
+            summary=document,
+            security=security,
+            candidate_fleet_runner=candidate_fleet_runner,
+            candidate_board_tool=candidate_board_tool,
+        )
+    assert candidate_harness is not None
     return _validate_physical_documents(
         policy_path=policy_path,
         version=version,
@@ -1250,6 +1632,8 @@ def verify_readiness(
     security_policy: Path | None = None,
     signer_directory: Path | None = None,
     candidate_harness: Path | None = None,
+    candidate_fleet_runner: Path | None = None,
+    candidate_board_tool: Path | None = None,
 ) -> dict[str, str]:
     if not SEMVER.fullmatch(version):
         raise ReadinessError("release readiness version must be exact SemVer")
@@ -1298,6 +1682,8 @@ def verify_readiness(
         security_policy=security_policy,
         signer_directory=signer_directory,
         candidate_harness=candidate_harness,
+        candidate_fleet_runner=candidate_fleet_runner,
+        candidate_board_tool=candidate_board_tool,
     )
 
 
@@ -1319,6 +1705,8 @@ def main() -> int:
     parser.add_argument("--security-policy", type=Path)
     parser.add_argument("--signer-directory", type=Path)
     parser.add_argument("--candidate-harness", type=Path)
+    parser.add_argument("--candidate-fleet-runner", type=Path)
+    parser.add_argument("--candidate-board-tool", type=Path)
     parser.add_argument("--github-output", type=Path)
     arguments = parser.parse_args()
     try:
@@ -1339,6 +1727,8 @@ def main() -> int:
             security_policy=arguments.security_policy,
             signer_directory=arguments.signer_directory,
             candidate_harness=arguments.candidate_harness,
+            candidate_fleet_runner=arguments.candidate_fleet_runner,
+            candidate_board_tool=arguments.candidate_board_tool,
         )
         if arguments.github_output is not None:
             with arguments.github_output.open("a", encoding="utf-8") as output:

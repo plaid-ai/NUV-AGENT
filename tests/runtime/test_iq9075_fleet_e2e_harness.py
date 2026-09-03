@@ -1136,6 +1136,32 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 self.assertEqual(before["latest"]["commandId"], fixture.command_id)
                 self.assertIsNone(before["latest"]["healthDeadline"])
 
+                payloads = fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state(
+                    "FUNCTIONAL_HEALTHY"
+                )
+                fixture.harness.arm_oak_fault(fixture.run_id)
+                current = fixture.root / "opt/nuv-agent/current"
+                previous = fixture.root / "opt/nuv-agent/previous"
+                current.unlink()
+                current.symlink_to(f"releases/{fixture.previous_digest}")
+                previous.unlink()
+                previous.symlink_to(f"releases/{fixture.current_digest}")
+                fixture.runner.run(
+                    ["/usr/bin/systemctl", "restart", "nuv-agent.service"],
+                    timeout=30,
+                )
+                fixture.runner.updater["update"] = fixture.update_state(
+                    "ROLLED_BACK"
+                )
+                fleet_evidence = fixture.harness.evidence(fixture.run_id)
+                self.assertEqual(fleet_evidence["schemaVersion"], 2)
+                self.assertEqual(fleet_evidence["antiReplay"], before)
+                HOST.validate_final_evidence(
+                    fleet_evidence, json.loads(payloads["manifest"])
+                )
+
                 connection = sqlite3.connect(fixture.paths.updater_state_db)
                 try:
                     connection.execute(
