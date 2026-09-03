@@ -30,6 +30,8 @@ KIND = "nuvion-iq9075-config-stream-e2e-evidence"
 DEFAULT_API_BASE_URL = "https://api.nuvion-dev.plaidlabs.ai"
 MAX_HTTP_BYTES = 2 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMPONENT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 DEVICE_ID_RE = re.compile(r"^sp-([1-9][0-9]*)-nuvion-[a-z0-9][a-z0-9-]{0,100}$")
 
 
@@ -319,16 +321,27 @@ import stat
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 MAX_FILE = 64 * 1024 * 1024
 MAX_MODEL_FILE = 8 * 1024 * 1024 * 1024
+MAX_PROCESS_ENV = 256 * 1024
+DEADMAN_SECONDS = 30 * 60
+DEADMAN_RECOVERY_SECONDS = 5 * 60
+FLEET_PROTOCOL = "iq9075-fleet-e2e-v2"
 RUN_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+COMPONENT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 COMMAND_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 CONFIG = Path("/etc/nuv-agent/agent.env")
 COMMAND_DB = Path("/var/lib/nuv-agent/commands.sqlite3")
 SETTINGS = Path("/var/lib/nuv-agent/settings")
+ACTIVE_RUN = Path("/var/lib/nuvion-fleet-e2e/active-run.json")
+CONFIG_LEASE = Path("/var/lib/nuvion-fleet-e2e/config-stream-active.json")
+GLOBAL_LOCK = Path("/run/lock/nuvion-fleet-e2e.lock")
+INSTALL_ROOT = Path("/opt/nuv-agent")
 FIXED = (
     CONFIG,
     COMMAND_DB,
@@ -467,6 +480,169 @@ def work_paths(value):
     dropin = Path("/run/systemd/system/nuv-agent.service.d") / ("90-nuvion-config-stream-" + rid + ".conf")
     return run_root, work, runtime, dropin
 
+def directory_snapshot(path):
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False, "mode": None, "uid": None, "gid": None}
+    meta = path.lstat()
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or meta.st_mode & 0o022:
+        raise Failure("config-stream parent ownership or mode is unsafe")
+    return {"exists": True, "mode": stat.S_IMODE(meta.st_mode), "uid": meta.st_uid, "gid": meta.st_gid}
+
+def ensure_directory_from_snapshot(path, snapshot):
+    if set(snapshot) != {"exists", "mode", "uid", "gid"} or type(snapshot.get("exists")) is not bool:
+        raise Failure("config-stream parent snapshot is invalid")
+    if snapshot["exists"]:
+        if directory_snapshot(path) != snapshot:
+            raise Failure("config-stream parent metadata changed")
+        return
+    if path.exists() or path.is_symlink():
+        raise Failure("config-stream parent appeared before creation")
+    parent_meta = path.parent.lstat()
+    if stat.S_ISLNK(parent_meta.st_mode) or not stat.S_ISDIR(parent_meta.st_mode) or parent_meta.st_uid != 0 or parent_meta.st_mode & 0o022:
+        raise Failure("config-stream parent ancestor is unsafe")
+    path.mkdir(mode=0o755)
+    os.chown(path, 0, 0)
+    os.chmod(path, 0o755)
+    fsync_dir(path.parent)
+
+def restore_parent(path, snapshot):
+    if snapshot.get("exists") is True:
+        if directory_snapshot(path) != snapshot:
+            raise Failure("config-stream parent metadata was not preserved")
+        return
+    if snapshot.get("exists") is not False:
+        raise Failure("config-stream parent snapshot is invalid")
+    if not path.exists() and not path.is_symlink():
+        return
+    meta = path.lstat()
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0:
+        raise Failure("config-stream parent restore path is unsafe")
+    try:
+        path.rmdir()
+    except OSError as exc:
+        raise Failure("config-stream parent is not empty after cleanup") from exc
+    fsync_dir(path.parent)
+
+def validate_active_run(rid):
+    payload, meta = read_regular(ACTIVE_RUN, 4096)
+    if meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o600:
+        raise Failure("Fleet E2E active-run lease metadata is unsafe")
+    lease = json.loads(payload.decode("utf-8"))
+    if lease != {"schemaVersion": 1, "protocolVersion": FLEET_PROTOCOL, "runId": rid}:
+        raise Failure("Fleet E2E active-run lease belongs to another run")
+
+@contextmanager
+def operation_lock(rid):
+    validate_active_run(rid)
+    lock_parent = GLOBAL_LOCK.parent.lstat()
+    if stat.S_ISLNK(lock_parent.st_mode) or not stat.S_ISDIR(lock_parent.st_mode) or lock_parent.st_uid != 0 or lock_parent.st_mode & 0o022:
+        raise Failure("Fleet E2E lock directory is unsafe")
+    descriptor = os.open(GLOBAL_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or stat.S_IMODE(opened.st_mode) != 0o600:
+            raise Failure("Fleet E2E global lock endpoint is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Failure("another Fleet E2E operation owns the global lock") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+def claim_config_lease(rid):
+    parent = CONFIG_LEASE.parent.lstat()
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+        raise Failure("config-stream lease directory is unsafe")
+    payload = canonical({"schemaVersion": 1, "runId": rid})
+    descriptor = os.open(CONFIG_LEASE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            count = os.write(descriptor, view)
+            if count <= 0:
+                raise Failure("config-stream lease write made no progress")
+            view = view[count:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    fsync_dir(CONFIG_LEASE.parent)
+
+def validate_config_lease(rid):
+    payload, meta = read_regular(CONFIG_LEASE, 4096)
+    if meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o600 or json.loads(payload.decode("utf-8")) != {"schemaVersion": 1, "runId": rid}:
+        raise Failure("config-stream exclusive lease is unsafe or belongs to another run")
+
+def release_config_lease(rid):
+    if not CONFIG_LEASE.exists() and not CONFIG_LEASE.is_symlink():
+        return
+    validate_config_lease(rid)
+    CONFIG_LEASE.unlink()
+    fsync_dir(CONFIG_LEASE.parent)
+
+def deadman_unit(rid):
+    return "nuvion-config-stream-deadman-" + rid.replace("-", "") + ".service"
+
+def deadman_timer(rid):
+    return deadman_unit(rid).removesuffix(".service") + ".timer"
+
+def program_source():
+    arguments = list(getattr(sys, "orig_argv", ()))
+    try:
+        index = arguments.index("-c")
+        source = arguments[index + 1]
+    except (ValueError, IndexError) as exc:
+        raise Failure("config-stream recovery source is unavailable") from exc
+    if not isinstance(source, str) or not source.startswith("\nimport base64\n") or len(source.encode("utf-8")) > 512 * 1024:
+        raise Failure("config-stream recovery source is invalid")
+    return source
+
+def arm_deadman(rid):
+    result = subprocess.run(
+        [
+            "/usr/bin/systemd-run",
+            "--unit=" + deadman_unit(rid),
+            "--collect",
+            "--on-active=" + str(DEADMAN_SECONDS) + "s",
+            "--timer-property=AccuracySec=1s",
+            "--property=Type=oneshot",
+            "--property=LimitCORE=0",
+            "--property=StandardOutput=null",
+            "--property=StandardError=journal",
+            "--property=RuntimeMaxSec=" + str(DEADMAN_RECOVERY_SECONDS) + "s",
+            "--property=TimeoutStartSec=" + str(DEADMAN_RECOVERY_SECONDS) + "s",
+            "--property=TimeoutStopSec=" + str(DEADMAN_RECOVERY_SECONDS) + "s",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=15s",
+            "--property=StartLimitIntervalSec=0",
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            program_source(),
+            "deadman-restore",
+            rid,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0 or systemctl("is-active", "--quiet", deadman_timer(rid), check=False).returncode != 0:
+        raise Failure("config-stream recovery deadman did not arm")
+
+def disarm_deadman(rid):
+    for target in (deadman_timer(rid), deadman_unit(rid)):
+        systemctl("stop", target, check=False)
+        if systemctl("is-active", "--quiet", target, check=False).returncode == 0:
+            raise Failure("config-stream recovery deadman remains active")
+        systemctl("reset-failed", target, check=False)
+
 def systemctl(*args, check=True):
     result = subprocess.run(["/usr/bin/systemctl", *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=False, text=True)
     if check and result.returncode != 0:
@@ -482,6 +658,64 @@ def service_pid():
     if not value.isdigit() or int(value) < 1:
         raise Failure("Agent service PID is unavailable")
     return int(value)
+
+def runtime_identity(run_root, manifest_sha):
+    manifest_path = run_root / "trust-transaction/immutable-manifest.json"
+    manifest_raw, manifest_meta = read_regular(manifest_path, 64 * 1024)
+    if manifest_meta.st_uid != 0 or stat.S_IMODE(manifest_meta.st_mode) != 0o600 or sha(manifest_raw) != manifest_sha:
+        raise Failure("immutable Fleet manifest metadata or digest is invalid")
+    manifest = json.loads(manifest_raw.decode("utf-8"))
+    scenario = manifest.get("scenario") if isinstance(manifest, dict) else None
+    release = scenario.get("release") if isinstance(scenario, dict) else None
+    bom = scenario.get("expectedBomDigest") if isinstance(scenario, dict) else None
+    if not isinstance(scenario, dict) or scenario.get("type") != "commit" or not isinstance(release, dict) or not isinstance(bom, str) or DIGEST_RE.fullmatch(bom) is None:
+        raise Failure("config-stream requires an immutable commit manifest")
+    if set(release) != {"agentVersion", "releaseSequence", "artifactDigest", "componentSha", "configSchema", "publisherKeyId"}:
+        raise Failure("commit manifest release identity fields are invalid")
+    expected_slot = "releases/" + bom.removeprefix("sha256:")
+    expected_release = {"schemaVersion": 2, "bomDigest": bom, **release}
+    current = INSTALL_ROOT / "current"
+    current_meta = current.lstat()
+    if not stat.S_ISLNK(current_meta.st_mode) or current_meta.st_uid != 0 or os.readlink(current) != expected_slot:
+        raise Failure("active release slot differs from the commit manifest")
+    slot = INSTALL_ROOT / expected_slot
+    slot_meta = slot.lstat()
+    if stat.S_ISLNK(slot_meta.st_mode) or not stat.S_ISDIR(slot_meta.st_mode) or slot_meta.st_uid != 0 or slot_meta.st_mode & 0o022:
+        raise Failure("active release slot metadata is unsafe")
+    marker_path = slot / ".nuvion/release.json"
+    marker_raw, marker_meta = read_regular(marker_path, 64 * 1024)
+    marker = json.loads(marker_raw.decode("utf-8"))
+    if marker_meta.st_uid != 0 or marker_meta.st_mode & 0o022 or marker != expected_release:
+        raise Failure("active release marker differs from the commit manifest")
+    build_info_raw, build_info_meta = read_regular(slot / "venv/lib/python3.12/site-packages/nuvion_app/build_info.py", 64 * 1024)
+    build_info_text = build_info_raw.decode("utf-8")
+    versions = re.findall(r'^AGENT_VERSION\s*=.*$', build_info_text, re.MULTILINE)
+    components = re.findall(r'^COMPONENT_SHA\s*=.*$', build_info_text, re.MULTILINE)
+    if build_info_meta.st_uid != 0 or build_info_meta.st_mode & 0o022 or versions != ['AGENT_VERSION = "' + str(release.get("agentVersion")) + '"'] or components != ['COMPONENT_SHA = "' + str(release.get("componentSha")) + '"']:
+        raise Failure("active Agent build info differs from the commit manifest")
+    pid = service_pid()
+    environment_raw, _ = read_regular(Path("/proc") / str(pid) / "environ", MAX_PROCESS_ENV)
+    selected = {}
+    for entry in environment_raw.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        if key in {b"NUVION_ACTIVE_SLOT", b"NUVION_EXPECTED_BOM_DIGEST"}:
+            selected[key.decode("ascii")] = value.decode("ascii")
+    if selected != {"NUVION_ACTIVE_SLOT": expected_slot, "NUVION_EXPECTED_BOM_DIGEST": bom}:
+        raise Failure("running Agent process is not bound to the active release")
+    current_after = current.lstat()
+    if (current_after.st_dev, current_after.st_ino) != (current_meta.st_dev, current_meta.st_ino) or os.readlink(current) != expected_slot:
+        raise Failure("active release slot changed during identity inspection")
+    return {
+        "activeSlot": expected_slot,
+        "processActiveSlot": selected["NUVION_ACTIVE_SLOT"],
+        "processExpectedBomDigest": selected["NUVION_EXPECTED_BOM_DIGEST"],
+        "servicePid": pid,
+        "releaseMarkerSha256": sha(marker_raw),
+        "buildInfoSha256": sha(build_info_raw),
+        "release": expected_release,
+    }
 
 def parse_env(raw):
     result = {}
@@ -638,7 +872,9 @@ def db_counts():
 def save_snapshots(work):
     before = work / "before"
     before.mkdir(parents=True, exist_ok=False)
+    os.chown(before, 0, 0)
     os.chmod(before, 0o700)
+    fsync_dir(work)
     records = []
     for index, path in enumerate(FIXED):
         if not path.exists() and not path.is_symlink():
@@ -662,6 +898,7 @@ def restore_snapshots(work, records):
                 if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
                     raise Failure("restore target is unsafe")
                 path.unlink()
+                fsync_dir(path.parent)
             continue
         payload, _ = read_regular(before / record["snapshot"])
         if sha(payload) != record["sha256"]:
@@ -688,55 +925,68 @@ def prepare(rid, manifest_sha):
     transaction = run_state.get("trustTransaction")
     if not isinstance(transaction, dict) or transaction.get("phase") != "APPLIED" or transaction.get("liveVerified") is not True or transaction.get("manifestSha256") != manifest_sha:
         raise Failure("Fleet trust transaction is not live and release-bound")
-    if work.exists() or work.is_symlink() or runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
+    validate_active_run(rid)
+    if work.exists() or work.is_symlink() or runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink() or CONFIG_LEASE.exists() or CONFIG_LEASE.is_symlink():
         raise Failure("config-stream workspace already exists")
-    runtime_parent_existed = runtime.parent.exists()
-    dropin_parent_existed = dropin.parent.exists()
-    for parent in (runtime.parent, dropin.parent):
-        if parent.exists():
-            meta = parent.lstat()
-            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
-                raise Failure("config-stream parent path is unsafe")
+    parent_snapshots = {
+        str(runtime.parent): directory_snapshot(runtime.parent),
+        str(dropin.parent): directory_snapshot(dropin.parent),
+    }
     was_active = service_active()
     if not was_active:
         raise Failure("Agent service must be active before config-stream E2E")
-    systemctl("stop", "nuv-agent.service")
+    initial_identity = runtime_identity(run_root, manifest_sha)
+    work.mkdir(mode=0o700)
+    os.chown(work, 0, 0)
+    os.chmod(work, 0o700)
+    dropin_payload = ("[Service]\nEnvironment=PATH=" + str(runtime / "bin") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n").encode()
+    state = {
+        "schemaVersion": 1,
+        "runId": rid,
+        "manifestSha256": manifest_sha,
+        "phase": "ARMING",
+        "serviceActiveBefore": was_active,
+        "initialRuntimeIdentity": initial_identity,
+        "configBeforeSha256": None,
+        "configTestSha256": None,
+        "dropinSha256": sha(dropin_payload),
+        "parentSnapshots": parent_snapshots,
+        "deadman": {"unit": deadman_unit(rid), "armed": True, "lifecycle": "ARMING"},
+    }
+    atomic(work / "state.json", canonical(state))
     try:
+        arm_deadman(rid)
+        claim_config_lease(rid)
+        state["deadman"]["lifecycle"] = "ARMED"
+        state["phase"] = "ARMED"
+        atomic(work / "state.json", canonical(state))
+        systemctl("stop", "nuv-agent.service")
         counts = db_counts()
         if any(counts.values()):
             raise Failure("pre-existing command work is not drained")
         active_baseline = baseline()
         config_raw, config_meta = read_regular(CONFIG, 2 * 1024 * 1024)
         test_config = render_updates(config_raw)
-        work.mkdir(mode=0o700)
         records = save_snapshots(work)
-        state = {
-            "schemaVersion": 1,
-            "runId": rid,
-            "manifestSha256": manifest_sha,
-            "phase": "PREPARED",
-            "serviceActiveBefore": was_active,
-            "snapshots": records,
-            "baseline": active_baseline,
-            "configBeforeSha256": sha(config_raw),
-            "configTestSha256": sha(test_config),
-            "dropinSha256": None,
-            "runtimeParentExisted": runtime_parent_existed,
-            "dropinParentExisted": dropin_parent_existed,
-        }
+        if records[0].get("sha256") != sha(config_raw):
+            raise Failure("Agent config changed while snapshotting")
+        state.update({"phase": "PREPARED", "snapshots": records, "baseline": active_baseline, "configBeforeSha256": sha(config_raw), "configTestSha256": sha(test_config)})
         atomic(work / "state.json", canonical(state))
         atomic(CONFIG, test_config, stat.S_IMODE(config_meta.st_mode), config_meta.st_uid, config_meta.st_gid)
-        (runtime / "bin").mkdir(parents=True, mode=0o755)
-        os.chmod(runtime.parent, 0o755)
+        ensure_directory_from_snapshot(runtime.parent, parent_snapshots[str(runtime.parent)])
+        ensure_directory_from_snapshot(dropin.parent, parent_snapshots[str(dropin.parent)])
+        runtime.mkdir(mode=0o755)
+        os.chown(runtime, 0, 0)
         os.chmod(runtime, 0o755)
+        (runtime / "bin").mkdir(mode=0o755)
+        os.chown(runtime / "bin", 0, 0)
+        os.chmod(runtime / "bin", 0o755)
         atomic(runtime / "quality", b"GOOD\n", 0o644, 0, 0)
         iw = ("#!/bin/sh\nset -eu\nmode=$(/bin/cat " + shlex_quote(str(runtime / "quality")) + ")\nif [ \"${1:-}\" = dev ] && [ \"$#\" -eq 1 ]; then /bin/printf 'phy#0\\n\\tInterface fleet0\\n'; exit 0; fi\nif [ \"$mode\" = POOR ]; then signal=-90; rate='0.1 MBit/s'; else signal=-50; rate='100.0 MBit/s'; fi\n/bin/printf 'Connected to 00:11:22:33:44:55 (on fleet0)\\n\\tsignal: %s dBm\\n\\ttx bitrate: %s\\n\\trx bitrate: %s\\n' \"$signal\" \"$rate\" \"$rate\"\n").encode()
         ping = ("#!/bin/sh\nset -eu\nmode=$(/bin/cat " + shlex_quote(str(runtime / "quality")) + ")\nif [ \"$mode\" = POOR ]; then /bin/printf '3 packets transmitted, 2 received, 20%% packet loss\\nrtt min/avg/max/mdev = 300.000/300.000/300.000/0.000 ms\\n'; else /bin/printf '3 packets transmitted, 3 received, 0%% packet loss\\nrtt min/avg/max/mdev = 20.000/20.000/20.000/0.000 ms\\n'; fi\n").encode()
         atomic(runtime / "bin/iw", iw, 0o755, 0, 0)
         atomic(runtime / "bin/ping", ping, 0o755, 0, 0)
-        dropin_payload = ("[Service]\nEnvironment=PATH=" + str(runtime / "bin") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n").encode()
         atomic(dropin, dropin_payload, 0o644, 0, 0)
-        state["dropinSha256"] = sha(dropin_payload)
         state["phase"] = "ACTIVE"
         atomic(work / "state.json", canonical(state))
         systemctl("daemon-reload")
@@ -744,23 +994,23 @@ def prepare(rid, manifest_sha):
         if not service_active():
             raise Failure("synthetic Agent service did not become active")
         state["testServicePid"] = service_pid()
+        active_identity = runtime_identity(run_root, manifest_sha)
+        if active_identity["release"] != initial_identity["release"] or active_identity["activeSlot"] != initial_identity["activeSlot"]:
+            raise Failure("Agent release identity changed during preparation")
+        state["activeRuntimeIdentity"] = active_identity
         atomic(work / "state.json", canonical(state))
     except BaseException:
         if (work / "state.json").exists():
             restore(rid, internal=True)
-        else:
-            if work.exists() and not work.is_symlink():
-                shutil.rmtree(work)
-            if was_active:
-                systemctl("start", "nuv-agent.service")
         raise
-    return {"schemaVersion": 1, "runId": rid, "prepared": True, "syntheticSource": "videotestsrc", "connectivityShim": "scoped-iw-ping", "baseline": active_baseline, "configBeforeSha256": state["configBeforeSha256"], "configTestSha256": state["configTestSha256"], "queue": counts}
+    return {"schemaVersion": 1, "runId": rid, "prepared": True, "syntheticSource": "videotestsrc", "connectivityShim": "scoped-iw-ping", "baseline": active_baseline, "configBeforeSha256": state["configBeforeSha256"], "configTestSha256": state["configTestSha256"], "runtimeIdentity": active_identity, "exclusiveLease": True, "deadmanArmed": True, "queue": counts}
 
 def shlex_quote(value):
     return "'" + value.replace("'", "'\\''") + "'"
 
 def set_link(rid, quality):
     _, work, runtime, _ = work_paths(rid)
+    validate_config_lease(rid)
     state = load_json(work / "state.json")
     if state.get("phase") != "ACTIVE" or quality not in {"GOOD", "POOR"}:
         raise Failure("config-stream link transition is invalid")
@@ -774,6 +1024,7 @@ def inspect(rid, command_id):
     if COMMAND_ID_RE.fullmatch(command_id) is None or str(uuid.UUID(command_id)) != command_id:
         raise Failure("commandId is invalid")
     _, work, _, _ = work_paths(rid)
+    validate_config_lease(rid)
     state = load_json(work / "state.json")
     if state.get("phase") != "ACTIVE":
         raise Failure("config-stream workspace is not active")
@@ -795,65 +1046,182 @@ def inspect(rid, command_id):
     finally:
         connection.close()
 
-def restore(rid, internal=False):
-    _, work, runtime, dropin = work_paths(rid)
-    if not work.exists():
-        if internal:
-            return {"schemaVersion": 1, "runId": rid, "restored": True, "idempotent": True}
-        raise Failure("config-stream workspace is missing")
-    state = load_json(work / "state.json")
-    if state.get("runId") != rid or state.get("schemaVersion") != 1 or not isinstance(state.get("snapshots"), list):
-        raise Failure("config-stream state identity is invalid")
-    if state.get("phase") == "RESTORED":
-        exact = verify_restored(state["snapshots"])
-        return {"schemaVersion": 1, "runId": rid, "restored": exact, "idempotent": True, "exactRestoration": exact}
-    systemctl("stop", "nuv-agent.service")
-    restore_snapshots(work, state["snapshots"])
+def validate_snapshot_records(records):
+    if not isinstance(records, list) or len(records) != len(FIXED):
+        raise Failure("config-stream snapshot set is invalid")
+    for index, (record, expected_path) in enumerate(zip(records, FIXED)):
+        if not isinstance(record, dict) or Path(str(record.get("path") or "")) != expected_path or type(record.get("exists")) is not bool:
+            raise Failure("config-stream snapshot identity is invalid")
+        if record["exists"]:
+            if record.get("snapshot") != str(index) or SHA_RE.fullmatch(str(record.get("sha256") or "")) is None or type(record.get("mode")) is not int or not 0 <= record["mode"] <= 0o7777 or type(record.get("uid")) is not int or record["uid"] < 0 or type(record.get("gid")) is not int or record["gid"] < 0:
+                raise Failure("config-stream snapshot metadata is invalid")
+        elif any(record.get(key) is not None for key in ("snapshot", "sha256", "mode", "uid", "gid")):
+            raise Failure("config-stream missing snapshot metadata is invalid")
+    return records
+
+def parent_snapshots(state, runtime, dropin):
+    snapshots = state.get("parentSnapshots")
+    expected = {str(runtime.parent), str(dropin.parent)}
+    if not isinstance(snapshots, dict) or set(snapshots) != expected:
+        raise Failure("config-stream parent snapshot set is invalid")
+    for value in snapshots.values():
+        if not isinstance(value, dict) or set(value) != {"exists", "mode", "uid", "gid"} or type(value.get("exists")) is not bool:
+            raise Failure("config-stream parent snapshot is invalid")
+    return snapshots
+
+def remove_runtime_artifacts(state, runtime, dropin):
     if dropin.exists() or dropin.is_symlink():
         payload, meta = read_regular(dropin, 64 * 1024)
-        if sha(payload) != state.get("dropinSha256") or meta.st_uid != 0:
+        if sha(payload) != state.get("dropinSha256") or meta.st_uid != 0 or meta.st_gid != 0 or stat.S_IMODE(meta.st_mode) != 0o644:
             raise Failure("config-stream drop-in changed")
         dropin.unlink()
+        fsync_dir(dropin.parent)
     if runtime.exists() or runtime.is_symlink():
-        if runtime.is_symlink() or not runtime.is_dir():
+        meta = runtime.lstat()
+        if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o755:
             raise Failure("config-stream runtime path is unsafe")
         shutil.rmtree(runtime)
-    for parent, existed in (
-        (runtime.parent, state.get("runtimeParentExisted")),
-        (dropin.parent, state.get("dropinParentExisted")),
-    ):
-        if type(existed) is not bool:
-            raise Failure("config-stream parent snapshot is invalid")
-        if not existed and parent.exists():
-            meta = parent.lstat()
-            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
-                raise Failure("config-stream parent restore path is unsafe")
-            try:
-                parent.rmdir()
-            except OSError as exc:
-                raise Failure("config-stream parent is not empty after cleanup") from exc
-    systemctl("daemon-reload")
-    exact = verify_restored(state["snapshots"])
-    if not exact:
-        raise Failure("config-stream byte restoration failed")
-    restored_pid = None
-    if state.get("serviceActiveBefore") is True:
-        systemctl("start", "nuv-agent.service")
+        fsync_dir(runtime.parent)
+
+def purge_snapshots(work):
+    before = work / "before"
+    if not before.exists() and not before.is_symlink():
+        return
+    meta = before.lstat()
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or stat.S_IMODE(meta.st_mode) != 0o700:
+        raise Failure("config-stream snapshot directory is unsafe")
+    shutil.rmtree(before)
+    fsync_dir(work)
+
+def complete_deadman_cleanup(rid, state, work, *, deadman):
+    if deadman:
+        state["deadman"] = {"unit": deadman_unit(rid), "armed": False, "lifecycle": "RECOVERED"}
+    else:
+        disarm_deadman(rid)
+        state["deadman"] = {"unit": deadman_unit(rid), "armed": False, "lifecycle": "DISARMED"}
+    atomic(work / "state.json", canonical(state))
+
+def restoration_response(state, rid, work, restored_settings, identity, *, idempotent, no_mutation):
+    cached = state.get("restorationResponse")
+    if isinstance(cached, dict):
+        if cached.get("schemaVersion") != 1 or cached.get("runId") != rid or cached.get("restored") is not True or cached.get("exactRestoration") is not True or cached.get("noMutation") is not no_mutation or cached.get("exclusiveLeaseReleased") is not True or cached.get("deadmanDisarmed") is not True:
+            raise Failure("sealed config-stream restoration response is invalid")
+        cached_settings = cached.get("settings")
+        if isinstance(cached_settings, dict) and sha(canonical(cached_settings)) != cached.get("settingsSha256"):
+            raise Failure("sealed config-stream settings evidence is invalid")
+        response = dict(cached)
+        response["idempotent"] = idempotent
+        return response
+    response = {
+        "schemaVersion": 1,
+        "runId": rid,
+        "restored": True,
+        "idempotent": idempotent,
+        "noMutation": no_mutation,
+        "exactRestoration": True,
+        "runtimeRestarted": not no_mutation,
+        "configSha256": state.get("configBeforeSha256"),
+        "settings": restored_settings,
+        "settingsSha256": sha(canonical(restored_settings)) if isinstance(restored_settings, dict) else None,
+        "encoderStartupBitrateKbps": restored_settings["video"]["bitrateKbps"] if isinstance(restored_settings, dict) else None,
+        "runtimeIdentity": identity,
+        "exclusiveLeaseReleased": not CONFIG_LEASE.exists() and not CONFIG_LEASE.is_symlink(),
+        "deadmanDisarmed": state.get("deadman", {}).get("armed") is False,
+    }
+    state["restorationResponse"] = dict(response)
+    atomic(work / "state.json", canonical(state))
+    return response
+
+def restore(rid, internal=False, deadman=False):
+    run_root, work, runtime, dropin = work_paths(rid)
+    if not work.exists() and not work.is_symlink():
+        if CONFIG_LEASE.exists() or CONFIG_LEASE.is_symlink():
+            raise Failure("config-stream lease exists without a recovery journal")
+        if not deadman:
+            disarm_deadman(rid)
+        return {"schemaVersion": 1, "runId": rid, "restored": True, "idempotent": True, "noMutation": True, "exactRestoration": True, "runtimeRestarted": False, "configSha256": None, "settings": None, "settingsSha256": None, "encoderStartupBitrateKbps": None, "runtimeIdentity": None, "exclusiveLeaseReleased": True, "deadmanDisarmed": True}
+    work_meta = work.lstat()
+    state_meta = (work / "state.json").lstat()
+    if stat.S_ISLNK(work_meta.st_mode) or not stat.S_ISDIR(work_meta.st_mode) or work_meta.st_uid != 0 or stat.S_IMODE(work_meta.st_mode) != 0o700 or stat.S_ISLNK(state_meta.st_mode) or not stat.S_ISREG(state_meta.st_mode) or state_meta.st_uid != 0 or stat.S_IMODE(state_meta.st_mode) != 0o600:
+        raise Failure("config-stream recovery journal metadata is unsafe")
+    state = load_json(work / "state.json")
+    if state.get("runId") != rid or state.get("schemaVersion") != 1 or SHA_RE.fullmatch(str(state.get("manifestSha256") or "")) is None:
+        raise Failure("config-stream state identity is invalid")
+    parents = parent_snapshots(state, runtime, dropin)
+    phase = state.get("phase")
+    if phase not in {"ARMING", "ARMED", "PREPARED", "ACTIVE", "RESTORING", "RESTORED"}:
+        raise Failure("config-stream state phase is invalid")
+    no_mutation = phase in {"ARMING", "ARMED"} or (phase == "RESTORED" and state.get("noMutation") is True)
+    if no_mutation:
+        if runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
+            raise Failure("config-stream mutation exists without snapshots")
+        if state.get("serviceActiveBefore") is True and not service_active():
+            systemctl("start", "nuv-agent.service")
+        if not service_active():
+            raise Failure("Agent service did not recover from pre-mutation state")
+        identity = runtime_identity(run_root, state["manifestSha256"])
+        state.update({"phase": "RESTORED", "restoredExact": True, "restoredServicePid": identity["servicePid"], "noMutation": True})
+        atomic(work / "state.json", canonical(state))
+        purge_snapshots(work)
+        release_config_lease(rid)
+        complete_deadman_cleanup(rid, state, work, deadman=deadman)
+        return restoration_response(state, rid, work, None, identity, idempotent=phase == "RESTORED", no_mutation=True)
+
+    records = validate_snapshot_records(state.get("snapshots"))
+    if phase != "RESTORED":
+        state["phase"] = "RESTORING"
+        atomic(work / "state.json", canonical(state))
+        systemctl("stop", "nuv-agent.service")
+        restore_snapshots(work, records)
+        remove_runtime_artifacts(state, runtime, dropin)
+        systemctl("daemon-reload")
+        if not verify_restored(records):
+            raise Failure("config-stream byte restoration failed")
+        if state.get("serviceActiveBefore") is True:
+            systemctl("start", "nuv-agent.service")
         if not service_active():
             raise Failure("Agent service did not recover")
-        restored_pid = service_pid()
-    restored_settings = baseline(False, state.get("baseline", {}).get("model"))
-    if restored_settings != state.get("baseline") or not verify_restored(state["snapshots"]):
-        raise Failure("Agent restart did not retain the exact settings baseline")
-    runtime_restarted = isinstance(restored_pid, int) and restored_pid != state.get("testServicePid")
-    if not runtime_restarted:
-        raise Failure("Agent runtime was not restarted from restored config")
-    shutil.rmtree(work / "before")
-    state["phase"] = "RESTORED"
-    state["restoredExact"] = True
-    state["restoredServicePid"] = restored_pid
-    atomic(work / "state.json", canonical(state))
-    return {"schemaVersion": 1, "runId": rid, "restored": True, "idempotent": False, "exactRestoration": True, "runtimeRestarted": True, "configSha256": state["configBeforeSha256"], "settings": restored_settings, "settingsSha256": sha(canonical(restored_settings)), "encoderStartupBitrateKbps": restored_settings["video"]["bitrateKbps"]}
+        restored_settings = baseline(False, state.get("baseline", {}).get("model"))
+        if restored_settings != state.get("baseline") or not verify_restored(records):
+            raise Failure("Agent restart did not retain the exact settings baseline")
+        identity = runtime_identity(run_root, state["manifestSha256"])
+        if identity["release"] != state.get("initialRuntimeIdentity", {}).get("release") or identity["activeSlot"] != state.get("initialRuntimeIdentity", {}).get("activeSlot"):
+            raise Failure("restored Agent release identity changed")
+        restored_pid = identity["servicePid"]
+        if isinstance(state.get("testServicePid"), int) and restored_pid == state["testServicePid"]:
+            raise Failure("Agent runtime was not restarted from restored config")
+        restore_parent(runtime.parent, parents[str(runtime.parent)])
+        restore_parent(dropin.parent, parents[str(dropin.parent)])
+        if not verify_restored(records):
+            raise Failure("config-stream restoration changed after restart")
+        state.update({
+            "phase": "RESTORED",
+            "restoredExact": True,
+            "restoredServicePid": restored_pid,
+            "restoredSettings": restored_settings,
+            "restoredSettingsSha256": sha(canonical(restored_settings)),
+            "restoredRuntimeIdentity": identity,
+            "noMutation": False,
+        })
+        # The durable RESTORED journal must precede deletion of the only
+        # rollback bytes. A retry can therefore return full evidence after a
+        # lost SSH response without depending on already-purged snapshots.
+        atomic(work / "state.json", canonical(state))
+    else:
+        restored_settings = baseline(False, state.get("baseline", {}).get("model"))
+        if state.get("restoredExact") is not True or restored_settings != state.get("baseline") or not verify_restored(records):
+            raise Failure("idempotent config-stream restoration is not exact")
+        if runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
+            raise Failure("idempotent config-stream artifacts remain")
+        restore_parent(runtime.parent, parents[str(runtime.parent)])
+        restore_parent(dropin.parent, parents[str(dropin.parent)])
+        identity = runtime_identity(run_root, state["manifestSha256"])
+        if identity["release"] != state.get("restoredRuntimeIdentity", {}).get("release"):
+            raise Failure("idempotent Agent release identity changed")
+    purge_snapshots(work)
+    release_config_lease(rid)
+    complete_deadman_cleanup(rid, state, work, deadman=deadman)
+    return restoration_response(state, rid, work, restored_settings, identity, idempotent=phase == "RESTORED", no_mutation=False)
 
 def main():
     if os.geteuid() != 0:
@@ -862,16 +1230,19 @@ def main():
         raise Failure("typed action and runId are required")
     action = sys.argv[1]
     rid = run_id(sys.argv[2])
-    if action == "prepare" and len(sys.argv) == 4:
-        result = prepare(rid, sys.argv[3])
-    elif action == "set-link" and len(sys.argv) == 4:
-        result = set_link(rid, sys.argv[3])
-    elif action == "inspect" and len(sys.argv) == 4:
-        result = inspect(rid, sys.argv[3])
-    elif action == "restore" and len(sys.argv) == 3:
-        result = restore(rid)
-    else:
-        raise Failure("action is outside the typed allowlist")
+    with operation_lock(rid):
+        if action == "prepare" and len(sys.argv) == 4:
+            result = prepare(rid, sys.argv[3])
+        elif action == "set-link" and len(sys.argv) == 4:
+            result = set_link(rid, sys.argv[3])
+        elif action == "inspect" and len(sys.argv) == 4:
+            result = inspect(rid, sys.argv[3])
+        elif action == "restore" and len(sys.argv) == 3:
+            result = restore(rid)
+        elif action == "deadman-restore" and len(sys.argv) == 3:
+            result = restore(rid, internal=True, deadman=True)
+        else:
+            raise Failure("action is outside the typed allowlist")
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 try:
@@ -919,7 +1290,7 @@ class RemoteBoard:
                 f"{self.transport.user}@{self.transport.host}",
                 shlex.join(remote),
             ],
-            timeout=120,
+            timeout=360 if action in {"prepare", "restore"} else 120,
             input_bytes=input_bytes,
         )
         return self.transport._parse_result(result, operation="config-stream-" + action)
@@ -1033,13 +1404,96 @@ def validate_queue_drained(value: Any) -> dict[str, int]:
 
 
 def twin_domain(projection: Mapping[str, Any], domain: str) -> dict[str, Any]:
-    twins = projection.get("twins")
-    if isinstance(twins, Mapping) and isinstance(twins.get(domain), dict):
-        return dict(twins[domain])
+    # The deployed dev contract exposes the authoritative current command as
+    # a single twin. Prefer it when a rollout also includes advisory domains.
     twin = projection.get("twin")
     if isinstance(twin, dict):
         return twin
+    twins = projection.get("twins")
+    if isinstance(twins, Mapping) and isinstance(twins.get(domain), dict):
+        return dict(twins[domain])
     raise ConfigStreamError("Fleet twin domain projection is unavailable")
+
+
+def projection_shape(projection: Mapping[str, Any], domain: str) -> str:
+    if isinstance(projection.get("twin"), dict):
+        return "single"
+    twins = projection.get("twins")
+    if isinstance(twins, Mapping) and isinstance(twins.get(domain), dict):
+        return "domained"
+    raise ConfigStreamError("Fleet twin projection shape is unavailable")
+
+
+def _utc_timestamp(value: Any, label: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ConfigStreamError(f"{label} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ConfigStreamError(f"{label} is invalid") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ConfigStreamError(f"{label} is invalid")
+    return parsed
+
+
+def validate_runtime_identity(
+    value: Any, *, scenario: Mapping[str, Any]
+) -> dict[str, Any]:
+    identity = _mapping(value, "board runtime release identity")
+    release = _mapping(scenario.get("release"), "Fleet manifest release")
+    expected_bom = scenario.get("expectedBomDigest")
+    if not isinstance(expected_bom, str) or DIGEST_RE.fullmatch(expected_bom) is None:
+        raise ConfigStreamError("Fleet manifest BOM digest is invalid")
+    expected_slot = "releases/" + expected_bom.removeprefix("sha256:")
+    marker = {
+        "schemaVersion": 2,
+        "bomDigest": expected_bom,
+        **dict(release),
+    }
+    if (
+        set(release)
+        != {
+            "agentVersion",
+            "releaseSequence",
+            "artifactDigest",
+            "componentSha",
+            "configSchema",
+            "publisherKeyId",
+        }
+        or set(identity)
+        != {
+            "activeSlot",
+            "processActiveSlot",
+            "processExpectedBomDigest",
+            "servicePid",
+            "releaseMarkerSha256",
+            "buildInfoSha256",
+            "release",
+        }
+        or identity.get("activeSlot") != expected_slot
+        or identity.get("processActiveSlot") != expected_slot
+        or identity.get("processExpectedBomDigest") != expected_bom
+        or type(identity.get("servicePid")) is not int
+        or identity["servicePid"] < 2
+        or not isinstance(identity.get("releaseMarkerSha256"), str)
+        or SHA256_RE.fullmatch(identity["releaseMarkerSha256"]) is None
+        or not isinstance(identity.get("buildInfoSha256"), str)
+        or SHA256_RE.fullmatch(identity["buildInfoSha256"]) is None
+        or identity.get("release") != marker
+        or not isinstance(release.get("agentVersion"), str)
+        or type(release.get("releaseSequence")) is not int
+        or release["releaseSequence"] < 1
+        or not isinstance(release.get("artifactDigest"), str)
+        or DIGEST_RE.fullmatch(release["artifactDigest"]) is None
+        or not isinstance(release.get("componentSha"), str)
+        or COMPONENT_RE.fullmatch(release["componentSha"]) is None
+        or not isinstance(release.get("configSchema"), str)
+        or re.fullmatch(r"[1-9][0-9]*", release["configSchema"]) is None
+        or not isinstance(release.get("publisherKeyId"), str)
+        or not release["publisherKeyId"]
+    ):
+        raise ConfigStreamError("board runtime release identity is invalid")
+    return dict(identity)
 
 
 class ConfigStreamOrchestrator:
@@ -1060,6 +1514,17 @@ class ConfigStreamOrchestrator:
 
     def _version_seed(self) -> int:
         return max(1, int(self.wall_clock().timestamp() * 1000))
+
+    def _restore_board(self, *, run_id: str) -> dict[str, Any]:
+        failure: BaseException | None = None
+        for attempt in range(2):
+            try:
+                return self.board.restore(run_id=run_id)
+            except BaseException as exc:
+                failure = exc
+                if attempt == 0:
+                    self.sleeper(1.0)
+        raise ConfigStreamError("board restoration RPC failed after retry") from failure
 
     def _journal_status(
         self, issued: IssuedCommand, *, space_id: int, device_id: str
@@ -1097,6 +1562,7 @@ class ConfigStreamOrchestrator:
                     raise ConfigStreamError("board command effect did not apply")
             projection = self.api.projection(space_id=space_id, device_id=device_id)
             twin = twin_domain(projection, domain)
+            shape = projection_shape(projection, domain)
             reported = twin.get("reportedState")
             complete = (
                 status == "SUCCEEDED"
@@ -1156,6 +1622,7 @@ class ConfigStreamOrchestrator:
                             "localObservationRevision": int(observation["revision"]),
                             "boardSettings": board_settings,
                             "boardSettingsSha256": board_settings_sha,
+                            "projectionShape": shape,
                             "queue": dict(queue),
                         }
             self.sleeper(1.0)
@@ -1173,10 +1640,21 @@ class ConfigStreamOrchestrator:
         deadline: float,
     ) -> dict[str, Any]:
         while self.monotonic() < deadline:
+            status = self._journal_status(
+                issued, space_id=space_id, device_id=device_id
+            )
+            if status in {"FAILED", "REJECTED", "ROLLED_BACK", "EXPIRED"}:
+                raise ConfigStreamError(
+                    "adaptive Fleet command reached a non-success terminal state"
+                )
+            if status != "SUCCEEDED":
+                self.sleeper(1.0)
+                continue
             board = self.board.inspect(run_id=run_id, command_id=issued.command_id)
             observation = board.get("observation") if isinstance(board, Mapping) else None
             projection = self.api.projection(space_id=space_id, device_id=device_id)
             twin = twin_domain(projection, "streaming")
+            shape = projection_shape(projection, "streaming")
             reported = twin.get("reportedState")
             if (
                 isinstance(observation, Mapping)
@@ -1186,9 +1664,13 @@ class ConfigStreamOrchestrator:
                 and isinstance(reported, Mapping)
                 and twin.get("desiredCommandId") == issued.command_id
                 and twin.get("reportedCommandId") == issued.command_id
+                and twin.get("desiredSequence") == issued.sequence
+                and twin.get("reportedSequence") == issued.sequence
                 and twin.get("convergenceStatus") == "CONVERGED"
                 and twin.get("reportedRevision") == observation["revision"]
                 and reported == observation.get("reportedState")
+                and reported.get("encoder") == "x264enc"
+                and reported.get("health") == "STREAM_CONTINUOUS"
                 and type(reported.get("appliedBitrateKbps")) is int
                 and bitrate_test(reported["appliedBitrateKbps"])
             ):
@@ -1204,6 +1686,8 @@ class ConfigStreamOrchestrator:
                             reported.get("lastAdjustmentReason") or ""
                         ),
                         "health": str(reported.get("health") or ""),
+                        "encoder": str(reported.get("encoder") or ""),
+                        "projectionShape": shape,
                         "queue": queue,
                     }
             self.sleeper(1.0)
@@ -1221,6 +1705,16 @@ class ConfigStreamOrchestrator:
         identity = _mapping(manifest.get("identity"), "Fleet manifest identity")
         scenario = _mapping(manifest.get("scenario"), "Fleet manifest scenario")
         release = _mapping(scenario.get("release"), "Fleet manifest release")
+        if scenario.get("type") != "commit":
+            raise ConfigStreamError("config-stream E2E requires a commit manifest")
+        try:
+            expected_release_command_id = str(
+                uuid.UUID(str(scenario.get("expectedCommandId") or ""))
+            )
+        except ValueError as exc:
+            raise ConfigStreamError("commit manifest command identity is invalid") from exc
+        if expected_release_command_id != scenario.get("expectedCommandId"):
+            raise ConfigStreamError("commit manifest command identity is invalid")
         space_id = _positive_int(identity.get("spaceId"), "spaceId")
         device_id = identity.get("deviceId")
         if (
@@ -1230,15 +1724,20 @@ class ConfigStreamOrchestrator:
         ):
             raise ConfigStreamError("Fleet manifest device identity is invalid")
         deadline = self.monotonic() + max(30, min(int(wait_seconds), 900))
-        prepared = False
+        cleanup_required = False
+        prep: dict[str, Any] | None = None
         baseline: dict[str, Any] | None = None
+        runtime_identity: dict[str, Any] | None = None
         primary: BaseException | None = None
         result: dict[str, Any] | None = None
         try:
+            # The board may durably mutate state and then lose its SSH reply.
+            # Arm cleanup before dispatch so that ambiguous prepare outcomes
+            # always reconcile through the board-owned journal.
+            cleanup_required = True
             prep = self.board.prepare(
                 run_id=run_id, manifest_sha256=manifest_sha256
             )
-            prepared = True
             if (
                 prep.get("schemaVersion") != 1
                 or prep.get("runId") != run_id
@@ -1247,29 +1746,113 @@ class ConfigStreamOrchestrator:
                 or prep.get("connectivityShim") != "scoped-iw-ping"
                 or not SHA256_RE.fullmatch(str(prep.get("configBeforeSha256") or ""))
                 or not SHA256_RE.fullmatch(str(prep.get("configTestSha256") or ""))
+                or prep.get("exclusiveLease") is not True
+                or prep.get("deadmanArmed") is not True
             ):
                 raise ConfigStreamError("board preparation evidence is invalid")
+            runtime_identity = validate_runtime_identity(
+                prep.get("runtimeIdentity"), scenario=scenario
+            )
             validate_queue_drained(prep.get("queue"))
             baseline = validate_baseline(prep.get("baseline"))
-            expired_predecessors: list[dict[str, Any]] = []
+            terminal_statuses = {
+                "SUCCEEDED",
+                "FAILED",
+                "REJECTED",
+                "ROLLED_BACK",
+                "EXPIRED",
+            }
+            journal_by_sequence: dict[int, dict[str, Any]] = {}
+            seen_command_ids: set[str] = set()
+            release_command: dict[str, Any] | None = None
             for item in self.api.commands(space_id=space_id, device_id=device_id):
-                if item.get("status") != "EXPIRED":
-                    continue
                 try:
-                    expired_id = str(uuid.UUID(str(item.get("commandId") or "")))
+                    command_id = str(uuid.UUID(str(item.get("commandId") or "")))
                 except ValueError as exc:
-                    raise ConfigStreamError("expired predecessor identity is invalid") from exc
-                expired_sequence = _positive_int(
-                    item.get("sequence"), "expired predecessor sequence"
+                    raise ConfigStreamError("Fleet journal command identity is invalid") from exc
+                sequence = _positive_int(item.get("sequence"), "Fleet journal sequence")
+                command_type = item.get("type")
+                status = item.get("status")
+                if (
+                    command_id != item.get("commandId")
+                    or command_id in seen_command_ids
+                    or sequence in journal_by_sequence
+                    or not isinstance(command_type, str)
+                    or not command_type
+                    or not isinstance(status, str)
+                ):
+                    raise ConfigStreamError("Fleet command journal identity is ambiguous")
+                seen_command_ids.add(command_id)
+                journal_by_sequence[sequence] = {
+                    "commandId": command_id,
+                    "sequence": sequence,
+                    "type": command_type,
+                    "status": status,
+                    "expiresAt": item.get("expiresAt"),
+                }
+                if command_id == expected_release_command_id:
+                    if release_command is not None:
+                        raise ConfigStreamError("commit Fleet command is duplicated")
+                    if (
+                        command_type != "AGENT_UPDATE"
+                        or status != "SUCCEEDED"
+                    ):
+                        raise ConfigStreamError("commit Fleet command is not successful")
+                    release_command = {
+                        "commandId": expected_release_command_id,
+                        "sequence": sequence,
+                        "type": "AGENT_UPDATE",
+                        "status": "SUCCEEDED",
+                    }
+            if release_command is None:
+                raise ConfigStreamError("commit Fleet command is absent from the journal")
+            if any(
+                sequence > release_command["sequence"]
+                for sequence in journal_by_sequence
+            ):
+                raise ConfigStreamError("commit Fleet command is not the journal head")
+            prior_rollback_raw = journal_by_sequence.get(
+                release_command["sequence"] - 1
+            )
+            if (
+                prior_rollback_raw is None
+                or prior_rollback_raw["type"] != "AGENT_UPDATE"
+                or prior_rollback_raw["status"] != "ROLLED_BACK"
+            ):
+                raise ConfigStreamError(
+                    "prior rollback command is not adjacent to the commit command"
                 )
+            prior_rollback_command = {
+                key: prior_rollback_raw[key]
+                for key in ("commandId", "sequence", "type", "status")
+            }
+            historical = [
+                item
+                for sequence, item in journal_by_sequence.items()
+                if sequence < release_command["sequence"]
+            ]
+            if any(item["status"] not in terminal_statuses for item in historical):
+                raise ConfigStreamError("pre-commit Fleet command is not terminal")
+            expired_predecessors = []
+            for item in sorted(historical, key=lambda value: value["sequence"]):
+                if item["status"] != "EXPIRED":
+                    continue
+                expires_at = item.get("expiresAt")
+                if _utc_timestamp(
+                    expires_at, "expired predecessor expiresAt"
+                ) > self.wall_clock():
+                    raise ConfigStreamError("expired predecessor deadline is in the future")
                 expired_predecessors.append(
                     {
-                        "commandId": expired_id,
-                        "sequence": expired_sequence,
+                        "commandId": item["commandId"],
+                        "sequence": item["sequence"],
+                        "type": item["type"],
                         "status": "EXPIRED",
+                        "expiresAt": expires_at,
                     }
                 )
-            expired_predecessors.sort(key=lambda item: item["sequence"])
+            if not expired_predecessors:
+                raise ConfigStreamError("expired predecessor evidence is unavailable")
             version = self._version_seed()
             baseline_bitrate = int(baseline["video"]["bitrateKbps"])
             changed_bitrate = (
@@ -1290,6 +1873,8 @@ class ConfigStreamOrchestrator:
                 payload=config_payload,
                 desired_state=config_payload,
             )
+            if issued_config.sequence != release_command["sequence"] + 1:
+                raise ConfigStreamError("fresh Fleet command does not follow the commit")
             config = self._wait_command(
                 issued_config,
                 space_id=space_id,
@@ -1327,6 +1912,8 @@ class ConfigStreamOrchestrator:
                 payload=restore_payload,
                 desired_state=restore_payload,
             )
+            if issued_restore.sequence != issued_config.sequence + 1:
+                raise ConfigStreamError("fresh Fleet command sequence is not contiguous")
             config_restore = self._wait_command(
                 issued_restore,
                 space_id=space_id,
@@ -1365,6 +1952,8 @@ class ConfigStreamOrchestrator:
                 payload=adaptive_payload,
                 desired_state=adaptive_payload,
             )
+            if issued_adaptive.sequence != issued_restore.sequence + 1:
+                raise ConfigStreamError("fresh Fleet command sequence is not contiguous")
             adaptive = self._wait_command(
                 issued_adaptive,
                 space_id=space_id,
@@ -1380,6 +1969,11 @@ class ConfigStreamOrchestrator:
                     "appliedBitrateKbps"
                 ),
                 "health": adaptive["reportedState"].get("health"),
+                "encoder": adaptive["reportedState"].get("encoder"),
+                "lastAdjustmentReason": adaptive["reportedState"].get(
+                    "lastAdjustmentReason"
+                ),
+                "projectionShape": adaptive["projectionShape"],
                 "queue": adaptive["queue"],
             }
             initial_applied = initial_state["appliedBitrateKbps"]
@@ -1388,6 +1982,11 @@ class ConfigStreamOrchestrator:
                 or not adaptive_payload["minBitrateKbps"]
                 <= initial_applied
                 <= adaptive_payload["maxBitrateKbps"]
+                or adaptive["reportedState"].get("mode") != "ADAPTIVE"
+                or adaptive["reportedState"].get("encoder") != "x264enc"
+                or adaptive["reportedState"].get("health") != "STREAM_CONTINUOUS"
+                or adaptive["reportedState"].get("lastAdjustmentReason")
+                != "policy_activated"
             ):
                 raise ConfigStreamError("adaptive initial bitrate readback is invalid")
 
@@ -1404,6 +2003,8 @@ class ConfigStreamOrchestrator:
                 bitrate_test=lambda bitrate: bitrate < initial_applied,
                 deadline=deadline,
             )
+            if "connectivity_poor" not in poor["lastAdjustmentReason"].split(","):
+                raise ConfigStreamError("adaptive poor-link reason is invalid")
             self.board.set_link(run_id=run_id, quality="GOOD")
             recovered = self._wait_adaptation(
                 issued_adaptive,
@@ -1414,6 +2015,8 @@ class ConfigStreamOrchestrator:
                 bitrate_test=lambda bitrate: bitrate > poor["appliedBitrateKbps"],
                 deadline=deadline,
             )
+            if recovered["lastAdjustmentReason"] != "healthy_recovery":
+                raise ConfigStreamError("adaptive recovery reason is invalid")
             disabled_payload = {"policyVersion": version + 3, "mode": "DISABLED"}
             issued_disabled = self.api.issue(
                 space_id=space_id,
@@ -1422,6 +2025,8 @@ class ConfigStreamOrchestrator:
                 payload=disabled_payload,
                 desired_state=disabled_payload,
             )
+            if issued_disabled.sequence != issued_adaptive.sequence + 1:
+                raise ConfigStreamError("fresh Fleet command sequence is not contiguous")
             disabled = self._wait_command(
                 issued_disabled,
                 space_id=space_id,
@@ -1431,8 +2036,24 @@ class ConfigStreamOrchestrator:
                 run_id=run_id,
                 deadline=deadline,
             )
-            if disabled["reportedState"].get("mode") != "DISABLED":
+            if (
+                disabled["reportedState"].get("mode") != "DISABLED"
+                or disabled["reportedState"].get("encoder") != "x264enc"
+                or disabled["reportedState"].get("health") != "STREAM_CONTINUOUS"
+                or disabled["reportedState"].get("lastAdjustmentReason")
+                != "policy_disabled"
+            ):
                 raise ConfigStreamError("stream policy did not disable")
+            projection_shapes = {
+                config["projectionShape"],
+                config_restore["projectionShape"],
+                adaptive["projectionShape"],
+                poor["projectionShape"],
+                recovered["projectionShape"],
+                disabled["projectionShape"],
+            }
+            if len(projection_shapes) != 1:
+                raise ConfigStreamError("Fleet twin projection shape changed during run")
             result = {
                 "schemaVersion": SCHEMA_VERSION,
                 "kind": KIND,
@@ -1445,12 +2066,25 @@ class ConfigStreamOrchestrator:
                     "componentSha": release.get("componentSha"),
                     "bomDigest": scenario.get("expectedBomDigest"),
                     "configSchema": release.get("configSchema"),
+                    "releaseSequence": release.get("releaseSequence"),
+                    "artifactDigest": release.get("artifactDigest"),
+                    "publisherKeyId": release.get("publisherKeyId"),
+                    "runtimeIdentity": runtime_identity,
                 },
                 "identity": dict(identity),
+                "releaseCommand": release_command,
+                "priorRollbackCommand": prior_rollback_command,
                 "expiredPredecessors": expired_predecessors,
+                "projectionShape": next(iter(projection_shapes)),
                 "config": {
                     "baseline": baseline,
                     "changedBitrateKbps": changed_bitrate,
+                    "fieldCoverage": {
+                        "model": "PRESERVED_WITHOUT_ACTIVATION",
+                        "labels": "PRESERVED_WITHOUT_ACTIVATION",
+                        "clipPolicy": "SAME_VALUE_RECONCILED",
+                        "video": "CHANGED_AND_RESTORED",
+                    },
                     "apply": config,
                     "restore": config_restore,
                 },
@@ -1477,9 +2111,9 @@ class ConfigStreamOrchestrator:
                 "gates": {
                     "releaseBound": True,
                     "cameraIndependent": True,
-                    "modelConfigurationPreserved": True,
-                    "labelConfigurationPreserved": True,
-                    "clipConfigurationPreserved": True,
+                    "modelConfigurationPreservedWithoutActivation": True,
+                    "labelConfigurationPreservedWithoutActivation": True,
+                    "clipPolicyReconciled": True,
                     "videoChangedAndRestored": True,
                     "ackReceivedToApplied": True,
                     "twinsConverged": True,
@@ -1511,19 +2145,30 @@ class ConfigStreamOrchestrator:
         except BaseException as exc:
             primary = exc
         finally:
-            if prepared:
+            if cleanup_required:
                 try:
-                    restored = self.board.restore(run_id=run_id)
+                    restored = self._restore_board(run_id=run_id)
+                    no_mutation = restored.get("noMutation") is True
                     valid_restoration = (
                         restored.get("schemaVersion") != 1
                         or restored.get("runId") != run_id
                         or restored.get("restored") is not True
                         or restored.get("exactRestoration") is not True
-                        or restored.get("runtimeRestarted") is not True
-                        or restored.get("configSha256")
-                        != prep.get("configBeforeSha256")
+                        or restored.get("exclusiveLeaseReleased") is not True
+                        or restored.get("deadmanDisarmed") is not True
                     )
-                    if baseline is not None:
+                    if prep is not None:
+                        valid_restoration = valid_restoration or (
+                            no_mutation
+                            or restored.get("runtimeRestarted") is not True
+                            or restored.get("configSha256")
+                            != prep.get("configBeforeSha256")
+                        )
+                    elif not no_mutation:
+                        valid_restoration = valid_restoration or (
+                            restored.get("runtimeRestarted") is not True
+                        )
+                    if baseline is not None and not no_mutation:
                         restored_settings = _mapping(
                             restored.get("settings"),
                             "restored settings readback",
@@ -1537,6 +2182,17 @@ class ConfigStreamOrchestrator:
                             ).hexdigest()
                             != restored.get("settingsSha256")
                         )
+                    if not no_mutation:
+                        restored_identity = validate_runtime_identity(
+                            restored.get("runtimeIdentity"), scenario=scenario
+                        )
+                        if runtime_identity is not None:
+                            valid_restoration = valid_restoration or (
+                                restored_identity["release"]
+                                != runtime_identity["release"]
+                                or restored_identity["activeSlot"]
+                                != runtime_identity["activeSlot"]
+                            )
                     if valid_restoration:
                         raise ConfigStreamError("board restoration evidence is invalid")
                     if result is not None:
