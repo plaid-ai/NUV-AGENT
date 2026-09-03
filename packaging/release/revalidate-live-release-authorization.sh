@@ -41,4 +41,5 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
   --signer-directory "$script_dir/trusted-tag-signers" \
   --candidate-harness "$publisher_root/packaging/dev/test-iq9075.sh" \
   --candidate-fleet-runner "$publisher_root/packaging/dev/run-iq9075-fleet-e2e.py" \
+  --candidate-config-stream-runner "$publisher_root/packaging/dev/run-iq9075-config-stream-e2e.py" \
   --candidate-board-tool "$publisher_root/packaging/dev/iq9075-board-e2e.py"

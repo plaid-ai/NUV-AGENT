@@ -233,6 +233,7 @@ jobs:
             --signer-directory publisher/packaging/release/trusted-tag-signers \
             --candidate-harness release-source/packaging/dev/test-iq9075.sh \
             --candidate-fleet-runner release-source/packaging/dev/run-iq9075-fleet-e2e.py \
+            --candidate-config-stream-runner release-source/packaging/dev/run-iq9075-config-stream-e2e.py \
             --candidate-board-tool release-source/packaging/dev/iq9075-board-e2e.py \
             --github-output "$GITHUB_OUTPUT"
 

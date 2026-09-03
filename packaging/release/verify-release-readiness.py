@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import types
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -407,6 +408,887 @@ def _fleet_runtime_gate(
     }
 
 
+def _validated_config_stream_gate(
+    *,
+    config_stream_evidence: dict[str, Any],
+    fleet_manifest: dict[str, Any],
+    fleet_manifest_raw: bytes,
+    fleet_evidence: dict[str, Any],
+    fleet_evidence_raw: bytes,
+    cleanup_evidence: dict[str, Any],
+    rollback_manifest: dict[str, Any],
+    rollback_evidence: dict[str, Any],
+    candidate_config_stream_runner: Path,
+) -> tuple[dict[str, Any], str]:
+    publisher_runner = (
+        Path(__file__).resolve().parents[1]
+        / "dev/run-iq9075-config-stream-e2e.py"
+    )
+    publisher_raw = _regular_bytes(publisher_runner)
+    candidate_raw = _regular_bytes(candidate_config_stream_runner)
+    runner_sha256 = hashlib.sha256(publisher_raw).hexdigest()
+    if candidate_raw != publisher_raw:
+        raise ReadinessError(
+            "IQ9075 config-stream runner differs from trusted publisher"
+        )
+    try:
+        def exact(value: object, fields: set[str], label: str) -> dict[str, Any]:
+            if not isinstance(value, dict) or set(value) != fields:
+                raise ReadinessError(f"IQ9075 config-stream {label} is invalid")
+            return value
+
+        def canonical_config(value: dict[str, Any]) -> bytes:
+            try:
+                return (
+                    json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise ReadinessError(
+                    "IQ9075 config-stream value is not canonical JSON"
+                ) from exc
+
+        def config_digest(value: dict[str, Any]) -> str:
+            encoded = canonical_config(value)[:-1]
+            return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+        def baseline(value: object) -> dict[str, Any]:
+            item = exact(
+                value,
+                {"model", "labels", "clip", "video"},
+                "settings baseline",
+            )
+            model = exact(
+                item.get("model"),
+                {
+                    "pointer",
+                    "configuredDigest",
+                    "artifactDigest",
+                    "artifactVerified",
+                    "runtimeEnabled",
+                    "runtimeBackend",
+                },
+                "model baseline",
+            )
+            labels = exact(
+                item.get("labels"),
+                {"inspection", "anomaly"},
+                "label baseline",
+            )
+            clip = exact(
+                item.get("clip"),
+                {"enabled", "preSeconds", "postSeconds"},
+                "clip baseline",
+            )
+            video = exact(
+                item.get("video"),
+                {"width", "height", "fps", "bitrateKbps"},
+                "video baseline",
+            )
+            if (
+                not isinstance(model.get("pointer"), str)
+                or not model["pointer"]
+                or any(
+                    digest is not None
+                    and (
+                        not isinstance(digest, str)
+                        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                        is None
+                    )
+                    for digest in (
+                        model.get("configuredDigest"),
+                        model.get("artifactDigest"),
+                    )
+                )
+                or type(model.get("artifactVerified")) is not bool
+                or type(model.get("runtimeEnabled")) is not bool
+                or not isinstance(model.get("runtimeBackend"), str)
+                or not model["runtimeBackend"]
+                or (
+                    model["artifactVerified"] is True
+                    and model["artifactDigest"] is None
+                )
+                or any(
+                    not isinstance(values, list)
+                    or any(
+                        not isinstance(entry, str) or not entry
+                        for entry in values
+                    )
+                    for values in labels.values()
+                )
+                or type(clip.get("enabled")) is not bool
+                or type(clip.get("preSeconds")) is not int
+                or type(clip.get("postSeconds")) is not int
+                or any(type(video.get(name)) is not int for name in video)
+            ):
+                raise ReadinessError(
+                    "IQ9075 config-stream settings baseline is invalid"
+                )
+            return item
+
+        def queue_drained(value: object) -> dict[str, Any]:
+            fields = {
+                "inboxPendingRows",
+                "observationPendingRows",
+                "observationReservedRows",
+                "observationDlqRows",
+            }
+            queue = exact(value, fields, "command queue")
+            if any(type(queue.get(name)) is not int or queue[name] != 0 for name in fields):
+                raise ReadinessError(
+                    "IQ9075 config-stream command queue is not drained"
+                )
+            return queue
+
+        def runtime_identity(
+            value: object,
+            *,
+            release: dict[str, Any],
+            bom_digest: object,
+        ) -> dict[str, Any]:
+            item = exact(
+                value,
+                {
+                    "activeSlot",
+                    "processActiveSlot",
+                    "processExpectedBomDigest",
+                    "servicePid",
+                    "releaseMarkerSha256",
+                    "buildInfoSha256",
+                    "release",
+                },
+                "runtime release identity",
+            )
+            if not isinstance(bom_digest, str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", bom_digest
+            ) is None:
+                raise ReadinessError(
+                    "IQ9075 config-stream runtime BOM identity is invalid"
+                )
+            slot = "releases/" + bom_digest[7:]
+            marker = {"schemaVersion": 2, "bomDigest": bom_digest, **release}
+            if (
+                item.get("activeSlot") != slot
+                or item.get("processActiveSlot") != slot
+                or item.get("processExpectedBomDigest") != bom_digest
+                or type(item.get("servicePid")) is not int
+                or item["servicePid"] < 2
+                or not isinstance(item.get("releaseMarkerSha256"), str)
+                or SHA256.fullmatch(item["releaseMarkerSha256"]) is None
+                or not isinstance(item.get("buildInfoSha256"), str)
+                or SHA256.fullmatch(item["buildInfoSha256"]) is None
+                or item.get("release") != marker
+            ):
+                raise ReadinessError(
+                    "IQ9075 config-stream runtime release identity is invalid"
+                )
+            return item
+
+        def command(value: object, command_type: str) -> dict[str, Any]:
+            item = exact(
+                value,
+                {
+                    "commandId",
+                    "sequence",
+                    "type",
+                    "lifecycleAckStatuses",
+                    "effectPhase",
+                    "reportedState",
+                    "reportedRevision",
+                    "localObservationRevision",
+                    "boardSettings",
+                    "boardSettingsSha256",
+                    "projectionShape",
+                    "queue",
+                },
+                f"{command_type} command",
+            )
+            try:
+                command_id = str(uuid.UUID(str(item.get("commandId") or "")))
+            except ValueError as exc:
+                raise ReadinessError(
+                    "IQ9075 config-stream command identity is invalid"
+                ) from exc
+            board_settings = baseline(item.get("boardSettings"))
+            settings_sha = item.get("boardSettingsSha256")
+            if (
+                command_id != item.get("commandId")
+                or item.get("type") != command_type
+                or item.get("lifecycleAckStatuses")
+                != ["RECEIVED", "IN_PROGRESS", "SUCCEEDED"]
+                or item.get("effectPhase") != "APPLIED"
+                or type(item.get("sequence")) is not int
+                or item["sequence"] < 1
+                or type(item.get("reportedRevision")) is not int
+                or item["reportedRevision"] < 1
+                or type(item.get("localObservationRevision")) is not int
+                or item["localObservationRevision"] < 1
+                or item["reportedRevision"]
+                != item["localObservationRevision"]
+                or item.get("projectionShape")
+                != document.get("projectionShape")
+                or not isinstance(item.get("reportedState"), dict)
+                or not isinstance(settings_sha, str)
+                or SHA256.fullmatch(settings_sha) is None
+                or hashlib.sha256(
+                    canonical_config(board_settings)
+                ).hexdigest()
+                != settings_sha
+            ):
+                raise ReadinessError(
+                    "IQ9075 config-stream command proof is invalid"
+                )
+            queue_drained(item.get("queue"))
+            return item
+
+        document = exact(
+            config_stream_evidence,
+            {
+                "schemaVersion",
+                "kind",
+                "runId",
+                "generatedAt",
+                "source",
+                "identity",
+                "releaseCommand",
+                "priorRollbackCommand",
+                "expiredPredecessors",
+                "projectionShape",
+                "config",
+                "stream",
+                "boardPreparation",
+                "gates",
+                "modelQualification",
+                "cleanup",
+            },
+            "evidence root",
+        )
+        identity = fleet_manifest.get("identity")
+        scenario = fleet_manifest.get("scenario")
+        release = scenario.get("release") if isinstance(scenario, dict) else None
+        source = exact(
+            document.get("source"),
+            {
+                "manifestSha256",
+                "otaEvidenceSha256",
+                "agentVersion",
+                "componentSha",
+                "bomDigest",
+                "configSchema",
+                "releaseSequence",
+                "artifactDigest",
+                "publisherKeyId",
+                "runtimeIdentity",
+            },
+            "source",
+        )
+        expected_source = {
+            "manifestSha256": hashlib.sha256(fleet_manifest_raw).hexdigest(),
+            "otaEvidenceSha256": hashlib.sha256(fleet_evidence_raw).hexdigest(),
+            "agentVersion": release.get("agentVersion")
+            if isinstance(release, dict)
+            else None,
+            "componentSha": release.get("componentSha")
+            if isinstance(release, dict)
+            else None,
+            "bomDigest": scenario.get("expectedBomDigest")
+            if isinstance(scenario, dict)
+            else None,
+            "configSchema": release.get("configSchema")
+            if isinstance(release, dict)
+            else None,
+            "releaseSequence": release.get("releaseSequence")
+            if isinstance(release, dict)
+            else None,
+            "artifactDigest": release.get("artifactDigest")
+            if isinstance(release, dict)
+            else None,
+            "publisherKeyId": release.get("publisherKeyId")
+            if isinstance(release, dict)
+            else None,
+            "runtimeIdentity": source.get("runtimeIdentity"),
+        }
+        if (
+            type(document.get("schemaVersion")) is not int
+            or document.get("schemaVersion") != 1
+            or document.get("kind")
+            != "nuvion-iq9075-config-stream-e2e-evidence"
+            or document.get("runId") != fleet_manifest.get("runId")
+            or not isinstance(identity, dict)
+            or document.get("identity") != identity
+            or source != expected_source
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream source binding is invalid"
+            )
+        if (
+            not isinstance(release, dict)
+            or not isinstance(scenario, dict)
+            or set(release)
+            != {
+                "agentVersion",
+                "releaseSequence",
+                "artifactDigest",
+                "componentSha",
+                "configSchema",
+                "publisherKeyId",
+            }
+            or document.get("projectionShape") not in {"single", "domained"}
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream release projection is invalid"
+            )
+        initial_runtime_identity = runtime_identity(
+            source.get("runtimeIdentity"),
+            release=release,
+            bom_digest=scenario.get("expectedBomDigest"),
+        )
+
+        fleet_generated = _timestamp(
+            fleet_evidence.get("generatedAt"), label="Fleet result generation"
+        )
+        config_generated = _timestamp(
+            document.get("generatedAt"), label="config-stream result generation"
+        )
+        fleet_cleanup_completed = _timestamp(
+            cleanup_evidence.get("completedAt"), label="Fleet cleanup completion"
+        )
+        if not fleet_generated <= config_generated <= fleet_cleanup_completed:
+            raise ReadinessError(
+                "IQ9075 config-stream and cleanup ordering is invalid"
+            )
+
+        def release_journal_command(
+            value: object,
+            *,
+            status: str,
+            label: str,
+        ) -> dict[str, Any]:
+            item = exact(
+                value,
+                {"commandId", "sequence", "type", "status"},
+                label,
+            )
+            try:
+                command_id = str(uuid.UUID(str(item.get("commandId") or "")))
+            except ValueError as exc:
+                raise ReadinessError(
+                    f"IQ9075 config-stream {label} identity is invalid"
+                ) from exc
+            if (
+                command_id != item.get("commandId")
+                or type(item.get("sequence")) is not int
+                or item["sequence"] < 1
+                or item.get("type") != "AGENT_UPDATE"
+                or item.get("status") != status
+            ):
+                raise ReadinessError(
+                    f"IQ9075 config-stream {label} proof is invalid"
+                )
+            return item
+
+        release_command = release_journal_command(
+            document.get("releaseCommand"),
+            status="SUCCEEDED",
+            label="committed release command",
+        )
+        prior_rollback_command = release_journal_command(
+            document.get("priorRollbackCommand"),
+            status="ROLLED_BACK",
+            label="prior rollback command",
+        )
+        commit_scenario = fleet_manifest.get("scenario")
+        commit_updater = fleet_evidence.get("updater")
+        commit_update = (
+            commit_updater.get("update")
+            if isinstance(commit_updater, dict)
+            else None
+        )
+        rollback_scenario = rollback_manifest.get("scenario")
+        rollback_updater = rollback_evidence.get("updater")
+        rollback_update = (
+            rollback_updater.get("update")
+            if isinstance(rollback_updater, dict)
+            else None
+        )
+        if (
+            not isinstance(commit_scenario, dict)
+            or not isinstance(commit_update, dict)
+            or not isinstance(rollback_scenario, dict)
+            or not isinstance(rollback_update, dict)
+            or release_command["commandId"]
+            != commit_scenario.get("expectedCommandId")
+            or release_command["commandId"] != commit_update.get("commandId")
+            or release_command["sequence"] != commit_update.get("sequence")
+            or prior_rollback_command["commandId"]
+            != rollback_scenario.get("expectedCommandId")
+            or prior_rollback_command["commandId"]
+            != rollback_update.get("commandId")
+            or prior_rollback_command["sequence"]
+            != rollback_update.get("sequence")
+            or prior_rollback_command["sequence"] + 1
+            != release_command["sequence"]
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream release command chain is invalid"
+            )
+
+        preparation = exact(
+            document.get("boardPreparation"),
+            {
+                "syntheticSource",
+                "connectivityShim",
+                "configBeforeSha256",
+                "configTestSha256",
+            },
+            "board preparation",
+        )
+        if (
+            preparation.get("syntheticSource") != "videotestsrc"
+            or preparation.get("connectivityShim") != "scoped-iw-ping"
+            or not isinstance(preparation.get("configBeforeSha256"), str)
+            or SHA256.fullmatch(preparation["configBeforeSha256"]) is None
+            or not isinstance(preparation.get("configTestSha256"), str)
+            or SHA256.fullmatch(preparation["configTestSha256"]) is None
+            or preparation["configBeforeSha256"]
+            == preparation["configTestSha256"]
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream synthetic preparation proof is invalid"
+            )
+
+        config = exact(
+            document.get("config"),
+            {
+                "baseline",
+                "changedBitrateKbps",
+                "fieldCoverage",
+                "apply",
+                "restore",
+            },
+            "CONFIG_APPLY evidence",
+        )
+        if config.get("fieldCoverage") != {
+            "model": "PRESERVED_WITHOUT_ACTIVATION",
+            "labels": "PRESERVED_WITHOUT_ACTIVATION",
+            "clipPolicy": "SAME_VALUE_RECONCILED",
+            "video": "CHANGED_AND_RESTORED",
+        }:
+            raise ReadinessError(
+                "IQ9075 CONFIG_APPLY field coverage claim is invalid"
+            )
+        baseline_settings = baseline(config.get("baseline"))
+        changed_bitrate = config.get("changedBitrateKbps")
+        if (
+            type(changed_bitrate) is not int
+            or changed_bitrate < 1
+            or changed_bitrate == baseline_settings["video"]["bitrateKbps"]
+        ):
+            raise ReadinessError(
+                "IQ9075 CONFIG_APPLY video delta is invalid"
+            )
+        apply = command(config.get("apply"), "CONFIG_APPLY")
+        restore = command(config.get("restore"), "CONFIG_APPLY")
+        apply_state = apply["reportedState"]
+        restore_state = restore["reportedState"]
+        apply_payload = {
+            "configVersion": apply_state.get("configVersion"),
+            "activation": "IMMEDIATE",
+            "clip": baseline_settings["clip"],
+            "video": {
+                **baseline_settings["video"],
+                "bitrateKbps": changed_bitrate,
+            },
+        }
+        restore_payload = {
+            "configVersion": restore_state.get("configVersion"),
+            "activation": "IMMEDIATE",
+            "clip": baseline_settings["clip"],
+            "video": baseline_settings["video"],
+        }
+        if (
+            type(apply_state.get("configVersion")) is not int
+            or apply_state["configVersion"] < 1
+            or restore_state.get("configVersion")
+            != apply_state["configVersion"] + 1
+            or any(apply_state.get(key) != value for key, value in apply_payload.items())
+            or any(
+                restore_state.get(key) != value
+                for key, value in restore_payload.items()
+            )
+            or apply_state.get("settingsDigest")
+            != config_digest(apply_payload)
+            or restore_state.get("settingsDigest")
+            != config_digest(restore_payload)
+            or apply_state.get("health") != "FUNCTIONAL_HEALTHY"
+            or restore_state.get("health") != "FUNCTIONAL_HEALTHY"
+            or apply_state.get("configSchema") != release.get("configSchema")
+            or restore_state.get("configSchema") != release.get("configSchema")
+            or apply["boardSettings"]
+            != {
+                **baseline_settings,
+                "video": {
+                    **baseline_settings["video"],
+                    "bitrateKbps": changed_bitrate,
+                },
+            }
+            or restore["boardSettings"] != baseline_settings
+        ):
+            raise ReadinessError(
+                "IQ9075 CONFIG_APPLY preservation or convergence proof is invalid"
+            )
+
+        stream = exact(
+            document.get("stream"),
+            {
+                "adaptiveCommand",
+                "initialGood",
+                "poor",
+                "recoveredGood",
+                "disabled",
+            },
+            "adaptive streaming evidence",
+        )
+        adaptive = exact(
+            stream.get("adaptiveCommand"),
+            {
+                "commandId",
+                "sequence",
+                "lifecycleAckStatuses",
+                "effectPhase",
+            },
+            "adaptive command",
+        )
+        try:
+            adaptive_id = str(uuid.UUID(str(adaptive.get("commandId") or "")))
+        except ValueError as exc:
+            raise ReadinessError(
+                "IQ9075 adaptive command identity is invalid"
+            ) from exc
+        initial = exact(
+            stream.get("initialGood"),
+            {
+                "policyRevision",
+                "appliedBitrateKbps",
+                "health",
+                "encoder",
+                "lastAdjustmentReason",
+                "projectionShape",
+                "queue",
+            },
+            "initial GOOD observation",
+        )
+
+        def adaptation(value: object, label: str) -> dict[str, Any]:
+            item = exact(
+                value,
+                {
+                    "policyRevision",
+                    "appliedBitrateKbps",
+                    "lastAdjustmentReason",
+                    "health",
+                    "encoder",
+                    "projectionShape",
+                    "queue",
+                },
+                label,
+            )
+            if (
+                type(item.get("policyRevision")) is not int
+                or item["policyRevision"] < 1
+                or type(item.get("appliedBitrateKbps")) is not int
+                or item["appliedBitrateKbps"] < 1
+                or not isinstance(item.get("lastAdjustmentReason"), str)
+                or not item["lastAdjustmentReason"]
+                or item.get("health") != "STREAM_CONTINUOUS"
+                or item.get("encoder") != "x264enc"
+                or item.get("projectionShape")
+                != document.get("projectionShape")
+            ):
+                raise ReadinessError(
+                    f"IQ9075 config-stream {label} is invalid"
+                )
+            queue_drained(item.get("queue"))
+            return item
+
+        poor = adaptation(stream.get("poor"), "POOR observation")
+        recovered = adaptation(
+            stream.get("recoveredGood"), "recovered GOOD observation"
+        )
+        disabled = command(stream.get("disabled"), "STREAM_POLICY")
+        if (
+            adaptive_id != adaptive.get("commandId")
+            or type(adaptive.get("sequence")) is not int
+            or adaptive["sequence"] < 1
+            or adaptive.get("lifecycleAckStatuses")
+            != ["RECEIVED", "IN_PROGRESS", "SUCCEEDED"]
+            or adaptive.get("effectPhase") != "APPLIED"
+            or type(initial.get("policyRevision")) is not int
+            or initial["policyRevision"] < 1
+            or type(initial.get("appliedBitrateKbps")) is not int
+            or initial["appliedBitrateKbps"] < 1
+            or initial.get("health") != "STREAM_CONTINUOUS"
+            or initial.get("encoder") != "x264enc"
+            or initial.get("lastAdjustmentReason") != "policy_activated"
+            or initial.get("projectionShape")
+            != document.get("projectionShape")
+            or not (
+                initial["policyRevision"]
+                < poor["policyRevision"]
+                < recovered["policyRevision"]
+            )
+            or not (
+                poor["appliedBitrateKbps"] < initial["appliedBitrateKbps"]
+                and recovered["appliedBitrateKbps"]
+                > poor["appliedBitrateKbps"]
+            )
+            or "connectivity_poor" not in poor["lastAdjustmentReason"]
+            or recovered["lastAdjustmentReason"] != "healthy_recovery"
+            or disabled["reportedState"].get("mode") != "DISABLED"
+            or disabled["reportedState"].get("encoder") != "x264enc"
+            or disabled["reportedState"].get("lastAdjustmentReason")
+            != "policy_disabled"
+            or disabled["reportedState"].get("health")
+            != "STREAM_CONTINUOUS"
+            or disabled["boardSettings"] != baseline_settings
+        ):
+            raise ReadinessError(
+                "IQ9075 adaptive streaming convergence proof is invalid"
+            )
+        queue_drained(initial.get("queue"))
+
+        anti_replay = fleet_evidence.get("antiReplay")
+        maximum_sequence = (
+            anti_replay.get("maximumCommandSequence")
+            if isinstance(anti_replay, dict)
+            else None
+        )
+        sequences = [
+            apply["sequence"],
+            restore["sequence"],
+            adaptive["sequence"],
+            disabled["sequence"],
+        ]
+        command_ids = [
+            apply["commandId"],
+            restore["commandId"],
+            adaptive["commandId"],
+            disabled["commandId"],
+        ]
+        if (
+            type(maximum_sequence) is not int
+            or maximum_sequence < 1
+            or sequences
+            != list(
+                range(
+                    release_command["sequence"] + 1,
+                    release_command["sequence"] + 5,
+                )
+            )
+            or len(set(command_ids)) != len(command_ids)
+            or maximum_sequence != release_command["sequence"]
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream command sequences are stale or reordered"
+            )
+
+        predecessors = document.get("expiredPredecessors")
+        predecessor_sequences: list[int] = []
+        if not isinstance(predecessors, list) or not predecessors:
+            raise ReadinessError(
+                "IQ9075 expired predecessor journal is invalid"
+            )
+        for predecessor in predecessors:
+            item = exact(
+                predecessor,
+                {"commandId", "sequence", "type", "status", "expiresAt"},
+                "expired predecessor",
+            )
+            try:
+                predecessor_id = str(
+                    uuid.UUID(str(item.get("commandId") or ""))
+                )
+            except ValueError as exc:
+                raise ReadinessError(
+                    "IQ9075 expired predecessor identity is invalid"
+                ) from exc
+            if (
+                predecessor_id != item.get("commandId")
+                or type(item.get("sequence")) is not int
+                or item["sequence"] < 1
+                or item.get("type")
+                not in {"AGENT_UPDATE", "CONFIG_APPLY", "STREAM_POLICY"}
+                or item.get("status") != "EXPIRED"
+                or _timestamp(
+                    item.get("expiresAt"),
+                    label="IQ9075 expired predecessor expiry",
+                )
+                > config_generated
+            ):
+                raise ReadinessError(
+                    "IQ9075 expired predecessor proof is invalid"
+                )
+            predecessor_sequences.append(item["sequence"])
+        if (
+            predecessor_sequences != sorted(set(predecessor_sequences))
+            or any(
+                sequence >= prior_rollback_command["sequence"]
+                for sequence in predecessor_sequences
+            )
+            or len(
+                {
+                    release_command["commandId"],
+                    prior_rollback_command["commandId"],
+                    *(
+                        str(item.get("commandId"))
+                        for item in predecessors
+                        if isinstance(item, dict)
+                    ),
+                }
+            )
+            != len(predecessors) + 2
+        ):
+            raise ReadinessError(
+                "IQ9075 expired predecessor ordering is invalid"
+            )
+
+        expected_gates = {
+            "releaseBound",
+            "cameraIndependent",
+            "modelConfigurationPreservedWithoutActivation",
+            "labelConfigurationPreservedWithoutActivation",
+            "clipPolicyReconciled",
+            "videoChangedAndRestored",
+            "ackReceivedToApplied",
+            "twinsConverged",
+            "adaptiveClosedLoop",
+            "commandQueuesDrained",
+            "encoderStartupBaselineRestored",
+            "exactBoardRestoration",
+        }
+        gates = exact(document.get("gates"), expected_gates, "gate set")
+        if any(gates.get(name) is not True for name in expected_gates):
+            raise ReadinessError("IQ9075 config-stream gates are incomplete")
+
+        cleanup = exact(
+            document.get("cleanup"),
+            {
+                "schemaVersion",
+                "runId",
+                "restored",
+                "idempotent",
+                "noMutation",
+                "exactRestoration",
+                "runtimeRestarted",
+                "configSha256",
+                "settings",
+                "settingsSha256",
+                "encoderStartupBitrateKbps",
+                "runtimeIdentity",
+                "exclusiveLeaseReleased",
+                "deadmanDisarmed",
+            },
+            "exact restoration",
+        )
+        cleanup_settings = baseline(cleanup.get("settings"))
+        cleanup_settings_sha = cleanup.get("settingsSha256")
+        restored_runtime_identity = runtime_identity(
+            cleanup.get("runtimeIdentity"),
+            release=release,
+            bom_digest=scenario.get("expectedBomDigest"),
+        )
+        initial_identity_without_pid = {
+            key: value
+            for key, value in initial_runtime_identity.items()
+            if key != "servicePid"
+        }
+        restored_identity_without_pid = {
+            key: value
+            for key, value in restored_runtime_identity.items()
+            if key != "servicePid"
+        }
+        if (
+            type(cleanup.get("schemaVersion")) is not int
+            or cleanup.get("schemaVersion") != 1
+            or cleanup.get("runId") != document["runId"]
+            or cleanup.get("restored") is not True
+            or cleanup.get("idempotent") is not False
+            or cleanup.get("noMutation") is not False
+            or cleanup.get("exactRestoration") is not True
+            or cleanup.get("runtimeRestarted") is not True
+            or cleanup.get("exclusiveLeaseReleased") is not True
+            or cleanup.get("deadmanDisarmed") is not True
+            or cleanup.get("configSha256")
+            != preparation["configBeforeSha256"]
+            or cleanup_settings != baseline_settings
+            or not isinstance(cleanup_settings_sha, str)
+            or hashlib.sha256(
+                canonical_config(cleanup_settings)
+            ).hexdigest()
+            != cleanup_settings_sha
+            or cleanup.get("encoderStartupBitrateKbps")
+            != baseline_settings["video"]["bitrateKbps"]
+            or restored_identity_without_pid != initial_identity_without_pid
+            or restored_runtime_identity["servicePid"]
+            == initial_runtime_identity["servicePid"]
+        ):
+            raise ReadinessError(
+                "IQ9075 config-stream exact restoration proof is invalid"
+            )
+
+        model = baseline_settings["model"]
+        expected_model_qualification = (
+            {
+                "status": "ARTIFACT_IDENTITY_VERIFIED",
+                "artifactDigest": model["artifactDigest"],
+            }
+            if model["artifactVerified"] is True
+            else (
+                {
+                    "status": "NOT_APPLICABLE_BACKEND_DISABLED",
+                    "artifactDigest": None,
+                }
+                if model["runtimeEnabled"] is False
+                or model["runtimeBackend"] == "none"
+                else {"status": "NOT_VERIFIED", "artifactDigest": None}
+            )
+        )
+        if document.get("modelQualification") != expected_model_qualification:
+            raise ReadinessError(
+                "IQ9075 model qualification claim is invalid"
+            )
+
+        gate = {
+            "runId": document["runId"],
+            "generatedAt": document["generatedAt"],
+            "identity": identity,
+            "source": source,
+            "releaseCommand": release_command,
+            "priorRollbackCommand": prior_rollback_command,
+            "projectionShape": document["projectionShape"],
+            "configSequences": [apply["sequence"], restore["sequence"]],
+            "streamSequences": [adaptive["sequence"], disabled["sequence"]],
+            "adaptiveRevisions": [
+                initial["policyRevision"],
+                poor["policyRevision"],
+                recovered["policyRevision"],
+            ],
+            "gates": gates,
+            "modelQualification": expected_model_qualification,
+        }
+    except Exception as exc:
+        raise ReadinessError("IQ9075 config-stream evidence is invalid") from exc
+    if not isinstance(gate, dict):
+        raise ReadinessError("IQ9075 config-stream gate is invalid")
+    return gate, runner_sha256
+
+
 def _validate_fleet_runtime_documents(
     *,
     policy_path: Path,
@@ -415,9 +1297,10 @@ def _validate_fleet_runtime_documents(
     summary: dict[str, Any],
     security: dict[str, Any],
     candidate_fleet_runner: Path,
+    candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
 ) -> dict[str, str]:
-    """Validate camera-independent OTA/rollback evidence for IQ9075."""
+    """Validate two-run rollback and committed-component Fleet evidence."""
 
     expected_summary_fields = {
         "schemaVersion",
@@ -425,58 +1308,98 @@ def _validate_fleet_runtime_documents(
         "agentVersion",
         "componentSha",
         "fleetRunnerSha256",
+        "configStreamRunnerSha256",
         "boardToolSha256",
-        "fleetManifest",
-        "fleetEvidence",
-        "cleanupEvidence",
+        "rollbackManifest",
+        "rollbackEvidence",
+        "rollbackCleanupEvidence",
+        "commitManifest",
+        "commitEvidence",
+        "configStreamEvidence",
+        "commitCleanupEvidence",
         "testedArtifact",
         "testedBom",
         "runtimeGate",
     }
     if set(summary) != expected_summary_fields or (
         type(summary.get("schemaVersion")) is not int
-        or summary.get("schemaVersion") != 2
+        or summary.get("schemaVersion") != 3
         or summary.get("kind")
         != "nuvion-iq9075-fleet-runtime-release-evidence"
         or summary.get("agentVersion") != version
         or summary.get("componentSha") != component_sha
         or not isinstance(summary.get("fleetRunnerSha256"), str)
         or not SHA256.fullmatch(summary["fleetRunnerSha256"])
+        or not isinstance(summary.get("configStreamRunnerSha256"), str)
+        or not SHA256.fullmatch(summary["configStreamRunnerSha256"])
         or not isinstance(summary.get("boardToolSha256"), str)
         or not SHA256.fullmatch(summary["boardToolSha256"])
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime evidence does not match schema v2"
+            "IQ9075 Fleet Runtime evidence does not match two-run schema v3"
         )
 
-    manifest_raw, _manifest_sha256 = _evidence_reference(
+    rollback_manifest_raw, _rollback_manifest_sha256 = _evidence_reference(
         policy_path.parent,
-        summary.get("fleetManifest"),
-        label="IQ9075 Fleet Runtime manifest",
+        summary.get("rollbackManifest"),
+        label="IQ9075 rollback manifest",
     )
-    evidence_raw, _evidence_sha256 = _evidence_reference(
+    rollback_evidence_raw, _rollback_evidence_sha256 = _evidence_reference(
         policy_path.parent,
-        summary.get("fleetEvidence"),
-        label="IQ9075 Fleet Runtime result",
+        summary.get("rollbackEvidence"),
+        label="IQ9075 rollback result",
     )
-    cleanup_raw, _cleanup_sha256 = _evidence_reference(
+    rollback_cleanup_raw, _rollback_cleanup_sha256 = _evidence_reference(
         policy_path.parent,
-        summary.get("cleanupEvidence"),
-        label="IQ9075 Fleet Runtime cleanup evidence",
+        summary.get("rollbackCleanupEvidence"),
+        label="IQ9075 rollback cleanup evidence",
+    )
+    commit_manifest_raw, _commit_manifest_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("commitManifest"),
+        label="IQ9075 commit manifest",
+    )
+    commit_evidence_raw, _commit_evidence_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("commitEvidence"),
+        label="IQ9075 commit result",
+    )
+    config_stream_raw, _config_stream_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("configStreamEvidence"),
+        label="IQ9075 config-stream evidence",
+    )
+    commit_cleanup_raw, _commit_cleanup_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("commitCleanupEvidence"),
+        label="IQ9075 commit cleanup evidence",
     )
     bom_raw, tested_bom_sha256 = _evidence_reference(
         policy_path.parent,
         summary.get("testedBom"),
         label="IQ9075 Fleet Runtime tested BOM",
     )
-    manifest = _strict_canonical_object(
-        manifest_raw, label="IQ9075 Fleet Runtime manifest"
+
+    rollback_manifest = _strict_canonical_object(
+        rollback_manifest_raw, label="IQ9075 rollback manifest"
     )
-    fleet_evidence = _strict_canonical_object(
-        evidence_raw, label="IQ9075 Fleet Runtime result"
+    rollback_evidence = _strict_canonical_object(
+        rollback_evidence_raw, label="IQ9075 rollback result"
     )
-    cleanup_evidence = _strict_canonical_object(
-        cleanup_raw, label="IQ9075 Fleet Runtime cleanup evidence"
+    rollback_cleanup = _strict_canonical_object(
+        rollback_cleanup_raw, label="IQ9075 rollback cleanup evidence"
+    )
+    commit_manifest = _strict_canonical_object(
+        commit_manifest_raw, label="IQ9075 commit manifest"
+    )
+    commit_evidence = _strict_canonical_object(
+        commit_evidence_raw, label="IQ9075 commit result"
+    )
+    config_stream_evidence = _strict_canonical_object(
+        config_stream_raw, label="IQ9075 config-stream evidence"
+    )
+    commit_cleanup = _strict_canonical_object(
+        commit_cleanup_raw, label="IQ9075 commit cleanup evidence"
     )
     bom = _strict_canonical_object(
         bom_raw, label="IQ9075 Fleet Runtime tested BOM"
@@ -504,10 +1427,11 @@ def _validate_fleet_runtime_documents(
     if (
         candidate_board_tool_raw != publisher_board_tool_raw
         or summary.get("boardToolSha256") != board_tool_sha256
-        or manifest.get("toolSha256") != board_tool_sha256
+        or rollback_manifest.get("toolSha256") != board_tool_sha256
+        or commit_manifest.get("toolSha256") != board_tool_sha256
     ):
         raise ReadinessError(
-            "IQ9075 board tool differs from Fleet Runtime manifest"
+            "IQ9075 board tool differs from either Fleet Runtime manifest"
         )
 
     module_name = "_nuvion_trusted_iq9075_fleet_runtime_validator"
@@ -517,59 +1441,180 @@ def _validate_fleet_runtime_documents(
         display_path=publisher_fleet_runner,
     )
     try:
-        validated_manifest = fleet_validator.validate_manifest(manifest)
-        fleet_validator.validate_final_evidence(fleet_evidence, validated_manifest)
-        canonical_cleanup = fleet_validator.validate_bound_cleanup_evidence(
-            cleanup_evidence,
-            run_id=str(validated_manifest["runId"]),
-            manifest_raw=manifest_raw,
-            fleet_evidence_raw=evidence_raw,
+        validated_rollback_manifest = fleet_validator.validate_manifest(
+            rollback_manifest
+        )
+        validated_commit_manifest = fleet_validator.validate_manifest(
+            commit_manifest
+        )
+        fleet_validator.validate_final_evidence(
+            rollback_evidence, validated_rollback_manifest
+        )
+        fleet_validator.validate_final_evidence(
+            commit_evidence, validated_commit_manifest
+        )
+        canonical_rollback_cleanup = (
+            fleet_validator.validate_bound_cleanup_evidence(
+                rollback_cleanup,
+                run_id=str(validated_rollback_manifest["runId"]),
+                manifest_raw=rollback_manifest_raw,
+                fleet_evidence_raw=rollback_evidence_raw,
+            )
+        )
+        canonical_commit_cleanup = fleet_validator.validate_bound_cleanup_evidence(
+            commit_cleanup,
+            run_id=str(validated_commit_manifest["runId"]),
+            manifest_raw=commit_manifest_raw,
+            fleet_evidence_raw=commit_evidence_raw,
         )
     except Exception as exc:
-        raise ReadinessError("IQ9075 Fleet Runtime evidence is invalid") from exc
+        raise ReadinessError(
+            "IQ9075 two-run Fleet Runtime evidence is invalid"
+        ) from exc
     finally:
         sys.modules.pop(module_name, None)
+
+    for label, evidence, cleanup, canonical_cleanup in (
+        (
+            "rollback",
+            rollback_evidence,
+            rollback_cleanup,
+            canonical_rollback_cleanup,
+        ),
+        ("commit", commit_evidence, commit_cleanup, canonical_commit_cleanup),
+    ):
+        if (
+            evidence.get("schemaVersion") != 2
+            or not isinstance(evidence.get("antiReplay"), dict)
+        ):
+            raise ReadinessError(
+                f"IQ9075 {label} evidence lacks persisted anti-replay proof"
+            )
+        if (
+            cleanup != canonical_cleanup
+            or cleanup.get("schemaVersion") != 2
+            or cleanup.get("phase") != "RESTORED"
+            or cleanup.get("proof", {}).get("transactionPhase") != "RESTORED"
+        ):
+            raise ReadinessError(
+                f"IQ9075 {label} cleanup did not restore the transaction"
+            )
+
+    rollback_scenario = rollback_manifest.get("scenario")
+    commit_scenario = commit_manifest.get("scenario")
+    rollback_updater = rollback_evidence.get("updater")
+    commit_updater = commit_evidence.get("updater")
+    rollback_update = (
+        rollback_updater.get("update")
+        if isinstance(rollback_updater, dict)
+        else None
+    )
+    commit_update = (
+        commit_updater.get("update") if isinstance(commit_updater, dict) else None
+    )
     if (
-        fleet_evidence.get("schemaVersion") != 2
-        or not isinstance(fleet_evidence.get("antiReplay"), dict)
+        not isinstance(rollback_scenario, dict)
+        or rollback_scenario.get("type") != "oak-fault-rollback"
+        or rollback_evidence.get("scenario") != "oak-fault-rollback"
+        or not isinstance(rollback_update, dict)
+        or rollback_update.get("phase") != "ROLLED_BACK"
+        or rollback_update.get("updatePhase") != "ROLLED_BACK"
+        or rollback_update.get("errorCode") != "ROLLED_BACK"
+        or rollback_update.get("health") != "LKG_RESTORED"
+        or rollback_update.get("functionalHealth") != "FUNCTIONAL_UNHEALTHY"
+        or "healthDeadline" in rollback_update
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime evidence lacks persisted anti-replay proof"
+            "IQ9075 rollback run does not prove terminal rollback"
         )
     if (
-        cleanup_evidence != canonical_cleanup
-        or cleanup_evidence.get("schemaVersion") != 2
-        or cleanup_evidence.get("phase") != "RESTORED"
-        or cleanup_evidence.get("proof", {}).get("transactionPhase")
-        != "RESTORED"
+        not isinstance(commit_scenario, dict)
+        or commit_scenario.get("type") != "commit"
+        or commit_evidence.get("scenario") != "commit"
+        or not isinstance(commit_update, dict)
+        or commit_update.get("phase") != "COMMITTED"
+        or commit_update.get("updatePhase") != "COMMITTED"
+        or commit_update.get("health") != "FUNCTIONAL_HEALTHY"
+        or commit_update.get("functionalHealth") != "FUNCTIONAL_HEALTHY"
+        or "errorCode" in commit_update
+        or "rollbackSlot" in commit_update
+        or "rollbackVersion" in commit_update
+        or "healthDeadline" in commit_update
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime cleanup did not restore the transaction"
+            "IQ9075 commit run does not prove candidate A is active"
         )
 
-    scenario = manifest.get("scenario")
-    updater = fleet_evidence.get("updater")
-    update = updater.get("update") if isinstance(updater, dict) else None
+    rollback_identity = rollback_manifest.get("identity")
+    commit_identity = commit_manifest.get("identity")
+    rollback_inputs = rollback_manifest.get("inputs")
+    commit_inputs = commit_manifest.get("inputs")
+    rollback_sequence = rollback_update.get("sequence")
+    commit_sequence = commit_update.get("sequence")
     if (
-        not isinstance(scenario, dict)
-        or scenario.get("type") != "oak-fault-rollback"
-        or fleet_evidence.get("scenario") != "oak-fault-rollback"
-        or not isinstance(update, dict)
-        or update.get("phase") != "ROLLED_BACK"
-        or update.get("updatePhase") != "ROLLED_BACK"
-        or update.get("errorCode") != "ROLLED_BACK"
-        or update.get("health") != "LKG_RESTORED"
-        or update.get("functionalHealth") != "FUNCTIONAL_UNHEALTHY"
-        or "healthDeadline" in update
+        rollback_manifest.get("runId") == commit_manifest.get("runId")
+        or rollback_identity != commit_identity
+        or rollback_inputs != commit_inputs
+        or rollback_scenario.get("release") != commit_scenario.get("release")
+        or any(
+            rollback_scenario.get(name) != commit_scenario.get(name)
+            for name in (
+                "expectedBomDigest",
+                "expectedCandidateSlot",
+                "expectedPreviousSlot",
+                "expectedPreviousVersion",
+            )
+        )
+        or rollback_scenario.get("expectedCommandId")
+        == commit_scenario.get("expectedCommandId")
+        or type(rollback_sequence) is not int
+        or type(commit_sequence) is not int
+        or commit_sequence <= rollback_sequence
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime evidence does not prove terminal rollback"
+            "IQ9075 rollback and commit runs do not share one advancing release"
+        )
+
+    rollback_cleanup_completed = _timestamp(
+        rollback_cleanup.get("completedAt"),
+        label="IQ9075 rollback cleanup completion",
+    )
+    commit_generated = _timestamp(
+        commit_evidence.get("generatedAt"),
+        label="IQ9075 commit result generation",
+    )
+    if rollback_cleanup_completed > commit_generated:
+        raise ReadinessError(
+            "IQ9075 commit run precedes rollback cleanup"
+        )
+
+    config_stream_gate, config_stream_runner_sha256 = (
+        _validated_config_stream_gate(
+            config_stream_evidence=config_stream_evidence,
+            fleet_manifest=commit_manifest,
+            fleet_manifest_raw=commit_manifest_raw,
+            fleet_evidence=commit_evidence,
+            fleet_evidence_raw=commit_evidence_raw,
+            cleanup_evidence=commit_cleanup,
+            rollback_manifest=rollback_manifest,
+            rollback_evidence=rollback_evidence,
+            candidate_config_stream_runner=candidate_config_stream_runner,
+        )
+    )
+    if (
+        summary.get("configStreamRunnerSha256")
+        != config_stream_runner_sha256
+    ):
+        raise ReadinessError(
+            "IQ9075 config-stream runner differs from signed evidence"
         )
 
     try:
         verified_bom = verify_release_bom(bom)
     except ReleaseBomValidationError as exc:
-        raise ReadinessError("IQ9075 Fleet Runtime tested BOM is invalid") from exc
+        raise ReadinessError(
+            "IQ9075 Fleet Runtime tested BOM is invalid"
+        ) from exc
     tested_artifact = _artifact_identity(
         summary.get("testedArtifact"),
         label="IQ9075 Fleet Runtime tested artifact",
@@ -583,7 +1628,7 @@ def _validate_fleet_runtime_documents(
 
     iq_policy = security.get("iq9075")
     target_policy = iq_policy.get("target") if isinstance(iq_policy, dict) else None
-    baseline = (
+    baseline_policy = (
         iq_policy.get("legacyPromotedBaseline")
         if isinstance(iq_policy, dict)
         else None
@@ -593,42 +1638,39 @@ def _validate_fleet_runtime_documents(
         or not isinstance(target_policy, dict)
         or set(target_policy)
         != {"productModel", "platformProfile", "hardwareRevision", "architecture"}
-        or not isinstance(baseline, dict)
-        or set(baseline) != {"agentVersion", "releaseSequence", "bomDigest"}
-        or not isinstance(baseline.get("agentVersion"), str)
-        or not SEMVER.fullmatch(baseline["agentVersion"])
-        or isinstance(baseline.get("releaseSequence"), bool)
-        or not isinstance(baseline.get("releaseSequence"), int)
-        or baseline["releaseSequence"] < 1
-        or not isinstance(baseline.get("bomDigest"), str)
-        or not baseline["bomDigest"].startswith("sha256:")
-        or not SHA256.fullmatch(baseline["bomDigest"][7:])
+        or not isinstance(baseline_policy, dict)
+        or set(baseline_policy) != {"agentVersion", "releaseSequence", "bomDigest"}
+        or not isinstance(baseline_policy.get("agentVersion"), str)
+        or not SEMVER.fullmatch(baseline_policy["agentVersion"])
+        or type(baseline_policy.get("releaseSequence")) is not int
+        or baseline_policy["releaseSequence"] < 1
+        or not isinstance(baseline_policy.get("bomDigest"), str)
+        or not baseline_policy["bomDigest"].startswith("sha256:")
+        or not SHA256.fullmatch(baseline_policy["bomDigest"][7:])
         or not isinstance(iq_policy.get("publicKeyringSha256"), str)
         or not SHA256.fullmatch(iq_policy["publicKeyringSha256"])
         or not isinstance(iq_policy.get("publisherKeyId"), str)
     ):
         raise ReadinessError("IQ9075 Fleet Runtime security policy is invalid")
 
-    release = scenario.get("release") if isinstance(scenario, dict) else None
-    inputs = manifest.get("inputs")
-    identity = manifest.get("identity")
-    slots = fleet_evidence.get("slots")
     expected_bom_digest = "sha256:" + verified_bom.bom_digest
     expected_candidate_slot = "/opt/nuv-agent/releases/" + verified_bom.bom_digest
-    expected_previous_slot = "releases/" + baseline["bomDigest"][7:]
-    baseline_marker = None
-    if isinstance(slots, dict) and isinstance(scenario, dict):
-        baseline_marker = (
-            slots.get("release")
-            if scenario.get("type") == "oak-fault-rollback"
-            else slots.get("previousRelease")
-        )
+    expected_relative_candidate_slot = "releases/" + verified_bom.bom_digest
+    expected_previous_slot = "releases/" + baseline_policy["bomDigest"][7:]
+    expected_release = {
+        "agentVersion": version,
+        "releaseSequence": verified_bom.release_sequence,
+        "artifactDigest": "sha256:" + verified_bom.artifact_sha256,
+        "componentSha": component_sha,
+        "configSchema": verified_bom.config_schema,
+        "publisherKeyId": iq_policy["publisherKeyId"],
+    }
     if (
         verified_bom.schema_version != 2
         or verified_bom.agent_version != version
         or verified_bom.component_sha != component_sha
         or verified_bom.release_sequence is None
-        or verified_bom.release_sequence <= baseline["releaseSequence"]
+        or verified_bom.release_sequence <= baseline_policy["releaseSequence"]
         or verified_bom.min_updater_version != "0.2.0"
         or verified_bom.artifact_kind != "agent-bundle"
         or verified_bom.artifact_name != tested_artifact["name"]
@@ -636,59 +1678,141 @@ def _validate_fleet_runtime_documents(
         or verified_bom.artifact_size_bytes != tested_artifact["sizeBytes"]
         or len(verified_bom.targets) != 1
         or verified_bom.targets[0].to_payload() != target_policy
-        or not isinstance(inputs, dict)
-        or inputs.get("releaseSha256") != iq_policy["publicKeyringSha256"]
-        or not isinstance(identity, dict)
-        or {
-            key: identity.get(key)
-            for key in (
-                "productModel",
-                "platformProfile",
-                "hardwareRevision",
-                "architecture",
-            )
-        }
-        != target_policy
-        or not isinstance(baseline_marker, dict)
-        or baseline_marker.get("agentVersion") != baseline["agentVersion"]
-        or baseline_marker.get("releaseSequence") != baseline["releaseSequence"]
-        or baseline_marker.get("bomDigest") != baseline["bomDigest"]
-        or not isinstance(scenario, dict)
-        or scenario.get("expectedBomDigest") != expected_bom_digest
-        or scenario.get("expectedCandidateSlot") != expected_candidate_slot
-        or scenario.get("expectedPreviousSlot") != expected_previous_slot
-        or scenario.get("expectedPreviousVersion") != baseline["agentVersion"]
-        or not isinstance(release, dict)
-        or release
-        != {
-            "agentVersion": version,
-            "releaseSequence": verified_bom.release_sequence,
-            "artifactDigest": "sha256:" + verified_bom.artifact_sha256,
-            "componentSha": component_sha,
-            "configSchema": verified_bom.config_schema,
-            "publisherKeyId": iq_policy["publisherKeyId"],
-        }
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime artifact, BOM, manifest, and policy differ"
+            "IQ9075 Fleet Runtime artifact, BOM, and policy differ"
         )
 
-    expected_runtime_gate = _fleet_runtime_gate(
-        fleet_evidence, cleanup_evidence, manifest
-    )
+    for (
+        label,
+        manifest,
+        evidence,
+        scenario,
+        baseline_marker_name,
+        candidate_marker_name,
+    ) in (
+        (
+            "rollback",
+            rollback_manifest,
+            rollback_evidence,
+            rollback_scenario,
+            "release",
+            "previousRelease",
+        ),
+        (
+            "commit",
+            commit_manifest,
+            commit_evidence,
+            commit_scenario,
+            "previousRelease",
+            "release",
+        ),
+    ):
+        identity = manifest.get("identity")
+        inputs = manifest.get("inputs")
+        slots = evidence.get("slots")
+        baseline_marker = (
+            slots.get(baseline_marker_name) if isinstance(slots, dict) else None
+        )
+        candidate_marker = (
+            slots.get(candidate_marker_name) if isinstance(slots, dict) else None
+        )
+        if (
+            not isinstance(inputs, dict)
+            or inputs.get("releaseSha256") != iq_policy["publicKeyringSha256"]
+            or not isinstance(identity, dict)
+            or {
+                key: identity.get(key)
+                for key in (
+                    "productModel",
+                    "platformProfile",
+                    "hardwareRevision",
+                    "architecture",
+                )
+            }
+            != target_policy
+            or scenario.get("expectedBomDigest") != expected_bom_digest
+            or scenario.get("expectedCandidateSlot") != expected_candidate_slot
+            or scenario.get("expectedPreviousSlot") != expected_previous_slot
+            or scenario.get("expectedPreviousVersion")
+            != baseline_policy["agentVersion"]
+            or scenario.get("release") != expected_release
+            or not isinstance(baseline_marker, dict)
+            or baseline_marker.get("agentVersion")
+            != baseline_policy["agentVersion"]
+            or baseline_marker.get("releaseSequence")
+            != baseline_policy["releaseSequence"]
+            or baseline_marker.get("bomDigest") != baseline_policy["bomDigest"]
+            or not isinstance(candidate_marker, dict)
+            or candidate_marker
+            != {
+                "schemaVersion": 2,
+                "bomDigest": expected_bom_digest,
+                **expected_release,
+            }
+            or not isinstance(slots, dict)
+            or (
+                label == "rollback"
+                and (
+                    slots.get("current") != expected_previous_slot
+                    or slots.get("previous") != expected_relative_candidate_slot
+                    or slots.get("currentVersion")
+                    != baseline_policy["agentVersion"]
+                )
+            )
+            or (
+                label == "commit"
+                and (
+                    slots.get("current") != expected_relative_candidate_slot
+                    or slots.get("previous") != expected_previous_slot
+                    or slots.get("currentVersion") != version
+                )
+            )
+        ):
+            raise ReadinessError(
+                f"IQ9075 {label} run differs from artifact/BOM/release identity"
+            )
+
+    if (
+        rollback_update.get("bomDigest") != expected_bom_digest
+        or commit_update.get("bomDigest") != expected_bom_digest
+        or rollback_update.get("artifactDigest")
+        != expected_release["artifactDigest"]
+        or commit_update.get("artifactDigest") != expected_release["artifactDigest"]
+        or rollback_update.get("componentSha") != component_sha
+        or commit_update.get("componentSha") != component_sha
+        or rollback_update.get("releaseSequence")
+        != verified_bom.release_sequence
+        or commit_update.get("releaseSequence") != verified_bom.release_sequence
+        or rollback_update.get("configSchema") != verified_bom.config_schema
+        or commit_update.get("configSchema") != verified_bom.config_schema
+        or rollback_update.get("publisherKeyId") != iq_policy["publisherKeyId"]
+        or commit_update.get("publisherKeyId") != iq_policy["publisherKeyId"]
+        or commit_update.get("slot") != expected_relative_candidate_slot
+    ):
+        raise ReadinessError(
+            "IQ9075 rollback/commit updater release identity differs"
+        )
+
+    expected_runtime_gate = {
+        "rollback": _fleet_runtime_gate(
+            rollback_evidence, rollback_cleanup, rollback_manifest
+        ),
+        "commit": _fleet_runtime_gate(
+            commit_evidence, commit_cleanup, commit_manifest
+        ),
+        "configStream": config_stream_gate,
+    }
     if summary.get("runtimeGate") != expected_runtime_gate:
         raise ReadinessError(
             "IQ9075 Fleet Runtime gate summary differs from raw evidence"
         )
     return {
-        # Preserve the established workflow output contract while exposing names
-        # that match the new evidence authority to future callers.
         "physical_artifact_sha256": verified_bom.artifact_sha256,
         "physical_bom_sha256": tested_bom_sha256,
         "runtime_artifact_sha256": verified_bom.artifact_sha256,
         "runtime_bom_sha256": tested_bom_sha256,
     }
-
 
 def _validate_physical_documents(
     *,
@@ -1512,6 +2636,7 @@ def _validate_ready_evidence(
     signer_directory: Path | None,
     candidate_harness: Path | None,
     candidate_fleet_runner: Path | None,
+    candidate_config_stream_runner: Path | None,
     candidate_board_tool: Path | None,
 ) -> dict[str, str]:
     common_fields = {"componentSha", "agentReleaseGate"}
@@ -1584,7 +2709,11 @@ def _validate_ready_evidence(
         or signer_directory is None
         or (
             evidence_key == "iq9075FleetRuntime"
-            and (candidate_fleet_runner is None or candidate_board_tool is None)
+            and (
+                candidate_fleet_runner is None
+                or candidate_config_stream_runner is None
+                or candidate_board_tool is None
+            )
         )
         or (evidence_key == "iq9075Physical" and candidate_harness is None)
     ):
@@ -1635,6 +2764,7 @@ def _validate_ready_evidence(
     )
     if evidence_key == "iq9075FleetRuntime":
         assert candidate_fleet_runner is not None
+        assert candidate_config_stream_runner is not None
         assert candidate_board_tool is not None
         return _validate_fleet_runtime_documents(
             policy_path=policy_path,
@@ -1643,6 +2773,7 @@ def _validate_ready_evidence(
             summary=document,
             security=security,
             candidate_fleet_runner=candidate_fleet_runner,
+            candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
         )
     assert candidate_harness is not None
@@ -1666,6 +2797,7 @@ def verify_readiness(
     signer_directory: Path | None = None,
     candidate_harness: Path | None = None,
     candidate_fleet_runner: Path | None = None,
+    candidate_config_stream_runner: Path | None = None,
     candidate_board_tool: Path | None = None,
 ) -> dict[str, str]:
     if not SEMVER.fullmatch(version):
@@ -1716,6 +2848,7 @@ def verify_readiness(
         signer_directory=signer_directory,
         candidate_harness=candidate_harness,
         candidate_fleet_runner=candidate_fleet_runner,
+        candidate_config_stream_runner=candidate_config_stream_runner,
         candidate_board_tool=candidate_board_tool,
     )
 
@@ -1739,6 +2872,7 @@ def main() -> int:
     parser.add_argument("--signer-directory", type=Path)
     parser.add_argument("--candidate-harness", type=Path)
     parser.add_argument("--candidate-fleet-runner", type=Path)
+    parser.add_argument("--candidate-config-stream-runner", type=Path)
     parser.add_argument("--candidate-board-tool", type=Path)
     parser.add_argument("--github-output", type=Path)
     arguments = parser.parse_args()
@@ -1761,6 +2895,9 @@ def main() -> int:
             signer_directory=arguments.signer_directory,
             candidate_harness=arguments.candidate_harness,
             candidate_fleet_runner=arguments.candidate_fleet_runner,
+            candidate_config_stream_runner=(
+                arguments.candidate_config_stream_runner
+            ),
             candidate_board_tool=arguments.candidate_board_tool,
         )
         if arguments.github_output is not None:

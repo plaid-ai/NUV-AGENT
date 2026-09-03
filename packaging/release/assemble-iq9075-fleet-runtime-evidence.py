@@ -170,12 +170,17 @@ def _load_readiness_validator():
 
 def _assemble_into(
     *,
-    fleet_manifest_path: Path,
-    fleet_evidence_path: Path,
-    cleanup_evidence_path: Path,
+    rollback_manifest_path: Path,
+    rollback_evidence_path: Path,
+    rollback_cleanup_evidence_path: Path,
+    commit_manifest_path: Path,
+    commit_evidence_path: Path,
+    config_stream_evidence_path: Path,
+    commit_cleanup_evidence_path: Path,
     artifact_path: Path,
     bom_path: Path,
     candidate_fleet_runner: Path,
+    candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
     security_policy_path: Path,
     output_directory: Path,
@@ -184,19 +189,39 @@ def _assemble_into(
 ) -> dict[str, str]:
     if SEMVER.fullmatch(version) is None or SHA.fullmatch(component_sha) is None:
         raise AssemblyError("release version or component SHA is invalid")
-    fleet_manifest, fleet_manifest_raw = _object(
-        fleet_manifest_path,
-        label="Fleet Runtime manifest",
+    rollback_manifest, rollback_manifest_raw = _object(
+        rollback_manifest_path,
+        label="Fleet Runtime rollback manifest",
         require_canonical=True,
     )
-    fleet_evidence, fleet_evidence_raw = _object(
-        fleet_evidence_path,
-        label="Fleet Runtime evidence",
+    rollback_evidence, rollback_evidence_raw = _object(
+        rollback_evidence_path,
+        label="Fleet Runtime rollback evidence",
         require_canonical=True,
     )
-    cleanup_evidence, cleanup_evidence_raw = _object(
-        cleanup_evidence_path,
-        label="Fleet Runtime cleanup evidence",
+    rollback_cleanup_evidence, rollback_cleanup_evidence_raw = _object(
+        rollback_cleanup_evidence_path,
+        label="Fleet Runtime rollback cleanup evidence",
+        require_canonical=True,
+    )
+    commit_manifest, commit_manifest_raw = _object(
+        commit_manifest_path,
+        label="Fleet Runtime commit manifest",
+        require_canonical=True,
+    )
+    commit_evidence, commit_evidence_raw = _object(
+        commit_evidence_path,
+        label="Fleet Runtime commit evidence",
+        require_canonical=True,
+    )
+    config_stream_evidence, config_stream_evidence_raw = _object(
+        config_stream_evidence_path,
+        label="Fleet config/stream evidence",
+        require_canonical=True,
+    )
+    commit_cleanup_evidence, commit_cleanup_evidence_raw = _object(
+        commit_cleanup_evidence_path,
+        label="Fleet Runtime commit cleanup evidence",
         require_canonical=True,
     )
     _bom, bom_raw = _object(
@@ -215,51 +240,130 @@ def _assemble_into(
     publisher_board_tool = (
         Path(__file__).resolve().parents[1] / "dev/iq9075-board-e2e.py"
     )
+    publisher_config_stream_runner = (
+        Path(__file__).resolve().parents[1]
+        / "dev/run-iq9075-config-stream-e2e.py"
+    )
     fleet_runner_sha256 = _digest(_regular_bytes(publisher_fleet_runner))
+    config_stream_runner_sha256 = _digest(
+        _regular_bytes(publisher_config_stream_runner)
+    )
     board_tool_sha256 = _digest(_regular_bytes(publisher_board_tool))
 
     output_directory = _private_output_directory(output_directory)
     names = {
-        "fleet_manifest": f"iq9075-v{version}-fleet-manifest.json",
-        "fleet_evidence": f"iq9075-v{version}-fleet-evidence.json",
-        "cleanup_evidence": f"iq9075-v{version}-cleanup-evidence.json",
+        "rollback_manifest": (
+            f"iq9075-v{version}-rollback-fleet-manifest.json"
+        ),
+        "rollback_evidence": (
+            f"iq9075-v{version}-rollback-fleet-evidence.json"
+        ),
+        "rollback_cleanup_evidence": (
+            f"iq9075-v{version}-rollback-cleanup-evidence.json"
+        ),
+        "commit_manifest": f"iq9075-v{version}-commit-fleet-manifest.json",
+        "commit_evidence": f"iq9075-v{version}-commit-fleet-evidence.json",
+        "config_stream_evidence": (
+            f"iq9075-v{version}-config-stream-evidence.json"
+        ),
+        "commit_cleanup_evidence": (
+            f"iq9075-v{version}-commit-cleanup-evidence.json"
+        ),
         "bom": f"nuv-agent_{version}_iq9075-aarch64.release-bom.json",
         "summary": f"iq9075-v{version}-fleet-runtime-evidence.json",
     }
     paths = {key: _safe_output(output_directory, name) for key, name in names.items()}
     for source, key, raw in (
-        (fleet_manifest_path, "fleet_manifest", fleet_manifest_raw),
-        (fleet_evidence_path, "fleet_evidence", fleet_evidence_raw),
-        (cleanup_evidence_path, "cleanup_evidence", cleanup_evidence_raw),
+        (rollback_manifest_path, "rollback_manifest", rollback_manifest_raw),
+        (rollback_evidence_path, "rollback_evidence", rollback_evidence_raw),
+        (
+            rollback_cleanup_evidence_path,
+            "rollback_cleanup_evidence",
+            rollback_cleanup_evidence_raw,
+        ),
+        (commit_manifest_path, "commit_manifest", commit_manifest_raw),
+        (commit_evidence_path, "commit_evidence", commit_evidence_raw),
+        (
+            config_stream_evidence_path,
+            "config_stream_evidence",
+            config_stream_evidence_raw,
+        ),
+        (
+            commit_cleanup_evidence_path,
+            "commit_cleanup_evidence",
+            commit_cleanup_evidence_raw,
+        ),
         (bom_path, "bom", bom_raw),
     ):
         _copy_input(source, paths[key], raw)
 
     readiness = _load_readiness_validator()
     try:
-        runtime_gate = readiness._fleet_runtime_gate(
-            fleet_evidence, cleanup_evidence, fleet_manifest
+        config_stream_gate, validated_config_stream_runner_sha256 = (
+            readiness._validated_config_stream_gate(
+                config_stream_evidence=config_stream_evidence,
+                fleet_manifest=commit_manifest,
+                fleet_manifest_raw=commit_manifest_raw,
+                fleet_evidence=commit_evidence,
+                fleet_evidence_raw=commit_evidence_raw,
+                cleanup_evidence=commit_cleanup_evidence,
+                rollback_manifest=rollback_manifest,
+                rollback_evidence=rollback_evidence,
+                candidate_config_stream_runner=candidate_config_stream_runner,
+            )
         )
+        if validated_config_stream_runner_sha256 != config_stream_runner_sha256:
+            raise AssemblyError("config-stream runner digest changed during assembly")
+        runtime_gate = {
+            "rollback": readiness._fleet_runtime_gate(
+                rollback_evidence,
+                rollback_cleanup_evidence,
+                rollback_manifest,
+            ),
+            "commit": readiness._fleet_runtime_gate(
+                commit_evidence,
+                commit_cleanup_evidence,
+                commit_manifest,
+            ),
+            "configStream": config_stream_gate,
+        }
     except Exception as exc:
         raise AssemblyError("Fleet Runtime result cannot be summarized") from exc
     summary = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "kind": "nuvion-iq9075-fleet-runtime-release-evidence",
         "agentVersion": version,
         "componentSha": component_sha,
         "fleetRunnerSha256": fleet_runner_sha256,
+        "configStreamRunnerSha256": config_stream_runner_sha256,
         "boardToolSha256": board_tool_sha256,
-        "fleetManifest": {
-            "file": names["fleet_manifest"],
-            "sha256": _digest(fleet_manifest_raw),
+        "rollbackManifest": {
+            "file": names["rollback_manifest"],
+            "sha256": _digest(rollback_manifest_raw),
         },
-        "fleetEvidence": {
-            "file": names["fleet_evidence"],
-            "sha256": _digest(fleet_evidence_raw),
+        "rollbackEvidence": {
+            "file": names["rollback_evidence"],
+            "sha256": _digest(rollback_evidence_raw),
         },
-        "cleanupEvidence": {
-            "file": names["cleanup_evidence"],
-            "sha256": _digest(cleanup_evidence_raw),
+        "rollbackCleanupEvidence": {
+            "file": names["rollback_cleanup_evidence"],
+            "sha256": _digest(rollback_cleanup_evidence_raw),
+        },
+        "commitManifest": {
+            "file": names["commit_manifest"],
+            "sha256": _digest(commit_manifest_raw),
+        },
+        "commitEvidence": {
+            "file": names["commit_evidence"],
+            "sha256": _digest(commit_evidence_raw),
+        },
+        "configStreamEvidence": {
+            "file": names["config_stream_evidence"],
+            "sha256": _digest(config_stream_evidence_raw),
+        },
+        "commitCleanupEvidence": {
+            "file": names["commit_cleanup_evidence"],
+            "sha256": _digest(commit_cleanup_evidence_raw),
         },
         "testedArtifact": {
             "name": artifact_path.name,
@@ -279,6 +383,7 @@ def _assemble_into(
             summary=summary,
             security=security,
             candidate_fleet_runner=candidate_fleet_runner,
+            candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
         )
     except Exception as exc:
@@ -288,9 +393,13 @@ def _assemble_into(
     return {
         "summary": str(paths["summary"]),
         "summarySha256": _digest(summary_raw),
-        "fleetManifest": str(paths["fleet_manifest"]),
-        "fleetEvidence": str(paths["fleet_evidence"]),
-        "cleanupEvidence": str(paths["cleanup_evidence"]),
+        "rollbackManifest": str(paths["rollback_manifest"]),
+        "rollbackEvidence": str(paths["rollback_evidence"]),
+        "rollbackCleanupEvidence": str(paths["rollback_cleanup_evidence"]),
+        "commitManifest": str(paths["commit_manifest"]),
+        "commitEvidence": str(paths["commit_evidence"]),
+        "configStreamEvidence": str(paths["config_stream_evidence"]),
+        "commitCleanupEvidence": str(paths["commit_cleanup_evidence"]),
         "artifactSha256": artifact_sha256,
         "bomSha256": _digest(bom_raw),
     }
@@ -298,12 +407,17 @@ def _assemble_into(
 
 def assemble(
     *,
-    fleet_manifest_path: Path,
-    fleet_evidence_path: Path,
-    cleanup_evidence_path: Path,
+    rollback_manifest_path: Path,
+    rollback_evidence_path: Path,
+    rollback_cleanup_evidence_path: Path,
+    commit_manifest_path: Path,
+    commit_evidence_path: Path,
+    config_stream_evidence_path: Path,
+    commit_cleanup_evidence_path: Path,
     artifact_path: Path,
     bom_path: Path,
     candidate_fleet_runner: Path,
+    candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
     security_policy_path: Path,
     output_directory: Path,
@@ -316,12 +430,17 @@ def assemble(
     ) as raw_staging:
         staging = Path(raw_staging)
         staged = _assemble_into(
-            fleet_manifest_path=fleet_manifest_path,
-            fleet_evidence_path=fleet_evidence_path,
-            cleanup_evidence_path=cleanup_evidence_path,
+            rollback_manifest_path=rollback_manifest_path,
+            rollback_evidence_path=rollback_evidence_path,
+            rollback_cleanup_evidence_path=rollback_cleanup_evidence_path,
+            commit_manifest_path=commit_manifest_path,
+            commit_evidence_path=commit_evidence_path,
+            config_stream_evidence_path=config_stream_evidence_path,
+            commit_cleanup_evidence_path=commit_cleanup_evidence_path,
             artifact_path=artifact_path,
             bom_path=bom_path,
             candidate_fleet_runner=candidate_fleet_runner,
+            candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
             security_policy_path=security_policy_path,
             output_directory=staging,
@@ -329,7 +448,7 @@ def assemble(
             component_sha=component_sha,
         )
         staged_files = sorted(path for path in staging.iterdir() if path.is_file())
-        if len(staged_files) != 5:
+        if len(staged_files) != 9:
             raise AssemblyError("staged Fleet Runtime evidence file set is incomplete")
         final_paths = [_safe_output(final_root, path.name) for path in staged_files]
         published: list[Path] = []
@@ -352,9 +471,13 @@ def assemble(
         result = dict(staged)
         for key in (
             "summary",
-            "fleetManifest",
-            "fleetEvidence",
-            "cleanupEvidence",
+            "rollbackManifest",
+            "rollbackEvidence",
+            "rollbackCleanupEvidence",
+            "commitManifest",
+            "commitEvidence",
+            "configStreamEvidence",
+            "commitCleanupEvidence",
         ):
             result[key] = str(final_root / Path(result[key]).name)
         return result
@@ -369,12 +492,19 @@ def main() -> int:
         )
         return 2
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fleet-manifest", required=True, type=Path)
-    parser.add_argument("--fleet-evidence", required=True, type=Path)
-    parser.add_argument("--cleanup-evidence", required=True, type=Path)
+    parser.add_argument("--rollback-manifest", required=True, type=Path)
+    parser.add_argument("--rollback-evidence", required=True, type=Path)
+    parser.add_argument("--rollback-cleanup-evidence", required=True, type=Path)
+    parser.add_argument("--commit-manifest", required=True, type=Path)
+    parser.add_argument("--commit-evidence", required=True, type=Path)
+    parser.add_argument("--config-stream-evidence", required=True, type=Path)
+    parser.add_argument("--commit-cleanup-evidence", required=True, type=Path)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--bom", required=True, type=Path)
     parser.add_argument("--candidate-fleet-runner", required=True, type=Path)
+    parser.add_argument(
+        "--candidate-config-stream-runner", required=True, type=Path
+    )
     parser.add_argument("--candidate-board-tool", required=True, type=Path)
     parser.add_argument("--security-policy", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
@@ -383,12 +513,23 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         result = assemble(
-            fleet_manifest_path=arguments.fleet_manifest,
-            fleet_evidence_path=arguments.fleet_evidence,
-            cleanup_evidence_path=arguments.cleanup_evidence,
+            rollback_manifest_path=arguments.rollback_manifest,
+            rollback_evidence_path=arguments.rollback_evidence,
+            rollback_cleanup_evidence_path=(
+                arguments.rollback_cleanup_evidence
+            ),
+            commit_manifest_path=arguments.commit_manifest,
+            commit_evidence_path=arguments.commit_evidence,
+            config_stream_evidence_path=arguments.config_stream_evidence,
+            commit_cleanup_evidence_path=(
+                arguments.commit_cleanup_evidence
+            ),
             artifact_path=arguments.artifact,
             bom_path=arguments.bom,
             candidate_fleet_runner=arguments.candidate_fleet_runner,
+            candidate_config_stream_runner=(
+                arguments.candidate_config_stream_runner
+            ),
             candidate_board_tool=arguments.candidate_board_tool,
             security_policy_path=arguments.security_policy,
             output_directory=arguments.output_directory,

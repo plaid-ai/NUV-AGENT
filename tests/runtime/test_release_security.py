@@ -823,12 +823,299 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         return summary, manifest_path, result_path
 
     @staticmethod
+    def _config_stream_fixture(
+        manifest: dict[str, object],
+        fleet_evidence: dict[str, object],
+        fleet_cleanup: dict[str, object],
+        rollback_manifest: dict[str, object],
+        rollback_evidence: dict[str, object],
+    ) -> dict[str, object]:
+        queue = {
+            "inboxPendingRows": 0,
+            "observationPendingRows": 0,
+            "observationReservedRows": 0,
+            "observationDlqRows": 0,
+        }
+        baseline = {
+            "model": {
+                "pointer": "anomalyclip/prod",
+                "configuredDigest": None,
+                "artifactDigest": None,
+                "artifactVerified": False,
+                "runtimeEnabled": False,
+                "runtimeBackend": "none",
+            },
+            "labels": {
+                "inspection": ["normal", "defect"],
+                "anomaly": ["defect"],
+            },
+            "clip": {"enabled": True, "preSeconds": 5, "postSeconds": 7},
+            "video": {
+                "width": 640,
+                "height": 480,
+                "fps": 30,
+                "bitrateKbps": 1000,
+            },
+        }
+
+        def settings_sha(value: dict[str, object]) -> str:
+            return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+        def settings_digest(value: dict[str, object]) -> str:
+            raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+        def command(
+            command_id: str,
+            sequence: int,
+            command_type: str,
+            reported: dict[str, object],
+            settings: dict[str, object],
+        ) -> dict[str, object]:
+            return {
+                "commandId": command_id,
+                "sequence": sequence,
+                "type": command_type,
+                "lifecycleAckStatuses": [
+                    "RECEIVED",
+                    "IN_PROGRESS",
+                    "SUCCEEDED",
+                ],
+                "effectPhase": "APPLIED",
+                "reportedState": reported,
+                "reportedRevision": 1,
+                "localObservationRevision": 1,
+                "boardSettings": settings,
+                "boardSettingsSha256": settings_sha(settings),
+                "projectionShape": "single",
+                "queue": dict(queue),
+            }
+
+        changed_video = {**baseline["video"], "bitrateKbps": 1100}
+        changed_settings = {**baseline, "video": changed_video}
+        apply_payload = {
+            "configVersion": 100,
+            "activation": "IMMEDIATE",
+            "clip": baseline["clip"],
+            "video": changed_video,
+        }
+        restore_payload = {
+            "configVersion": 101,
+            "activation": "IMMEDIATE",
+            "clip": baseline["clip"],
+            "video": baseline["video"],
+        }
+        scenario = manifest["scenario"]
+        release = scenario["release"]
+        release_update = fleet_evidence["updater"]["update"]
+        rollback_scenario = rollback_manifest["scenario"]
+        rollback_update = rollback_evidence["updater"]["update"]
+        run_id = manifest["runId"]
+        cleanup_settings_sha = settings_sha(baseline)
+        relative_slot = "releases/" + scenario["expectedBomDigest"][7:]
+        runtime_release = {
+            "schemaVersion": 2,
+            "bomDigest": scenario["expectedBomDigest"],
+            **release,
+        }
+        runtime_identity = {
+            "activeSlot": relative_slot,
+            "processActiveSlot": relative_slot,
+            "processExpectedBomDigest": scenario["expectedBomDigest"],
+            "servicePid": 4400,
+            "releaseMarkerSha256": "d" * 64,
+            "buildInfoSha256": "9" * 64,
+            "release": runtime_release,
+        }
+        gates = {
+            "releaseBound": True,
+            "cameraIndependent": True,
+            "modelConfigurationPreservedWithoutActivation": True,
+            "labelConfigurationPreservedWithoutActivation": True,
+            "clipPolicyReconciled": True,
+            "videoChangedAndRestored": True,
+            "ackReceivedToApplied": True,
+            "twinsConverged": True,
+            "adaptiveClosedLoop": True,
+            "commandQueuesDrained": True,
+            "encoderStartupBaselineRestored": True,
+            "exactBoardRestoration": True,
+        }
+        return {
+            "schemaVersion": 1,
+            "kind": "nuvion-iq9075-config-stream-e2e-evidence",
+            "runId": run_id,
+            "generatedAt": "2026-09-03T10:06:00Z",
+            "source": {
+                "manifestSha256": hashlib.sha256(
+                    canonical_bytes(manifest)
+                ).hexdigest(),
+                "otaEvidenceSha256": hashlib.sha256(
+                    canonical_bytes(fleet_evidence)
+                ).hexdigest(),
+                "agentVersion": release["agentVersion"],
+                "componentSha": release["componentSha"],
+                "bomDigest": scenario["expectedBomDigest"],
+                "configSchema": release["configSchema"],
+                "releaseSequence": release["releaseSequence"],
+                "artifactDigest": release["artifactDigest"],
+                "publisherKeyId": release["publisherKeyId"],
+                "runtimeIdentity": runtime_identity,
+            },
+            "identity": manifest["identity"],
+            "releaseCommand": {
+                "commandId": scenario["expectedCommandId"],
+                "sequence": release_update["sequence"],
+                "type": "AGENT_UPDATE",
+                "status": "SUCCEEDED",
+            },
+            "priorRollbackCommand": {
+                "commandId": rollback_scenario["expectedCommandId"],
+                "sequence": rollback_update["sequence"],
+                "type": "AGENT_UPDATE",
+                "status": "ROLLED_BACK",
+            },
+            "expiredPredecessors": [
+                {
+                    "commandId": "33333333-3333-4333-8333-333333333333",
+                    "sequence": 1,
+                    "type": "STREAM_POLICY",
+                    "status": "EXPIRED",
+                    "expiresAt": "2026-09-03T10:00:00Z",
+                }
+            ],
+            "projectionShape": "single",
+            "config": {
+                "baseline": baseline,
+                "changedBitrateKbps": 1100,
+                "fieldCoverage": {
+                    "model": "PRESERVED_WITHOUT_ACTIVATION",
+                    "labels": "PRESERVED_WITHOUT_ACTIVATION",
+                    "clipPolicy": "SAME_VALUE_RECONCILED",
+                    "video": "CHANGED_AND_RESTORED",
+                },
+                "apply": command(
+                    "44444444-4444-4444-8444-444444444444",
+                    4,
+                    "CONFIG_APPLY",
+                    {
+                        **apply_payload,
+                        "configSchema": "12",
+                        "settingsDigest": settings_digest(apply_payload),
+                        "health": "FUNCTIONAL_HEALTHY",
+                    },
+                    changed_settings,
+                ),
+                "restore": command(
+                    "55555555-5555-4555-8555-555555555555",
+                    5,
+                    "CONFIG_APPLY",
+                    {
+                        **restore_payload,
+                        "configSchema": "12",
+                        "settingsDigest": settings_digest(restore_payload),
+                        "health": "FUNCTIONAL_HEALTHY",
+                    },
+                    baseline,
+                ),
+            },
+            "stream": {
+                "adaptiveCommand": {
+                    "commandId": "66666666-6666-4666-8666-666666666666",
+                    "sequence": 6,
+                    "lifecycleAckStatuses": [
+                        "RECEIVED",
+                        "IN_PROGRESS",
+                        "SUCCEEDED",
+                    ],
+                    "effectPhase": "APPLIED",
+                },
+                "initialGood": {
+                    "policyRevision": 1,
+                    "appliedBitrateKbps": 1000,
+                    "health": "STREAM_CONTINUOUS",
+                    "encoder": "x264enc",
+                    "lastAdjustmentReason": "policy_activated",
+                    "projectionShape": "single",
+                    "queue": dict(queue),
+                },
+                "poor": {
+                    "policyRevision": 2,
+                    "appliedBitrateKbps": 500,
+                    "lastAdjustmentReason": "connectivity_poor",
+                    "health": "STREAM_CONTINUOUS",
+                    "encoder": "x264enc",
+                    "projectionShape": "single",
+                    "queue": dict(queue),
+                },
+                "recoveredGood": {
+                    "policyRevision": 3,
+                    "appliedBitrateKbps": 700,
+                    "lastAdjustmentReason": "healthy_recovery",
+                    "health": "STREAM_CONTINUOUS",
+                    "encoder": "x264enc",
+                    "projectionShape": "single",
+                    "queue": dict(queue),
+                },
+                "disabled": command(
+                    "77777777-7777-4777-8777-777777777777",
+                    7,
+                    "STREAM_POLICY",
+                    {
+                        "policyVersion": 103,
+                        "mode": "DISABLED",
+                        "encoder": "x264enc",
+                        "requestedBitrateKbps": 1000,
+                        "appliedBitrateKbps": 700,
+                        "lastAdjustmentReason": "policy_disabled",
+                        "health": "STREAM_CONTINUOUS",
+                    },
+                    baseline,
+                ),
+            },
+            "boardPreparation": {
+                "syntheticSource": "videotestsrc",
+                "connectivityShim": "scoped-iw-ping",
+                "configBeforeSha256": "b" * 64,
+                "configTestSha256": "c" * 64,
+            },
+            "gates": gates,
+            "modelQualification": {
+                "status": "NOT_APPLICABLE_BACKEND_DISABLED",
+                "artifactDigest": None,
+            },
+            "cleanup": {
+                "schemaVersion": 1,
+                "runId": run_id,
+                "restored": True,
+                "idempotent": False,
+                "noMutation": False,
+                "exactRestoration": True,
+                "runtimeRestarted": True,
+                "configSha256": "b" * 64,
+                "settings": baseline,
+                "settingsSha256": cleanup_settings_sha,
+                "encoderStartupBitrateKbps": 1000,
+                "runtimeIdentity": {
+                    **runtime_identity,
+                    "servicePid": 4401,
+                },
+                "exclusiveLeaseReleased": True,
+                "deadmanDisarmed": True,
+            },
+        }
+
+    @classmethod
     def _fleet_runtime_fixture(
-        root: Path, *, component_sha: str
+        cls,
+        root: Path,
+        *,
+        component_sha: str,
     ) -> dict[str, Path]:
         source = root / "source"
         source.mkdir(mode=0o700)
-        run_id = "12345678-1234-4abc-8def-123456789abc"
+        rollback_run_id = "12345678-1234-4abc-8def-123456789abc"
+        commit_run_id = "87654321-4321-4cba-8fed-cba987654321"
         artifact_path = (
             source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
         )
@@ -868,41 +1155,57 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "configSchema": "12",
             "publisherKeyId": "release-iq9075-dev-2026-09-01",
         }
-        fleet_manifest = FLEET_E2E.build_manifest(
-            run_id=run_id,
-            tool_sha256=hashlib.sha256(
-                (ROOT / "packaging/dev/iq9075-board-e2e.py").read_bytes()
-            ).hexdigest(),
-            input_digests={
-                "commandSha256": "6" * 64,
-                "releaseSha256": (
-                    "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
-                ),
-                "healthSha256": "8" * 64,
-                "bindingSha256": "9" * 64,
-            },
-            identity={
-                "deviceId": "sp-3-nuvion-runtime",
-                "spaceId": 3,
-                "productModel": "IQ9075_DEV",
-                "platformProfile": "iq9075_dev",
-                "hardwareRevision": "QCS9075-EVK",
-                "architecture": "aarch64",
-                "dockerRequired": False,
-            },
-            scenario_type="oak-fault-rollback",
-            expected_command_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            expected_bom_digest=bom["bomDigest"],
-            expected_candidate_slot="/opt/nuv-agent/releases/" + bom["bomDigest"][7:],
-            expected_previous_slot=baseline_slot,
-            expected_previous_version="0.1.120",
-            hold_seconds=10,
-            release=fleet_release,
+        input_digests = {
+            "commandSha256": "6" * 64,
+            "releaseSha256": (
+                "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
+            ),
+            "healthSha256": "8" * 64,
+            "bindingSha256": "9" * 64,
+        }
+        identity = {
+            "deviceId": "sp-3-nuvion-runtime",
+            "spaceId": 3,
+            "productModel": "IQ9075_DEV",
+            "platformProfile": "iq9075_dev",
+            "hardwareRevision": "QCS9075-EVK",
+            "architecture": "aarch64",
+            "dockerRequired": False,
+        }
+        tool_sha = hashlib.sha256(
+            (ROOT / "packaging/dev/iq9075-board-e2e.py").read_bytes()
+        ).hexdigest()
+
+        def manifest(
+            run_id: str,
+            scenario_type: str,
+            command_id: str,
+        ) -> dict[str, object]:
+            return FLEET_E2E.build_manifest(
+                run_id=run_id,
+                tool_sha256=tool_sha,
+                input_digests=input_digests,
+                identity=identity,
+                scenario_type=scenario_type,
+                expected_command_id=command_id,
+                expected_bom_digest=bom["bomDigest"],
+                expected_candidate_slot="/opt/nuv-agent/releases/"
+                + bom["bomDigest"][7:],
+                expected_previous_slot=baseline_slot,
+                expected_previous_version="0.1.120",
+                hold_seconds=10 if scenario_type == "oak-fault-rollback" else 0,
+                release=fleet_release,
+            )
+
+        rollback_manifest = manifest(
+            rollback_run_id,
+            "oak-fault-rollback",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         )
-        fleet_manifest_path = source / "immutable-manifest.json"
-        fleet_manifest_path.write_text(
-            json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
+        commit_manifest = manifest(
+            commit_run_id,
+            "commit",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         )
         services = {
             "nuv-agent.service": {
@@ -924,117 +1227,206 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "mainPid": 0,
             },
         }
-        update = {
-            "commandId": fleet_manifest["scenario"]["expectedCommandId"],
-            "sequence": 2,
-            "targetVersion": "0.1.121",
-            "bomDigest": bom["bomDigest"],
-            "phase": "ROLLED_BACK",
-            "updatePhase": "ROLLED_BACK",
-            "updatedAt": "2026-09-03T10:02:00Z",
-            "commandExpiresAt": "2026-09-03T11:00:00Z",
-            "candidateSlot": fleet_manifest["scenario"]["expectedCandidateSlot"],
-            "previousSlot": baseline_slot,
-            "previousVersion": "0.1.120",
-            "releaseSequence": 2,
-            "artifactDigest": "sha256:" + artifact_sha256,
-            "componentSha": component_sha,
+        oak = {
+            "port": "2-1.1",
+            "vendorId": "03e7",
+            "productId": "f63b",
+            "speedMbps": 5000,
+            "mxidSha256": "3" * 64,
+            "attached": True,
+            "bound": True,
+        }
+        baseline_release = {
+            "schemaVersion": 2,
+            "bomDigest": "sha256:" + baseline_digest,
+            "agentVersion": "0.1.120",
+            "releaseSequence": 1,
+            "artifactDigest": "sha256:" + "e" * 64,
+            "componentSha": "f" * 40,
             "configSchema": "12",
             "publisherKeyId": "release-iq9075-dev-2026-09-01",
-            "bomVerificationStatus": "VERIFIED",
-            "slot": baseline_slot,
-            "rollbackSlot": baseline_slot,
-            "rollbackVersion": "0.1.120",
-            "errorCode": "ROLLED_BACK",
-            "health": "LKG_RESTORED",
-            "functionalHealth": "FUNCTIONAL_UNHEALTHY",
         }
-        fleet_evidence = {
+        candidate_release = {
             "schemaVersion": 2,
-            "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
-            "runId": run_id,
-            "generatedAt": "2026-09-03T10:03:00Z",
-            "scenario": "oak-fault-rollback",
-            "complete": True,
-            "gates": {
-                "foundation": True,
-                "backup": True,
-                "trust": True,
-                "updater2": True,
-                "oak": True,
-                "services": True,
-                "scenario": True,
-            },
-            "oak": {
-                "port": "2-1.1",
-                "vendorId": "03e7",
-                "productId": "f63b",
-                "speedMbps": 5000,
-                "mxidSha256": "3" * 64,
-                "attached": True,
-                "bound": True,
-            },
-            "services": services,
-            "runtimePids": {"candidate": 4100, "restored": 4200},
-            "slots": {
-                "current": baseline_slot,
-                "previous": candidate_slot,
-                "currentVersion": "0.1.120",
-                "release": {
-                    "schemaVersion": 2,
-                    "bomDigest": "sha256:" + baseline_digest,
-                    "agentVersion": "0.1.120",
-                    "releaseSequence": 1,
-                    "artifactDigest": "sha256:" + "e" * 64,
-                    "componentSha": "f" * 40,
-                    "configSchema": "12",
-                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
-                },
-                "previousRelease": {
-                    "schemaVersion": 2,
-                    "bomDigest": bom["bomDigest"],
-                    **fleet_release,
-                },
-            },
-            "updater": {
-                "capabilityAvailable": True,
-                "authenticatedHelper": True,
-                "reason": "READY",
-                "updaterVersion": "0.2.0",
-                "update": update,
-            },
-            "antiReplay": {
-                "schemaVersion": 4,
-                "semanticSha256": "0" * 64,
-                "maximumCommandSequence": 2,
-                "currentReleaseSequence": "1",
-                "currentBomDigest": "sha256:" + baseline_digest,
-                "latest": {
-                    "commandId": update["commandId"],
-                    "sequence": 2,
-                    "phase": "ROLLED_BACK",
-                    "bomDigest": bom["bomDigest"],
-                    "releaseSequence": 2,
-                    "healthDeadline": None,
-                },
-            },
+            "bomDigest": bom["bomDigest"],
+            **fleet_release,
         }
-        fleet_evidence_path = source / "evidence.json"
-        fleet_evidence_path.write_text(
-            json.dumps(fleet_evidence, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
+
+        def update(
+            source_manifest: dict[str, object],
+            *,
+            sequence: int,
+            phase: str,
+            updated_at: str,
+        ) -> dict[str, object]:
+            scenario = source_manifest["scenario"]
+            value: dict[str, object] = {
+                "commandId": scenario["expectedCommandId"],
+                "sequence": sequence,
+                "targetVersion": "0.1.121",
+                "bomDigest": bom["bomDigest"],
+                "phase": phase,
+                "updatePhase": phase,
+                "updatedAt": updated_at,
+                "commandExpiresAt": "2026-09-03T11:00:00Z",
+                "candidateSlot": scenario["expectedCandidateSlot"],
+                "previousSlot": baseline_slot,
+                "previousVersion": "0.1.120",
+                "releaseSequence": 2,
+                "artifactDigest": "sha256:" + artifact_sha256,
+                "componentSha": component_sha,
+                "configSchema": "12",
+                "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                "bomVerificationStatus": "VERIFIED",
+            }
+            if phase == "ROLLED_BACK":
+                value.update(
+                    {
+                        "slot": baseline_slot,
+                        "rollbackSlot": baseline_slot,
+                        "rollbackVersion": "0.1.120",
+                        "errorCode": "ROLLED_BACK",
+                        "health": "LKG_RESTORED",
+                        "functionalHealth": "FUNCTIONAL_UNHEALTHY",
+                    }
+                )
+            else:
+                value.update(
+                    {
+                        "slot": candidate_slot,
+                        "health": "FUNCTIONAL_HEALTHY",
+                        "functionalHealth": "FUNCTIONAL_HEALTHY",
+                    }
+                )
+            return value
+
+        def evidence(
+            source_manifest: dict[str, object],
+            *,
+            generated_at: str,
+            sequence: int,
+            phase: str,
+        ) -> dict[str, object]:
+            scenario_type = source_manifest["scenario"]["type"]
+            terminal = update(
+                source_manifest,
+                sequence=sequence,
+                phase=phase,
+                updated_at=generated_at,
+            )
+            committed = phase == "COMMITTED"
+            return {
+                "schemaVersion": 2,
+                "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+                "runId": source_manifest["runId"],
+                "generatedAt": generated_at,
+                "scenario": scenario_type,
+                "complete": True,
+                "gates": {
+                    "foundation": True,
+                    "backup": True,
+                    "trust": True,
+                    "updater2": True,
+                    "oak": True,
+                    "services": True,
+                    "scenario": True,
+                },
+                "oak": oak,
+                "services": services,
+                "runtimePids": None
+                if committed
+                else {"candidate": 4100, "restored": 4200},
+                "slots": {
+                    "current": candidate_slot if committed else baseline_slot,
+                    "previous": baseline_slot if committed else candidate_slot,
+                    "currentVersion": "0.1.121" if committed else "0.1.120",
+                    "release": candidate_release
+                    if committed
+                    else baseline_release,
+                    "previousRelease": baseline_release
+                    if committed
+                    else candidate_release,
+                },
+                "updater": {
+                    "capabilityAvailable": True,
+                    "authenticatedHelper": True,
+                    "reason": "READY",
+                    "updaterVersion": "0.2.0",
+                    "update": terminal,
+                },
+                "antiReplay": {
+                    "schemaVersion": 4,
+                    "semanticSha256": "0" * 64,
+                    "maximumCommandSequence": sequence,
+                    "currentReleaseSequence": "2" if committed else "1",
+                    "currentBomDigest": bom["bomDigest"]
+                    if committed
+                    else "sha256:" + baseline_digest,
+                    "latest": {
+                        "commandId": terminal["commandId"],
+                        "sequence": sequence,
+                        "phase": phase,
+                        "bomDigest": bom["bomDigest"],
+                        "releaseSequence": 2,
+                        "healthDeadline": None,
+                    },
+                },
+            }
+
+        rollback_evidence = evidence(
+            rollback_manifest,
+            generated_at="2026-09-03T10:03:00Z",
+            sequence=2,
+            phase="ROLLED_BACK",
         )
-        cleanup_path = source / "cleanup-evidence.json"
-        cleanup_path.write_bytes(
-            canonical_bytes(bound_cleanup_evidence(fleet_manifest, fleet_evidence))
+        commit_evidence = evidence(
+            commit_manifest,
+            generated_at="2026-09-03T10:05:00Z",
+            sequence=3,
+            phase="COMMITTED",
         )
-        return {
-            "fleet_manifest": fleet_manifest_path,
-            "fleet_evidence": fleet_evidence_path,
-            "cleanup_evidence": cleanup_path,
+        rollback_cleanup = bound_cleanup_evidence(
+            rollback_manifest,
+            rollback_evidence,
+            completed_at="2026-09-03T10:04:00Z",
+        )
+        commit_cleanup = bound_cleanup_evidence(
+            commit_manifest,
+            commit_evidence,
+            completed_at="2026-09-03T10:07:00Z",
+        )
+
+        paths: dict[str, Path] = {
+            "rollback_manifest": source / "rollback-manifest.json",
+            "rollback_evidence": source / "rollback-evidence.json",
+            "rollback_cleanup_evidence": source / "rollback-cleanup.json",
+            "commit_manifest": source / "commit-manifest.json",
+            "commit_evidence": source / "commit-evidence.json",
+            "commit_cleanup_evidence": source / "commit-cleanup.json",
+            "config_stream_evidence": source / "config-stream-evidence.json",
             "artifact": artifact_path,
             "bom": bom_path,
         }
+        for key, value in (
+            ("rollback_manifest", rollback_manifest),
+            ("rollback_evidence", rollback_evidence),
+            ("rollback_cleanup_evidence", rollback_cleanup),
+            ("commit_manifest", commit_manifest),
+            ("commit_evidence", commit_evidence),
+            ("commit_cleanup_evidence", commit_cleanup),
+            (
+                "config_stream_evidence",
+                cls._config_stream_fixture(
+                    commit_manifest,
+                    commit_evidence,
+                    commit_cleanup,
+                    rollback_manifest,
+                    rollback_evidence,
+                ),
+            ),
+        ):
+            paths[key].write_bytes(canonical_bytes(value))
+        return paths
 
     @classmethod
     def _candidate_physical_fixture(
@@ -1513,6 +1905,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             preflight,
         )
         self.assertIn(
+            "--candidate-config-stream-runner release-source/packaging/dev/"
+            "run-iq9075-config-stream-e2e.py",
+            preflight,
+        )
+        self.assertIn(
             "--candidate-board-tool release-source/packaging/dev/"
             "iq9075-board-e2e.py",
             preflight,
@@ -1666,6 +2063,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "--expected-check-suite-id",
             "--expected-workflow-sha256",
             "--candidate-fleet-runner",
+            "--candidate-config-stream-runner",
             "--candidate-board-tool",
         ):
             self.assertIn(option, script)
@@ -1787,13 +2185,23 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             output = root / "output"
             output.mkdir(mode=0o700)
             assembled = FLEET_RUNTIME_EVIDENCE.assemble(
-                fleet_manifest_path=inputs["fleet_manifest"],
-                fleet_evidence_path=inputs["fleet_evidence"],
-                cleanup_evidence_path=inputs["cleanup_evidence"],
+                rollback_manifest_path=inputs["rollback_manifest"],
+                rollback_evidence_path=inputs["rollback_evidence"],
+                rollback_cleanup_evidence_path=inputs[
+                    "rollback_cleanup_evidence"
+                ],
+                commit_manifest_path=inputs["commit_manifest"],
+                commit_evidence_path=inputs["commit_evidence"],
+                config_stream_evidence_path=inputs["config_stream_evidence"],
+                commit_cleanup_evidence_path=inputs[
+                    "commit_cleanup_evidence"
+                ],
                 artifact_path=inputs["artifact"],
                 bom_path=inputs["bom"],
                 candidate_fleet_runner=ROOT
                 / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_config_stream_runner=ROOT
+                / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
@@ -1801,28 +2209,58 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 version="0.1.121",
                 component_sha=component_sha,
             )
-            self.assertEqual(len(list(output.iterdir())), 5)
+            self.assertEqual(len(list(output.iterdir())), 9)
             summary_path = Path(assembled["summary"])
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            self.assertEqual(summary["schemaVersion"], 2)
+            self.assertEqual(summary["schemaVersion"], 3)
             gate = summary["runtimeGate"]
-            self.assertEqual(gate["terminalPhase"], "ROLLED_BACK")
-            self.assertEqual(gate["antiReplay"]["maximumCommandSequence"], 2)
+            self.assertEqual(gate["rollback"]["terminalPhase"], "ROLLED_BACK")
+            self.assertEqual(gate["commit"]["terminalPhase"], "COMMITTED")
             self.assertEqual(
-                gate["antiReplay"]["currentReleaseSequence"], "1"
+                gate["rollback"]["antiReplay"]["maximumCommandSequence"], 2
             )
             self.assertEqual(
-                gate["healthDecision"]["health"], "LKG_RESTORED"
+                gate["commit"]["antiReplay"]["maximumCommandSequence"], 3
             )
-            self.assertEqual(gate["cleanup"]["phase"], "RESTORED")
             self.assertEqual(
-                gate["cleanup"]["identity"]["deviceId"],
+                gate["rollback"]["antiReplay"]["currentReleaseSequence"], "1"
+            )
+            self.assertEqual(
+                gate["commit"]["antiReplay"]["currentReleaseSequence"], "2"
+            )
+            self.assertEqual(
+                gate["rollback"]["healthDecision"]["health"], "LKG_RESTORED"
+            )
+            self.assertEqual(
+                gate["commit"]["healthDecision"]["health"],
+                "FUNCTIONAL_HEALTHY",
+            )
+            self.assertEqual(gate["rollback"]["cleanup"]["phase"], "RESTORED")
+            self.assertEqual(gate["commit"]["cleanup"]["phase"], "RESTORED")
+            self.assertEqual(
+                gate["rollback"]["cleanup"]["identity"]["deviceId"],
                 "sp-3-nuvion-runtime",
             )
             self.assertEqual(
-                gate["cleanup"]["fleetEvidenceSha256"],
-                hashlib.sha256(inputs["fleet_evidence"].read_bytes()).hexdigest(),
+                gate["rollback"]["cleanup"]["fleetEvidenceSha256"],
+                hashlib.sha256(
+                    inputs["rollback_evidence"].read_bytes()
+                ).hexdigest(),
             )
+            self.assertEqual(
+                summary["configStreamRunnerSha256"],
+                hashlib.sha256(
+                    (
+                        ROOT
+                        / "packaging/dev/run-iq9075-config-stream-e2e.py"
+                    ).read_bytes()
+                ).hexdigest(),
+            )
+            self.assertEqual(
+                gate["configStream"]["source"]["componentSha"],
+                component_sha,
+            )
+            self.assertTrue(all(gate["configStream"]["gates"].values()))
             serialized = json.dumps(summary, sort_keys=True)
             for forbidden in (
                 "oakSoak",
@@ -1846,6 +2284,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 security=security,
                 candidate_fleet_runner=ROOT
                 / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_config_stream_runner=ROOT
+                / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
             )
             self.assertEqual(
@@ -1853,7 +2293,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(verified["runtime_bom_sha256"], assembled["bomSha256"])
             tampered_summary = copy.deepcopy(summary)
-            tampered_summary["runtimeGate"]["antiReplay"][
+            tampered_summary["runtimeGate"]["rollback"]["antiReplay"][
                 "maximumCommandSequence"
             ] = 999
             with self.assertRaisesRegex(
@@ -1867,6 +2307,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     security=security,
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_config_stream_runner=ROOT
+                    / "packaging/dev/run-iq9075-config-stream-e2e.py",
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
                 )
@@ -1874,9 +2316,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
     def test_fleet_runtime_chain_rejects_noncanonical_raw_json(self) -> None:
         component_sha = "a" * 40
         for role in (
-            "fleet_manifest",
-            "fleet_evidence",
-            "cleanup_evidence",
+            "rollback_manifest",
+            "rollback_evidence",
+            "rollback_cleanup_evidence",
+            "commit_manifest",
+            "commit_evidence",
+            "config_stream_evidence",
+            "commit_cleanup_evidence",
             "bom",
         ):
             for encoding in ("key-order", "indent", "trailing-whitespace"):
@@ -1910,13 +2356,25 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         "canonical",
                     ):
                         FLEET_RUNTIME_EVIDENCE.assemble(
-                            fleet_manifest_path=inputs["fleet_manifest"],
-                            fleet_evidence_path=inputs["fleet_evidence"],
-                            cleanup_evidence_path=inputs["cleanup_evidence"],
+                            rollback_manifest_path=inputs["rollback_manifest"],
+                            rollback_evidence_path=inputs["rollback_evidence"],
+                            rollback_cleanup_evidence_path=inputs[
+                                "rollback_cleanup_evidence"
+                            ],
+                            commit_manifest_path=inputs["commit_manifest"],
+                            commit_evidence_path=inputs["commit_evidence"],
+                            config_stream_evidence_path=inputs[
+                                "config_stream_evidence"
+                            ],
+                            commit_cleanup_evidence_path=inputs[
+                                "commit_cleanup_evidence"
+                            ],
                             artifact_path=inputs["artifact"],
                             bom_path=inputs["bom"],
                             candidate_fleet_runner=ROOT
                             / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_config_stream_runner=ROOT
+                            / "packaging/dev/run-iq9075-config-stream-e2e.py",
                             candidate_board_tool=ROOT
                             / "packaging/dev/iq9075-board-e2e.py",
                             security_policy_path=ROOT
@@ -1926,6 +2384,166 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             component_sha=component_sha,
                         )
                     self.assertEqual(list(output.iterdir()), [])
+
+    def test_fleet_runtime_chain_rejects_config_stream_runner_drift(self) -> None:
+        component_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            candidate_runner = root / "run-iq9075-config-stream-e2e.py"
+            candidate_runner.write_bytes(
+                (
+                    ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py"
+                ).read_bytes()
+                + b"\n"
+            )
+            with self.assertRaisesRegex(
+                FLEET_RUNTIME_EVIDENCE.AssemblyError,
+                "cannot be summarized",
+            ):
+                FLEET_RUNTIME_EVIDENCE.assemble(
+                    rollback_manifest_path=inputs["rollback_manifest"],
+                    rollback_evidence_path=inputs["rollback_evidence"],
+                    rollback_cleanup_evidence_path=inputs[
+                        "rollback_cleanup_evidence"
+                    ],
+                    commit_manifest_path=inputs["commit_manifest"],
+                    commit_evidence_path=inputs["commit_evidence"],
+                    config_stream_evidence_path=inputs[
+                        "config_stream_evidence"
+                    ],
+                    commit_cleanup_evidence_path=inputs[
+                        "commit_cleanup_evidence"
+                    ],
+                    artifact_path=inputs["artifact"],
+                    bom_path=inputs["bom"],
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_config_stream_runner=candidate_runner,
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                    security_policy_path=ROOT
+                    / "packaging/release/release-security-policy.json",
+                    output_directory=output,
+                    version="0.1.121",
+                    component_sha=component_sha,
+                )
+            self.assertEqual(list(output.iterdir()), [])
+
+    def test_fleet_runtime_chain_rejects_cross_run_splicing(self) -> None:
+        component_sha = "a" * 40
+
+        def duplicate_run_id(
+            inputs: dict[str, Path],
+            manifest: dict[str, object],
+            evidence: dict[str, object],
+        ) -> None:
+            rollback = json.loads(
+                inputs["rollback_manifest"].read_text(encoding="utf-8")
+            )
+            manifest["runId"] = rollback["runId"]
+            evidence["runId"] = rollback["runId"]
+
+        def change_command_keyring(
+            _inputs: dict[str, Path],
+            manifest: dict[str, object],
+            _evidence: dict[str, object],
+        ) -> None:
+            manifest["inputs"]["commandSha256"] = "a" * 64
+
+        def reuse_rollback_sequence(
+            _inputs: dict[str, Path],
+            _manifest: dict[str, object],
+            evidence: dict[str, object],
+        ) -> None:
+            evidence["updater"]["update"]["sequence"] = 2
+            evidence["antiReplay"]["maximumCommandSequence"] = 2
+            evidence["antiReplay"]["latest"]["sequence"] = 2
+
+        for label, mutation in (
+            ("same-run", duplicate_run_id),
+            ("different-keyring", change_command_keyring),
+            ("non-advancing-command", reuse_rollback_sequence),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                inputs = self._fleet_runtime_fixture(
+                    root, component_sha=component_sha
+                )
+                commit_manifest = json.loads(
+                    inputs["commit_manifest"].read_text(encoding="utf-8")
+                )
+                commit_evidence = json.loads(
+                    inputs["commit_evidence"].read_text(encoding="utf-8")
+                )
+                mutation(inputs, commit_manifest, commit_evidence)
+                commit_cleanup = bound_cleanup_evidence(
+                    commit_manifest,
+                    commit_evidence,
+                    completed_at="2026-09-03T10:07:00Z",
+                )
+                inputs["commit_manifest"].write_bytes(
+                    canonical_bytes(commit_manifest)
+                )
+                inputs["commit_evidence"].write_bytes(
+                    canonical_bytes(commit_evidence)
+                )
+                inputs["commit_cleanup_evidence"].write_bytes(
+                    canonical_bytes(commit_cleanup)
+                )
+                inputs["config_stream_evidence"].write_bytes(
+                    canonical_bytes(
+                        self._config_stream_fixture(
+                            commit_manifest,
+                            commit_evidence,
+                            commit_cleanup,
+                            json.loads(
+                                inputs["rollback_manifest"].read_text(
+                                    encoding="utf-8"
+                                )
+                            ),
+                            json.loads(
+                                inputs["rollback_evidence"].read_text(
+                                    encoding="utf-8"
+                                )
+                            ),
+                        )
+                    )
+                )
+                output = root / "output"
+                output.mkdir(mode=0o700)
+                with self.assertRaises(FLEET_RUNTIME_EVIDENCE.AssemblyError):
+                    FLEET_RUNTIME_EVIDENCE.assemble(
+                        rollback_manifest_path=inputs["rollback_manifest"],
+                        rollback_evidence_path=inputs["rollback_evidence"],
+                        rollback_cleanup_evidence_path=inputs[
+                            "rollback_cleanup_evidence"
+                        ],
+                        commit_manifest_path=inputs["commit_manifest"],
+                        commit_evidence_path=inputs["commit_evidence"],
+                        config_stream_evidence_path=inputs[
+                            "config_stream_evidence"
+                        ],
+                        commit_cleanup_evidence_path=inputs[
+                            "commit_cleanup_evidence"
+                        ],
+                        artifact_path=inputs["artifact"],
+                        bom_path=inputs["bom"],
+                        candidate_fleet_runner=ROOT
+                        / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_config_stream_runner=ROOT
+                        / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                        candidate_board_tool=ROOT
+                        / "packaging/dev/iq9075-board-e2e.py",
+                        security_policy_path=ROOT
+                        / "packaging/release/release-security-policy.json",
+                        output_directory=output,
+                        version="0.1.121",
+                        component_sha=component_sha,
+                    )
+                self.assertEqual(list(output.iterdir()), [])
 
     def test_fleet_runtime_cleanup_is_bound_to_exact_run_identity_and_time(
         self,
@@ -1959,21 +2577,35 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     root, component_sha=component_sha
                 )
                 cleanup = json.loads(
-                    inputs["cleanup_evidence"].read_text(encoding="utf-8")
+                    inputs["rollback_cleanup_evidence"].read_text(encoding="utf-8")
                 )
                 mutation(cleanup)
-                inputs["cleanup_evidence"].write_bytes(canonical_bytes(cleanup))
+                inputs["rollback_cleanup_evidence"].write_bytes(
+                    canonical_bytes(cleanup)
+                )
                 output = root / "output"
                 output.mkdir(mode=0o700)
                 with self.assertRaises(FLEET_RUNTIME_EVIDENCE.AssemblyError):
                     FLEET_RUNTIME_EVIDENCE.assemble(
-                        fleet_manifest_path=inputs["fleet_manifest"],
-                        fleet_evidence_path=inputs["fleet_evidence"],
-                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        rollback_manifest_path=inputs["rollback_manifest"],
+                        rollback_evidence_path=inputs["rollback_evidence"],
+                        rollback_cleanup_evidence_path=inputs[
+                            "rollback_cleanup_evidence"
+                        ],
+                        commit_manifest_path=inputs["commit_manifest"],
+                        commit_evidence_path=inputs["commit_evidence"],
+                        config_stream_evidence_path=inputs[
+                            "config_stream_evidence"
+                        ],
+                        commit_cleanup_evidence_path=inputs[
+                            "commit_cleanup_evidence"
+                        ],
                         artifact_path=inputs["artifact"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_config_stream_runner=ROOT
+                        / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
                         security_policy_path=ROOT
@@ -1994,9 +2626,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
         )
         references = (
-            "fleetManifest",
-            "fleetEvidence",
-            "cleanupEvidence",
+            "rollbackManifest",
+            "rollbackEvidence",
+            "rollbackCleanupEvidence",
+            "commitManifest",
+            "commitEvidence",
+            "configStreamEvidence",
+            "commitCleanupEvidence",
             "testedBom",
         )
         for reference in references:
@@ -2012,13 +2648,25 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     output = root / "output"
                     output.mkdir(mode=0o700)
                     assembled = FLEET_RUNTIME_EVIDENCE.assemble(
-                        fleet_manifest_path=inputs["fleet_manifest"],
-                        fleet_evidence_path=inputs["fleet_evidence"],
-                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        rollback_manifest_path=inputs["rollback_manifest"],
+                        rollback_evidence_path=inputs["rollback_evidence"],
+                        rollback_cleanup_evidence_path=inputs[
+                            "rollback_cleanup_evidence"
+                        ],
+                        commit_manifest_path=inputs["commit_manifest"],
+                        commit_evidence_path=inputs["commit_evidence"],
+                        config_stream_evidence_path=inputs[
+                            "config_stream_evidence"
+                        ],
+                        commit_cleanup_evidence_path=inputs[
+                            "commit_cleanup_evidence"
+                        ],
                         artifact_path=inputs["artifact"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_config_stream_runner=ROOT
+                        / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
                         security_policy_path=ROOT
@@ -2062,6 +2710,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             security=security,
                             candidate_fleet_runner=ROOT
                             / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_config_stream_runner=ROOT
+                            / "packaging/dev/run-iq9075-config-stream-e2e.py",
                             candidate_board_tool=ROOT
                             / "packaging/dev/iq9075-board-e2e.py",
                         )
@@ -2072,41 +2722,51 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         component_sha = "a" * 40
 
         def mutate_cleanup(inputs: dict[str, Path]) -> None:
-            cleanup = json.loads(inputs["cleanup_evidence"].read_text(encoding="utf-8"))
+            cleanup = json.loads(
+                inputs["rollback_cleanup_evidence"].read_text(encoding="utf-8")
+            )
             cleanup["proof"]["trustStagingAbsent"] = False
-            inputs["cleanup_evidence"].write_text(
+            inputs["rollback_cleanup_evidence"].write_text(
                 json.dumps(cleanup, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
 
         def mutate_sequence(inputs: dict[str, Path]) -> None:
-            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence = json.loads(
+                inputs["rollback_evidence"].read_text(encoding="utf-8")
+            )
             evidence["updater"]["update"]["sequence"] = False
-            inputs["fleet_evidence"].write_text(
+            inputs["rollback_evidence"].write_text(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
 
         def mutate_anti_replay_snapshot(inputs: dict[str, Path]) -> None:
-            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence = json.loads(
+                inputs["rollback_evidence"].read_text(encoding="utf-8")
+            )
             evidence["antiReplay"]["maximumCommandSequence"] = 999
-            inputs["fleet_evidence"].write_text(
+            inputs["rollback_evidence"].write_text(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
 
         def mutate_service(inputs: dict[str, Path]) -> None:
-            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence = json.loads(
+                inputs["rollback_evidence"].read_text(encoding="utf-8")
+            )
             evidence["services"]["nuv-agent.service"]["active"] = False
-            inputs["fleet_evidence"].write_text(
+            inputs["rollback_evidence"].write_text(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
 
         def mutate_slot(inputs: dict[str, Path]) -> None:
-            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            evidence = json.loads(
+                inputs["rollback_evidence"].read_text(encoding="utf-8")
+            )
             evidence["slots"]["current"] = evidence["slots"]["previous"]
-            inputs["fleet_evidence"].write_text(
+            inputs["rollback_evidence"].write_text(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
@@ -2114,9 +2774,136 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         def mutate_artifact(inputs: dict[str, Path]) -> None:
             inputs["artifact"].write_bytes(b"different candidate artifact")
 
+        def mutate_config_queue(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["stream"]["poor"]["queue"]["observationDlqRows"] = 1
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_order(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["generatedAt"] = "2026-09-03T10:04:01Z"
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_ack(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["config"]["apply"]["lifecycleAckStatuses"] = [
+                "RECEIVED",
+                "SUCCEEDED",
+            ]
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_source(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["source"]["componentSha"] = "b" * 40
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_prior_rollback_command(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["priorRollbackCommand"]["sequence"] = 1
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_release_command_status(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["releaseCommand"]["status"] = "QUEUED"
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_expired_predecessor_time(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["expiredPredecessors"] = [
+                {
+                    "commandId": "11111111-1111-4111-8111-111111111111",
+                    "sequence": 1,
+                    "type": "AGENT_UPDATE",
+                    "status": "EXPIRED",
+                    "expiresAt": "2026-09-03T10:06:01Z",
+                }
+            ]
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_expired_predecessor_absent(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["expiredPredecessors"] = []
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_sequence_gap(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["config"]["restore"]["sequence"] = 6
+            evidence["stream"]["adaptiveCommand"]["sequence"] = 7
+            evidence["stream"]["disabled"]["sequence"] = 8
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_projection_shape(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["stream"]["poor"]["projectionShape"] = "domained"
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_runtime_identity(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["source"]["runtimeIdentity"]["buildInfoSha256"] = "0" * 64
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
+        def mutate_config_cleanup_no_restart(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["config_stream_evidence"].read_text(encoding="utf-8")
+            )
+            evidence["cleanup"]["runtimeIdentity"]["servicePid"] = evidence[
+                "source"
+            ]["runtimeIdentity"]["servicePid"]
+            inputs["config_stream_evidence"].write_bytes(
+                canonical_bytes(evidence)
+            )
+
         def mutate_to_valid_commit(inputs: dict[str, Path]) -> None:
-            manifest = json.loads(inputs["fleet_manifest"].read_text(encoding="utf-8"))
-            evidence = json.loads(inputs["fleet_evidence"].read_text(encoding="utf-8"))
+            manifest = json.loads(
+                inputs["rollback_manifest"].read_text(encoding="utf-8")
+            )
+            evidence = json.loads(
+                inputs["rollback_evidence"].read_text(encoding="utf-8")
+            )
             scenario = manifest["scenario"]
             scenario["type"] = "commit"
             scenario["holdSeconds"] = 0
@@ -2160,12 +2947,18 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 }
             )
             for path, value in (
-                (inputs["fleet_manifest"], manifest),
-                (inputs["fleet_evidence"], evidence),
+                (inputs["rollback_manifest"], manifest),
+                (inputs["rollback_evidence"], evidence),
             ):
                 path.write_bytes(canonical_bytes(value))
-            inputs["cleanup_evidence"].write_bytes(
-                canonical_bytes(bound_cleanup_evidence(manifest, evidence))
+            inputs["rollback_cleanup_evidence"].write_bytes(
+                canonical_bytes(
+                    bound_cleanup_evidence(
+                        manifest,
+                        evidence,
+                        completed_at="2026-09-03T10:04:00Z",
+                    )
+                )
             )
 
         for label, mutation in (
@@ -2175,6 +2968,18 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ("service", mutate_service),
             ("slot", mutate_slot),
             ("artifact", mutate_artifact),
+            ("config-dlq", mutate_config_queue),
+            ("config-order", mutate_config_order),
+            ("config-ack", mutate_config_ack),
+            ("config-source", mutate_config_source),
+            ("prior-rollback-command", mutate_prior_rollback_command),
+            ("release-command-status", mutate_release_command_status),
+            ("expired-predecessor-time", mutate_expired_predecessor_time),
+            ("expired-predecessor-absent", mutate_expired_predecessor_absent),
+            ("config-sequence-gap", mutate_config_sequence_gap),
+            ("config-projection-shape", mutate_config_projection_shape),
+            ("config-runtime-identity", mutate_config_runtime_identity),
+            ("config-cleanup-no-restart", mutate_config_cleanup_no_restart),
             ("commit-does-not-prove-rollback", mutate_to_valid_commit),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
@@ -2186,10 +2991,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 if label == "commit-does-not-prove-rollback":
                     FLEET_E2E.validate_final_evidence(
                         json.loads(
-                            inputs["fleet_evidence"].read_text(encoding="utf-8")
+                            inputs["rollback_evidence"].read_text(encoding="utf-8")
                         ),
                         json.loads(
-                            inputs["fleet_manifest"].read_text(encoding="utf-8")
+                            inputs["rollback_manifest"].read_text(encoding="utf-8")
                         ),
                     )
                 output = root / "output"
@@ -2198,13 +3003,25 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     FLEET_RUNTIME_EVIDENCE.AssemblyError
                 ) as caught:
                     FLEET_RUNTIME_EVIDENCE.assemble(
-                        fleet_manifest_path=inputs["fleet_manifest"],
-                        fleet_evidence_path=inputs["fleet_evidence"],
-                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        rollback_manifest_path=inputs["rollback_manifest"],
+                        rollback_evidence_path=inputs["rollback_evidence"],
+                        rollback_cleanup_evidence_path=inputs[
+                            "rollback_cleanup_evidence"
+                        ],
+                        commit_manifest_path=inputs["commit_manifest"],
+                        commit_evidence_path=inputs["commit_evidence"],
+                        config_stream_evidence_path=inputs[
+                            "config_stream_evidence"
+                        ],
+                        commit_cleanup_evidence_path=inputs[
+                            "commit_cleanup_evidence"
+                        ],
                         artifact_path=inputs["artifact"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_config_stream_runner=ROOT
+                        / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
                         security_policy_path=ROOT
@@ -2241,13 +3058,23 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             output = root / "output"
             output.mkdir(mode=0o700)
             assembled = FLEET_RUNTIME_EVIDENCE.assemble(
-                fleet_manifest_path=inputs["fleet_manifest"],
-                fleet_evidence_path=inputs["fleet_evidence"],
-                cleanup_evidence_path=inputs["cleanup_evidence"],
+                rollback_manifest_path=inputs["rollback_manifest"],
+                rollback_evidence_path=inputs["rollback_evidence"],
+                rollback_cleanup_evidence_path=inputs[
+                    "rollback_cleanup_evidence"
+                ],
+                commit_manifest_path=inputs["commit_manifest"],
+                commit_evidence_path=inputs["commit_evidence"],
+                config_stream_evidence_path=inputs["config_stream_evidence"],
+                commit_cleanup_evidence_path=inputs[
+                    "commit_cleanup_evidence"
+                ],
                 artifact_path=inputs["artifact"],
                 bom_path=inputs["bom"],
                 candidate_fleet_runner=ROOT
                 / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_config_stream_runner=ROOT
+                / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
@@ -2304,6 +3131,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     / "packaging/release/trusted-tag-signers",
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_config_stream_runner=ROOT
+                    / "packaging/dev/run-iq9075-config-stream-e2e.py",
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
                 )
@@ -3412,13 +4241,48 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             runbook,
         )
         self.assertIn("assemble-iq9075-fleet-runtime-evidence.py", runbook)
-        self.assertIn('--fleet-manifest "$fleet_run_dir/immutable-manifest.json"', runbook)
-        self.assertIn('--fleet-evidence "$fleet_run_dir/evidence.json"', runbook)
-        self.assertIn('--cleanup-evidence "$cleanup_evidence"', runbook)
-        self.assertIn('--candidate-fleet-runner "$component_root/packaging/dev/run-iq9075-fleet-e2e.py"', runbook)
-        self.assertIn('--candidate-board-tool "$component_root/packaging/dev/iq9075-board-e2e.py"', runbook)
-        self.assertIn("five-file canonical Fleet Runtime chain", runbook)
+        self.assertIn(
+            '--rollback-manifest "$rollback_run_dir/immutable-manifest.json"',
+            runbook,
+        )
+        self.assertIn('--rollback-evidence "$rollback_run_dir/evidence.json"', runbook)
+        self.assertIn('--rollback-cleanup-evidence "$rollback_cleanup"', runbook)
+        self.assertIn(
+            '--commit-manifest "$commit_run_dir/immutable-manifest.json"',
+            runbook,
+        )
+        self.assertIn('--commit-evidence "$commit_run_dir/evidence.json"', runbook)
+        self.assertIn('--config-stream-evidence "$config_stream_evidence"', runbook)
+        self.assertIn('--commit-cleanup-evidence "$commit_cleanup"', runbook)
+        self.assertIn(
+            '--candidate-fleet-runner "$component_root/packaging/dev/'
+            'run-iq9075-fleet-e2e.py"',
+            runbook,
+        )
+        self.assertIn(
+            '--candidate-config-stream-runner "$component_root/packaging/dev/'
+            'run-iq9075-config-stream-e2e.py"',
+            runbook,
+        )
+        self.assertIn(
+            '--candidate-board-tool "$component_root/packaging/dev/'
+            'iq9075-board-e2e.py"',
+            runbook,
+        )
+        self.assertIn("nine-file", runbook)
         rollback_call = runbook.index("--scenario oak-fault-rollback")
+        rollback_cleanup_call = runbook.index(
+            '--run-id "$rollback_run_id" --output-dir "$rollback_run_dir" cleanup',
+            rollback_call,
+        )
+        commit_call = runbook.index("--scenario commit", rollback_cleanup_call)
+        config_stream_call = runbook.index(
+            "run-iq9075-config-stream-e2e.py", commit_call
+        )
+        runtime_cleanup_call = runbook.index(
+            '--run-id "$commit_run_id" --output-dir "$commit_run_dir" cleanup',
+            config_stream_call,
+        )
         assembly_call = runbook.index(
             "assemble-iq9075-fleet-runtime-evidence.py", rollback_call
         )
@@ -3429,7 +4293,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             '--run-id "$media_run_id" --output-dir "$media_run_dir" cleanup',
             soak_call,
         )
-        self.assertLess(rollback_call, assembly_call)
+        self.assertLess(rollback_call, rollback_cleanup_call)
+        self.assertLess(rollback_cleanup_call, commit_call)
+        self.assertLess(commit_call, config_stream_call)
+        self.assertLess(config_stream_call, runtime_cleanup_call)
+        self.assertLess(runtime_cleanup_call, assembly_call)
         self.assertLess(assembly_call, soak_call)
         self.assertLess(soak_call, cleanup_call)
         self.assertIn('--candidate-bundle "$candidate_bundle"', runbook)
