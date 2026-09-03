@@ -1634,6 +1634,174 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("path: settings-evidence", self.publish)
         self.assertIn('--trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA"', self.publish)
 
+    def test_file_sparse_checkouts_disable_cone_mode_and_materialize(self) -> None:
+        file_sparse_checkouts: list[tuple[Path, int, list[str]]] = []
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        workflows.extend(sorted((ROOT / ".github/workflows").glob("*.yaml")))
+
+        for workflow in workflows:
+            lines = workflow.read_text(encoding="utf-8").splitlines()
+            for index, line in enumerate(lines):
+                match = re.fullmatch(r"(\s*)sparse-checkout:\s*\|\s*", line)
+                if match is None:
+                    continue
+                indentation = len(match.group(1))
+                patterns: list[str] = []
+                cursor = index + 1
+                while cursor < len(lines):
+                    candidate = lines[cursor]
+                    if candidate.strip() and len(candidate) - len(
+                        candidate.lstrip()
+                    ) <= indentation:
+                        break
+                    if candidate.strip() and not candidate.lstrip().startswith("#"):
+                        patterns.append(candidate.strip())
+                    cursor += 1
+
+                step_start = index
+                while step_start >= 0 and not lines[step_start].startswith("      - "):
+                    step_start -= 1
+                self.assertGreaterEqual(step_start, 0, f"{workflow}:{index + 1}")
+                step = "\n".join(lines[step_start:cursor])
+                self.assertIn("uses: actions/checkout@", step)
+
+                literal_files = [
+                    pattern
+                    for pattern in patterns
+                    if "${{" not in pattern
+                    and not any(character in pattern for character in "*?![]{}")
+                    and ((ROOT / pattern).is_file() or Path(pattern).suffix)
+                ]
+                if not literal_files:
+                    continue
+                self.assertRegex(
+                    step,
+                    r"(?m)^\s+sparse-checkout-cone-mode:\s*false\s*$",
+                    f"{workflow}:{index + 1} checks out file paths in cone mode",
+                )
+                file_sparse_checkouts.append((workflow, index + 1, patterns))
+
+        self.assertTrue(file_sparse_checkouts, "no file-pattern sparse checkouts found")
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            origin = temporary_root / "origin"
+            origin.mkdir()
+            subprocess.run(
+                ["git", "init", "--initial-branch=main"],
+                cwd=origin,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=origin,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "release-test"],
+                cwd=origin,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            fixture_files = {
+                pattern
+                for _, _, patterns in file_sparse_checkouts
+                for pattern in patterns
+                if "${{" not in pattern
+                and not any(character in pattern for character in "*?![]{}")
+                and ((ROOT / pattern).is_file() or Path(pattern).suffix)
+            }
+            for relative in fixture_files:
+                target = origin / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(relative + "\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=origin,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "sparse checkout fixture"],
+                cwd=origin,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            for checkout_index, (workflow, line, patterns) in enumerate(
+                file_sparse_checkouts
+            ):
+                cone_checkout = temporary_root / f"cone-checkout-{checkout_index}"
+                subprocess.run(
+                    ["git", "clone", "--no-local", str(origin), str(cone_checkout)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "sparse-checkout", "init", "--cone"],
+                    cwd=cone_checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                cone = subprocess.run(
+                    ["git", "sparse-checkout", "set", *patterns],
+                    cwd=cone_checkout,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(workflow=workflow.name, line=line, mode="cone"):
+                    self.assertNotEqual(cone.returncode, 0)
+
+                checkout = temporary_root / f"no-cone-checkout-{checkout_index}"
+                subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--no-local",
+                        "--no-checkout",
+                        str(origin),
+                        str(checkout),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "sparse-checkout", "init", "--no-cone"],
+                    cwd=checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "sparse-checkout", "set", "--no-cone", *patterns],
+                    cwd=checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "checkout", "HEAD"],
+                    cwd=checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(workflow=workflow.name, line=line, mode="no-cone"):
+                    for pattern in patterns:
+                        if (origin / pattern).is_file():
+                            self.assertTrue((checkout / pattern).is_file(), pattern)
+
     def test_every_credential_job_uses_environment_and_trusted_checkout(self) -> None:
         job_names = [
             "github-release-publish",

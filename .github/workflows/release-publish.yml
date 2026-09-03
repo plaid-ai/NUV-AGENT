@@ -142,6 +142,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
@@ -502,6 +503,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
@@ -681,6 +683,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
@@ -816,6 +819,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
@@ -1144,6 +1148,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
           persist-credentials: false
+          sparse-checkout-cone-mode: false
           sparse-checkout: |
             .github/workflows/release-publish.yml
             packaging/release/release-settings-attestation.json
