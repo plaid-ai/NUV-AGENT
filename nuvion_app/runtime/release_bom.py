@@ -928,7 +928,11 @@ def canonical_release_bom_json(payload: dict[str, Any]) -> str:
     verify_release_bom(payload)
     return (
         json.dumps(
-            payload, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
         + "\n"
     )

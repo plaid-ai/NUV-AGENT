@@ -154,6 +154,15 @@ SECRET_VALUE_RES = (
     re.compile(r"(?i)\bcandidate:[0-9]+\s"),
 )
 SAFE_SECRET_LIKE_FIELDS = frozenset({"offerSdpHadPinnedProfile"})
+CLEANUP_IDENTITY_FIELDS = (
+    "deviceId",
+    "spaceId",
+    "productModel",
+    "platformProfile",
+    "hardwareRevision",
+    "architecture",
+    "dockerRequired",
+)
 
 BOOTSTRAP_REMOTE_PROGRAM = r"""
 import hashlib
@@ -472,6 +481,45 @@ def strict_json(payload: bytes | str, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RunnerError(f"{label} root is not an object")
     return value
+
+
+def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    try:
+        return (
+            json.dumps(
+                dict(value),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RunnerError("evidence is not canonical JSON data") from exc
+
+
+def strict_canonical_json(payload: bytes, *, label: str) -> dict[str, Any]:
+    value = strict_json(payload, label=label)
+    if payload != canonical_json_bytes(value):
+        raise RunnerError(f"{label} is not canonical compact JSON")
+    return value
+
+
+def canonical_utc(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{3})?Z",
+        value,
+    ) is None:
+        raise RunnerError(f"{label} is not canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise RunnerError(f"{label} is not canonical UTC") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise RunnerError(f"{label} is not canonical UTC")
+    return parsed
 
 
 def _askpass_entrypoint() -> bool:
@@ -1644,6 +1692,8 @@ def validate_candidate_soak_evidence(
     raw_evidence_sha256: str | None = None,
     cleanup_evidence_sha256: str | None = None,
     require_cleanup_evidence: bool = False,
+    manifest_raw: bytes | None = None,
+    fleet_evidence_raw: bytes | None = None,
 ) -> None:
     def timestamp(value: object, *, label: str) -> datetime:
         if not isinstance(value, str) or re.fullmatch(
@@ -1778,17 +1828,22 @@ def validate_candidate_soak_evidence(
         cleanup_evidence = evidence.get("cleanupEvidence")
         if not isinstance(cleanup_evidence, Mapping):
             raise RunnerError("candidate soak cleanup evidence is missing")
-        validate_cleanup_result(cleanup_evidence, run_id=run_id)
-        cleanup_proof = cleanup_evidence.get("proof")
-        cleanup_payload = (
-            json.dumps(
-                dict(cleanup_evidence),
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
+        if cleanup_evidence.get("schemaVersion") == 2:
+            if manifest_raw is None or fleet_evidence_raw is None:
+                raise RunnerError("candidate soak cleanup binding inputs are missing")
+            validate_bound_cleanup_evidence(
+                cleanup_evidence,
+                run_id=run_id,
+                manifest_raw=manifest_raw,
+                fleet_evidence_raw=fleet_evidence_raw,
             )
-            + "\n"
-        ).encode("utf-8")
+        else:
+            # Historical candidate-soak evidence used the normalized board
+            # receipt directly. It remains readable but is not accepted by the
+            # camera-independent Fleet Runtime release gate.
+            validate_cleanup_result(cleanup_evidence, run_id=run_id)
+        cleanup_proof = cleanup_evidence.get("proof")
+        cleanup_payload = canonical_json_bytes(cleanup_evidence)
         actual_cleanup_sha256 = hashlib.sha256(cleanup_payload).hexdigest()
         if (
             cleanup_evidence.get("phase") != "RESTORED"
@@ -3046,6 +3101,124 @@ def canonical_cleanup_evidence(
     }
 
 
+def validate_bound_cleanup_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    run_id: str,
+    manifest_raw: bytes,
+    fleet_evidence_raw: bytes,
+) -> dict[str, Any]:
+    """Validate the host wrapper binding cleanup to one exact rollback run."""
+
+    canonical_run_id(run_id)
+    manifest = strict_canonical_json(
+        manifest_raw, label="immutable manifest"
+    )
+    fleet_evidence = strict_canonical_json(
+        fleet_evidence_raw, label="Fleet evidence"
+    )
+    validated_manifest = validate_manifest(manifest)
+    validate_final_evidence(fleet_evidence, validated_manifest)
+    expected_fields = {
+        "schemaVersion",
+        "kind",
+        "protocolVersion",
+        "runId",
+        "complete",
+        "recovered",
+        "phase",
+        "proof",
+        "completedAt",
+        "manifestSha256",
+        "fleetEvidenceSha256",
+        "identity",
+    }
+    identity = evidence.get("identity")
+    expected_identity = {
+        field: validated_manifest["identity"][field]
+        for field in CLEANUP_IDENTITY_FIELDS
+    }
+    if (
+        set(evidence) != expected_fields
+        or type(evidence.get("schemaVersion")) is not int
+        or evidence.get("schemaVersion") != 2
+        or evidence.get("kind") != "nuvion-iq9075-cleanup-evidence"
+        or evidence.get("protocolVersion") != PROTOCOL_VERSION
+        or evidence.get("runId") != run_id
+        or evidence.get("manifestSha256")
+        != hashlib.sha256(manifest_raw).hexdigest()
+        or evidence.get("fleetEvidenceSha256")
+        != hashlib.sha256(fleet_evidence_raw).hexdigest()
+        or not isinstance(identity, Mapping)
+        or dict(identity) != expected_identity
+    ):
+        raise RunnerError("cleanup evidence is not bound to the exact Fleet run")
+    remote_result = {
+        "schemaVersion": 1,
+        "kind": evidence["kind"],
+        "runId": evidence["runId"],
+        "complete": evidence.get("complete"),
+        "recovered": evidence.get("recovered"),
+        "phase": evidence.get("phase"),
+        "proof": evidence.get("proof"),
+    }
+    validate_cleanup_result(remote_result, run_id=run_id)
+    completed_at = canonical_utc(
+        evidence.get("completedAt"), label="cleanup completedAt"
+    )
+    generated_at = canonical_utc(
+        fleet_evidence.get("generatedAt"), label="Fleet evidence generatedAt"
+    )
+    if generated_at > completed_at:
+        raise RunnerError("cleanup evidence predates Fleet rollback evidence")
+    assert_no_secret_material(evidence)
+    return dict(evidence)
+
+
+def build_bound_cleanup_evidence(
+    result: Mapping[str, Any],
+    *,
+    run_id: str,
+    manifest_raw: bytes,
+    fleet_evidence_raw: bytes,
+    completed_at: str,
+) -> dict[str, Any]:
+    """Wrap the unchanged board cleanup RPC in exact local run bindings."""
+
+    remote = canonical_cleanup_evidence(result, run_id=run_id)
+    manifest = strict_canonical_json(
+        manifest_raw, label="immutable manifest"
+    )
+    fleet_evidence = strict_canonical_json(
+        fleet_evidence_raw, label="Fleet evidence"
+    )
+    validated_manifest = validate_manifest(manifest)
+    validate_final_evidence(fleet_evidence, validated_manifest)
+    evidence = {
+        "schemaVersion": 2,
+        "kind": remote["kind"],
+        "protocolVersion": PROTOCOL_VERSION,
+        "runId": run_id,
+        "complete": remote["complete"],
+        "recovered": remote["recovered"],
+        "phase": remote["phase"],
+        "proof": remote["proof"],
+        "completedAt": completed_at,
+        "manifestSha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "fleetEvidenceSha256": hashlib.sha256(fleet_evidence_raw).hexdigest(),
+        "identity": {
+            field: validated_manifest["identity"][field]
+            for field in CLEANUP_IDENTITY_FIELDS
+        },
+    }
+    return validate_bound_cleanup_evidence(
+        evidence,
+        run_id=run_id,
+        manifest_raw=manifest_raw,
+        fleet_evidence_raw=fleet_evidence_raw,
+    )
+
+
 class FleetRunner:
     def __init__(
         self,
@@ -3646,9 +3819,10 @@ class FleetRunner:
             raise RunnerError("candidate soak inputs must be normalized absolute paths")
         manifest_path = self.output_dir / "immutable-manifest.json"
         fleet_evidence_path = self.output_dir / "evidence.json"
+        manifest_raw = read_regular(manifest_path, MAX_INPUT_BYTES)
         manifest = validate_manifest(
-            strict_json(
-                read_regular(manifest_path, MAX_INPUT_BYTES),
+            strict_canonical_json(
+                manifest_raw,
                 label="immutable manifest",
             )
         )
@@ -3823,6 +3997,8 @@ class FleetRunner:
             raw_evidence_sha256=persisted_raw_sha256,
             cleanup_evidence_sha256=cleanup_sha256,
             require_cleanup_evidence=True,
+            manifest_raw=manifest_raw,
+            fleet_evidence_raw=fleet_evidence_raw,
         )
         evidence_path = self.output_dir / "candidate-soak-evidence.json"
         if evidence_path.exists() or evidence_path.is_symlink():
@@ -3856,29 +4032,64 @@ class FleetRunner:
                 run_id=self.run_id,
             ),
         )
-        evidence = canonical_cleanup_evidence(result, run_id=self.run_id)
+        manifest_path = self.output_dir / "immutable-manifest.json"
+        fleet_evidence_path = self.output_dir / "evidence.json"
         evidence_path = self.output_dir / "cleanup-evidence.json"
-        if evidence_path.exists() or evidence_path.is_symlink():
-            persisted = strict_json(
-                read_regular(evidence_path, MAX_OUTPUT_BYTES),
-                label="cleanup evidence",
+        manifest_present = manifest_path.exists() or manifest_path.is_symlink()
+        fleet_evidence_present = (
+            fleet_evidence_path.exists() or fleet_evidence_path.is_symlink()
+        )
+        persisted_present = evidence_path.exists() or evidence_path.is_symlink()
+        if persisted_present:
+            persisted_bytes = read_regular(evidence_path, MAX_OUTPUT_BYTES)
+            persisted = strict_canonical_json(
+                persisted_bytes, label="cleanup evidence"
             )
-            if persisted != evidence:
-                raise RunnerError("persisted cleanup evidence differs")
-        else:
-            atomic_json(evidence_path, evidence, immutable=True)
-        persisted_bytes = read_regular(evidence_path, MAX_OUTPUT_BYTES)
-        if hashlib.sha256(persisted_bytes).hexdigest() != hashlib.sha256(
-            (
-                json.dumps(
-                    evidence,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
+            if persisted.get("schemaVersion") == 2:
+                if not (manifest_present and fleet_evidence_present):
+                    raise RunnerError("bound cleanup inputs are unavailable")
+                validate_bound_cleanup_evidence(
+                    persisted,
+                    run_id=self.run_id,
+                    manifest_raw=read_regular(manifest_path, MAX_INPUT_BYTES),
+                    fleet_evidence_raw=read_regular(
+                        fleet_evidence_path, MAX_OUTPUT_BYTES
+                    ),
                 )
-                + "\n"
-            ).encode("utf-8")
-        ).hexdigest():
+            else:
+                validate_cleanup_result(persisted, run_id=self.run_id)
+                if persisted != canonical_cleanup_evidence(
+                    persisted, run_id=self.run_id
+                ):
+                    raise RunnerError("persisted cleanup evidence is not canonical")
+            return persisted
+        evidence: dict[str, Any]
+        if manifest_present and fleet_evidence_present:
+            try:
+                manifest_raw = read_regular(manifest_path, MAX_INPUT_BYTES)
+                fleet_evidence_raw = read_regular(
+                    fleet_evidence_path, MAX_OUTPUT_BYTES
+                )
+                evidence = build_bound_cleanup_evidence(
+                    result,
+                    run_id=self.run_id,
+                    manifest_raw=manifest_raw,
+                    fleet_evidence_raw=fleet_evidence_raw,
+                    completed_at=utc_now(),
+                )
+            except (RunnerError, KeyError, TypeError):
+                # Cleanup itself must remain available for crash recovery. An
+                # invalid/incomplete local chain receives only a schema-v1
+                # operational receipt, which release validation rejects.
+                evidence = canonical_cleanup_evidence(result, run_id=self.run_id)
+        else:
+            # Failure cleanup can legitimately happen before a manifest or
+            # terminal result exists. Such a receipt is operational evidence,
+            # but schema v1 can never satisfy the release readiness validator.
+            evidence = canonical_cleanup_evidence(result, run_id=self.run_id)
+        atomic_json(evidence_path, evidence, immutable=True)
+        persisted_bytes = read_regular(evidence_path, MAX_OUTPUT_BYTES)
+        if persisted_bytes != canonical_json_bytes(evidence):
             raise RunnerError("cleanup evidence read-back digest differs")
         return evidence
 

@@ -285,6 +285,28 @@ def canonical_sha256(value: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_bytes(value: Mapping[str, object]) -> bytes:
+    return (
+        json.dumps(dict(value), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def bound_cleanup_evidence(
+    manifest: Mapping[str, object],
+    fleet_evidence: Mapping[str, object],
+    *,
+    completed_at: str = "2026-09-03T10:04:00Z",
+) -> dict[str, object]:
+    run_id = str(manifest["runId"])
+    return FLEET_E2E.build_bound_cleanup_evidence(
+        cleanup_evidence(run_id),
+        run_id=run_id,
+        manifest_raw=canonical_bytes(manifest),
+        fleet_evidence_raw=canonical_bytes(fleet_evidence),
+        completed_at=completed_at,
+    )
+
+
 def production_restoration_evidence(
     manifest: dict[str, object],
 ) -> dict[str, object]:
@@ -832,7 +854,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             artifact_kind="agent-bundle",
             built_at="2026-09-03T09:00:00Z",
         )
-        bom_path.write_text(canonical_release_bom_json(bom), encoding="utf-8")
+        bom_path.write_bytes(canonical_bytes(bom))
         baseline_digest = (
             "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
         )
@@ -1003,14 +1025,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             encoding="utf-8",
         )
         cleanup_path = source / "cleanup-evidence.json"
-        cleanup_path.write_text(
-            json.dumps(
-                cleanup_evidence(fleet_manifest["runId"]),
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n",
-            encoding="utf-8",
+        cleanup_path.write_bytes(
+            canonical_bytes(bound_cleanup_evidence(fleet_manifest, fleet_evidence))
         )
         return {
             "fleet_manifest": fleet_manifest_path,
@@ -1788,6 +1804,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.assertEqual(len(list(output.iterdir())), 5)
             summary_path = Path(assembled["summary"])
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["schemaVersion"], 2)
             gate = summary["runtimeGate"]
             self.assertEqual(gate["terminalPhase"], "ROLLED_BACK")
             self.assertEqual(gate["antiReplay"]["maximumCommandSequence"], 2)
@@ -1798,6 +1815,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 gate["healthDecision"]["health"], "LKG_RESTORED"
             )
             self.assertEqual(gate["cleanup"]["phase"], "RESTORED")
+            self.assertEqual(
+                gate["cleanup"]["identity"]["deviceId"],
+                "sp-3-nuvion-runtime",
+            )
+            self.assertEqual(
+                gate["cleanup"]["fleetEvidenceSha256"],
+                hashlib.sha256(inputs["fleet_evidence"].read_bytes()).hexdigest(),
+            )
             serialized = json.dumps(summary, sort_keys=True)
             for forbidden in (
                 "oakSoak",
@@ -1845,6 +1870,201 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
                 )
+
+    def test_fleet_runtime_chain_rejects_noncanonical_raw_json(self) -> None:
+        component_sha = "a" * 40
+        for role in (
+            "fleet_manifest",
+            "fleet_evidence",
+            "cleanup_evidence",
+            "bom",
+        ):
+            for encoding in ("key-order", "indent", "trailing-whitespace"):
+                with (
+                    self.subTest(role=role, encoding=encoding),
+                    tempfile.TemporaryDirectory() as raw_root,
+                ):
+                    root = Path(raw_root)
+                    inputs = self._fleet_runtime_fixture(
+                        root, component_sha=component_sha
+                    )
+                    path = inputs[role]
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if encoding == "key-order":
+                        reordered = dict(reversed(list(value.items())))
+                        path.write_text(
+                            json.dumps(reordered, separators=(",", ":")) + "\n",
+                            encoding="utf-8",
+                        )
+                    elif encoding == "indent":
+                        path.write_text(
+                            json.dumps(value, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        path.write_bytes(path.read_bytes() + b" ")
+                    output = root / "output"
+                    output.mkdir(mode=0o700)
+                    with self.assertRaisesRegex(
+                        FLEET_RUNTIME_EVIDENCE.AssemblyError,
+                        "canonical",
+                    ):
+                        FLEET_RUNTIME_EVIDENCE.assemble(
+                            fleet_manifest_path=inputs["fleet_manifest"],
+                            fleet_evidence_path=inputs["fleet_evidence"],
+                            cleanup_evidence_path=inputs["cleanup_evidence"],
+                            artifact_path=inputs["artifact"],
+                            bom_path=inputs["bom"],
+                            candidate_fleet_runner=ROOT
+                            / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_board_tool=ROOT
+                            / "packaging/dev/iq9075-board-e2e.py",
+                            security_policy_path=ROOT
+                            / "packaging/release/release-security-policy.json",
+                            output_directory=output,
+                            version="0.1.121",
+                            component_sha=component_sha,
+                        )
+                    self.assertEqual(list(output.iterdir()), [])
+
+    def test_fleet_runtime_cleanup_is_bound_to_exact_run_identity_and_time(
+        self,
+    ) -> None:
+        component_sha = "a" * 40
+
+        def mutate_identity(cleanup: dict[str, object]) -> None:
+            cleanup["identity"]["deviceId"] = "sp-3-nuvion-other-board"
+
+        def mutate_manifest_digest(cleanup: dict[str, object]) -> None:
+            cleanup["manifestSha256"] = "a" * 64
+
+        def mutate_evidence_digest(cleanup: dict[str, object]) -> None:
+            cleanup["fleetEvidenceSha256"] = "b" * 64
+
+        def mutate_time(cleanup: dict[str, object]) -> None:
+            cleanup["completedAt"] = "2026-09-03T10:02:59Z"
+
+        for label, mutation in (
+            ("cross-device", mutate_identity),
+            ("manifest-splice", mutate_manifest_digest),
+            ("evidence-splice", mutate_evidence_digest),
+            ("cleanup-before-rollback", mutate_time),
+        ):
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as raw_root,
+            ):
+                root = Path(raw_root)
+                inputs = self._fleet_runtime_fixture(
+                    root, component_sha=component_sha
+                )
+                cleanup = json.loads(
+                    inputs["cleanup_evidence"].read_text(encoding="utf-8")
+                )
+                mutation(cleanup)
+                inputs["cleanup_evidence"].write_bytes(canonical_bytes(cleanup))
+                output = root / "output"
+                output.mkdir(mode=0o700)
+                with self.assertRaises(FLEET_RUNTIME_EVIDENCE.AssemblyError):
+                    FLEET_RUNTIME_EVIDENCE.assemble(
+                        fleet_manifest_path=inputs["fleet_manifest"],
+                        fleet_evidence_path=inputs["fleet_evidence"],
+                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        artifact_path=inputs["artifact"],
+                        bom_path=inputs["bom"],
+                        candidate_fleet_runner=ROOT
+                        / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_board_tool=ROOT
+                        / "packaging/dev/iq9075-board-e2e.py",
+                        security_policy_path=ROOT
+                        / "packaging/release/release-security-policy.json",
+                        output_directory=output,
+                        version="0.1.121",
+                        component_sha=component_sha,
+                    )
+                self.assertEqual(list(output.iterdir()), [])
+
+    def test_fleet_runtime_validator_rejects_signed_noncanonical_raw_json(
+        self,
+    ) -> None:
+        component_sha = "a" * 40
+        security = json.loads(
+            (ROOT / "packaging/release/release-security-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        references = (
+            "fleetManifest",
+            "fleetEvidence",
+            "cleanupEvidence",
+            "testedBom",
+        )
+        for reference in references:
+            for encoding in ("key-order", "indent", "trailing-whitespace"):
+                with (
+                    self.subTest(reference=reference, encoding=encoding),
+                    tempfile.TemporaryDirectory() as raw_root,
+                ):
+                    root = Path(raw_root)
+                    inputs = self._fleet_runtime_fixture(
+                        root, component_sha=component_sha
+                    )
+                    output = root / "output"
+                    output.mkdir(mode=0o700)
+                    assembled = FLEET_RUNTIME_EVIDENCE.assemble(
+                        fleet_manifest_path=inputs["fleet_manifest"],
+                        fleet_evidence_path=inputs["fleet_evidence"],
+                        cleanup_evidence_path=inputs["cleanup_evidence"],
+                        artifact_path=inputs["artifact"],
+                        bom_path=inputs["bom"],
+                        candidate_fleet_runner=ROOT
+                        / "packaging/dev/run-iq9075-fleet-e2e.py",
+                        candidate_board_tool=ROOT
+                        / "packaging/dev/iq9075-board-e2e.py",
+                        security_policy_path=ROOT
+                        / "packaging/release/release-security-policy.json",
+                        output_directory=output,
+                        version="0.1.121",
+                        component_sha=component_sha,
+                    )
+                    summary = json.loads(
+                        Path(assembled["summary"]).read_text(encoding="utf-8")
+                    )
+                    path = output / summary[reference]["file"]
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if encoding == "key-order":
+                        path.write_text(
+                            json.dumps(
+                                dict(reversed(list(value.items()))),
+                                separators=(",", ":"),
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    elif encoding == "indent":
+                        path.write_text(
+                            json.dumps(value, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        path.write_bytes(path.read_bytes() + b" ")
+                    summary[reference]["sha256"] = hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+                    with self.assertRaisesRegex(
+                        READINESS.ReadinessError, "canonical"
+                    ):
+                        READINESS._validate_fleet_runtime_documents(
+                            policy_path=output / "release-readiness.json",
+                            version="0.1.121",
+                            component_sha=component_sha,
+                            summary=summary,
+                            security=security,
+                            candidate_fleet_runner=ROOT
+                            / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_board_tool=ROOT
+                            / "packaging/dev/iq9075-board-e2e.py",
+                        )
 
     def test_fleet_runtime_assembler_fails_closed_on_runtime_or_cleanup_drift(
         self,
@@ -1943,10 +2163,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 (inputs["fleet_manifest"], manifest),
                 (inputs["fleet_evidence"], evidence),
             ):
-                path.write_text(
-                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
-                )
+                path.write_bytes(canonical_bytes(value))
+            inputs["cleanup_evidence"].write_bytes(
+                canonical_bytes(bound_cleanup_evidence(manifest, evidence))
+            )
 
         for label, mutation in (
             ("cleanup", mutate_cleanup),

@@ -210,6 +210,28 @@ def _strict_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return payload
 
 
+def _strict_canonical_object(raw: bytes, *, label: str) -> dict[str, Any]:
+    payload = _strict_object(raw, label=label)
+    try:
+        canonical = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ReadinessError(f"{label} is not canonical JSON data") from exc
+    if raw != canonical:
+        raise ReadinessError(
+            f"{label} is not canonical sort_keys compact JSON with one newline"
+        )
+    return payload
+
+
 def _module_from_verified_source(
     *, module_name: str, source: bytes, display_path: Path
 ) -> types.ModuleType:
@@ -374,6 +396,12 @@ def _fleet_runtime_gate(
             "complete": cleanup_evidence.get("complete"),
             "recovered": cleanup_evidence.get("recovered"),
             "phase": cleanup_evidence.get("phase"),
+            "completedAt": cleanup_evidence.get("completedAt"),
+            "manifestSha256": cleanup_evidence.get("manifestSha256"),
+            "fleetEvidenceSha256": cleanup_evidence.get(
+                "fleetEvidenceSha256"
+            ),
+            "identity": cleanup_evidence.get("identity"),
             "proof": cleanup_evidence.get("proof"),
         },
     }
@@ -407,7 +435,7 @@ def _validate_fleet_runtime_documents(
     }
     if set(summary) != expected_summary_fields or (
         type(summary.get("schemaVersion")) is not int
-        or summary.get("schemaVersion") != 1
+        or summary.get("schemaVersion") != 2
         or summary.get("kind")
         != "nuvion-iq9075-fleet-runtime-release-evidence"
         or summary.get("agentVersion") != version
@@ -418,7 +446,7 @@ def _validate_fleet_runtime_documents(
         or not SHA256.fullmatch(summary["boardToolSha256"])
     ):
         raise ReadinessError(
-            "IQ9075 Fleet Runtime evidence does not match schema v1"
+            "IQ9075 Fleet Runtime evidence does not match schema v2"
         )
 
     manifest_raw, _manifest_sha256 = _evidence_reference(
@@ -441,16 +469,18 @@ def _validate_fleet_runtime_documents(
         summary.get("testedBom"),
         label="IQ9075 Fleet Runtime tested BOM",
     )
-    manifest = _strict_object(
+    manifest = _strict_canonical_object(
         manifest_raw, label="IQ9075 Fleet Runtime manifest"
     )
-    fleet_evidence = _strict_object(
+    fleet_evidence = _strict_canonical_object(
         evidence_raw, label="IQ9075 Fleet Runtime result"
     )
-    cleanup_evidence = _strict_object(
+    cleanup_evidence = _strict_canonical_object(
         cleanup_raw, label="IQ9075 Fleet Runtime cleanup evidence"
     )
-    bom = _strict_object(bom_raw, label="IQ9075 Fleet Runtime tested BOM")
+    bom = _strict_canonical_object(
+        bom_raw, label="IQ9075 Fleet Runtime tested BOM"
+    )
 
     publisher_fleet_runner = (
         Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
@@ -489,11 +519,11 @@ def _validate_fleet_runtime_documents(
     try:
         validated_manifest = fleet_validator.validate_manifest(manifest)
         fleet_validator.validate_final_evidence(fleet_evidence, validated_manifest)
-        fleet_validator.validate_cleanup_result(
-            cleanup_evidence, run_id=str(validated_manifest["runId"])
-        )
-        canonical_cleanup = fleet_validator.canonical_cleanup_evidence(
-            cleanup_evidence, run_id=str(validated_manifest["runId"])
+        canonical_cleanup = fleet_validator.validate_bound_cleanup_evidence(
+            cleanup_evidence,
+            run_id=str(validated_manifest["runId"]),
+            manifest_raw=manifest_raw,
+            fleet_evidence_raw=evidence_raw,
         )
     except Exception as exc:
         raise ReadinessError("IQ9075 Fleet Runtime evidence is invalid") from exc
@@ -508,6 +538,7 @@ def _validate_fleet_runtime_documents(
         )
     if (
         cleanup_evidence != canonical_cleanup
+        or cleanup_evidence.get("schemaVersion") != 2
         or cleanup_evidence.get("phase") != "RESTORED"
         or cleanup_evidence.get("proof", {}).get("transactionPhase")
         != "RESTORED"
@@ -1030,6 +1061,8 @@ def _validate_physical_documents(
                 raw_evidence_sha256=hashlib.sha256(oak_soak_raw).hexdigest(),
                 cleanup_evidence_sha256=cleanup_evidence_sha256,
                 require_cleanup_evidence=True,
+                manifest_raw=fleet_manifest_raw,
+                fleet_evidence_raw=fleet_evidence_raw,
             )
             if candidate_soak.get("rawEvidence") != oak_soak:
                 raise ReadinessError(

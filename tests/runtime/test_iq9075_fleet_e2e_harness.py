@@ -5595,6 +5595,114 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
                 "FAILED",
             )
 
+    def test_host_cleanup_binds_exact_manifest_evidence_identity_and_time(
+        self,
+    ) -> None:
+        class BoundCleanupTransport(PollingRunTransport):
+            def invoke_board(
+                self,
+                command: str,
+                arguments: Sequence[str] = (),
+                *,
+                timeout: float = 90,
+            ) -> dict[str, Any]:
+                if command == "cleanup":
+                    return {
+                        "schemaVersion": 1,
+                        "kind": "nuvion-iq9075-cleanup-evidence",
+                        "runId": self.manifest["runId"],
+                        "complete": True,
+                        "recovered": False,
+                        "phase": "RESTORED",
+                        "proof": cleanup_proof(),
+                    }
+                return super().invoke_board(command, arguments, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = str(uuid.uuid4())
+            output = root / run_id
+            output.mkdir()
+            baseline = "b" * 64
+            transport = BoundCleanupTransport(
+                tool_sha="f" * 64, baseline_digest=baseline
+            )
+            manifest = HOST.build_manifest(
+                run_id=run_id,
+                tool_sha256="f" * 64,
+                input_digests={
+                    "commandSha256": "1" * 64,
+                    "releaseSha256": "2" * 64,
+                    "healthSha256": "3" * 64,
+                    "bindingSha256": "4" * 64,
+                },
+                identity={
+                    "deviceId": "sp-3-nuvion-iq9075",
+                    "spaceId": 3,
+                    "productModel": "IQ9075_DEV",
+                    "platformProfile": "iq9075_dev",
+                    "hardwareRevision": "QCS9075-EVK",
+                    "architecture": "aarch64",
+                    "dockerRequired": False,
+                },
+                scenario_type="commit",
+                expected_command_id=str(uuid.uuid4()),
+                expected_bom_digest="sha256:" + "a" * 64,
+                expected_candidate_slot="/opt/nuv-agent/releases/" + "a" * 64,
+                expected_previous_slot="releases/" + baseline,
+                expected_previous_version="0.1.120",
+                hold_seconds=0,
+                release={
+                    "agentVersion": "0.1.121",
+                    "releaseSequence": 2,
+                    "artifactDigest": "sha256:" + "c" * 64,
+                    "componentSha": "d" * 40,
+                    "configSchema": "12",
+                    "publisherKeyId": "release-iq9075-dev",
+                },
+            )
+            transport.manifest = manifest
+            transport.evidence_calls = 1
+            fleet_evidence = transport.invoke_board("evidence")
+            manifest_raw = HOST.canonical_json_bytes(manifest)
+            fleet_evidence_raw = HOST.canonical_json_bytes(fleet_evidence)
+            (output / "immutable-manifest.json").write_bytes(manifest_raw)
+            (output / "evidence.json").write_bytes(fleet_evidence_raw)
+            runner = HOST.FleetRunner(
+                transport=transport,
+                journal=HOST.HostJournal(
+                    output / "journal.json",
+                    run_id=run_id,
+                    host="iq9075",
+                    fingerprint=HOST.DEFAULT_FINGERPRINT,
+                ),
+                output_dir=output,
+                run_id=run_id,
+            )
+            with mock.patch.object(
+                HOST, "utc_now", return_value="2026-09-02T00:00:03Z"
+            ):
+                receipt = runner.cleanup()
+            with mock.patch.object(
+                HOST, "utc_now", return_value="2026-09-02T00:00:30Z"
+            ):
+                repeated = runner.cleanup()
+            self.assertEqual(receipt["schemaVersion"], 2)
+            self.assertEqual(
+                receipt["manifestSha256"], hashlib.sha256(manifest_raw).hexdigest()
+            )
+            self.assertEqual(
+                receipt["fleetEvidenceSha256"],
+                hashlib.sha256(fleet_evidence_raw).hexdigest(),
+            )
+            self.assertEqual(receipt["identity"], manifest["identity"])
+            self.assertEqual(receipt["completedAt"], "2026-09-02T00:00:03Z")
+            self.assertEqual(repeated, receipt)
+            self.assertEqual(
+                (output / "cleanup-evidence.json").read_bytes(),
+                HOST.canonical_json_bytes(receipt),
+            )
+
     def test_host_cleanup_accepts_only_exact_success_contract(self) -> None:
         run_id = str(uuid.uuid4())
         exact = {

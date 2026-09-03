@@ -373,6 +373,8 @@ def _assemble_into(
                 fleet_evidence_sha256=_digest(fleet_evidence_raw),
                 raw_evidence_sha256=_digest(soak_raw),
                 require_cleanup_evidence=True,
+                manifest_raw=fleet_manifest_raw,
+                fleet_evidence_raw=fleet_evidence_raw,
             )
         except Exception as exc:
             raise AssemblyError("candidate soak evidence is invalid") from exc

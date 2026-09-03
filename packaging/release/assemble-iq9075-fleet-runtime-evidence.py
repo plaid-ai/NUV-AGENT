@@ -58,7 +58,9 @@ def _regular_digest(path: Path, *, maximum: int) -> tuple[str, int]:
         raise AssemblyError(f"cannot read input: {path}") from exc
 
 
-def _object(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
+def _object(
+    path: Path, *, label: str, require_canonical: bool = False
+) -> tuple[dict[str, Any], bytes]:
     raw = _regular_bytes(path)
     try:
         value = json.loads(
@@ -72,6 +74,10 @@ def _object(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
         raise AssemblyError(f"{label} is not strict JSON") from exc
     if not isinstance(value, dict):
         raise AssemblyError(f"{label} root must be an object")
+    if require_canonical and raw != _canonical(value):
+        raise AssemblyError(
+            f"{label} is not canonical sort_keys compact JSON with one newline"
+        )
     return value, raw
 
 
@@ -179,15 +185,23 @@ def _assemble_into(
     if SEMVER.fullmatch(version) is None or SHA.fullmatch(component_sha) is None:
         raise AssemblyError("release version or component SHA is invalid")
     fleet_manifest, fleet_manifest_raw = _object(
-        fleet_manifest_path, label="Fleet Runtime manifest"
+        fleet_manifest_path,
+        label="Fleet Runtime manifest",
+        require_canonical=True,
     )
     fleet_evidence, fleet_evidence_raw = _object(
-        fleet_evidence_path, label="Fleet Runtime evidence"
+        fleet_evidence_path,
+        label="Fleet Runtime evidence",
+        require_canonical=True,
     )
     cleanup_evidence, cleanup_evidence_raw = _object(
-        cleanup_evidence_path, label="Fleet Runtime cleanup evidence"
+        cleanup_evidence_path,
+        label="Fleet Runtime cleanup evidence",
+        require_canonical=True,
     )
-    _bom, bom_raw = _object(bom_path, label="release BOM")
+    _bom, bom_raw = _object(
+        bom_path, label="release BOM", require_canonical=True
+    )
     security, _security_raw = _object(
         security_policy_path, label="release security policy"
     )
@@ -229,7 +243,7 @@ def _assemble_into(
     except Exception as exc:
         raise AssemblyError("Fleet Runtime result cannot be summarized") from exc
     summary = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "kind": "nuvion-iq9075-fleet-runtime-release-evidence",
         "agentVersion": version,
         "componentSha": component_sha,
