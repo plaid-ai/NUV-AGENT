@@ -403,6 +403,7 @@ jobs:
 
       - name: Prove offline MPS inference with the exact shipped tuple
         env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
           HF_HOME: ${{ runner.temp }}/huggingface
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
@@ -413,9 +414,13 @@ jobs:
         run: |
           set -euo pipefail
           # Reclaim the large filesystem cache left by the Formula install
-          # before allocating from the same unified-memory pool.
+          # before allocating from the same unified-memory pool. Ephemeral
+          # self-hosted proof runners may not grant passwordless sudo; their
+          # larger physical-memory floor is still enforced below.
           sync
-          sudo purge
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            sudo purge
+          fi
           FORMULA_PREFIX="$(brew --prefix nuv-agent)"
           FORMULA_PYTHON="$FORMULA_PREFIX/libexec/bin/python"
           export FORMULA_PREFIX
@@ -526,13 +531,14 @@ jobs:
           for scalar in (detector._mps_logit_scale, detector._mps_logit_bias):
               assert scalar.device.type == "mps" and scalar.dtype == torch.float16
 
-          # The 8 GiB hosted runner has one unified CPU/GPU pool. Reclaim
-          # checkpoint/import pages after the real model is resident and before
-          # the first MPS graph allocates its shared command buffers. This is
-          # proof-process hygiene only; no production environment is changed.
+          # Reclaim checkpoint/import pages on passwordless hosted runners
+          # after the real model is resident and before the first MPS graph
+          # allocates its shared command buffers. This is proof-process hygiene
+          # only; no production environment is changed.
           torch.mps.synchronize()
           subprocess.run(["sync"], check=True)
-          subprocess.run(["sudo", "purge"], check=True)
+          if os.environ["RUNNER_ENVIRONMENT"] == "github-hosted":
+              subprocess.run(["sudo", "purge"], check=True)
 
           result = detector.classify(frame)
           assert result is not None and len(result["scores"]) == 2
