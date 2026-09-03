@@ -6,6 +6,8 @@
 /pyproject.toml @plaid-ai/platform-admin
 /nuvion_app/inference/requirements*.txt @plaid-ai/platform-admin
 /nuvion_app/runtime/release_bom.py @plaid-ai/platform-admin
+/nuvion_app/runtime/update_commit_readiness.py @plaid-ai/platform-admin
+/nuvion_app/runtime/update_health_attestation.py @plaid-ai/platform-admin
 /nuvion_app/runtime/updater_client.py @plaid-ai/platform-admin
 /nuvion_updater/** @plaid-ai/platform-admin
 /tests/runtime/test_release_*.py @plaid-ai/platform-admin
