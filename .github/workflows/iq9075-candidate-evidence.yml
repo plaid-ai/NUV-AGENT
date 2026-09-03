@@ -1,0 +1,499 @@
+name: Build signed IQ9075 evidence candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      component_sha:
+        description: "Exact current protected-main commit to build"
+        required: true
+        type: string
+      version:
+        description: "Exact Agent semantic version"
+        required: true
+        type: string
+      release_sequence:
+        description: "Expected next IQ9075 release sequence"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iq9075-candidate-evidence-global
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  build:
+    name: Build exact secretless arm64 candidate
+    if: >-
+      github.repository == 'plaid-ai/NUV-AGENT' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      bundle_name: ${{ steps.identity.outputs.bundle_name }}
+      bundle_sha256: ${{ steps.identity.outputs.bundle_sha256 }}
+      bundle_size: ${{ steps.identity.outputs.bundle_size }}
+      built_at: ${{ steps.source.outputs.built_at }}
+      config_schema: ${{ steps.identity.outputs.config_schema }}
+      min_updater_version: ${{ steps.identity.outputs.min_updater_version }}
+    steps:
+      - name: Check out exact protected-main candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.component_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable source identity
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
+          EXECUTING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$REQUESTED_SEQUENCE" =~ ^[1-9][0-9]*$ ]]
+          [ "$GITHUB_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$EXECUTING_WORKFLOW_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$REQUESTED_COMPONENT_SHA" ] \
+            || { echo "candidate is not the current protected main" >&2; exit 1; }
+          source_version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [ "$source_version" = "$REQUESTED_VERSION" ] \
+            || { echo "requested version differs from protected source" >&2; exit 1; }
+          expected_sequence="$(jq -er '.iq9075.legacyPromotedBaseline.releaseSequence + 1' packaging/release/release-security-policy.json)"
+          [ "$REQUESTED_SEQUENCE" = "$expected_sequence" ] \
+            || { echo "requested sequence is not the policy next sequence" >&2; exit 1; }
+          source_date_epoch="$(git show -s --format=%ct "$REQUESTED_COMPONENT_SHA")"
+          built_at="$(git show -s --format=%cI "$REQUESTED_COMPONENT_SHA")"
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          [ -n "$built_at" ]
+          {
+            echo "source_date_epoch=$source_date_epoch"
+            echo "built_at=$built_at"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Stamp and build deterministic candidate bundle
+        id: identity
+        env:
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+          BUILT_AT: ${{ steps.source.outputs.built_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/release/stamp-build-info.py \
+            --sha "$COMPONENT_SHA" --version "$VERSION"
+          [ "$(git status --porcelain --untracked-files=all)" = " M nuvion_app/build_info.py" ]
+          mkdir -p dist
+          bundle_name="nuv-agent_${VERSION}_iq9075-aarch64.agent-bundle.tar.gz"
+          bundle_path="dist/$bundle_name"
+          packaging/release/build-agent-bundle.sh "$VERSION" "$bundle_path"
+          config_schema="$(python3 -c 'from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)')"
+          min_updater_version="$(python3 -c 'from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)')"
+          [[ "$config_schema" =~ ^[1-9][0-9]*$ ]]
+          [[ "$min_updater_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          bundle_sha256="$(sha256sum "$bundle_path" | awk '{print $1}')"
+          bundle_size="$(stat -c %s "$bundle_path")"
+          python3 - "$COMPONENT_SHA" "$VERSION" "$RELEASE_SEQUENCE" "$BUILT_AT" \
+            "$bundle_name" "$bundle_sha256" "$bundle_size" "$config_schema" \
+            "$min_updater_version" > dist/candidate-build-manifest.json <<'PY'
+          import json
+          import sys
+
+          (
+              component_sha,
+              version,
+              release_sequence,
+              built_at,
+              bundle_name,
+              bundle_sha256,
+              bundle_size,
+              config_schema,
+              min_updater_version,
+          ) = sys.argv[1:]
+          payload = {
+              "schemaVersion": 1,
+              "kind": "nuvion-iq9075-candidate-build",
+              "componentSha": component_sha,
+              "agentVersion": version,
+              "releaseSequence": int(release_sequence),
+              "builtAt": built_at,
+              "configSchema": config_schema,
+              "minUpdaterVersion": min_updater_version,
+              "artifact": {
+                  "name": bundle_name,
+                  "sha256": bundle_sha256,
+                  "sizeBytes": int(bundle_size),
+              },
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
+          {
+            echo "bundle_name=$bundle_name"
+            echo "bundle_sha256=$bundle_sha256"
+            echo "bundle_size=$bundle_size"
+            echo "config_schema=$config_schema"
+            echo "min_updater_version=$min_updater_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Transfer unsigned candidate without credentials
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iq9075-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ steps.identity.outputs.bundle_name }}
+            dist/candidate-build-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  sign:
+    name: Sign exact candidate for Fleet Runtime evidence
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: iq9075-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the same protected source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.component_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download exact secretless build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Revalidate source and artifact before signer access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          BUNDLE_SIZE: ${{ needs.build.outputs.bundle_size }}
+          BUILT_AT: ${{ needs.build.outputs.built_at }}
+          CONFIG_SCHEMA: ${{ needs.build.outputs.config_schema }}
+          MIN_UPDATER_VERSION: ${{ needs.build.outputs.min_updater_version }}
+          EXECUTING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$EXECUTING_WORKFLOW_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$REQUESTED_COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate signing" >&2; exit 1; }
+          [ "$BUNDLE_NAME" = "nuv-agent_${REQUESTED_VERSION}_iq9075-aarch64.agent-bundle.tar.gz" ]
+          bundle_path="dist/$BUNDLE_NAME"
+          [ -f "$bundle_path" ] && [ ! -L "$bundle_path" ]
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          [ "$(stat -c %s "$bundle_path")" = "$BUNDLE_SIZE" ]
+          python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
+            "$REQUESTED_SEQUENCE" "$BUILT_AT" \
+            "$BUNDLE_NAME" "$BUNDLE_SHA256" "$BUNDLE_SIZE" \
+            "$CONFIG_SCHEMA" "$MIN_UPDATER_VERSION" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          expected = {
+              "schemaVersion": 1,
+              "kind": "nuvion-iq9075-candidate-build",
+              "componentSha": sys.argv[1],
+              "agentVersion": sys.argv[2],
+              "releaseSequence": int(sys.argv[3]),
+              "builtAt": sys.argv[4],
+              "configSchema": sys.argv[8],
+              "minUpdaterVersion": sys.argv[9],
+              "artifact": {
+                  "name": sys.argv[5],
+                  "sha256": sys.argv[6],
+                  "sizeBytes": int(sys.argv[7]),
+              },
+          }
+          path = pathlib.Path("dist/candidate-build-manifest.json")
+          raw = path.read_bytes()
+          canonical = (json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if raw != canonical:
+              raise SystemExit("candidate build manifest differs from protected inputs")
+          PY
+
+      - name: Install the signer verification runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+
+      - name: Sign exact canonical BOM and verify with tracked public keyring
+        env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUILT_AT: ${{ needs.build.outputs.built_at }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          CONFIG_SCHEMA: ${{ needs.build.outputs.config_schema }}
+          MIN_UPDATER_VERSION: ${{ needs.build.outputs.min_updater_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$RELEASE_SIGNING_PRIVATE_KEY" ] \
+            || { echo "IQ9075 candidate signer is unavailable" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          signing_key_id="$(jq -er .iq9075.publisherKeyId packaging/release/release-security-policy.json)"
+          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
+          NUVION_IQ9075_RELEASE_SIGNING_KEY="$RELEASE_SIGNING_PRIVATE_KEY" \
+          PYTHONPATH=. python3 packaging/release/generate-release-bom.py \
+            --schema-version 2 \
+            --bom-id "nuv-agent-${VERSION}-iq9075-aarch64" \
+            --version "$VERSION" \
+            --component-sha "$COMPONENT_SHA" \
+            --config-schema "$CONFIG_SCHEMA" \
+            --release-sequence "$RELEASE_SEQUENCE" \
+            --min-updater-version "$MIN_UPDATER_VERSION" \
+            --target "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64" \
+            --artifact "$bundle_path" \
+            --artifact-kind agent-bundle \
+            --built-at "$BUILT_AT" \
+            --output "$bom_path" \
+            --signature-output "$signature_path" \
+            --signing-key-id "$signing_key_id" \
+            --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+          RELEASE_KEYRING_PATH=packaging/release/trusted-release-keyrings/iq9075-dev.json \
+          PYTHONPATH=. python3 - "$bom_path" "$signature_path" "$bundle_path" \
+            "$COMPONENT_SHA" "$VERSION" "$RELEASE_SEQUENCE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from nuvion_app.runtime.release_bom import load_signed_release_bom, verify_release_artifact
+          from nuvion_updater.trust import load_release_keyring
+
+          bom_path, signature_path, artifact_path = map(Path, sys.argv[1:4])
+          expected_sha, expected_version, expected_sequence = sys.argv[4:]
+          keyring = load_release_keyring(
+              Path("packaging/release/trusted-release-keyrings/iq9075-dev.json"),
+              expected_trust_domain="iq9075-dev",
+              require_root_owner=False,
+          )
+          verified = load_signed_release_bom(
+              bom_path, signature_path, release_keyring=keyring
+          )
+          verify_release_artifact(verified, artifact_path)
+          if (
+              verified.component_sha != expected_sha
+              or verified.agent_version != expected_version
+              or verified.release_sequence != int(expected_sequence)
+          ):
+              raise SystemExit("signed candidate BOM identity is invalid")
+          PY
+          unset RELEASE_SIGNING_PRIVATE_KEY NUVION_IQ9075_RELEASE_SIGNING_KEY
+
+      - name: Assemble secret-free download manifest
+        env:
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bom_name="nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          bom_digest="$(jq -er '.bomDigest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' "dist/$bom_name")"
+          python3 - "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$COMPONENT_SHA" \
+            "$VERSION" "$RELEASE_SEQUENCE" "$BUNDLE_NAME" "$BUNDLE_SHA256" \
+            "$bom_name" "$(sha256sum "dist/$bom_name" | awk '{print $1}')" \
+            "$(sha256sum "dist/$bom_name.sig" | awk '{print $1}')" \
+            "$(sha256sum packaging/release/trusted-release-keyrings/iq9075-dev.json | awk '{print $1}')" \
+            "$bom_digest" \
+            > dist/candidate-evidence-manifest.json <<'PY'
+          import json
+          import sys
+
+          payload = {
+              "schemaVersion": 1,
+              "kind": "nuvion-iq9075-signed-evidence-candidate",
+              "workflowRunId": int(sys.argv[1]),
+              "workflowRunAttempt": int(sys.argv[2]),
+              "componentSha": sys.argv[3],
+              "agentVersion": sys.argv[4],
+              "releaseSequence": int(sys.argv[5]),
+              "artifact": {"name": sys.argv[6], "sha256": sys.argv[7]},
+              "bom": {"name": sys.argv[8], "sha256": sys.argv[9]},
+              "signature": {"name": sys.argv[8] + ".sig", "sha256": sys.argv[10]},
+              "releaseKeyringSha256": sys.argv[11],
+              "contentAddressedPath": "releases/by-bom-sha256/" + sys.argv[12],
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
+
+      - name: Transfer signed candidate without cloud credentials
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iq9075-signed-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ needs.build.outputs.bundle_name }}
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json.sig
+            dist/candidate-evidence-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  stage:
+    name: Stage content-addressed IQ9075 evidence candidate
+    needs: [build, sign]
+    if: needs.sign.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: iq9075-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the same protected source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.component_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download signed candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-signed-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Install verifier runtime before cloud credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+
+      - name: Revalidate source and signed bytes before cloud credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          BUNDLE_SHA256: ${{ needs.build.outputs.bundle_sha256 }}
+          EXECUTING_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$EXECUTING_WORKFLOW_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
+          [ -z "$(git status --porcelain --untracked-files=all)" ]
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$REQUESTED_COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate staging" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${REQUESTED_VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
+          [ -f "$bundle_path" ] && [ ! -L "$bundle_path" ]
+          [ -f "$bom_path" ] && [ ! -L "$bom_path" ]
+          [ -f "$signature_path" ] && [ ! -L "$signature_path" ]
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          PYTHONPATH=. python3 - "$bom_path" "$signature_path" "$bundle_path" \
+            "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from nuvion_app.runtime.release_bom import load_signed_release_bom, verify_release_artifact
+          from nuvion_updater.trust import load_release_keyring
+
+          bom_path, signature_path, artifact_path = map(Path, sys.argv[1:4])
+          expected_sha, expected_version, expected_sequence = sys.argv[4:]
+          keyring = load_release_keyring(
+              Path("packaging/release/trusted-release-keyrings/iq9075-dev.json"),
+              expected_trust_domain="iq9075-dev",
+              require_root_owner=False,
+          )
+          verified = load_signed_release_bom(
+              bom_path, signature_path, release_keyring=keyring
+          )
+          verify_release_artifact(verified, artifact_path)
+          if (
+              verified.component_sha != expected_sha
+              or verified.agent_version != expected_version
+              or verified.release_sequence != int(expected_sequence)
+          ):
+              raise SystemExit("staged candidate identity is invalid")
+          PY
+
+      - name: Authenticate content-addressed OTA stager
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud for the pinned project
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Create only content-addressed OTA objects
+        env:
+          VERSION: ${{ inputs.version }}
+          BUNDLE_NAME: ${{ needs.build.outputs.bundle_name }}
+          APT_RUNTIME_ROOT: ${{ runner.temp }}/iq9075-candidate-stage-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          OTA_CONTENT_ONLY=true \
+          SKIP_APT_PUBLISH=true \
+          BUCKET=apt.plaidai.io \
+          RELEASE_KEYRING_PATH=packaging/release/trusted-release-keyrings/iq9075-dev.json \
+          RELEASE_TRUST_DOMAIN=iq9075-dev \
+            packaging/apt/publish-gcs.sh \
+              "$bundle_path" "$bom_path" "$bom_path.sig" "$bundle_path"
+
+      - name: Upload successfully staged evidence candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ needs.build.outputs.bundle_name }}
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json.sig
+            dist/candidate-evidence-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2

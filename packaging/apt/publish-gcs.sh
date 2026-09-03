@@ -78,6 +78,15 @@ case "$SKIP_APT_PUBLISH" in
   true|false) ;;
   *) echo "SKIP_APT_PUBLISH must be true or false" >&2; exit 2 ;;
 esac
+OTA_CONTENT_ONLY="${OTA_CONTENT_ONLY:-false}"
+case "$OTA_CONTENT_ONLY" in
+  true|false) ;;
+  *) echo "OTA_CONTENT_ONLY must be true or false" >&2; exit 2 ;;
+esac
+if [ "$OTA_CONTENT_ONLY" = true ] && [ "$SKIP_APT_PUBLISH" != true ]; then
+  echo "OTA_CONTENT_ONLY requires SKIP_APT_PUBLISH=true" >&2
+  exit 2
+fi
 APTLY_PASSPHRASE_FILE="${APTLY_PASSPHRASE_FILE:-}"
 
 if [ "$SKIP_APT_PUBLISH" = false ]; then
@@ -178,9 +187,12 @@ PY
     exit 1
   fi
 
-  VERSION_BOM_DIR="$PUBLIC_DIR/releases/$VERSION"
   CONTENT_BOM_DIR="$PUBLIC_DIR/releases/by-bom-sha256/$BOM_DIGEST"
-  mkdir -p "$VERSION_BOM_DIR" "$CONTENT_BOM_DIR"
+  mkdir -p "$CONTENT_BOM_DIR"
+  if [ "$OTA_CONTENT_ONLY" = false ]; then
+    VERSION_BOM_DIR="$PUBLIC_DIR/releases/$VERSION"
+    mkdir -p "$VERSION_BOM_DIR"
+  fi
   if [ "$BOM_SCHEMA" = "2" ] && [ -z "$SIGNATURE_PATH" ]; then
     echo "release-bom-v2 requires a detached signature sidecar" >&2
     exit 1
@@ -233,13 +245,15 @@ PY
     PUBLISHED_RELEASE_PATHS+=("$destination")
   }
 
-  version_artifact="$VERSION_BOM_DIR/$(basename "$BOM_ARTIFACT_PATH")"
-  install_immutable_release_file "$BOM_ARTIFACT_PATH" "$version_artifact"
-  VERSION_PAYLOAD_PATHS+=("$version_artifact")
-  if [ -n "$SIGNATURE_PATH" ]; then
-    version_signature="$VERSION_BOM_DIR/release-bom.json.sig"
-    install_immutable_release_file "$SIGNATURE_PATH" "$version_signature"
-    VERSION_PAYLOAD_PATHS+=("$version_signature")
+  if [ "$OTA_CONTENT_ONLY" = false ]; then
+    version_artifact="$VERSION_BOM_DIR/$(basename "$BOM_ARTIFACT_PATH")"
+    install_immutable_release_file "$BOM_ARTIFACT_PATH" "$version_artifact"
+    VERSION_PAYLOAD_PATHS+=("$version_artifact")
+    if [ -n "$SIGNATURE_PATH" ]; then
+      version_signature="$VERSION_BOM_DIR/release-bom.json.sig"
+      install_immutable_release_file "$SIGNATURE_PATH" "$version_signature"
+      VERSION_PAYLOAD_PATHS+=("$version_signature")
+    fi
   fi
 
   content_artifact="$CONTENT_BOM_DIR/$(basename "$BOM_ARTIFACT_PATH")"
@@ -254,8 +268,10 @@ PY
   install_immutable_release_file "$BOM_PATH" "$content_bom"
   CONTENT_RELEASE_PATHS+=("$content_bom")
 
-  VERSION_DISCOVERY_PATH="$VERSION_BOM_DIR/release-bom.json"
-  install_immutable_release_file "$BOM_PATH" "$VERSION_DISCOVERY_PATH"
+  if [ "$OTA_CONTENT_ONLY" = false ]; then
+    VERSION_DISCOVERY_PATH="$VERSION_BOM_DIR/release-bom.json"
+    install_immutable_release_file "$BOM_PATH" "$VERSION_DISCOVERY_PATH"
+  fi
 fi
 
 RELEASE_FILE="$PUBLIC_DIR/dists/$DIST/Release"
