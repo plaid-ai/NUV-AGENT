@@ -1491,6 +1491,16 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("--trusted-workflow publisher/", preflight)
         self.assertIn("--gate-workflow-sha256 \"$GATE_WORKFLOW_SHA256\"", preflight)
         self.assertIn("--signer-directory publisher/packaging/release/", preflight)
+        self.assertIn(
+            "--candidate-fleet-runner release-source/packaging/dev/"
+            "run-iq9075-fleet-e2e.py",
+            preflight,
+        )
+        self.assertIn(
+            "--candidate-board-tool release-source/packaging/dev/"
+            "iq9075-board-e2e.py",
+            preflight,
+        )
         self.assertLess(
             preflight.index("verify-agent-release-gate.py"),
             preflight.index("verify-release-readiness.py"),
@@ -1639,6 +1649,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "--expected-check-id",
             "--expected-check-suite-id",
             "--expected-workflow-sha256",
+            "--candidate-fleet-runner",
+            "--candidate-board-tool",
         ):
             self.assertIn(option, script)
 
@@ -3164,7 +3176,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     self.assertEqual(nonisolated.returncode, 2)
                     self.assertIn("requires Python isolated mode", nonisolated.stderr)
 
-    def test_iq9075_runbook_keeps_optional_candidate_soak_isolated(
+    def test_iq9075_runbook_uses_camera_independent_release_evidence_and_keeps_optional_soak_isolated(
         self,
     ) -> None:
         runbook = (
@@ -3179,19 +3191,30 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "qualification and is not part of this Fleet Runtime release decision",
             runbook,
         )
+        self.assertIn("assemble-iq9075-fleet-runtime-evidence.py", runbook)
+        self.assertIn('--fleet-manifest "$fleet_run_dir/immutable-manifest.json"', runbook)
+        self.assertIn('--fleet-evidence "$fleet_run_dir/evidence.json"', runbook)
+        self.assertIn('--cleanup-evidence "$cleanup_evidence"', runbook)
+        self.assertIn('--candidate-fleet-runner "$component_root/packaging/dev/run-iq9075-fleet-e2e.py"', runbook)
+        self.assertIn('--candidate-board-tool "$component_root/packaging/dev/iq9075-board-e2e.py"', runbook)
+        self.assertIn("five-file canonical Fleet Runtime chain", runbook)
         rollback_call = runbook.index("--scenario oak-fault-rollback")
+        assembly_call = runbook.index(
+            "assemble-iq9075-fleet-runtime-evidence.py", rollback_call
+        )
         soak_call = runbook.index(
-            '--run-id "$run_id" --output-dir "$fleet_run_dir" candidate-soak'
+            '--run-id "$media_run_id" --output-dir "$media_run_dir" candidate-soak'
         )
         cleanup_call = runbook.index(
-            '--run-id "$run_id" --output-dir "$fleet_run_dir" cleanup',
+            '--run-id "$media_run_id" --output-dir "$media_run_dir" cleanup',
             soak_call,
         )
-        self.assertLess(rollback_call, soak_call)
+        self.assertLess(rollback_call, assembly_call)
+        self.assertLess(assembly_call, soak_call)
         self.assertLess(soak_call, cleanup_call)
         self.assertIn('--candidate-bundle "$candidate_bundle"', runbook)
         self.assertIn('--candidate-bom "$candidate_bom"', runbook)
-        self.assertIn(
+        self.assertNotIn(
             '--candidate-soak-evidence "$candidate_soak_evidence"', runbook
         )
         self.assertNotIn("sudo -n env -u PYTHONPATH NUVION_AGENT_PYTHON", runbook)

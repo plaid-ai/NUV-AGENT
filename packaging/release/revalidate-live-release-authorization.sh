@@ -39,4 +39,6 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
   --gate-workflow-sha256 "$RELEASE_AUTH_GATE_WORKFLOW_SHA256" \
   --security-policy "$script_dir/release-security-policy.json" \
   --signer-directory "$script_dir/trusted-tag-signers" \
-  --candidate-harness "$publisher_root/packaging/dev/test-iq9075.sh"
+  --candidate-harness "$publisher_root/packaging/dev/test-iq9075.sh" \
+  --candidate-fleet-runner "$publisher_root/packaging/dev/run-iq9075-fleet-e2e.py" \
+  --candidate-board-tool "$publisher_root/packaging/dev/iq9075-board-e2e.py"
