@@ -6,7 +6,7 @@ This directory contains packaging templates for Homebrew and Debian/Ubuntu.
 The pinned wheel set targets Apple Silicon macOS (`arm64`). Intel macOS developers
 must use a source/virtualenv install until a separately pinned x86_64 resource set exists.
 
-1. Create a tap repo (e.g., `plaid-ai/homebrew-NUV-agent-homebrew`).
+1. Create a tap repo (e.g., `plaid-ai/homebrew-NUV-AGENT-HOMEBREW`).
 2. Copy `packaging/homebrew/nuv-agent.rb` into `Formula/nuv-agent.rb`.
 3. Replace `__URL__` and `__SHA256__` with the release tarball URL and SHA256.
 4. Tag a release matching the formula version.
@@ -265,7 +265,7 @@ preflight에서 확인되므로 publish 이후 tag와 asset은 수정/삭제할 
 version을 변경해야 할 때는 새 signed patch version을 발행해야 합니다.
 
 Required secrets:
-- `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)
+- `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/homebrew-NUV-AGENT-HOMEBREW`)
 - `IQ9075_RELEASE_SIGNING_PRIVATE_KEY` (Ed25519 private publisher key)
 - Publisher key ID is pinned in `release-security-policy.json`, not a secret
 - `packaging/release/trusted-release-keyrings/iq9075-dev.json` is public,

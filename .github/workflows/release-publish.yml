@@ -659,7 +659,7 @@ jobs:
       checks: read
       contents: read
     env:
-      TAP_REPO: plaid-ai/homebrew-NUV-agent-homebrew
+      TAP_REPO: plaid-ai/homebrew-NUV-AGENT-HOMEBREW
       FORMULA_PATH: Formula/nuv-agent.rb
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
       RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}

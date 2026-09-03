@@ -4,6 +4,7 @@ set -euo pipefail
 readonly REPOSITORY="plaid-ai/NUV-AGENT"
 readonly MIGRATION_ENVIRONMENT="release-secret-migration"
 readonly WORKFLOW_PATH=".github/workflows/migrate-release-secrets.yml"
+readonly HELPER_PATH="packaging/release/resume-release-secret-migration.py"
 readonly PLATFORM_ADMIN_TEAM_ID="16128529"
 
 die() {
@@ -41,15 +42,20 @@ setup_environment() {
     *) die "provided token does not belong to an active Platform-Admin member" ;;
   esac
 
-  local main_protected workflow_paths
+  local main_protected one_shot_paths tree_metadata
   main_protected="$(GH_TOKEN="$admin_token" gh api \
     "repos/${REPOSITORY}/branches/main" --jq .protected)"
   [ "$main_protected" = true ] || die "main is not protected"
-  workflow_paths="$(GH_TOKEN="$admin_token" gh api \
-    "repos/${REPOSITORY}/git/trees/main?recursive=1" \
-    --jq ".tree[] | select(.path == \"${WORKFLOW_PATH}\") | .path")"
-  [ "$workflow_paths" = "$WORKFLOW_PATH" ] \
-    || die "merge the one-shot workflow to protected main before setup"
+  tree_metadata="$(GH_TOKEN="$admin_token" gh api \
+    "repos/${REPOSITORY}/git/trees/main?recursive=1")"
+  [ "$(jq -r .truncated <<<"$tree_metadata")" = false ] \
+    || die "protected-main tree metadata is truncated"
+  one_shot_paths="$(jq -r \
+    --arg workflow "$WORKFLOW_PATH" --arg helper "$HELPER_PATH" \
+    '.tree[].path | select(. == $workflow or . == $helper)' \
+    <<<"$tree_metadata" | LC_ALL=C sort)"
+  [ "$one_shot_paths" = "$(printf '%s\n%s' "$WORKFLOW_PATH" "$HELPER_PATH" | LC_ALL=C sort)" ] \
+    || die "merge the one-shot workflow and helper to protected main before setup"
 
   GH_TOKEN="$admin_token" gh api --method PUT \
     "repos/${REPOSITORY}/environments/${MIGRATION_ENVIRONMENT}" \
@@ -136,11 +142,16 @@ cleanup_environment() {
   [ "$#" -eq 0 ] || die "cleanup takes no arguments"
   authenticated_admin
 
-  local workflow_paths
-  workflow_paths="$(gh api "repos/${REPOSITORY}/git/trees/main?recursive=1" \
-    --jq ".tree[] | select(.path == \"${WORKFLOW_PATH}\") | .path")"
-  [ -z "$workflow_paths" ] \
-    || die "remove the one-shot workflow from protected main before cleanup"
+  local one_shot_paths tree_metadata
+  tree_metadata="$(gh api "repos/${REPOSITORY}/git/trees/main?recursive=1")"
+  [ "$(jq -r .truncated <<<"$tree_metadata")" = false ] \
+    || die "protected-main tree metadata is truncated"
+  one_shot_paths="$(jq -r \
+    --arg workflow "$WORKFLOW_PATH" --arg helper "$HELPER_PATH" \
+    '.tree[].path | select(. == $workflow or . == $helper)' \
+    <<<"$tree_metadata" | LC_ALL=C sort)"
+  [ -z "$one_shot_paths" ] \
+    || die "remove the one-shot workflow and helper from protected main before cleanup"
 
   local repository_names name
   repository_names="$(gh api --paginate \
