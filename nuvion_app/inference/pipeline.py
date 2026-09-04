@@ -102,6 +102,7 @@ from nuvion_app.inference.snapshot import capture_and_upload_snapshot
 from nuvion_app.inference.stream_policy import (
     GlibMainContextDispatcher,
     StreamPolicyReconciler,
+    StreamRuntimeEvidence,
     X264EncoderAdapter,
 )
 from nuvion_app.inference.settings_reconciler import (
@@ -2362,6 +2363,17 @@ async def webrtc_stats_sender(runtime: FleetCommandRuntime) -> None:
                         str(exc)[:500],
                     )
             controller.request_outbound_stats()
+        try:
+            # A viewer-less or stalled WebRTC branch may yield no stats at all.
+            # Poll local GStreamer/appsink proof independently so the durable
+            # STREAM_POLICY twin transitions out of STREAM_CONTINUOUS promptly.
+            await runtime.observe_stream_health()
+        except Exception as exc:  # noqa: BLE001 - next probe retries safely.
+            log.error(
+                "[STREAM-POLICY] runtime health observation failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:500],
+            )
         await asyncio.sleep(interval)
 
 
@@ -3439,6 +3451,22 @@ class GStreamerInferenceApp:
             image_duration_sec=float(os.getenv("NUVION_DEMO_IMAGE_DURATION_SEC", "1.0")),
         )
 
+    def _stream_runtime_evidence(self) -> StreamRuntimeEvidence:
+        """Return fail-closed local media evidence without requiring a viewer."""
+
+        pipeline_running = False
+        active_pipeline = self.pipeline
+        if active_pipeline is not None and self.user_data.running:
+            try:
+                _change, current_state, _pending = active_pipeline.get_state(0)
+                pipeline_running = current_state == Gst.State.PLAYING
+            except Exception:  # noqa: BLE001 - a probe failure is unhealthy.
+                pipeline_running = False
+        return StreamRuntimeEvidence(
+            pipeline_running=pipeline_running,
+            last_frame_monotonic=self.user_data.last_frame_monotonic,
+        )
+
     def create_pipeline(self):
         Gst.init(None)
         source_pipeline = build_video_source_pipeline(
@@ -3632,7 +3660,10 @@ class GStreamerInferenceApp:
                 dispatch=GlibMainContextDispatcher(GLib.idle_add),
             )
             fleet_effect_registry.register(
-                StreamPolicyReconciler(self.encoder_adapter)
+                StreamPolicyReconciler(
+                    self.encoder_adapter,
+                    runtime_evidence=self._stream_runtime_evidence,
+                )
             )
             log.info("[STREAM-POLICY] x264 reconciler registered")
 
@@ -3678,6 +3709,9 @@ class GStreamerInferenceApp:
         self._demo_restarting = True
         self._demo_last_restart_at = now
         try:
+            # A frame from the previous PLAYING generation cannot prove the
+            # restarted pipeline healthy, even when it is only milliseconds old.
+            self.user_data.last_frame_monotonic = None
             self.pipeline.set_state(Gst.State.NULL)
             # Wait state transition to settle before replay.
             self.pipeline.get_state(2 * Gst.SECOND)

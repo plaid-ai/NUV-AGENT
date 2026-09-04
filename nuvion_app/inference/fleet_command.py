@@ -534,6 +534,7 @@ class FleetCommandVerifier:
         expected_space_id: int,
         capabilities: AbstractSet[str],
         capability_provider: Callable[[], AbstractSet[str]] | None = None,
+        unready_command_admission: Callable[[VerifiedFleetCommand], bool] | None = None,
         supported_schema_versions: AbstractSet[int] = frozenset({1}),
         allowed_authorization_contexts: AbstractSet[
             str
@@ -573,6 +574,11 @@ class FleetCommandVerifier:
         if capability_provider is not None and not callable(capability_provider):
             raise TypeError("capability_provider must be callable")
         self._capability_provider = capability_provider
+        if unready_command_admission is not None and not callable(
+            unready_command_admission
+        ):
+            raise TypeError("unready_command_admission must be callable")
+        self._unready_command_admission = unready_command_admission
         self.supported_schema_versions = frozenset(supported_schema_versions)
         self.allowed_authorization_contexts = normalized_contexts
         self.max_command_ttl = max_command_ttl
@@ -843,10 +849,17 @@ class FleetCommandVerifier:
                 "command type is not supported",
             )
         if command.required_capability not in self.capabilities:
-            return CommandValidationError(
-                "MISSING_CAPABILITY",
-                "platform does not provide command capability",
-            )
+            admitted = False
+            if self._unready_command_admission is not None:
+                try:
+                    admitted = bool(self._unready_command_admission(command))
+                except Exception:  # noqa: BLE001 - admission must fail closed.
+                    admitted = False
+            if not admitted:
+                return CommandValidationError(
+                    "MISSING_CAPABILITY",
+                    "platform does not provide command capability",
+                )
         try:
             _validate_command_payload(command.command_type, command.payload)
         except CommandValidationError as exc:

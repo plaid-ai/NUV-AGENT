@@ -30,12 +30,23 @@ from nuvion_app.inference.settings_reconciler import (
     canonical_settings_digest,
     config_env_updates,
 )
-from nuvion_app.inference.stream_policy import StreamPolicyReconciler
+from nuvion_app.inference.stream_policy import (
+    StreamPolicyReconciler,
+    StreamRuntimeEvidence,
+)
 from nuvion_app.runtime.settings_boot_guard import (
     SettingsBootGuardError,
     run_settings_boot_guard,
 )
 from nuvion_app.runtime.telemetry import verify_model_artifact_identity
+
+
+def _stream_reconciler(encoder: object) -> StreamPolicyReconciler:
+    return StreamPolicyReconciler(
+        encoder,
+        runtime_evidence=lambda: StreamRuntimeEvidence(True, 0.0),
+        health_clock=lambda: 0.0,
+    )
 
 
 def _command(
@@ -522,7 +533,7 @@ class SettingsReconcilerTest(unittest.TestCase):
         store = DurableReconcileStore(inbox)
         registry = ReconcilerRegistry()
         encoder = _Encoder()
-        registry.register(StreamPolicyReconciler(encoder))
+        registry.register(_stream_reconciler(encoder))
         settings = self._reconciler(_Runtime(), "process-a")
         registry.register(settings)
         coordinator = FleetEffectCoordinator(

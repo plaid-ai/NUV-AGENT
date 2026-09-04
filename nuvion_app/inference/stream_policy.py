@@ -7,7 +7,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
-from nuvion_app.inference.command_inbox import CommandEffectOutcome
+from nuvion_app.inference.command_inbox import (
+    COMMAND_STATUS_FAILED,
+    COMMAND_STATUS_SUCCEEDED,
+    CommandEffectOutcome,
+)
 from nuvion_app.inference.effect_reconciler import (
     ObservedStateUpdate,
 )
@@ -24,6 +28,8 @@ STREAM_POLICY_DEFAULT_CONGESTION_SAMPLES = 3
 STREAM_POLICY_DEFAULT_RECOVERY_SAMPLES = 8
 STREAM_POLICY_DEFAULT_COOLDOWN_SECONDS = 5
 STREAM_POLICY_PRIMARY_STALE_SECONDS = 5
+STREAM_POLICY_MAX_FRAME_AGE_SECONDS = 5
+STREAM_HEALTH_CONTINUOUS = "STREAM_CONTINUOUS"
 
 
 @dataclass(frozen=True)
@@ -139,6 +145,19 @@ class AdaptiveDecision:
     ewma_uplink_kbps: float | None
 
 
+@dataclass(frozen=True)
+class StreamRuntimeEvidence:
+    """Minimal media proof used to authorize a stream-policy effect.
+
+    A WebRTC viewer is deliberately not part of this evidence: a running
+    camera-independent ``videotestsrc`` pipeline can prove continuity through
+    its appsink frames even when nobody is watching.
+    """
+
+    pipeline_running: bool
+    last_frame_monotonic: float | None
+
+
 def _optional_number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -174,6 +193,12 @@ class AdaptiveBitrateController:
     def set_current_bitrate(self, bitrate_kbps: int) -> None:
         self.current_bitrate_kbps = int(bitrate_kbps)
 
+    def reset_hysteresis(self) -> None:
+        """Forget incomplete decisions across an untrusted media interval."""
+
+        self._congested_samples = 0
+        self._stable_samples = 0
+
     def _ewma(self, previous: float | None, current: float | None) -> float | None:
         if current is None:
             return previous
@@ -193,6 +218,10 @@ class AdaptiveBitrateController:
         nack_delta = _optional_number(sample.get("nackDelta"))
         pli_delta = _optional_number(sample.get("pliDelta"))
         queue_pressure = _optional_number(sample.get("queuePressurePct"))
+        outbound_packets_delta = _optional_number(
+            sample.get("outboundPacketsDelta")
+        )
+        outbound_bytes_delta = _optional_number(sample.get("outboundBytesDelta"))
         has_primary_signal = any(
             value is not None
             for value in (
@@ -201,6 +230,8 @@ class AdaptiveBitrateController:
                 nack_delta,
                 pli_delta,
                 queue_pressure,
+                outbound_packets_delta,
+                outbound_bytes_delta,
             )
         )
         auxiliary_loss = _optional_number(sample.get("packetLossPct"))
@@ -293,13 +324,51 @@ class AdaptiveBitrateController:
                 nack_delta,
                 pli_delta,
                 queue_pressure,
+                outbound_packets_delta,
+                outbound_bytes_delta,
             )
         )
         congested = bool(reasons)
         if not has_signal:
-            self._congested_samples = 0
-            self._stable_samples = 0
+            self.reset_hysteresis()
             return self._decision(False, "HOLD", "insufficient_signal")
+
+        if not congested and has_primary_signal:
+            outbound_progress = tuple(
+                value
+                for value in (outbound_packets_delta, outbound_bytes_delta)
+                if value is not None
+            )
+            outbound_progress_reported = bool(outbound_progress)
+            # RTP packet and byte counters are separate views of the same
+            # outbound media path.  A positive value in either counter proves
+            # forward progress; requiring both would reject a valid partial
+            # stats report.  Conversely, no/zero progress must not lift the
+            # bitrate merely because link telemetry happens to be good.
+            outbound_progress_proven = any(
+                value > 0.0 for value in outbound_progress
+            )
+            if not outbound_progress_proven:
+                # A zero-delta (idle viewer) or delta-free primary sample is
+                # not evidence of successful media delivery. In particular it
+                # must never accumulate recovery hysteresis and raise bitrate.
+                self.reset_hysteresis()
+                return self._decision(
+                    False,
+                    "HOLD",
+                    (
+                        "outbound_progress_idle"
+                        if outbound_progress_reported
+                        else "outbound_progress_unproven"
+                    ),
+                )
+        elif not congested:
+            # Auxiliary connectivity is useful to lower bitrate during a bad
+            # link, but it cannot prove an outbound WebRTC path exists.  Do
+            # not accumulate recovery hysteresis from a viewer-less/stats-less
+            # interval and later raise encoder demand on speculation.
+            self.reset_hysteresis()
+            return self._decision(False, "HOLD", "outbound_progress_unproven")
 
         if congested:
             self._congested_samples += 1
@@ -349,7 +418,7 @@ class AdaptiveBitrateController:
             return self._decision(
                 changed,
                 "INCREASE" if changed else "HOLD",
-                "stable" if changed else "at_maximum",
+                "healthy_recovery" if changed else "at_maximum",
             )
 
         return self._decision(
@@ -487,9 +556,21 @@ class StreamPolicyReconciler:
         encoder: EncoderAdapter,
         *,
         clock_ms: Callable[[], float] | None = None,
+        runtime_evidence: Callable[[], StreamRuntimeEvidence] | None = None,
+        health_clock: Callable[[], float] | None = None,
+        max_frame_age_seconds: float = STREAM_POLICY_MAX_FRAME_AGE_SECONDS,
     ) -> None:
         self.encoder = encoder
         self._clock_ms = clock_ms or (lambda: time.monotonic() * 1000.0)
+        self._runtime_evidence = runtime_evidence
+        self._health_clock = health_clock or time.monotonic
+        normalized_max_frame_age = float(max_frame_age_seconds)
+        if (
+            not math.isfinite(normalized_max_frame_age)
+            or normalized_max_frame_age < 0.1
+        ):
+            raise ValueError("max_frame_age_seconds must be finite and at least 0.1")
+        self._max_frame_age_seconds = normalized_max_frame_age
         self._lock = threading.RLock()
         self._command_id: str | None = None
         self._policy: StreamPolicy | None = None
@@ -510,36 +591,140 @@ class StreamPolicyReconciler:
     def _ensure_fence(self) -> None:
         self._effect_fence()
 
+    def _runtime_health(self) -> tuple[str | None, str]:
+        if self._runtime_evidence is None:
+            return None, "STREAM_HEALTH_EVIDENCE_UNAVAILABLE"
+        try:
+            evidence = self._runtime_evidence()
+        except Exception:  # noqa: BLE001 - capability/effect must fail closed.
+            return None, "STREAM_HEALTH_PROBE_FAILED"
+        if not isinstance(evidence, StreamRuntimeEvidence):
+            return None, "STREAM_HEALTH_EVIDENCE_INVALID"
+        if evidence.pipeline_running is not True:
+            return None, "STREAM_PIPELINE_NOT_RUNNING"
+
+        last_frame = evidence.last_frame_monotonic
+        try:
+            now = self._health_clock()
+        except Exception:  # noqa: BLE001 - capability/effect must fail closed.
+            return None, "STREAM_FRAME_CLOCK_INVALID"
+        if (
+            isinstance(last_frame, bool)
+            or not isinstance(last_frame, (int, float))
+            or not math.isfinite(float(last_frame))
+            or float(last_frame) < 0.0
+        ):
+            return None, "STREAM_FRAME_UNAVAILABLE"
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(float(now))
+            or float(now) < float(last_frame)
+        ):
+            return None, "STREAM_FRAME_CLOCK_INVALID"
+        if float(now) - float(last_frame) > self._max_frame_age_seconds:
+            return None, "STREAM_FRAME_STALE"
+        return STREAM_HEALTH_CONTINUOUS, STREAM_HEALTH_CONTINUOUS
+
+    def ready(self) -> bool:
+        """Advertise the capability only while live media proof is current."""
+
+        with self._lock:
+            health, _reason = self._runtime_health()
+            return health == STREAM_HEALTH_CONTINUOUS
+
+    def admit_when_unready(self, command: VerifiedFleetCommand) -> bool:
+        """Allow the one safe control-plane action while media is unhealthy.
+
+        A disabled policy only disarms this local controller; it does not
+        mutate an encoder.  Operators must be able to stop a previously
+        accepted adaptive policy after frame proof has disappeared.
+        """
+
+        return (
+            command.command_type == self.command_type
+            and isinstance(command.payload, Mapping)
+            and command.payload.get("mode") == "DISABLED"
+        )
+
+    @staticmethod
+    def _unhealthy_outcome(reason: str) -> CommandEffectOutcome:
+        return CommandEffectOutcome(
+            status=COMMAND_STATUS_FAILED,
+            code=reason,
+            message=(
+                "stream policy was not applied because live pipeline/frame "
+                f"evidence failed: {reason}"
+            ),
+            reported_state={"health": "NOT_APPLIED"},
+        )
+
     def reconcile(self, command: VerifiedFleetCommand) -> CommandEffectOutcome:
         policy = StreamPolicy.from_payload(command.payload)
         with self._lock:
             self._ensure_fence()
-            self._policy = policy
+            health, health_reason = self._runtime_health()
             if policy.mode == "DISABLED":
-                self._ensure_fence()
-                applied = self.encoder.read_bitrate_kbps()
+                # Disabling an already active controller remains safe when
+                # frame evidence is stale: it only clears local adaptive state
+                # and reports the last known/read-only encoder value.
+                previous = dict(self._reported_state or {})
+                applied = previous.get("appliedBitrateKbps")
+                if isinstance(applied, bool) or not isinstance(applied, int):
+                    try:
+                        self._ensure_fence()
+                        applied = self.encoder.read_bitrate_kbps()
+                    except Exception as exc:  # noqa: BLE001 - terminal ACK must be truthful.
+                        return CommandEffectOutcome(
+                            status=COMMAND_STATUS_FAILED,
+                            code="STREAM_DISABLE_READBACK_FAILED",
+                            message=(
+                                "stream policy disable could not be acknowledged "
+                                f"because encoder readback failed: {type(exc).__name__}: {exc}"
+                            )[:1000],
+                            reported_state={"health": "NOT_APPLIED"},
+                        )
+                self._policy = policy
                 self._controller = None
-                reason = "policy_disabled"
-            else:
-                self._ensure_fence()
-                applied = self.encoder.set_bitrate_kbps(
-                    int(
-                        policy.target_bitrate_kbps
-                        or policy.initial_bitrate_kbps
-                        or 0
-                    )
+                self._command_id = command.command_id
+                reported_health = health or health_reason
+                self._reported_state = self._snapshot(
+                    applied_bitrate_kbps=int(applied),
+                    # The control-plane action is already complete.  When
+                    # media proof is degraded, preserve the strict twin
+                    # invariant that the observed reason names that health.
+                    reason=(
+                        "policy_disabled"
+                        if reported_health == STREAM_HEALTH_CONTINUOUS
+                        else reported_health
+                    ),
+                    health=reported_health,
                 )
-                if policy.mode == "ADAPTIVE":
-                    self._controller = AdaptiveBitrateController(policy)
-                    self._controller.set_current_bitrate(applied)
-                    reason = "policy_activated"
-                else:
-                    self._controller = None
-                    reason = "fixed_target_applied"
+                self._observation_pending = False
+                return CommandEffectOutcome.succeeded(self._reported_state)
+            if health != STREAM_HEALTH_CONTINUOUS:
+                return self._unhealthy_outcome(health_reason)
+            self._policy = policy
+            self._ensure_fence()
+            applied = self.encoder.set_bitrate_kbps(
+                int(
+                    policy.target_bitrate_kbps
+                    or policy.initial_bitrate_kbps
+                    or 0
+                )
+            )
+            if policy.mode == "ADAPTIVE":
+                self._controller = AdaptiveBitrateController(policy)
+                self._controller.set_current_bitrate(applied)
+                reason = "policy_activated"
+            else:
+                self._controller = None
+                reason = "fixed_target_applied"
             self._command_id = command.command_id
             self._reported_state = self._snapshot(
                 applied_bitrate_kbps=applied,
                 reason=reason,
+                health=health,
             )
             self._observation_pending = False
             return CommandEffectOutcome.succeeded(self._reported_state)
@@ -548,9 +733,14 @@ class StreamPolicyReconciler:
         self, sample: Mapping[str, Any]
     ) -> ObservedStateUpdate | None:
         with self._lock:
-            if self._controller is None or self._command_id is None:
+            if self._policy is None or self._command_id is None:
                 return None
             self._ensure_fence()
+            health_update = self._observe_runtime_health_locked()
+            if health_update is not None:
+                return health_update
+            if self._controller is None:
+                return None
             if self._observation_pending and self._reported_state is not None:
                 # Preserve every applied transition: do not mutate the encoder
                 # again until the previous runtime state is durably enqueued.
@@ -578,12 +768,15 @@ class StreamPolicyReconciler:
             self._reported_state = self._snapshot(
                 applied_bitrate_kbps=applied,
                 reason=decision.reason,
+                health=STREAM_HEALTH_CONTINUOUS,
             )
             if (
                 previous_reported.get("appliedBitrateKbps")
                 == self._reported_state.get("appliedBitrateKbps")
                 and previous_reported.get("health")
                 == self._reported_state.get("health")
+                and previous_reported.get("lastAdjustmentReason")
+                == self._reported_state.get("lastAdjustmentReason")
                 and not self._observation_pending
             ):
                 return None
@@ -592,6 +785,60 @@ class StreamPolicyReconciler:
                 command_id=self._command_id,
                 reported_state=dict(self._reported_state),
             )
+
+    def observe_runtime_health(self) -> ObservedStateUpdate | None:
+        """Publish a media-health transition without touching the encoder."""
+
+        with self._lock:
+            if self._policy is None or self._command_id is None:
+                return None
+            self._ensure_fence()
+            return self._observe_runtime_health_locked()
+
+    def _observe_runtime_health_locked(self) -> ObservedStateUpdate | None:
+        health, health_reason = self._runtime_health()
+        previous = dict(self._reported_state or {})
+        if health != STREAM_HEALTH_CONTINUOUS:
+            # Never use an unproven media interval to mutate bitrate.  The
+            # reported twin must nevertheless become truthful, so emit one
+            # durable health/reason transition and dedupe repeated probes.
+            if self._controller is not None:
+                self._controller.reset_hysteresis()
+            return self._publish_runtime_state_locked(
+                health=health_reason,
+                reason=health_reason,
+            )
+        if previous.get("health") != STREAM_HEALTH_CONTINUOUS:
+            return self._publish_runtime_state_locked(
+                health=STREAM_HEALTH_CONTINUOUS,
+                reason="stream_health_recovered",
+            )
+        return None
+
+    def _publish_runtime_state_locked(
+        self,
+        *,
+        health: str,
+        reason: str,
+    ) -> ObservedStateUpdate | None:
+        if self._command_id is None or self._reported_state is None:
+            return None
+        previous = dict(self._reported_state)
+        applied = previous.get("appliedBitrateKbps")
+        if isinstance(applied, bool) or not isinstance(applied, int):
+            return None
+        self._reported_state = self._snapshot(
+            applied_bitrate_kbps=applied,
+            reason=reason,
+            health=health,
+        )
+        if self._reported_state == previous and not self._observation_pending:
+            return None
+        return ObservedStateUpdate(
+            command_type=self.command_type,
+            command_id=self._command_id,
+            reported_state=dict(self._reported_state),
+        )
 
     def observation_failed(self, update: ObservedStateUpdate) -> None:
         with self._lock:
@@ -621,9 +868,30 @@ class StreamPolicyReconciler:
         _persisted_state: Mapping[str, Any],
     ) -> dict[str, Any]:
         outcome = self.reconcile(command)
-        if outcome.reported_state is None:
+        if (
+            outcome.status != COMMAND_STATUS_SUCCEEDED
+            or outcome.reported_state is None
+        ):
             raise RuntimeError("restored stream policy did not report encoder state")
         restored = dict(outcome.reported_state)
+        persisted_health = _persisted_state.get("health")
+        persisted_reason = _persisted_state.get("lastAdjustmentReason")
+        if (
+            isinstance(persisted_health, str)
+            and persisted_health
+            and persisted_health != STREAM_HEALTH_CONTINUOUS
+        ):
+            # Restore may run after the media pipeline is fresh again.  Keep
+            # the last durable degraded twin state until the periodic health
+            # probe can publish an ordered STREAM_CONTINUOUS recovery
+            # observation.  Otherwise local restore would silently overwrite
+            # the state while the server remained stale forever.
+            restored["health"] = persisted_health
+            restored["lastAdjustmentReason"] = (
+                persisted_reason
+                if persisted_reason == persisted_health
+                else persisted_health
+            )
         if (
             _persisted_state.get("appliedBitrateKbps")
             == restored.get("appliedBitrateKbps")
@@ -642,6 +910,7 @@ class StreamPolicyReconciler:
         *,
         applied_bitrate_kbps: int,
         reason: str,
+        health: str,
     ) -> dict[str, Any]:
         if self._policy is None:
             raise RuntimeError("stream policy is not active")
@@ -656,7 +925,7 @@ class StreamPolicyReconciler:
             ),
             "appliedBitrateKbps": int(applied_bitrate_kbps),
             "lastAdjustmentReason": reason,
-            "health": "STREAM_CONTINUOUS",
+            "health": health,
         }
         if self._policy.mode == "ADAPTIVE":
             reported.update(

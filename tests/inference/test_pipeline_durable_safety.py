@@ -65,6 +65,38 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_stream_runtime_evidence_reads_playing_state_and_frame_without_webrtc(
+        self,
+    ) -> None:
+        playing = object()
+
+        class _Pipeline:
+            def __init__(self, state: object) -> None:
+                self.state = state
+
+            def get_state(self, timeout: int):
+                self.timeout = timeout
+                return object(), self.state, object()
+
+        app = object.__new__(pipeline.GStreamerInferenceApp)
+        app.pipeline = _Pipeline(playing)
+        app.user_data = types.SimpleNamespace(
+            running=True,
+            last_frame_monotonic=123.0,
+        )
+
+        with mock.patch.object(
+            pipeline.Gst,
+            "State",
+            types.SimpleNamespace(PLAYING=playing),
+            create=True,
+        ):
+            evidence = app._stream_runtime_evidence()
+
+        self.assertTrue(evidence.pipeline_running)
+        self.assertEqual(evidence.last_frame_monotonic, 123.0)
+        self.assertEqual(app.pipeline.timeout, 0)
+
     def test_update_commit_readiness_uses_live_pipeline_stomp_rtp_and_outboxes(self) -> None:
         class _Controller:
             @staticmethod

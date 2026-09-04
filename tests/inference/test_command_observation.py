@@ -22,7 +22,23 @@ from nuvion_app.inference.effect_reconciler import (
 )
 from nuvion_app.inference.fleet_command import VerifiedFleetCommand
 from nuvion_app.inference.reconcile_store import DurableReconcileStore
-from nuvion_app.inference.stream_policy import StreamPolicyReconciler
+from nuvion_app.inference.stream_policy import (
+    StreamPolicyReconciler,
+    StreamRuntimeEvidence,
+)
+
+
+def _stream_reconciler(
+    encoder: object,
+    *,
+    clock_ms=None,
+) -> StreamPolicyReconciler:
+    return StreamPolicyReconciler(
+        encoder,
+        clock_ms=clock_ms,
+        runtime_evidence=lambda: StreamRuntimeEvidence(True, 0.0),
+        health_clock=lambda: 0.0,
+    )
 
 
 def _command(sequence: int = 1) -> VerifiedFleetCommand:
@@ -315,7 +331,7 @@ class CommandObservationOutboxTest(unittest.TestCase):
         )
         registry = ReconcilerRegistry()
         registry.register(
-            StreamPolicyReconciler(
+            _stream_reconciler(
                 _Encoder(),
                 clock_ms=iter((0.0, 2000.0, 4000.0)).__next__,
             )
@@ -354,14 +370,35 @@ class CommandObservationOutboxTest(unittest.TestCase):
         # No new bitrate transition occurs here; the failed durable write itself
         # forces replay of the current state.
         self.assertEqual(coordinator.observe_connectivity({"quality": "POOR"}), 1)
+        second = outbox.pending()[0]
+        with self.assertRaises(CommandObservationError):
+            coordinator.observe_connectivity({"quality": "POOR"})
+        outbox.acknowledge_body(
+            json.dumps(
+                {
+                    "observationId": second.observation_id,
+                    "commandId": command.command_id,
+                    "revision": 2,
+                    "status": "ACCEPTED",
+                    "processedAt": "2026-09-01T00:00:03Z",
+                }
+            )
+        )
+        # The bitrate remains at the minimum, but the reason-only transition
+        # from connectivity_poor to at_minimum is still durable and observable.
+        self.assertEqual(coordinator.observe_connectivity({"quality": "POOR"}), 1)
+        third = outbox.pending()[0]
         self.assertEqual(coordinator.observe_connectivity({"quality": "POOR"}), 0)
 
-        observations = [terminal] + [
-            item for item in outbox.pending() if item.command_id == command.command_id
-        ]
-        self.assertEqual([item.revision for item in observations], [1, 2])
+        observations = [terminal, second, third]
+        self.assertEqual([item.revision for item in observations], [1, 2, 3])
         self.assertEqual(observations[0].reported_state["appliedBitrateKbps"], 1000)
         self.assertEqual(observations[1].reported_state["appliedBitrateKbps"], 500)
+        self.assertEqual(observations[2].reported_state["appliedBitrateKbps"], 500)
+        self.assertEqual(
+            observations[2].reported_state["lastAdjustmentReason"],
+            "at_minimum",
+        )
         for observation in observations:
             for key, expected in payload.items():
                 self.assertEqual(observation.reported_state[key], expected)
@@ -371,6 +408,81 @@ class CommandObservationOutboxTest(unittest.TestCase):
                 "STREAM_CONTINUOUS",
             )
             self.assertIn("requestedBitrateKbps", observation.reported_state)
+
+    def test_stream_health_transitions_are_durable_without_encoder_mutation(self) -> None:
+        self.inbox.transition(self.command.command_id, "IN_PROGRESS")
+        outbox = DurableCommandObservationOutbox(self.inbox)
+        store = DurableReconcileStore(self.inbox, observation_outbox=outbox)
+        self.inbox.run_transactional_effect(
+            self.command.command_id,
+            lambda connection: store.stage_verified(self.command, connection),
+        )
+        evidence = {"last_frame": 100.0, "now": 100.0}
+        encoder = _Encoder()
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            runtime_evidence=lambda: StreamRuntimeEvidence(
+                pipeline_running=True,
+                last_frame_monotonic=evidence["last_frame"],
+            ),
+            health_clock=lambda: evidence["now"],
+            max_frame_age_seconds=5.0,
+        )
+        registry = ReconcilerRegistry()
+        registry.register(reconciler)
+        coordinator = FleetEffectCoordinator(
+            inbox=self.inbox,
+            store=store,
+            registry=registry,
+        )
+
+        coordinator.run_once()
+        evidence["now"] = 106.0
+        self.assertEqual(coordinator.observe_stream_health(), 1)
+        self.assertEqual(coordinator.observe_stream_health(), 0)
+
+        # Simulate a process restart after the stale observation persisted but
+        # before its recovery.  The fresh replacement must preserve that
+        # degraded local state until it can emit the ordered recovery revision.
+        evidence["last_frame"] = 106.0
+        restarted_encoder = _Encoder()
+        restarted_reconciler = StreamPolicyReconciler(
+            restarted_encoder,
+            runtime_evidence=lambda: StreamRuntimeEvidence(
+                pipeline_running=True,
+                last_frame_monotonic=evidence["last_frame"],
+            ),
+            health_clock=lambda: evidence["now"],
+            max_frame_age_seconds=5.0,
+        )
+        restarted_registry = ReconcilerRegistry()
+        restarted_registry.register(restarted_reconciler)
+        restarted = FleetEffectCoordinator(
+            inbox=self.inbox,
+            store=store,
+            registry=restarted_registry,
+        )
+        self.assertEqual(restarted.run_once().processed, 0)
+        self.assertEqual(
+            store.applied_state("STREAM_POLICY").reported_state["health"],
+            "STREAM_FRAME_STALE",
+        )
+        self.assertEqual(restarted.observe_stream_health(), 1)
+
+        observations = outbox.pending()
+        self.assertEqual([item.revision for item in observations], [1, 2, 3])
+        self.assertEqual(observations[1].reported_state["health"], "STREAM_FRAME_STALE")
+        self.assertEqual(
+            observations[1].reported_state["lastAdjustmentReason"],
+            "STREAM_FRAME_STALE",
+        )
+        self.assertEqual(observations[2].reported_state["health"], "STREAM_CONTINUOUS")
+        self.assertEqual(
+            observations[2].reported_state["lastAdjustmentReason"],
+            "stream_health_recovered",
+        )
+        self.assertEqual(encoder.set_calls, [1200])
+        self.assertEqual(restarted_encoder.set_calls, [1200])
 
     def test_row_and_byte_quota_fail_closed(self) -> None:
         outbox = DurableCommandObservationOutbox(
@@ -499,7 +611,7 @@ class CommandObservationOutboxTest(unittest.TestCase):
 
         encoder = _Encoder()
         registry = ReconcilerRegistry()
-        registry.register(StreamPolicyReconciler(encoder))
+        registry.register(_stream_reconciler(encoder))
         coordinator = FleetEffectCoordinator(
             inbox=self.inbox,
             store=store,
