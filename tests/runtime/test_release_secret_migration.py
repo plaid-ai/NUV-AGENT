@@ -410,28 +410,63 @@ class ReleaseSecretMigrationTests(unittest.TestCase):
         self.assertIn("iq9075-candidate-stage", manager)
         self.assertIn("forbidden repository secret remains", manager)
 
-    def test_one_shot_removal_requires_workflow_and_helper_to_leave_main(self) -> None:
-        workflow_path = ".github/workflows/migrate-release-secrets.yml"
-        helper_path = "packaging/release/resume-release-secret-migration.py"
+    def test_one_shot_removal_requires_exact_five_file_set_to_leave_main(self) -> None:
+        one_shot_paths = {
+            ".github/workflows/migrate-release-secrets.yml",
+            "packaging/release/manage-secret-migration-environment.sh",
+            "packaging/release/verify-secret-migration-material.py",
+            "packaging/release/resume-release-secret-migration.py",
+            "tests/runtime/test_release_secret_migration.py",
+        }
         manager = MANAGER_PATH.read_text(encoding="utf-8")
+        setup = manager.split("setup_environment()", maxsplit=1)[1].split(
+            "cleanup_environment()", maxsplit=1
+        )[0]
         cleanup = manager.split("cleanup_environment()", maxsplit=1)[1]
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
         removal = runbook.split("whose exact delete\nset is:", maxsplit=1)[1].split(
-            "After both paths", maxsplit=1
+            "After all five paths", maxsplit=1
         )[0]
 
-        self.assertIn(f'readonly WORKFLOW_PATH="{workflow_path}"', manager)
-        self.assertIn(f'readonly HELPER_PATH="{helper_path}"', manager)
-        self.assertIn("--arg workflow \"$WORKFLOW_PATH\" --arg helper \"$HELPER_PATH\"", cleanup)
-        self.assertIn("select(. == $workflow or . == $helper)", cleanup)
+        constants = {
+            "WORKFLOW_PATH": ".github/workflows/migrate-release-secrets.yml",
+            "MANAGER_PATH": "packaging/release/manage-secret-migration-environment.sh",
+            "MATERIAL_VERIFIER_PATH": "packaging/release/verify-secret-migration-material.py",
+            "HELPER_PATH": "packaging/release/resume-release-secret-migration.py",
+            "TEST_PATH": "tests/runtime/test_release_secret_migration.py",
+        }
+        for name, path in constants.items():
+            arg_name = (
+                "verifier"
+                if name == "MATERIAL_VERIFIER_PATH"
+                else name.removesuffix("_PATH").lower()
+            )
+            self.assertIn(f'readonly {name}="{path}"', manager)
+            self.assertIn(f'--arg {arg_name} "${name}"', setup)
+            self.assertIn(f'--arg {arg_name} "${name}"', cleanup)
         self.assertIn("protected-main tree metadata is truncated", cleanup)
-        self.assertIn("remove the one-shot workflow and helper", cleanup)
+        self.assertIn("exact five-file one-shot migration set", setup)
+        self.assertIn("remove the exact five-file one-shot migration set", cleanup)
         self.assertEqual(
-            {line for line in removal.splitlines() if line.startswith((".github/", "packaging/"))},
-            {workflow_path, helper_path},
+            {
+                line
+                for line in removal.splitlines()
+                if line.startswith((".github/", "packaging/", "tests/"))
+            },
+            one_shot_paths,
+        )
+        self.assertIn(
+            '"$migration_control_root/packaging/release/'
+            'manage-secret-migration-environment.sh" cleanup',
+            runbook,
+        )
+        self.assertIn(
+            'git worktree add --detach "$migration_control_root" '
+            '"$migration_publisher_sha"',
+            runbook,
         )
 
-    def test_cleanup_refuses_when_only_helper_remains_on_remote_main(self) -> None:
+    def test_cleanup_refuses_when_any_one_shot_path_remains_on_remote_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake_gh = Path(directory) / "gh"
             fake_gh.write_text(
@@ -465,7 +500,7 @@ esac
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn(
-            "remove the one-shot workflow and helper from protected main",
+            "remove the exact five-file one-shot migration set from protected main",
             completed.stderr,
         )
         self.assertNotIn("forbidden repository secret remains", completed.stderr)

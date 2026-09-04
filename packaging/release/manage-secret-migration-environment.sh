@@ -4,7 +4,10 @@ set -euo pipefail
 readonly REPOSITORY="plaid-ai/NUV-AGENT"
 readonly MIGRATION_ENVIRONMENT="release-secret-migration"
 readonly WORKFLOW_PATH=".github/workflows/migrate-release-secrets.yml"
+readonly MANAGER_PATH="packaging/release/manage-secret-migration-environment.sh"
+readonly MATERIAL_VERIFIER_PATH="packaging/release/verify-secret-migration-material.py"
 readonly HELPER_PATH="packaging/release/resume-release-secret-migration.py"
+readonly TEST_PATH="tests/runtime/test_release_secret_migration.py"
 readonly PLATFORM_ADMIN_TEAM_ID="16128529"
 
 die() {
@@ -51,11 +54,17 @@ setup_environment() {
   [ "$(jq -r .truncated <<<"$tree_metadata")" = false ] \
     || die "protected-main tree metadata is truncated"
   one_shot_paths="$(jq -r \
-    --arg workflow "$WORKFLOW_PATH" --arg helper "$HELPER_PATH" \
-    '.tree[].path | select(. == $workflow or . == $helper)' \
+    --arg workflow "$WORKFLOW_PATH" \
+    --arg manager "$MANAGER_PATH" \
+    --arg verifier "$MATERIAL_VERIFIER_PATH" \
+    --arg helper "$HELPER_PATH" \
+    --arg test "$TEST_PATH" \
+    '.tree[].path | select(. == $workflow or . == $manager or . == $verifier or . == $helper or . == $test)' \
     <<<"$tree_metadata" | LC_ALL=C sort)"
-  [ "$one_shot_paths" = "$(printf '%s\n%s' "$WORKFLOW_PATH" "$HELPER_PATH" | LC_ALL=C sort)" ] \
-    || die "merge the one-shot workflow and helper to protected main before setup"
+  [ "$one_shot_paths" = "$(printf '%s\n' \
+      "$WORKFLOW_PATH" "$MANAGER_PATH" "$MATERIAL_VERIFIER_PATH" \
+      "$HELPER_PATH" "$TEST_PATH" | LC_ALL=C sort)" ] \
+    || die "merge the exact five-file one-shot migration set to protected main before setup"
 
   GH_TOKEN="$admin_token" gh api --method PUT \
     "repos/${REPOSITORY}/environments/${MIGRATION_ENVIRONMENT}" \
@@ -147,11 +156,15 @@ cleanup_environment() {
   [ "$(jq -r .truncated <<<"$tree_metadata")" = false ] \
     || die "protected-main tree metadata is truncated"
   one_shot_paths="$(jq -r \
-    --arg workflow "$WORKFLOW_PATH" --arg helper "$HELPER_PATH" \
-    '.tree[].path | select(. == $workflow or . == $helper)' \
+    --arg workflow "$WORKFLOW_PATH" \
+    --arg manager "$MANAGER_PATH" \
+    --arg verifier "$MATERIAL_VERIFIER_PATH" \
+    --arg helper "$HELPER_PATH" \
+    --arg test "$TEST_PATH" \
+    '.tree[].path | select(. == $workflow or . == $manager or . == $verifier or . == $helper or . == $test)' \
     <<<"$tree_metadata" | LC_ALL=C sort)"
   [ -z "$one_shot_paths" ] \
-    || die "remove the one-shot workflow and helper from protected main before cleanup"
+    || die "remove the exact five-file one-shot migration set from protected main before cleanup"
 
   local repository_names name
   repository_names="$(gh api --paginate \
