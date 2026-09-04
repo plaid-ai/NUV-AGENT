@@ -100,7 +100,7 @@ class ReleaseSecretMigrationTests(unittest.TestCase):
         self.assertNotIn("key-12345678", message)
         self.assertNotIn("unexpected-project", message)
 
-    def test_iq_private_key_must_match_committed_public_keyring(self) -> None:
+    def test_iq_private_key_must_match_raw_or_spki_public_keyring(self) -> None:
         private_key = Ed25519PrivateKey.generate()
         private_raw = private_key.private_bytes(
             serialization.Encoding.Raw,
@@ -111,18 +111,12 @@ class ReleaseSecretMigrationTests(unittest.TestCase):
             serialization.Encoding.Raw,
             serialization.PublicFormat.Raw,
         )
+        public_spki = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "keyring.json").write_text(
-                json.dumps(
-                    {
-                        "keys": {
-                            "release-key": base64.b64encode(public_raw).decode("ascii")
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             policy = root / "policy.json"
             policy.write_text(
                 json.dumps(
@@ -135,25 +129,61 @@ class ReleaseSecretMigrationTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            for keyring_material in (public_raw, public_spki):
+                with self.subTest(keyring_length=len(keyring_material)):
+                    (root / "keyring.json").write_text(
+                        json.dumps(
+                            {
+                                "keys": {
+                                    "release-key": base64.b64encode(
+                                        keyring_material
+                                    ).decode("ascii")
+                                }
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            "IQ_KEY": base64.b64encode(private_raw).decode("ascii"),
+                            "UNRELATED_SECRET": "must-not-reach-child",
+                        },
+                        clear=False,
+                    ):
+                        with mock.patch.object(
+                            HELPER.subprocess,
+                            "run",
+                            return_value=subprocess.CompletedProcess(
+                                [], 0, stdout=public_spki
+                            ),
+                        ) as run:
+                            HELPER.verify_iq_signing_key("IQ_KEY", policy)
+                    child_environment = run.call_args.kwargs["env"]
+                    self.assertNotIn("IQ_KEY", child_environment)
+                    self.assertNotIn("UNRELATED_SECRET", child_environment)
+
+            (root / "keyring.json").write_text(
+                json.dumps(
+                    {
+                        "keys": {
+                            "release-key": base64.b64encode(
+                                (b"\x00" * 12) + public_raw
+                            ).decode("ascii")
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             with mock.patch.dict(
                 os.environ,
-                {
-                    "IQ_KEY": base64.b64encode(private_raw).decode("ascii"),
-                    "UNRELATED_SECRET": "must-not-reach-child",
-                },
+                {"IQ_KEY": base64.b64encode(private_raw).decode("ascii")},
                 clear=False,
             ):
-                with mock.patch.object(
-                    HELPER.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess(
-                        [], 0, stdout=b"der-prefix" + public_raw
-                    ),
-                ) as run:
+                with self.assertRaisesRegex(
+                    HELPER.MaterialError, "IQ9075 public key is invalid"
+                ):
                     HELPER.verify_iq_signing_key("IQ_KEY", policy)
-            child_environment = run.call_args.kwargs["env"]
-            self.assertNotIn("IQ_KEY", child_environment)
-            self.assertNotIn("UNRELATED_SECRET", child_environment)
 
     def test_workflow_is_a_protected_main_only_one_shot(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
