@@ -162,6 +162,18 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", credentialed_stage)
         self.assertNotIn("gh api", credentialed_stage)
 
+    def test_called_workflow_declares_only_fixed_environment_secret_names(self) -> None:
+        declarations = self.trusted_header.split("    secrets:", maxsplit=1)[1]
+        self.assertEqual(declarations.count("        required: false"), 3)
+        for name in (
+            "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
+            "GCP_PROJECT_ID",
+            "GCP_SA_KEY",
+        ):
+            self.assertEqual(declarations.count(f"      {name}:"), 1)
+        self.assertNotIn("secrets: inherit", self.workflow + self.trusted_workflow)
+        self.assertNotIn("    secrets:", self.workflow)
+
     def test_signing_is_bound_to_policy_key_and_downloaded_artifact(self) -> None:
         revalidate = self.sign.index(
             "Revalidate source and artifact before signer access"

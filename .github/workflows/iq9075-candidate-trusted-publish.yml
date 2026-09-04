@@ -46,6 +46,16 @@ on:
       min_updater_version:
         required: true
         type: string
+    secrets:
+      IQ9075_RELEASE_SIGNING_PRIVATE_KEY:
+        description: "Resolved from the fixed iq9075-candidate-sign environment"
+        required: false
+      GCP_PROJECT_ID:
+        description: "Resolved from the fixed iq9075-candidate-stage environment"
+        required: false
+      GCP_SA_KEY:
+        description: "Resolved from the fixed iq9075-candidate-stage environment"
+        required: false
 
 permissions:
   contents: read
