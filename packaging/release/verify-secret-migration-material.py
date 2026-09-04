@@ -33,6 +33,8 @@ _SAFE_SUBPROCESS_ENVIRONMENT = (
     "TMPDIR",
 )
 
+_ED25519_DER_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
 
 def _subprocess_environment(**overrides: str) -> dict[str, str]:
     """Build a capability-minimal child environment without source secrets."""
@@ -225,7 +227,14 @@ def verify_iq_signing_key(private_key_environment: str, policy_path: Path) -> No
         expected_public = base64.b64decode(keyring["keys"][key_id], validate=True)
     except (OSError, ValueError, KeyError, TypeError, binascii.Error) as error:
         raise MaterialError("IQ9075 public keyring is invalid") from error
-    if len(expected_public) != 32:
+    if len(expected_public) == 32:
+        expected_public_spki = _ED25519_DER_SPKI_PREFIX + expected_public
+    elif (
+        len(expected_public) == len(_ED25519_DER_SPKI_PREFIX) + 32
+        and expected_public.startswith(_ED25519_DER_SPKI_PREFIX)
+    ):
+        expected_public_spki = expected_public
+    else:
         raise MaterialError("IQ9075 public key is invalid")
 
     private_material, private_format = _openssl_private_key(
@@ -246,7 +255,7 @@ def verify_iq_signing_key(private_key_environment: str, policy_path: Path) -> No
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    if public_key.returncode != 0 or public_key.stdout[-32:] != expected_public:
+    if public_key.returncode != 0 or public_key.stdout != expected_public_spki:
         raise MaterialError("IQ9075 private key differs from protected keyring")
 
 
