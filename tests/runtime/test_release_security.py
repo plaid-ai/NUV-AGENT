@@ -4758,6 +4758,36 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         assembly_call = runbook.index(
             "assemble-iq9075-fleet-runtime-evidence.py", rollback_call
         )
+        evidence_signature = runbook.index(
+            'runtime_signature="${runtime_summary}.asc"', assembly_call
+        )
+        gate_evidence_capture = runbook.index(
+            'gate_evidence_json="$(',
+            evidence_signature,
+        )
+        exact_gate_run_binding = runbook.index(
+            '.workflowRunId == $run', gate_evidence_capture
+        )
+        readiness_generation = runbook.index(
+            'runtime_readiness="$runtime_stage/release-readiness.json"',
+            exact_gate_run_binding,
+        )
+        readiness_validation = runbook.index(
+            "verify-release-readiness.py", readiness_generation
+        )
+        staged_readiness_validation = runbook.index(
+            'verify_runtime_readiness "$runtime_readiness"', readiness_validation
+        )
+        readiness_install = runbook.index(
+            'readiness_target=packaging/release/release-readiness.json',
+            staged_readiness_validation,
+        )
+        worktree_readiness_validation = runbook.index(
+            'verify_runtime_readiness "$readiness_target"', readiness_install
+        )
+        exact_staged_delta = runbook.index(
+            "git diff --cached --name-status --no-renames", readiness_install
+        )
         soak_call = runbook.index(
             '--run-id "$media_run_id" --output-dir "$media_run_dir" candidate-soak'
         )
@@ -4773,8 +4803,71 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertLess(commit_call, config_stream_call)
         self.assertLess(config_stream_call, runtime_cleanup_call)
         self.assertLess(runtime_cleanup_call, assembly_call)
+        self.assertLess(assembly_call, evidence_signature)
+        self.assertLess(evidence_signature, gate_evidence_capture)
+        self.assertLess(gate_evidence_capture, exact_gate_run_binding)
+        self.assertLess(exact_gate_run_binding, readiness_generation)
+        self.assertLess(readiness_generation, readiness_validation)
+        self.assertLess(readiness_validation, staged_readiness_validation)
+        self.assertLess(staged_readiness_validation, readiness_install)
+        self.assertLess(readiness_install, worktree_readiness_validation)
+        self.assertLess(worktree_readiness_validation, exact_staged_delta)
+        self.assertLess(exact_staged_delta, soak_call)
         self.assertLess(assembly_call, soak_call)
         self.assertLess(soak_call, cleanup_call)
+        self.assertIn(
+            'GITHUB_TOKEN="$(gh auth token)" python3 -I',
+            runbook[gate_evidence_capture:readiness_generation],
+        )
+        self.assertIn(
+            '--trusted-workflow "$component_root/.github/workflows/'
+            'agent-release-gate.yml"',
+            runbook[gate_evidence_capture:readiness_generation],
+        )
+        self.assertIn(
+            '--gate-run-id "$gate_run_id"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            '--gate-check-id "$gate_check_id"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            '--gate-check-suite-id "$gate_check_suite_id"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            '--gate-workflow-sha256 "$gate_workflow_sha256"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            '"$(git rev-parse "$release_sha:$readiness_target")"',
+            runbook[readiness_install:soak_call],
+        )
+        self.assertIn(
+            'for evidence_file in "${evidence_files[@]}"',
+            runbook[readiness_install:soak_call],
+        )
+        self.assertNotIn(
+            'for evidence_file in "$runtime_stage"/*.json',
+            runbook[readiness_install:soak_call],
+        )
+        self.assertIn(
+            'test "$(git rev-parse HEAD)" = "$release_sha"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            'test -z "$(git status --porcelain --untracked-files=all)"',
+            runbook[readiness_validation:readiness_install],
+        )
+        self.assertIn(
+            'install -m 0644 "$runtime_readiness" "$readiness_target"',
+            runbook[readiness_install:worktree_readiness_validation],
+        )
+        self.assertIn(
+            'test "$actual_b_changes" = "$expected_b_changes"',
+            runbook[exact_staged_delta:soak_call],
+        )
         self.assertIn('--candidate-bundle "$candidate_bundle"', runbook)
         self.assertIn('--candidate-bom "$candidate_bom"', runbook)
         self.assertNotIn(
@@ -4826,6 +4919,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "assemble-iq9075-fleet-runtime-evidence.py", candidate_dispatch
         )
         evidence_b = runbook.index("as evidence-only commit B.", evidence_assembly)
+        gate_evidence_capture = runbook.index(
+            'gate_evidence_json="$(', evidence_assembly
+        )
+        ready_validation = runbook.index(
+            'verify_runtime_readiness "$readiness_target"', gate_evidence_capture
+        )
         live_gate_validation = runbook.index(
             "verify-agent-release-gate.py", evidence_b
         )
@@ -4862,6 +4961,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertLess(exact_main_gate, component_a_binding)
         self.assertLess(component_a_binding, candidate_dispatch)
         self.assertLess(candidate_dispatch, evidence_assembly)
+        self.assertLess(evidence_assembly, gate_evidence_capture)
+        self.assertLess(gate_evidence_capture, ready_validation)
+        self.assertLess(ready_validation, evidence_b)
         self.assertLess(evidence_assembly, evidence_b)
         self.assertLess(evidence_b, live_gate_validation)
         self.assertLess(live_gate_validation, full_readiness_validation)
