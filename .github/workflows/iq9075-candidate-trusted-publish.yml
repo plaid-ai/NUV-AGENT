@@ -1,0 +1,808 @@
+name: Trusted IQ9075 candidate signer and stager
+
+on:
+  workflow_call:
+    inputs:
+      trusted_workflow_sha:
+        description: "Literal commit SHA used to load this reusable workflow"
+        required: true
+        type: string
+      component_sha:
+        description: "Exact protected-main component commit built as untrusted data"
+        required: true
+        type: string
+      version:
+        description: "Exact Agent semantic version"
+        required: true
+        type: string
+      release_sequence:
+        description: "Expected next IQ9075 release sequence"
+        required: true
+        type: string
+      bundle_name:
+        required: true
+        type: string
+      bundle_sha256:
+        required: true
+        type: string
+      bundle_size:
+        required: true
+        type: string
+      deb_name:
+        required: true
+        type: string
+      deb_sha256:
+        required: true
+        type: string
+      deb_size:
+        required: true
+        type: string
+      built_at:
+        required: true
+        type: string
+      config_schema:
+        required: true
+        type: string
+      min_updater_version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  sign:
+    name: Sign exact candidate for Fleet Runtime evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: iq9075-candidate-sign
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Install the trusted identity verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+
+      - name: Verify the signed GitHub reusable-workflow identity
+        id: trusted-identity
+        env:
+          EXPECTED_TRUSTED_WORKFLOW_SHA: ${{ inputs.trusted_workflow_sha }}
+          EXPECTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          EXPECTED_ENVIRONMENT: iq9075-candidate-sign
+          OIDC_AUDIENCE: nuvion-iq9075-candidate-trusted-publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          identity_dir="$RUNNER_TEMP/nuvion-trusted-identity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          mkdir "$identity_dir"
+          cleanup_identity() { rm -rf -- "$identity_dir"; }
+          trap cleanup_identity EXIT INT TERM
+          [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == https://* ]]
+          request_separator='?'
+          [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *\?* ]] && request_separator='&'
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}${request_separator}audience=${OIDC_AUDIENCE}" \
+            -o "$identity_dir/token.json"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://token.actions.githubusercontent.com/.well-known/openid-configuration \
+            -o "$identity_dir/openid.json"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://token.actions.githubusercontent.com/.well-known/jwks \
+            -o "$identity_dir/jwks.json"
+          python3 - "$identity_dir/token.json" "$identity_dir/openid.json" \
+            "$identity_dir/jwks.json" "$EXPECTED_TRUSTED_WORKFLOW_SHA" \
+            "$EXPECTED_COMPONENT_SHA" "$EXPECTED_ENVIRONMENT" "$OIDC_AUDIENCE" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import time
+
+          from cryptography.hazmat.primitives import hashes
+          from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+          (
+              token_path,
+              configuration_path,
+              jwks_path,
+              trusted_sha,
+              component_sha,
+              environment,
+              audience,
+              run_id,
+              run_attempt,
+          ) = sys.argv[1:]
+
+          def decode_base64url(value: str) -> bytes:
+              return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+          if not re.fullmatch(r"[0-9a-f]{40}", trusted_sha):
+              raise SystemExit("trusted workflow input is not a full commit SHA")
+          if not re.fullmatch(r"[0-9a-f]{40}", component_sha):
+              raise SystemExit("component input is not a full commit SHA")
+          configuration = json.loads(Path(configuration_path).read_text())
+          if configuration.get("issuer") != "https://token.actions.githubusercontent.com":
+              raise SystemExit("unexpected GitHub OIDC issuer configuration")
+          if configuration.get("jwks_uri") != "https://token.actions.githubusercontent.com/.well-known/jwks":
+              raise SystemExit("unexpected GitHub OIDC JWKS location")
+          response = json.loads(Path(token_path).read_text())
+          token = response.get("value")
+          if not isinstance(token, str) or len(token.split(".")) != 3:
+              raise SystemExit("GitHub OIDC endpoint returned an invalid token")
+          encoded_header, encoded_payload, encoded_signature = token.split(".")
+          header = json.loads(decode_base64url(encoded_header))
+          claims = json.loads(decode_base64url(encoded_payload))
+          if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+              raise SystemExit("GitHub OIDC token is not an identified RS256 JWT")
+          keys = json.loads(Path(jwks_path).read_text()).get("keys")
+          matches = [
+              key for key in keys if isinstance(key, dict)
+              and key.get("kid") == header["kid"] and key.get("kty") == "RSA"
+              and key.get("alg") in (None, "RS256") and key.get("use") in (None, "sig")
+          ] if isinstance(keys, list) else []
+          if len(matches) != 1:
+              raise SystemExit("GitHub OIDC signing key is missing or ambiguous")
+          key = matches[0]
+          public_key = rsa.RSAPublicNumbers(
+              int.from_bytes(decode_base64url(key["e"]), "big"),
+              int.from_bytes(decode_base64url(key["n"]), "big"),
+          ).public_key()
+          public_key.verify(
+              decode_base64url(encoded_signature),
+              f"{encoded_header}.{encoded_payload}".encode(),
+              padding.PKCS1v15(),
+              hashes.SHA256(),
+          )
+          expected = {
+              "iss": "https://token.actions.githubusercontent.com",
+              "aud": audience,
+              "repository": "plaid-ai/NUV-AGENT",
+              "repository_id": "1149331364",
+              "repository_owner": "plaid-ai",
+              "repository_owner_id": "199492120",
+              "repository_visibility": "public",
+              "sub": "repo:plaid-ai/NUV-AGENT:environment:" + environment,
+              "ref": "refs/heads/main",
+              "ref_type": "branch",
+              "event_name": "workflow_dispatch",
+              "runner_environment": "github-hosted",
+              "sha": component_sha,
+              "workflow_ref": "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-evidence.yml@refs/heads/main",
+              "workflow_sha": component_sha,
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "environment": environment,
+              "job_workflow_ref": "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@" + trusted_sha,
+              "job_workflow_sha": trusted_sha,
+          }
+          for name, value in expected.items():
+              if claims.get(name) != value:
+                  raise SystemExit(f"GitHub OIDC claim {name} is not the protected value")
+          now = int(time.time())
+          if not isinstance(claims.get("nbf"), int) or claims["nbf"] > now + 30:
+              raise SystemExit("GitHub OIDC token is not active")
+          if not isinstance(claims.get("exp"), int) or claims["exp"] <= now:
+              raise SystemExit("GitHub OIDC token is expired")
+          if not isinstance(claims.get("iat"), int) or claims["iat"] > now + 30:
+              raise SystemExit("GitHub OIDC token issuance time is invalid")
+          if not 0 < claims["exp"] - claims["iat"] <= 600:
+              raise SystemExit("GitHub OIDC token lifetime is invalid")
+          PY
+          echo "workflow_sha=$EXPECTED_TRUSTED_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+          cleanup_identity
+          trap - EXIT INT TERM
+
+      - name: Check out the immutable trusted workflow source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: plaid-ai/NUV-AGENT
+          ref: ${{ steps.trusted-identity.outputs.workflow_sha }}
+          path: publisher
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify immutable reusable workflow identity
+        env:
+          EXPECTED_TRUSTED_WORKFLOW_SHA: ${{ inputs.trusted_workflow_sha }}
+          RESOLVED_TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$RESOLVED_TRUSTED_WORKFLOW_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
+          [ "$(git -C publisher rev-parse HEAD)" = "$RESOLVED_TRUSTED_WORKFLOW_SHA" ]
+          [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
+
+      - name: Download exact secretless build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Revalidate source and artifact before signer access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          BUNDLE_SIZE: ${{ inputs.bundle_size }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
+          BUILT_AT: ${{ inputs.built_at }}
+          CONFIG_SCHEMA: ${{ inputs.config_schema }}
+          MIN_UPDATER_VERSION: ${{ inputs.min_updater_version }}
+          TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
+          [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$REQUESTED_COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate signing" >&2; exit 1; }
+          [ "$BUNDLE_NAME" = "nuv-agent_${REQUESTED_VERSION}_iq9075-aarch64.agent-bundle.tar.gz" ]
+          bundle_path="dist/$BUNDLE_NAME"
+          [ -f "$bundle_path" ] && [ ! -L "$bundle_path" ]
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          [ "$(stat -c %s "$bundle_path")" = "$BUNDLE_SIZE" ]
+          [ "$DEB_NAME" = "nuv-agent_${REQUESTED_VERSION}_arm64.deb" ]
+          deb_path="dist/$DEB_NAME"
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
+          trusted_config_schema="$(PYTHONPATH=publisher python3 -c 'from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)')"
+          trusted_updater_version="$(PYTHONPATH=publisher python3 -c 'from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)')"
+          [ "$CONFIG_SCHEMA" = "$trusted_config_schema" ]
+          [ "$MIN_UPDATER_VERSION" = "$trusted_updater_version" ]
+          python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
+            "$REQUESTED_SEQUENCE" "$BUILT_AT" \
+            "$BUNDLE_NAME" "$BUNDLE_SHA256" "$BUNDLE_SIZE" \
+            "$CONFIG_SCHEMA" "$MIN_UPDATER_VERSION" \
+            "$DEB_NAME" "$DEB_SHA256" "$DEB_SIZE" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          expected = {
+              "schemaVersion": 1,
+              "kind": "nuvion-iq9075-candidate-build",
+              "componentSha": sys.argv[1],
+              "agentVersion": sys.argv[2],
+              "releaseSequence": int(sys.argv[3]),
+              "builtAt": sys.argv[4],
+              "configSchema": sys.argv[8],
+              "minUpdaterVersion": sys.argv[9],
+              "artifact": {
+                  "name": sys.argv[5],
+                  "sha256": sys.argv[6],
+                  "sizeBytes": int(sys.argv[7]),
+              },
+              "bootstrapDeb": {
+                  "name": sys.argv[10],
+                  "sha256": sys.argv[11],
+                  "sizeBytes": int(sys.argv[12]),
+              },
+          }
+          path = pathlib.Path("dist/candidate-build-manifest.json")
+          raw = path.read_bytes()
+          canonical = (json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if raw != canonical:
+              raise SystemExit("candidate build manifest differs from protected inputs")
+          PY
+
+      - name: Recheck exact source immediately before signer access
+        id: signer-preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
+          TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
+          live_main_sha="$(env -i PATH="$PATH" HOME="$HOME" GH_TOKEN="$GH_TOKEN" \
+            GH_PROMPT_DISABLED=1 gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate signing" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          deb_path="dist/$DEB_NAME"
+          [ "$DEB_NAME" = "nuv-agent_${VERSION}_arm64.deb" ]
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
+          signing_key_id="$(jq -er .iq9075.publisherKeyId publisher/packaging/release/release-security-policy.json)"
+          echo "signing_key_id=$signing_key_id" >> "$GITHUB_OUTPUT"
+
+      - name: Sign exact canonical BOM with the isolated key
+        env:
+          NUVION_IQ9075_RELEASE_SIGNING_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUILT_AT: ${{ inputs.built_at }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+          CONFIG_SCHEMA: ${{ inputs.config_schema }}
+          MIN_UPDATER_VERSION: ${{ inputs.min_updater_version }}
+          SIGNING_KEY_ID: ${{ steps.signer-preflight.outputs.signing_key_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$NUVION_IQ9075_RELEASE_SIGNING_KEY" ] \
+            || { echo "IQ9075 candidate signer is unavailable" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
+          PYTHONPATH=publisher python3 publisher/packaging/release/generate-release-bom.py \
+            --schema-version 2 \
+            --bom-id "nuv-agent-${VERSION}-iq9075-aarch64" \
+            --version "$VERSION" \
+            --component-sha "$COMPONENT_SHA" \
+            --config-schema "$CONFIG_SCHEMA" \
+            --release-sequence "$RELEASE_SEQUENCE" \
+            --min-updater-version "$MIN_UPDATER_VERSION" \
+            --target "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64" \
+            --artifact "$bundle_path" \
+            --artifact-kind agent-bundle \
+            --built-at "$BUILT_AT" \
+            --output "$bom_path" \
+            --signature-output "$signature_path" \
+            --signing-key-id "$SIGNING_KEY_ID" \
+            --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+
+      - name: Verify the signed candidate without signing material
+        env:
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
+          RELEASE_KEYRING_PATH=publisher/packaging/release/trusted-release-keyrings/iq9075-dev.json \
+          PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
+            "$COMPONENT_SHA" "$VERSION" "$RELEASE_SEQUENCE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from nuvion_app.runtime.release_bom import load_signed_release_bom, verify_release_artifact
+          from nuvion_updater.trust import load_release_keyring
+
+          bom_path, signature_path, artifact_path = map(Path, sys.argv[1:4])
+          expected_sha, expected_version, expected_sequence = sys.argv[4:]
+          keyring = load_release_keyring(
+              Path("publisher/packaging/release/trusted-release-keyrings/iq9075-dev.json"),
+              expected_trust_domain="iq9075-dev",
+              require_root_owner=False,
+          )
+          verified = load_signed_release_bom(
+              bom_path, signature_path, release_keyring=keyring
+          )
+          verify_release_artifact(verified, artifact_path)
+          if (
+              verified.component_sha != expected_sha
+              or verified.agent_version != expected_version
+              or verified.release_sequence != int(expected_sequence)
+          ):
+              raise SystemExit("signed candidate BOM identity is invalid")
+          PY
+
+      - name: Assemble secret-free download manifest
+        env:
+          COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bom_name="nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
+          bom_digest="$(jq -er '.bomDigest | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' "dist/$bom_name")"
+          python3 - "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$COMPONENT_SHA" \
+            "$VERSION" "$RELEASE_SEQUENCE" "$BUNDLE_NAME" "$BUNDLE_SHA256" \
+            "$bom_name" "$(sha256sum "dist/$bom_name" | awk '{print $1}')" \
+            "$(sha256sum "dist/$bom_name.sig" | awk '{print $1}')" \
+            "$(sha256sum publisher/packaging/release/trusted-release-keyrings/iq9075-dev.json | awk '{print $1}')" \
+            "$bom_digest" "$DEB_NAME" "$DEB_SHA256" "$DEB_SIZE" \
+            > dist/candidate-evidence-manifest.json <<'PY'
+          import json
+          import sys
+
+          payload = {
+              "schemaVersion": 1,
+              "kind": "nuvion-iq9075-signed-evidence-candidate",
+              "workflowRunId": int(sys.argv[1]),
+              "workflowRunAttempt": int(sys.argv[2]),
+              "componentSha": sys.argv[3],
+              "agentVersion": sys.argv[4],
+              "releaseSequence": int(sys.argv[5]),
+              "artifact": {"name": sys.argv[6], "sha256": sys.argv[7]},
+              "bootstrapDeb": {
+                  "name": sys.argv[13],
+                  "sha256": sys.argv[14],
+                  "sizeBytes": int(sys.argv[15]),
+              },
+              "bom": {"name": sys.argv[8], "sha256": sys.argv[9]},
+              "signature": {"name": sys.argv[8] + ".sig", "sha256": sys.argv[10]},
+              "releaseKeyringSha256": sys.argv[11],
+              "contentAddressedPath": "releases/by-bom-sha256/" + sys.argv[12],
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
+
+      - name: Transfer signed candidate without cloud credentials
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/${{ inputs.bundle_name }}
+            dist/${{ inputs.deb_name }}
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
+            dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json.sig
+            dist/candidate-evidence-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  stage:
+    name: Stage content-addressed IQ9075 evidence candidate
+    needs: sign
+    if: needs.sign.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: iq9075-candidate-stage
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Install the trusted identity verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-cryptography
+
+      - name: Verify the signed GitHub reusable-workflow identity
+        id: trusted-identity
+        env:
+          EXPECTED_TRUSTED_WORKFLOW_SHA: ${{ inputs.trusted_workflow_sha }}
+          EXPECTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          EXPECTED_ENVIRONMENT: iq9075-candidate-stage
+          OIDC_AUDIENCE: nuvion-iq9075-candidate-trusted-publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          identity_dir="$RUNNER_TEMP/nuvion-trusted-identity-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          mkdir "$identity_dir"
+          cleanup_identity() { rm -rf -- "$identity_dir"; }
+          trap cleanup_identity EXIT INT TERM
+          [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == https://* ]]
+          request_separator='?'
+          [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *\?* ]] && request_separator='&'
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}${request_separator}audience=${OIDC_AUDIENCE}" \
+            -o "$identity_dir/token.json"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://token.actions.githubusercontent.com/.well-known/openid-configuration \
+            -o "$identity_dir/openid.json"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://token.actions.githubusercontent.com/.well-known/jwks \
+            -o "$identity_dir/jwks.json"
+          python3 - "$identity_dir/token.json" "$identity_dir/openid.json" \
+            "$identity_dir/jwks.json" "$EXPECTED_TRUSTED_WORKFLOW_SHA" \
+            "$EXPECTED_COMPONENT_SHA" "$EXPECTED_ENVIRONMENT" "$OIDC_AUDIENCE" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import base64
+          import json
+          from pathlib import Path
+          import re
+          import sys
+          import time
+
+          from cryptography.hazmat.primitives import hashes
+          from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+          (
+              token_path,
+              configuration_path,
+              jwks_path,
+              trusted_sha,
+              component_sha,
+              environment,
+              audience,
+              run_id,
+              run_attempt,
+          ) = sys.argv[1:]
+
+          def decode_base64url(value: str) -> bytes:
+              return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+          if not re.fullmatch(r"[0-9a-f]{40}", trusted_sha):
+              raise SystemExit("trusted workflow input is not a full commit SHA")
+          if not re.fullmatch(r"[0-9a-f]{40}", component_sha):
+              raise SystemExit("component input is not a full commit SHA")
+          configuration = json.loads(Path(configuration_path).read_text())
+          if configuration.get("issuer") != "https://token.actions.githubusercontent.com":
+              raise SystemExit("unexpected GitHub OIDC issuer configuration")
+          if configuration.get("jwks_uri") != "https://token.actions.githubusercontent.com/.well-known/jwks":
+              raise SystemExit("unexpected GitHub OIDC JWKS location")
+          response = json.loads(Path(token_path).read_text())
+          token = response.get("value")
+          if not isinstance(token, str) or len(token.split(".")) != 3:
+              raise SystemExit("GitHub OIDC endpoint returned an invalid token")
+          encoded_header, encoded_payload, encoded_signature = token.split(".")
+          header = json.loads(decode_base64url(encoded_header))
+          claims = json.loads(decode_base64url(encoded_payload))
+          if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+              raise SystemExit("GitHub OIDC token is not an identified RS256 JWT")
+          keys = json.loads(Path(jwks_path).read_text()).get("keys")
+          matches = [
+              key for key in keys if isinstance(key, dict)
+              and key.get("kid") == header["kid"] and key.get("kty") == "RSA"
+              and key.get("alg") in (None, "RS256") and key.get("use") in (None, "sig")
+          ] if isinstance(keys, list) else []
+          if len(matches) != 1:
+              raise SystemExit("GitHub OIDC signing key is missing or ambiguous")
+          key = matches[0]
+          public_key = rsa.RSAPublicNumbers(
+              int.from_bytes(decode_base64url(key["e"]), "big"),
+              int.from_bytes(decode_base64url(key["n"]), "big"),
+          ).public_key()
+          public_key.verify(
+              decode_base64url(encoded_signature),
+              f"{encoded_header}.{encoded_payload}".encode(),
+              padding.PKCS1v15(),
+              hashes.SHA256(),
+          )
+          expected = {
+              "iss": "https://token.actions.githubusercontent.com",
+              "aud": audience,
+              "repository": "plaid-ai/NUV-AGENT",
+              "repository_id": "1149331364",
+              "repository_owner": "plaid-ai",
+              "repository_owner_id": "199492120",
+              "repository_visibility": "public",
+              "sub": "repo:plaid-ai/NUV-AGENT:environment:" + environment,
+              "ref": "refs/heads/main",
+              "ref_type": "branch",
+              "event_name": "workflow_dispatch",
+              "runner_environment": "github-hosted",
+              "sha": component_sha,
+              "workflow_ref": "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-evidence.yml@refs/heads/main",
+              "workflow_sha": component_sha,
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "environment": environment,
+              "job_workflow_ref": "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@" + trusted_sha,
+              "job_workflow_sha": trusted_sha,
+          }
+          for name, value in expected.items():
+              if claims.get(name) != value:
+                  raise SystemExit(f"GitHub OIDC claim {name} is not the protected value")
+          now = int(time.time())
+          if not isinstance(claims.get("nbf"), int) or claims["nbf"] > now + 30:
+              raise SystemExit("GitHub OIDC token is not active")
+          if not isinstance(claims.get("exp"), int) or claims["exp"] <= now:
+              raise SystemExit("GitHub OIDC token is expired")
+          if not isinstance(claims.get("iat"), int) or claims["iat"] > now + 30:
+              raise SystemExit("GitHub OIDC token issuance time is invalid")
+          if not 0 < claims["exp"] - claims["iat"] <= 600:
+              raise SystemExit("GitHub OIDC token lifetime is invalid")
+          PY
+          echo "workflow_sha=$EXPECTED_TRUSTED_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+          cleanup_identity
+          trap - EXIT INT TERM
+
+      - name: Check out the immutable trusted workflow source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: plaid-ai/NUV-AGENT
+          ref: ${{ steps.trusted-identity.outputs.workflow_sha }}
+          path: publisher
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify immutable reusable workflow identity
+        env:
+          EXPECTED_TRUSTED_WORKFLOW_SHA: ${{ inputs.trusted_workflow_sha }}
+          RESOLVED_TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$RESOLVED_TRUSTED_WORKFLOW_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
+          [ "$(git -C publisher rev-parse HEAD)" = "$RESOLVED_TRUSTED_WORKFLOW_SHA" ]
+          [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
+
+      - name: Download signed candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+
+      - name: Revalidate source and signed bytes before cloud credentials
+        id: signed-inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_COMPONENT_SHA: ${{ inputs.component_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
+          TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$GITHUB_SHA" = "$REQUESTED_COMPONENT_SHA" ]
+          [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
+          [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          [ "$live_main_sha" = "$REQUESTED_COMPONENT_SHA" ] \
+            || { echo "protected main advanced before candidate staging" >&2; exit 1; }
+          bundle_path="dist/$BUNDLE_NAME"
+          bom_path="dist/nuv-agent_${REQUESTED_VERSION}_iq9075-aarch64.release-bom.json"
+          signature_path="$bom_path.sig"
+          [ -f "$bundle_path" ] && [ ! -L "$bundle_path" ]
+          [ -f "$bom_path" ] && [ ! -L "$bom_path" ]
+          [ -f "$signature_path" ] && [ ! -L "$signature_path" ]
+          [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          deb_path="dist/$DEB_NAME"
+          [ "$DEB_NAME" = "nuv-agent_${REQUESTED_VERSION}_arm64.deb" ]
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
+          PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
+            "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          from nuvion_app.runtime.release_bom import load_signed_release_bom, verify_release_artifact
+          from nuvion_updater.trust import load_release_keyring
+
+          bom_path, signature_path, artifact_path = map(Path, sys.argv[1:4])
+          expected_sha, expected_version, expected_sequence = sys.argv[4:]
+          keyring = load_release_keyring(
+              Path("publisher/packaging/release/trusted-release-keyrings/iq9075-dev.json"),
+              expected_trust_domain="iq9075-dev",
+              require_root_owner=False,
+          )
+          verified = load_signed_release_bom(
+              bom_path, signature_path, release_keyring=keyring
+          )
+          verify_release_artifact(verified, artifact_path)
+          if (
+              verified.component_sha != expected_sha
+              or verified.agent_version != expected_version
+              or verified.release_sequence != int(expected_sequence)
+          ):
+              raise SystemExit("staged candidate identity is invalid")
+          PY
+          {
+            echo "bom_sha256=$(sha256sum "$bom_path" | awk '{print $1}')"
+            echo "signature_sha256=$(sha256sum "$signature_path" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up gcloud before cloud credentials
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Authenticate source GCP credential for downscoping
+        id: candidate-source-auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Mint prefix-bound token and destroy broad ADC
+        env:
+          SOURCE_CREDENTIAL_PATH: ${{ steps.candidate-source-auth.outputs.credentials_file_path }}
+          CAB_POLICY_PATH: ${{ github.workspace }}/publisher/packaging/release/iq9075-candidate-gcs-cab.json
+          CAB_TOKEN_DIRECTORY: ${{ runner.temp }}/iq9075-candidate-cab-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          source_credential="$(realpath "$SOURCE_CREDENTIAL_PATH")"
+          case "$source_credential" in
+            "$GITHUB_WORKSPACE"/gha-creds*.json) ;;
+            *) echo "source credential path is outside the expected workspace boundary" >&2; exit 1 ;;
+          esac
+          [ "$GOOGLE_APPLICATION_CREDENTIALS" = "$source_credential" ]
+          [ "$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" = "$source_credential" ]
+          [ "$GOOGLE_GHA_CREDS_PATH" = "$source_credential" ]
+          [ -f "$source_credential" ] && [ ! -L "$source_credential" ]
+          chmod 0600 "$source_credential"
+          mkdir -m 0700 "$CAB_TOKEN_DIRECTORY"
+          cab_token="$CAB_TOKEN_DIRECTORY/cab-token"
+          cleanup_candidate_credentials() {
+            rm -f -- "$cab_token"
+            if [ -f "$source_credential" ] || [ -L "$source_credential" ]; then
+              rm -f -- "$source_credential"
+            fi
+          }
+          trap cleanup_candidate_credentials EXIT INT TERM
+          env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+          python3 publisher/packaging/release/mint-candidate-gcs-cab-token.py \
+            --credential "$source_credential" \
+            --policy "$CAB_POLICY_PATH" \
+            --output-token "$cab_token"
+          [ ! -e "$source_credential" ] && [ ! -L "$source_credential" ]
+          [ -f "$cab_token" ] && [ ! -L "$cab_token" ]
+          [ "$(stat -c %a "$cab_token")" = 600 ]
+          {
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_GHA_CREDS_PATH="
+            echo "CANDIDATE_CAB_TOKEN_FILE=$cab_token"
+          } >> "$GITHUB_ENV"
+          unset GOOGLE_APPLICATION_CREDENTIALS
+          unset CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE
+          unset GOOGLE_GHA_CREDS_PATH
+          trap - EXIT INT TERM
+
+      - name: Publish exact candidate objects with downscoped token
+        env:
+          VERSION: ${{ inputs.version }}
+          BUNDLE_NAME: ${{ inputs.bundle_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]
+          [ -z "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ]
+          [ -z "${GOOGLE_GHA_CREDS_PATH:-}" ]
+          token_path="$CANDIDATE_CAB_TOKEN_FILE"
+          cleanup_downscoped_token() { rm -f -- "$token_path"; }
+          trap cleanup_downscoped_token EXIT INT TERM
+          [ -f "$token_path" ] && [ ! -L "$token_path" ]
+          [ "$(stat -c %a "$token_path")" = 600 ]
+          bundle_path="$(realpath "dist/$BUNDLE_NAME")"
+          bom_path="$(realpath "dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json")"
+          signature_path="$(realpath "$bom_path.sig")"
+          manifest_path="$(realpath dist/candidate-evidence-manifest.json)"
+          env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+          python3 publisher/packaging/release/publish-iq9075-candidate-gcs.py \
+            --token-file "$token_path" \
+            --manifest "$manifest_path" \
+            --artifact "$bundle_path" \
+            --bom "$bom_path" \
+            --signature "$signature_path"
+          [ ! -e "$token_path" ] && [ ! -L "$token_path" ]
+          trap - EXIT INT TERM

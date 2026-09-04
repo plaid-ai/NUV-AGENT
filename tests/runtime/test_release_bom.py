@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,19 @@ class ReleaseBomTest(unittest.TestCase):
             root = Path(tmp)
             payload = self._build(root)
             path = root / "release-bom.json"
-            path.write_text(canonical_release_bom_json(payload), encoding="utf-8")
+            document = canonical_release_bom_json(payload)
+            self.assertEqual(
+                document,
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+            )
+            path.write_text(document, encoding="utf-8")
 
             verified = load_release_bom(path, expected_bom_digest=payload["bomDigest"])
 

@@ -8,7 +8,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from nuvion_app.inference.command_inbox import DurableCommandInbox
+from nuvion_app.inference.command_inbox import CommandEffectOutcome, DurableCommandInbox
 from nuvion_app.inference.command_observation import (
     COMMAND_OBSERVED_DESTINATION,
     CommandObservationError,
@@ -134,6 +134,8 @@ class CommandObservationOutboxTest(unittest.TestCase):
         self.assertNotIn("commandType", payload)
 
     def test_retry_reuses_observation_id_until_ack_and_survives_reopen(self) -> None:
+        self.inbox.transition(self.command.command_id, "IN_PROGRESS")
+        self.inbox.transition(self.command.command_id, "SUCCEEDED")
         observation = self.outbox.enqueue(
             command_id=self.command.command_id,
             sequence=1,
@@ -186,6 +188,33 @@ class CommandObservationOutboxTest(unittest.TestCase):
         self.assertTrue(removed)
         self.assertEqual(reopened.pending(), [])
         self.assertFalse(runtime.acknowledge_observation(body)[1])
+
+    def test_non_succeeded_legacy_observation_is_discarded_without_send(self) -> None:
+        self.inbox.transition(self.command.command_id, "IN_PROGRESS")
+        observation = self.outbox.enqueue(
+            command_id=self.command.command_id,
+            sequence=1,
+            command_type="STREAM_POLICY",
+            reported_state={"updatePhase": "ROLLBACK_FAILED"},
+        )
+        self.inbox.transition(
+            self.command.command_id,
+            "FAILED",
+            code="EXPIRED",
+            reported_state={"updatePhase": "ROLLBACK_FAILED"},
+        )
+        attempts: list[dict[str, object]] = []
+        runtime = FleetCommandRuntime(
+            inbox=self.inbox,
+            processor=object(),
+            http_client=_HttpClient(),
+            ack_sender=lambda _destination, payload: not attempts.append(payload),
+            observation_outbox=self.outbox,
+        )
+
+        self.assertEqual(runtime.replay_observations(), 0)
+        self.assertEqual(attempts, [])
+        self.assertIsNone(self.outbox.get(observation.observation_id))
 
     def test_ack_identity_collision_cannot_delete_pending_observation(self) -> None:
         observation = self.outbox.enqueue(
@@ -484,6 +513,34 @@ class CommandObservationOutboxTest(unittest.TestCase):
         self.assertEqual(outbox.health_snapshot().reserved_rows, 0)
         self.assertEqual(len(outbox.pending()), 1)
         self.assertEqual(encoder.set_calls, [1200])
+
+    def test_failed_terminal_uses_lifecycle_ack_and_releases_observation_quota(
+        self,
+    ) -> None:
+        self.inbox.transition(self.command.command_id, "IN_PROGRESS")
+        outbox = DurableCommandObservationOutbox(self.inbox, max_rows=1)
+        store = DurableReconcileStore(self.inbox, observation_outbox=outbox)
+        self.inbox.run_transactional_effect(
+            self.command.command_id,
+            lambda connection: store.stage_verified(self.command, connection),
+        )
+        self.assertIsNotNone(store.claim_next(owner="worker", lease_seconds=30))
+
+        ack = store.finish(
+            self.command,
+            owner="worker",
+            outcome=CommandEffectOutcome(
+                status="FAILED",
+                code="EXPIRED",
+                reported_state={"updatePhase": "ROLLBACK_FAILED"},
+            ),
+        )
+
+        self.assertIsNotNone(ack)
+        self.assertEqual(ack.status, "FAILED")
+        self.assertEqual(ack.code, "EXPIRED")
+        self.assertEqual(outbox.pending(), [])
+        self.assertEqual(outbox.health_snapshot().reserved_rows, 0)
 
     def test_capacity_exhaustion_rejects_before_external_effect(self) -> None:
         outbox = DurableCommandObservationOutbox(self.inbox, max_rows=1)

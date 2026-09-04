@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -12,6 +13,86 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Iq9075PackagingTest(unittest.TestCase):
+    def test_rollback_oak_probe_is_version_neutral_and_bounded(self) -> None:
+        probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text(
+            encoding="utf-8"
+        )
+        runtime = (ROOT / "nuvion_updater/systemd_runtime.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("/opt/nuv-agent/current/venv/bin/python", probe)
+        self.assertIn('version("depthai") != "2.32.0.0"', probe)
+        self.assertIn("queue.tryGet()", probe)
+        self.assertIn(
+            "timeout --signal=TERM --kill-after=5s 60s runuser -u nuvion",
+            probe,
+        )
+        self.assertIn("depthai.Device.getAllAvailableDevices()", probe)
+        self.assertIn("stable_polls < 2", probe)
+        self.assertIn("NUVION_DEPTHAI_DEVICE_ID", probe)
+        self.assertIn("depthai.Device(pipeline, selected)", probe)
+        self.assertIn('Path("/sys/bus/usb/devices")', probe)
+        self.assertIn("IQ9075 requires exactly one attached OAK", probe)
+        self.assertIn("deadline = time.monotonic() + 45.0", probe)
+        self.assertIn("time.monotonic() + 10.0", probe)
+        self.assertIn('chown nuvion:nuvion "$runtime_dir"', probe)
+        self.assertNotIn("nuvion_app", probe)
+        self.assertNotIn("WebRTCUplinkController", probe)
+        self.assertNotIn("build_uplink_pipeline", probe)
+        self.assertIn(
+            'IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"',
+            runtime,
+        )
+
+    def test_rollback_oak_probe_selects_only_the_configured_stable_device(
+        self,
+    ) -> None:
+        probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text(
+            encoding="utf-8"
+        )
+        embedded = probe.split("<<'PY'\n", 2)[2].rsplit("\nPY", 1)[0]
+        tree = ast.parse(embedded)
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"configured_mxid", "select_device"}
+        ]
+        namespace: dict[str, object] = {"Path": Path, "re": __import__("re")}
+        exec(  # noqa: S102 - execute only two AST-selected repository functions.
+            compile(ast.Module(body=functions, type_ignores=[]), "<probe>", "exec"),
+            namespace,
+        )
+        configured_mxid = namespace["configured_mxid"]
+        select_device = namespace["select_device"]
+
+        class DeviceInfo:
+            def __init__(self, mxid: str) -> None:
+                self.mxid = mxid
+
+            def getMxId(self) -> str:
+                return self.mxid
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "agent.env"
+            config.write_text("NUVION_DEPTHAI_DEVICE_ID=oak-b\n", encoding="utf-8")
+            self.assertEqual(configured_mxid(config), "oak-b")
+            devices = [DeviceInfo("oak-a"), DeviceInfo("oak-b")]
+            self.assertIsNone(select_device(devices, "oak-b"))
+            self.assertIsNone(select_device(devices, "missing"))
+            self.assertIsNone(select_device(devices, None))
+            self.assertIs(select_device(devices[:1], None), devices[0])
+            self.assertIsNone(select_device(devices[:1], "oak-b"))
+
+            config.write_text(
+                "NUVION_DEPTHAI_DEVICE_ID=oak-a\n"
+                "NUVION_DEPTHAI_DEVICE_ID=oak-b\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "duplicate"):
+                configured_mxid(config)
+
     def test_deb_declares_camera_and_webrtc_runtime_dependencies(self) -> None:
         build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
             encoding="utf-8"
@@ -90,6 +171,8 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertNotIn("pip install", postinst)
         self.assertIn("Unsupported NUVION_INSTALL_PROFILE", postinst)
         self.assertIn("systemctl disable --now nuv-agent.service", postinst)
+        self.assertIn('"$INSTALL_ROOT/candidates"', postinst)
+        self.assertIn("install -d -m 0755 -o root -g root", postinst)
 
     def test_iq9075_installer_is_board_bound_and_leaves_service_disabled(self) -> None:
         installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
@@ -116,6 +199,14 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('camera_mode="oak"', installer)
         self.assertIn("--camera must be oak or uvc", installer)
         self.assertIn("preserve_if_present", installer)
+        self.assertIn("--expected-version", installer)
+        self.assertIn("--expected-sha256", installer)
+        self.assertIn('[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]', installer)
+        self.assertIn('dpkg-deb -f "$deb_path" Version', installer)
+        self.assertIn('sha256sum "$deb_path"', installer)
+        self.assertIn('package version mismatch', installer)
+        self.assertIn('package SHA-256 mismatch', installer)
+        self.assertIn('package must not be a symlink', installer)
 
     def test_iq9075_camera_config_update_is_idempotent(self) -> None:
         installer = (ROOT / "packaging/dev/install-iq9075.sh").read_text(
@@ -200,26 +291,494 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('camera_mode="oak"', e2e)
         self.assertIn("runuser -u nuvion", e2e)
         self.assertIn("/opt/nuv-agent/current/venv/bin/python", e2e)
+        self.assertIn("NUVION_AGENT_PYTHON", e2e)
+        self.assertIn("evidence Python and site-packages identity is invalid", e2e)
+        self.assertIn("--evidence-output", e2e)
+        self.assertIn(
+            "evidence mode requires the exact BOM-addressed site-packages", e2e
+        )
+        runbook = (
+            ROOT / "packaging/release/v0.1.121-release-runbook.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("env -u PYTHONPATH", runbook)
+        self.assertGreaterEqual(e2e.count('-C "$probe_runtime_dir"'), 2)
+        self.assertGreaterEqual(e2e.count("/usr/bin/python3 -I -s"), 3)
+        self.assertIn("OAK evidence process imported outside candidate slot", e2e)
+        self.assertIn('"runtimeIdentity"', e2e)
+        self.assertIn("physical release test requires exactly one OAK MXID", e2e)
+        self.assertIn("pre-release hardware evidence only", e2e)
+        self.assertIn("not path.is_absolute()", e2e)
+        self.assertIn("raw != normalized", e2e)
+        self.assertIn("metadata.st_uid != 0", e2e)
+        self.assertIn("metadata.st_mode & 0o022", e2e)
+        self.assertIn("parent.is_relative_to(install_root)", e2e)
+        self.assertIn("/usr/bin/python3 -I", e2e)
+        self.assertIn('runuser -u nuvion --', e2e)
+        identity_probe = e2e.split("validate_release_identity() {", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        self.assertIn(
+            "identity_python=(/usr/sbin/runuser -u nuvion -- /usr/bin/python3 -I -s)",
+            identity_probe,
+        )
+        self.assertNotIn(
+            'NUVION_SYSTEM_PYTHON=/usr/bin/python3 "$agent_python" -s -',
+            identity_probe,
+        )
+        self.assertIn('"G_DEBUG=fatal-criticals"', e2e)
+        self.assertIn("mktemp -d /tmp/nuvion-iq9075-e2e.XXXXXX", e2e)
+        self.assertIn('"HOME=$probe_runtime_dir/home"', e2e)
+        self.assertIn('"XDG_CACHE_HOME=$probe_runtime_dir/cache"', e2e)
+        self.assertIn(
+            '"DEPTHAI_CRASHDUMP=$oak_crash_dump"',
+            e2e,
+        )
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_NATIVE_CAPTURE=$oak_native_capture"',
+            e2e,
+        )
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_NATIVE_CAPTURE_OWNER=$oak_native_capture_owner"',
+            e2e,
+        )
+        self.assertIn('exec 9<>"$oak_native_capture"', e2e)
+        self.assertIn('1>&9 2>&1 <<\'PY\'', e2e)
+        self.assertNotIn('2>"$oak_native_stderr"', e2e)
+        self.assertIn('install -d -m 0711 -o root -g root', e2e)
+        self.assertIn('install -m 0600 -o root -g root /dev/null "$oak_native_capture"', e2e)
+        self.assertIn('chmod 0711 "$probe_runtime_dir"', e2e)
+        self.assertNotIn('chown "$probe_user:$probe_group" "$probe_runtime_dir"', e2e)
+        self.assertIn('install -m 0600 -o "$probe_user" -g "$probe_group"', e2e)
+        self.assertIn('"XDG_CONFIG_HOME=$probe_runtime_dir/config"', e2e)
+        self.assertIn('"XDG_RUNTIME_DIR=$probe_runtime_dir/runtime"', e2e)
+        self.assertIn(
+            '"NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/runtime/'
+            'oak-soak-result.json"',
+            e2e,
+        )
+        self.assertNotIn(
+            '"NUVION_IQ9075_OAK_EVIDENCE_OUTPUT=$probe_runtime_dir/'
+            'oak-soak-result.json"',
+            e2e,
+        )
         self.assertIn('expected_version = "2.32.0.0"', e2e)
-        self.assertIn("timeout 45s", e2e)
+        self.assertIn("timeout 720s", e2e)
         self.assertIn("DepthAIFrameSource", e2e)
         self.assertIn("DepthAIGStreamerBridge", e2e)
-        self.assertIn("range(30)", e2e)
-        self.assertIn('structure.get_name() != "application/x-rtp"', e2e)
-        self.assertIn('structure.get_string("encoding-name") != "H264"', e2e)
-        self.assertIn("buffer.pts == Gst.CLOCK_TIME_NONE", e2e)
+        self.assertIn('NUVION_IQ9075_OAK_SOAK_SECONDS", "120"', e2e)
+        self.assertIn('read_proc_status_kib("RssAnon")', e2e)
+        self.assertIn("appsrc buffer bound exceeded", e2e)
+        self.assertIn("appsrc byte bound exceeded", e2e)
+        self.assertIn("post-rejection anonymous RSS slope exceeded bound", e2e)
+        self.assertIn("post-rejection anonymous RSS range exceeded bound", e2e)
+        self.assertIn("rss_slope_mib_per_min", e2e)
+        self.assertIn("len(samples) < 18", e2e)
+        self.assertIn("raw_fps < MIN_RAW_FPS", e2e)
+        self.assertIn("minimum_raw_samples = int(0.9 * FPS * soak_seconds)", e2e)
+        self.assertIn('structure.get_name() != "video/x-raw"', e2e)
+        self.assertIn("raw sample is missing a PTS", e2e)
+        self.assertIn("build_bounded_live_queue", e2e)
+        self.assertIn("build_uplink_pipeline", e2e)
+        self.assertIn("clip_enabled=True", e2e)
+        self.assertIn("splitmux fragment progress fell below bound", e2e)
+        self.assertIn("newest_segment_age > 2 * SEGMENT_SECONDS + 5", e2e)
+        self.assertIn("len(segments) > MAX_SEGMENTS", e2e)
+        self.assertIn("offer_answer_timeout_sec=3.0", e2e)
+        self.assertIn('"sessionId": "unanswered-offer"', e2e)
+        self.assertIn("unanswered WebRTC watchdog branch teardown", e2e)
+        self.assertIn("unanswered offer watchdog did not emit exact terminal STOP", e2e)
+        self.assertNotIn("controller.reject_signaling(", e2e)
+        self.assertIn('"profile-level-id=42e01f"', e2e)
+        self.assertIn("old_queue.get_parent() is not None", e2e)
+        self.assertIn("old_webrtc.get_state(0)[1] != Gst.State.NULL", e2e)
+        self.assertIn("old_webrtc_ref = weakref.ref(old_webrtc)", e2e)
+        self.assertIn("rejected WebRTC branch object finalization", e2e)
+        self.assertIn('"branchObjectsFinalized": True', e2e)
+        self.assertIn("request_pad_count(uplink_tee) != 0", e2e)
+        self.assertIn("controller._branch is not None", e2e)
+        self.assertIn("bridge.stats_snapshot()", e2e)
+        self.assertIn('"status": "failed" if run_failure', e2e)
+        self.assertIn('"schemaVersion": 2', e2e)
+        self.assertIn('"rssAnonSlopeMiBPerMin"', e2e)
+        self.assertIn('cleanup_errors.append(f"DepthAI teardown:', e2e)
+        self.assertIn("DepthAI capture thread remained running after teardown", e2e)
+        self.assertIn("DepthAI crash dump detected:", e2e)
+        self.assertIn("current_crash_dump_metadata.st_size > 16 * 1024 * 1024", e2e)
+        self.assertIn("DepthAI crash dump file escaped its protected root", e2e)
+        self.assertIn("native_capture_path.is_symlink()", e2e)
+        self.assertIn("capture_metadata.st_size > 1024 * 1024", e2e)
+        self.assertIn("sys.stdout.flush()", e2e)
+        self.assertIn("sys.stderr.flush()", e2e)
+        self.assertIn("ctypes.CDLL(None).fflush(None)", e2e)
+        self.assertIn("os.fsync(1)", e2e)
+        self.assertIn("os.pread(1, 1024 * 1024 + 1, 0)", e2e)
+        self.assertIn("DepthAI native output reported a device crash", e2e)
+        bridge_close = e2e.index("bridge.close()")
+        bridge_running = e2e.index("if bridge.running:", bridge_close)
+        pipeline_null = e2e.index("pipeline.set_state(Gst.State.NULL)", bridge_running)
+        output_flush = e2e.index("sys.stdout.flush()", pipeline_null)
+        self.assertLess(bridge_close, bridge_running)
+        self.assertLess(bridge_running, pipeline_null)
+        self.assertLess(pipeline_null, output_flush)
+        self.assertIn("[iq9075-e2e] preserved failure evidence:", e2e)
+        self.assertGreaterEqual(e2e.count("os.link("), 2)
+        self.assertGreaterEqual(e2e.count("time.monotonic_ns()"), 2)
+        self.assertIn("IQ9075 evidence source root schema is invalid", e2e)
+        self.assertIn("failed IQ9075 evidence lacks bounded failure details", e2e)
+        evidence_copy = e2e.index(
+            'if [ -n "$evidence_output" ] && [ -f "$probe_runtime_dir/runtime/oak-soak-result.json" ]'
+        )
+        oak_failure = e2e.index('if [ "$oak_status" -ne 0 ]', evidence_copy)
+        self.assertLess(evidence_copy, oak_failure)
         self.assertIn("Gst.MessageType.ERROR", e2e)
         self.assertIn('oak_status" -eq 3', e2e)
         self.assertIn('NUVION_GST_SOURCE must be empty', e2e)
+        self.assertIn('--expected-slot-kind)', e2e)
+        self.assertIn('--expected-slot-path)', e2e)
+        self.assertIn('--expected-control-marker-sha256)', e2e)
+        self.assertIn('evidence["schemaVersion"] = 3', e2e)
+        self.assertIn('evidence["slotKind"] = "candidate"', e2e)
+        self.assertIn('/opt/nuv-agent/candidates/${evidence_run_id}-', e2e)
+        self.assertIn("fixed 120-second soak", e2e)
+        self.assertIn("fixed 2 MiB/min RSS slope", e2e)
+        self.assertIn("fixed 32 MiB RSS range", e2e)
+        self.assertIn("candidate evidence requires the fixed system Python", e2e)
+        self.assertIn('"NUVION_SYSTEM_PYTHON=/usr/bin/python3"', e2e)
         self.assertIn('NUVION_DEMO_MODE must be false', e2e)
-        self.assertIn('Path("/sys/bus/usb/devices").glob("*/idVendor")', e2e)
+        self.assertIn('re.compile(r"^[12]-1(?:\\.[1-9][0-9]*)+$")', e2e)
+        self.assertIn('oak_products = {"2485": "bootloader", "f63b": "runtime"}', e2e)
+        self.assertIn("require_runtime_oak(startup_timeout)", e2e)
+        self.assertIn("runtime OAK-D Lite must enumerate on USB3", e2e)
+        self.assertIn("len(oak_usb_paths) != 1", e2e)
+        self.assertIn('Path("/sys/bus/usb/drivers/usb")', e2e)
+        self.assertNotIn('Path("/sys/bus/usb/devices/2-1")', e2e)
+        self.assertNotIn("DevNum", e2e)
+        self.assertIn("driver_path != expected_driver", e2e)
+        self.assertIn("speed_mbps < 5000.0", e2e)
         self.assertIn("OAK USB device is present but DepthAI could not enumerate it", e2e)
         self.assertIn("no OAK-D device detected", e2e)
         self.assertIn("/dev/v4l/by-id", e2e)
         self.assertIn('driver" = "uvcvideo"', e2e)
         self.assertIn("timeout 20s gst-launch-1.0", e2e)
+        self.assertIn("G_DEBUG=fatal-criticals", e2e)
+        self.assertIn("WebRTCUplinkController", e2e)
+        self.assertIn("controller.on_signaling_reset()", e2e)
+        self.assertIn("advance_after_offer", e2e)
+        self.assertIn("or not branch.offer_enqueued", e2e)
+        self.assertIn("GLib.timeout_add(10_000, sequence_timeout)", e2e)
+        self.assertIn("offer_session_ids != session_ids", e2e)
+        self.assertNotIn("GLib.timeout_add(300, reset)", e2e)
+        self.assertNotIn('GLib.timeout_add(450, start, "session-2")', e2e)
+        self.assertIn("partial teardown did not recover idempotently", e2e)
+        self.assertIn('"webrtc_uplink_session_5"', e2e)
+        self.assertIn("Gst.MessageType.ERROR | Gst.MessageType.WARNING", e2e)
         self.assertNotIn("NUVION_DEVICE_PASSWORD", e2e)
         self.assertNotIn("curl ", e2e)
+
+    def test_oak_native_output_detects_fileless_depthai_crash_markers(self) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        command = e2e.index('timeout 720s "${oak_python[@]}"')
+        start = e2e.index("<<'PY'\n", command) + len("<<'PY'\n")
+        end = e2e.index("\nPY\n  oak_status=$?", start)
+        tree = ast.parse(e2e[start:end])
+        selected_nodes = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name)
+                and target.id == "DEPTHAI_NATIVE_CRASH_MARKERS"
+                for target in node.targets
+            ):
+                selected_nodes.append(node)
+            elif (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "depthai_native_capture_has_crash_marker"
+            ):
+                selected_nodes.append(node)
+        self.assertEqual(len(selected_nodes), 2)
+        namespace: dict[str, object] = {"re": __import__("re")}
+        exec(  # noqa: S102 - execute only AST-selected diagnostic matcher code.
+            compile(
+                ast.Module(body=selected_nodes, type_ignores=[]),
+                "<iq9075-oak-native-output>",
+                "exec",
+            ),
+            namespace,
+        )
+        detected = namespace["depthai_native_capture_has_crash_marker"]
+
+        crash_lines = (
+            "Device with id 19443010DEADBEEF00 has crashed. Crash dump logs are stored",
+            "Device crashed, but no crash dump could be extracted.",
+            "Device crashed, but no crash dump payload could be extracted.",
+            "Device likely crashed but did not reboot in time to get the crash dump",
+            "Device crashed.\nCrash dump retrieval disabled.",
+            "There was a fatal error. Crash dump saved to /private/path",
+            "Device has crashed. Crash dump stored in a private cache",
+            "Fatal error. Please report to developers. Log: trap",
+        )
+        for line in crash_lines:
+            with self.subTest(line=line):
+                self.assertTrue(detected(line))
+        self.assertFalse(detected("Device closed normally; shutdown OK"))
+
+    def test_oak_native_capture_fd_routes_stdout_and_stderr_without_truncate_redirect(
+        self,
+    ) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        self.assertIn('exec 9<>"$oak_native_capture"', e2e)
+        self.assertIn('1>&9 2>&1 <<\'PY\'', e2e)
+        self.assertNotIn('2>"$oak_native_capture"', e2e)
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "native-output.log"
+            capture.touch(mode=0o600)
+            probe = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    """
+set -euo pipefail
+capture=$1
+exec 9<>"$capture"
+python3 -c 'import os; os.write(1, b"stdout-marker\\n"); os.write(2, b"stderr-marker\\n")' \
+  1>&9 2>&1
+exec 9>&-
+""",
+                    "bash",
+                    str(capture),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            captured = capture.read_text(encoding="utf-8")
+            self.assertIn("stdout-marker", captured)
+            self.assertIn("stderr-marker", captured)
+
+    def test_oak_evidence_export_is_atomic_strict_and_preserves_failures(
+        self,
+    ) -> None:
+        e2e = (ROOT / "packaging/dev/test-iq9075.sh").read_text(encoding="utf-8")
+        marker = (
+            '"$(id -u)" "$oak_status" <<\'PY\'\n'
+        )
+        start = e2e.index(marker) + len(marker)
+        end = e2e.index(
+            "\nPY\n    echo \"[iq9075-e2e] canonical OAK evidence",
+            start,
+        )
+        exporter = e2e[start:end]
+
+        def payload(status: str) -> dict[str, object]:
+            passed = status == "passed"
+            return {
+                "schemaVersion": 2,
+                "kind": "nuvion-iq9075-oak-soak-result",
+                "startedAt": "2026-09-03T00:00:00Z",
+                "outcome": {
+                    "status": status,
+                    "error": None,
+                    "cleanupErrors": []
+                    if passed
+                    else ["DepthAI native output reported a device crash"],
+                },
+                "board": {
+                    "productModel": "IQ9075_DEV",
+                    "platformProfile": "iq9075_dev",
+                    "hardwareRevision": "QCS9075-EVK",
+                    "architecture": "aarch64",
+                    "kernel": "6.8.0",
+                    "depthaiVersion": "2.32.0.0",
+                    "gstreamerVersion": "1.24.2",
+                },
+                "oakMxidSha256": "a" * 64,
+                "deviceIdentity": {"deviceId": "sp-3-nuvion-test", "spaceId": 3},
+                "runtimeIdentity": {
+                    "agentVersion": "0.1.121",
+                    "componentSha": "b" * 40,
+                    "bomDigest": "sha256:" + "c" * 64,
+                    "pythonPath": "/usr/bin/python3",
+                    "sitePackagesPath": (
+                        "/opt/nuv-agent/test/venv/lib/python3.12/site-packages"
+                    ),
+                    "buildInfoPath": (
+                        "/opt/nuv-agent/test/venv/lib/python3.12/site-packages/"
+                        "nuvion_app/build_info.py"
+                    ),
+                    "releaseMarkerSha256": "d" * 64,
+                },
+                "soak": {
+                    "durationSeconds": 120.0 if passed else 0.0,
+                    "targetFps": 30.0,
+                    "rawSamples": 3600 if passed else 0,
+                    "rssAnonSamples": [],
+                    "rssAnonSlopeMiBPerMin": 0.0 if passed else None,
+                    "rssAnonRangeMiB": 0.0 if passed else None,
+                    "gstreamerErrors": [],
+                    "gstreamerWarnings": [],
+                    "maxAppsrcBuffers": 1,
+                    "maxAppsrcBytes": 921600,
+                    "queueHighWatermarks": {},
+                },
+                "webrtc": {
+                    "offerCount": 1,
+                    "terminalStopCount": 1,
+                    "offerSdpHadPinnedProfile": True,
+                    "branchParentDetached": True,
+                    "queueParentDetached": True,
+                    "webrtcParentDetached": True,
+                    "teeRequestPadCount": 0,
+                    "queueState": "NULL",
+                    "webrtcState": "NULL",
+                    "branchObjectsFinalized": True,
+                    "hasPipeline": False,
+                }
+                if passed
+                else {},
+                "splitmux": {
+                    "segmentSeconds": 4.0,
+                    "retentionLimit": 30,
+                    "segmentsAtEnd": 0,
+                    "fragmentsOpenedDuringSoak": 0,
+                    "newestSegmentAgeSeconds": None,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for status in ("passed", "failed"):
+                with self.subTest(status=status):
+                    source = root / f"{status}-source.json"
+                    destination = root / f"{status}-evidence.json"
+                    raw = (
+                        json.dumps(
+                            payload(status),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode()
+                    source.write_bytes(raw)
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-",
+                            str(source),
+                            str(destination),
+                            str(os.getuid()),
+                            "0" if status == "passed" else "1",
+                        ],
+                        input=exporter,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(destination.read_bytes(), raw)
+                    self.assertEqual(
+                        json.loads(destination.read_text(encoding="utf-8"))["outcome"][
+                            "status"
+                        ],
+                        status,
+                    )
+                    self.assertEqual(
+                        list(root.glob(f".{destination.name}.*.tmp")),
+                        [],
+                    )
+
+                    repeated = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-",
+                            str(source),
+                            str(destination),
+                            str(os.getuid()),
+                            "0" if status == "passed" else "1",
+                        ],
+                        input=exporter,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(repeated.returncode, 0)
+                    self.assertEqual(destination.read_bytes(), raw)
+
+            invalid = payload("failed")
+            invalid["unexpected"] = True
+            source = root / "invalid-source.json"
+            destination = root / "invalid-evidence.json"
+            source.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                    "1",
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertFalse(destination.exists())
+
+            malformed_failure = payload("failed")
+            malformed_failure["outcome"]["error"] = None
+            malformed_failure["outcome"]["cleanupErrors"] = []
+            source = root / "malformed-failure-source.json"
+            destination = root / "malformed-failure-evidence.json"
+            source.write_text(
+                json.dumps(malformed_failure) + "\n",
+                encoding="utf-8",
+            )
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                    "1",
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("lacks bounded failure details", rejected.stderr)
+            self.assertFalse(destination.exists())
+
+            mismatched = payload("passed")
+            source = root / "mismatched-status-source.json"
+            destination = root / "mismatched-status-evidence.json"
+            source.write_text(json.dumps(mismatched) + "\n", encoding="utf-8")
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-",
+                    str(source),
+                    str(destination),
+                    str(os.getuid()),
+                    "1",
+                ],
+                input=exporter,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("does not match the OAK process status", rejected.stderr)
+            self.assertFalse(destination.exists())
 
     def test_packaging_shell_scripts_parse(self) -> None:
         scripts = sorted((ROOT / "packaging").rglob("*.sh"))
@@ -244,13 +803,21 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn('"NUVION_DEMO_MODE": "false"', provisioner)
         self.assertIn("--synthetic-camera", provisioner)
         self.assertIn("--consume", provisioner)
+        self.assertIn("credential_path.lstat()", provisioner)
+        self.assertIn('getattr(os, "O_NOFOLLOW", 0)', provisioner)
+        self.assertIn("opened.st_dev, opened.st_ino", provisioner)
+        self.assertIn("credential_path.unlink()", provisioner)
+        self.assertNotIn('credentials_path="$(realpath', provisioner)
         self.assertNotIn('echo "$password"', provisioner)
 
     def test_provisioner_clears_stale_synthetic_source_in_physical_mode(self) -> None:
         provisioner = (
             ROOT / "packaging/dev/provision-iq9075.sh"
         ).read_text(encoding="utf-8")
-        marker = 'python3 - "$credentials_path" "$CONFIG_PATH" "$synthetic_camera" <<\'PY\'\n'
+        marker = (
+            'python3 - "$credentials_path" "$CONFIG_PATH" '
+            '"$synthetic_camera" "$consume" <<\'PY\'\n'
+        )
         updater = provisioner.split(marker, 1)[1].split("\nPY\n", 1)[0]
         updater = updater.replace(
             "os.chown(temporary, 0, config_path.stat().st_gid)",
@@ -286,6 +853,7 @@ class Iq9075PackagingTest(unittest.TestCase):
                         str(credentials_path),
                         str(config_path),
                         synthetic,
+                        "false",
                     ],
                     input=updater,
                     check=True,
@@ -300,6 +868,25 @@ class Iq9075PackagingTest(unittest.TestCase):
             )
             self.assertEqual(values["NUVION_GST_SOURCE"], "")
             self.assertEqual(values["NUVION_DEMO_MODE"], "false")
+
+            symlink_path = root / "credentials-link.json"
+            symlink_path.symlink_to(credentials_path)
+            rejected = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(symlink_path),
+                    str(config_path),
+                    "false",
+                    "false",
+                ],
+                input=updater,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("regular file", rejected.stderr)
 
 
 if __name__ == "__main__":

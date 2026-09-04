@@ -14,6 +14,7 @@ from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
 DEPTHAI_SOURCE_ALIASES = frozenset({"depthai", "oak", "oak-d", "oak-d-lite"})
 DEPTHAI_APPSRC_NAME = "oak_depthai_source"
+DEPTHAI_APPSRC_MAX_BUFFERS = 2
 
 
 def is_depthai_video_source(raw: str | None) -> bool:
@@ -310,10 +311,12 @@ def _finalize_camera_pipeline(base_pipeline: str) -> str:
 
 
 def _build_depthai_appsrc_pipeline(width: int, height: int, fps: int) -> str:
+    max_bytes = DEPTHAI_APPSRC_MAX_BUFFERS * width * height * 3
     appsrc = (
         f"appsrc name={DEPTHAI_APPSRC_NAME} "
         "is-live=true format=time do-timestamp=true block=false emit-signals=false "
-        "max-buffers=2 max-bytes=0 max-time=0 leaky-type=downstream "
+        f"max-buffers={DEPTHAI_APPSRC_MAX_BUFFERS} max-bytes={max_bytes} "
+        "max-time=0 leaky-type=downstream "
         f"caps=video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1"
     )
     return _finalize_camera_pipeline(f"{appsrc} ! videoconvert")

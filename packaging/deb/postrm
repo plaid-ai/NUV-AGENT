@@ -1,5 +1,170 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ulimit -S -c 0
+ulimit -H -c 0
+
+readonly BOARD_TOOL=/usr/local/libexec/nuvion/iq9075-board-e2e.py
+readonly LEGACY_BOARD_TOOL=/var/lib/nuvion-fleet-e2e/legacy-board-tool.preinst
+readonly MAINTENANCE=/var/lib/nuvion-fleet-e2e/package-maintenance.json
+
+case "${1:-}" in
+  abort-install|abort-upgrade|disappear)
+    install -d -m 0755 -o root -g root /run/lock
+    exec {package_lock_fd}>/run/lock/nuvion-fleet-e2e.lock
+    flock --exclusive --timeout 30 "$package_lock_fd"
+    systemctl stop \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service || true
+    for protected_unit in \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service; do
+      protected_state="$(systemctl is-active "$protected_unit" 2>/dev/null || true)"
+      case "$protected_state" in
+        inactive|failed|unknown) ;;
+        *)
+          echo "Cannot quiesce protected runtime during package rollback" >&2
+          exit 1
+          ;;
+      esac
+    done
+    /usr/bin/python3 -I - \
+      "$BOARD_TOOL" "$LEGACY_BOARD_TOOL" "$MAINTENANCE" <<'PY'
+import json
+import os
+import resource
+import stat
+import sys
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+tool, backup, marker = sys.argv[1:]
+blocker = (
+    b"#!/usr/bin/python3\n"
+    b"import sys\n"
+    b"sys.stderr.write('Fleet E2E is blocked during package maintenance\\n')\n"
+    b"raise SystemExit(1)\n"
+)
+
+def read_root_regular(target, *, mode, maximum):
+    metadata = os.lstat(target)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or metadata.st_size > maximum
+    ):
+        raise SystemExit("package rollback endpoint is unsafe")
+    descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        content = os.read(descriptor, maximum + 1)
+    finally:
+        os.close(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    ) or len(content) > maximum:
+        raise SystemExit("package rollback endpoint changed while reading")
+    return content
+
+# The marker is the durable package-maintenance authority. Validate it before
+# even inspecting rollback material so corrupt state can never expose the old,
+# marker-blind helper by partially completing this unwind.
+if os.path.lexists(marker):
+    expected = (json.dumps({
+        "schemaVersion": 1,
+        "kind": "nuvion-package-maintenance",
+        "active": True,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if read_root_regular(marker, mode=0o600, maximum=4096) != expected:
+        raise SystemExit("package maintenance rollback marker is invalid")
+
+backup_content = None
+if os.path.lexists(backup):
+    backup_content = read_root_regular(backup, mode=0o700, maximum=2 * 1024 * 1024)
+tool_content = None
+if os.path.lexists(tool):
+    tool_content = read_root_regular(tool, mode=0o755, maximum=2 * 1024 * 1024)
+tool_changed = False
+if backup_content is not None and tool_content in {None, blocker}:
+    restore_temporary = tool + f".restore-{os.getpid()}"
+    restore_fd = os.open(
+        restore_temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW,
+        0o755,
+    )
+    try:
+        remaining = memoryview(backup_content)
+        while remaining:
+            written = os.write(restore_fd, remaining)
+            if written <= 0:
+                raise SystemExit("Fleet recovery tool restore write failed")
+            remaining = remaining[written:]
+        os.fchmod(restore_fd, 0o755)
+        os.fsync(restore_fd)
+    finally:
+        os.close(restore_fd)
+    os.replace(restore_temporary, tool)
+    tool_directory = os.open(
+        os.path.dirname(tool), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(tool_directory)
+    finally:
+        os.close(tool_directory)
+    os.unlink(backup)
+    backup_directory = os.open(
+        os.path.dirname(backup), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(backup_directory)
+    finally:
+        os.close(backup_directory)
+elif tool_content == blocker:
+    os.unlink(tool)
+    tool_changed = True
+elif backup_content is not None:
+    if tool_content != backup_content:
+        raise SystemExit("cannot prove restored Fleet recovery tool identity")
+    os.unlink(backup)
+    backup_directory = os.open(
+        os.path.dirname(backup), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(backup_directory)
+    finally:
+        os.close(backup_directory)
+if tool_changed:
+    tool_directory = os.open(
+        os.path.dirname(tool), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(tool_directory)
+    finally:
+        os.close(tool_directory)
+
+if os.path.lexists(marker):
+    os.unlink(marker)
+    marker_directory = os.open(
+        os.path.dirname(marker), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(marker_directory)
+    finally:
+        os.close(marker_directory)
+PY
+    flock --unlock "$package_lock_fd"
+    ;;
+esac
+
+systemctl daemon-reload || true
 
 case "${1:-}" in
   remove|purge)

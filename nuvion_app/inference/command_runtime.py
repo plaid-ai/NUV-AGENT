@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from nuvion_app.inference.command_inbox import (
+    COMMAND_STATUS_SUCCEEDED,
     CommandEffectOutcome,
     CommandInboxError,
     DurableCommandInbox,
@@ -341,6 +342,10 @@ class FleetCommandRuntime:
             return 0
         sent = 0
         for observation in self.observation_outbox.pending(limit=limit):
+            command = self.inbox.get(observation.command_id)
+            if command is None or command.status != COMMAND_STATUS_SUCCEEDED:
+                self.observation_outbox.discard_command(observation.command_id)
+                continue
             payload = build_command_observation_payload(observation)
             accepted = self.ack_sender(COMMAND_OBSERVED_DESTINATION, payload)
             self.observation_outbox.mark_attempt(

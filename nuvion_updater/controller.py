@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import secrets
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,9 +21,14 @@ from nuvion_app.runtime.release_bom import (
     verify_release_artifact,
 )
 from nuvion_updater.errors import UpdaterError, UpdaterSecurityError
+from nuvion_updater.health_attestation import (
+    CommitProcessIdentity,
+    ExpectedHealthAttestation,
+    HealthAttestationVerifier,
+)
 from nuvion_updater.repository import ContentAddressedReleaseRepository
 from nuvion_updater.slots import ReleaseSlotManager
-from nuvion_updater.store import UpdatePhase, UpdaterStore, UpdateState
+from nuvion_updater.store import CommitGate, UpdatePhase, UpdaterStore, UpdateState
 from nuvion_updater.trust import DeviceBinding
 from nuvion_updater.util import parse_digest
 
@@ -46,6 +54,10 @@ class UpdaterController:
         activation_callback: Callable[[str], None] | None = None,
         boot_health_check: Callable[[UpdateState], tuple[bool, str]] | None = None,
         functional_health_check: Callable[[UpdateState], tuple[bool, str]] | None = None,
+        commit_process_check: (
+            Callable[[UpdateState, int], CommitProcessIdentity] | None
+        ) = None,
+        health_attestation_verifier: HealthAttestationVerifier | None = None,
         rollback_boot_health_check: Callable[[str], tuple[bool, str]] | None = None,
         safe_stop_callback: Callable[[], None] | None = None,
         activation_timeout_seconds: int = 300,
@@ -75,6 +87,8 @@ class UpdaterController:
         self.activation_callback = activation_callback
         self.boot_health_check = boot_health_check
         self.functional_health_check = functional_health_check
+        self.commit_process_check = commit_process_check
+        self.health_attestation_verifier = health_attestation_verifier
         self.rollback_boot_health_check = rollback_boot_health_check
         self.safe_stop_callback = safe_stop_callback
         self.activation_timeout_seconds = activation_timeout_seconds
@@ -93,6 +107,8 @@ class UpdaterController:
             and self.activation_callback is not None
             and self.boot_health_check is not None
             and self.functional_health_check is not None
+            and self.commit_process_check is not None
+            and self.health_attestation_verifier is not None
             and self.rollback_boot_health_check is not None
             and self.safe_stop_callback is not None
         )
@@ -122,18 +138,20 @@ class UpdaterController:
             compact_jws=command.compact_jws,
             target_version=str(command.payload["targetVersion"]),
             bom_digest=str(command.payload["bomDigest"]),
+            command_expires_at=command.expires_at,
         )
         if duplicate and state.phase not in {
             UpdatePhase.AUTHORIZED,
             UpdatePhase.DOWNLOADING,
             UpdatePhase.STAGING,
         }:
-            return state
+            return self._enforce_command_expiry(state)
         return self._stage_authorized(state)
 
     def status(self, command_id: str | None = None) -> dict[str, object]:
         state = self.store.get(command_id) if command_id else self.store.current()
         if state is not None:
+            state = self._enforce_command_expiry(state)
             state = self._enforce_health_deadline(state)
         return {
             "capabilityAvailable": self.capability_available,
@@ -259,19 +277,104 @@ class UpdaterController:
             health_deadline=self._deadline(self.commit_timeout_seconds),
         )
 
-    def commit(self, command_id: str) -> UpdateState:
+    def begin_commit_gate(self, command_id: str, *, peer_pid: int) -> CommitGate:
         state = self._require_state(command_id)
-        if state.phase == UpdatePhase.COMMITTED:
-            return state
         if state.phase != UpdatePhase.FUNCTIONAL_HEALTHY:
+            raise UpdaterError(
+                "INVALID_PHASE", "FUNCTIONAL_HEALTHY is required before commit gate"
+            )
+        if (
+            state.candidate_slot is None
+            or state.component_sha is None
+            or state.release_sequence is None
+            or state.health_deadline is None
+            or state.command_expires_at is None
+        ):
+            raise UpdaterError(
+                "INVALID_JOURNAL", "commit gate release identity is incomplete"
+            )
+        process = self._capture_commit_process(state, peer_pid)
+        return self.store.begin_commit_gate(
+            command_id=command_id,
+            gate_id=str(uuid.uuid4()),
+            challenge=base64.urlsafe_b64encode(secrets.token_bytes(32))
+            .decode("ascii")
+            .rstrip("="),
+            process=process,
+            bom_digest=state.bom_digest,
+            component_sha=state.component_sha,
+            release_sequence=state.release_sequence,
+            health_deadline=state.health_deadline,
+            command_expires_at=state.command_expires_at,
+        )
+
+    def commit(
+        self,
+        command_id: str,
+        *,
+        gate_id: str,
+        health_attestation_jws: str,
+        peer_pid: int,
+    ) -> UpdateState:
+        state = self._require_state(command_id)
+        if state.phase not in {UpdatePhase.FUNCTIONAL_HEALTHY, UpdatePhase.COMMITTED}:
             raise UpdaterError(
                 "INVALID_PHASE", "FUNCTIONAL_HEALTHY is required before commit"
             )
-        if state.release_sequence is None:
-            raise UpdaterError("INVALID_JOURNAL", "release sequence is missing")
-        if state.candidate_slot is None or not self.slots.is_active(state.candidate_slot):
-            return self.rollback(command_id, reason="ACTIVE_SLOT_MISMATCH")
-        return self.store.commit_command(command_id)
+        gate = self.store.commit_gate(command_id)
+        if gate is None:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_REQUIRED", "BEGIN_COMMIT_GATE is required before commit"
+            )
+        if gate.gate_id != gate_id:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_MISMATCH", "gateId does not match the durable commit gate"
+            )
+        process = self._capture_commit_process(state, peer_pid)
+        if process != gate.process:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_MISMATCH",
+                "live Agent process does not match the durable commit gate",
+            )
+        assert self.health_attestation_verifier is not None
+        verified = self.health_attestation_verifier.verify(
+            health_attestation_jws,
+            expected=self._expected_health_attestation(gate),
+        )
+        # Signature verification and local process inspection must not extend
+        # the persisted absolute deadline. Timeout follows the existing
+        # watchdog rollback path.
+        state = self._require_state(command_id)
+        if state.phase not in {UpdatePhase.FUNCTIONAL_HEALTHY, UpdatePhase.COMMITTED}:
+            return state
+        second_process = self._capture_commit_process(state, peer_pid)
+        if second_process != gate.process:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_MISMATCH",
+                "Agent process changed while validating the health attestation",
+            )
+        try:
+            return self.store.commit_command_attested(
+                command_id,
+                gate_id=gate.gate_id,
+                process=second_process,
+                attestation_id=verified.attestation_id,
+                attestation_jws_sha256=verified.compact_jws_sha256,
+                attestation_expires_at=verified.expires_at,
+            )
+        except UpdaterError as exc:
+            # The store rechecks every signed/durable absolute deadline inside
+            # the same IMMEDIATE transaction that would consume the proof. A
+            # slow process check or verifier must therefore roll back, never
+            # commit evidence that expired between the outer checks and the
+            # atomic journal mutation.
+            if exc.code in {
+                "COMMAND_EXPIRED",
+                "COMMIT_TIMEOUT",
+                "HEALTH_ATTESTATION_EXPIRED",
+            }:
+                self.rollback(command_id, reason=exc.code)
+            raise
 
     def rollback(self, command_id: str, *, reason: str = "OPERATOR_REQUEST") -> UpdateState:
         # Do not call _require_state here: deadline enforcement itself enters
@@ -337,6 +440,10 @@ class UpdaterController:
         if state.terminal:
             self.repository.cleanup_release(state.bom_digest)
             return state
+        state = self._enforce_command_expiry(state)
+        if state.terminal:
+            self.repository.cleanup_release(state.bom_digest)
+            return state
         if state.phase in {
             UpdatePhase.AUTHORIZED,
             UpdatePhase.DOWNLOADING,
@@ -377,6 +484,7 @@ class UpdaterController:
 
     def _stage_authorized(self, state: UpdateState) -> UpdateState:
         try:
+            state = self._require_live_staging_command(state)
             if state.phase == UpdatePhase.AUTHORIZED:
                 state = self.store.transition(
                     state.command_id,
@@ -426,12 +534,14 @@ class UpdaterController:
             if fetched.artifact_path is None:
                 raise UpdaterError("DOWNLOAD_FAILED", "artifact was not downloaded")
             verify_release_artifact(bom, fetched.artifact_path)
+            state = self._require_live_staging_command(state)
             slot = self.slots.stage_bundle(
                 bom=bom,
                 bom_path=fetched.bom_path,
                 signature_path=fetched.signature_path,
                 artifact_path=fetched.artifact_path,
             )
+            state = self._require_live_staging_command(state)
             verified_state = self.store.transition(
                 state.command_id,
                 UpdatePhase.VERIFIED,
@@ -500,7 +610,62 @@ class UpdaterController:
         state = self.store.get(command_id)
         if state is None:
             raise UpdaterError("UPDATE_NOT_FOUND", "update command is not journaled")
+        state = self._enforce_command_expiry(state)
         return self._enforce_health_deadline(state)
+
+    def _require_live_staging_command(self, state: UpdateState) -> UpdateState:
+        state = self._enforce_command_expiry(state)
+        if state.phase == UpdatePhase.FAILED and state.error_code in {
+            "COMMAND_EXPIRED",
+            "COMMAND_EXPIRY_MISSING",
+        }:
+            raise UpdaterSecurityError(
+                state.error_code,
+                state.message or "accepted command is no longer live",
+            )
+        return state
+
+    def _enforce_command_expiry(self, state: UpdateState) -> UpdateState:
+        if state.terminal or state.phase == UpdatePhase.ROLLING_BACK:
+            return state
+        expiry = self._parse_command_expiry(state.command_expires_at)
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError("updater clock must be timezone-aware")
+        now = now.astimezone(timezone.utc)
+        code = "COMMAND_EXPIRY_MISSING" if expiry is None else "COMMAND_EXPIRED"
+        if expiry is not None and now < expiry:
+            return state
+        if state.phase in {
+            UpdatePhase.AUTHORIZED,
+            UpdatePhase.DOWNLOADING,
+            UpdatePhase.STAGING,
+            UpdatePhase.VERIFIED,
+        }:
+            return self.store.transition(
+                state.command_id,
+                UpdatePhase.FAILED,
+                allowed_from={state.phase},
+                error_code=code,
+                message=(
+                    "accepted command has no durable expiry"
+                    if expiry is None
+                    else "accepted command expired before activation"
+                ),
+            )
+        return self.rollback(state.command_id, reason=code)
+
+    @staticmethod
+    def _parse_command_expiry(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
 
     def _enforce_health_deadline(self, state: UpdateState) -> UpdateState:
         if state.phase not in {
@@ -546,6 +711,7 @@ class UpdaterController:
             return state
         if state.phase == UpdatePhase.ROLLING_BACK:
             return self.rollback(state.command_id, reason=state.message or "WATCHDOG")
+        state = self._enforce_command_expiry(state)
         return self._enforce_health_deadline(state)
 
     def _recover_restore_target(self, state: UpdateState) -> str:
@@ -565,6 +731,54 @@ class UpdaterController:
                 "ROLLBACK_UNAVAILABLE", "no previous slot exists for rollback"
             )
         return previous
+
+    def _capture_commit_process(
+        self,
+        state: UpdateState,
+        peer_pid: int,
+    ) -> CommitProcessIdentity:
+        if self.commit_process_check is None:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNAVAILABLE", "commit process verifier is unavailable"
+            )
+        try:
+            process = self.commit_process_check(state, peer_pid)
+        except Exception as exc:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNVERIFIED",
+                f"candidate process identity could not be verified: {type(exc).__name__}",
+            ) from exc
+        if not isinstance(process, CommitProcessIdentity) or process.pid != peer_pid:
+            raise UpdaterSecurityError(
+                "COMMIT_PROCESS_UNVERIFIED", "candidate process identity is invalid"
+            )
+        return process
+
+    def _expected_health_attestation(
+        self,
+        gate: CommitGate,
+    ) -> ExpectedHealthAttestation:
+        command_expires_at = self._parse_command_expiry(gate.command_expires_at)
+        if command_expires_at is None:
+            raise UpdaterSecurityError(
+                "COMMIT_GATE_BINDING_MISMATCH",
+                "commit gate command expiry is invalid",
+            )
+        return ExpectedHealthAttestation(
+            gate_id=gate.gate_id,
+            challenge=gate.challenge,
+            trust_domain=self.binding.trust_domain,
+            device_id=self.binding.device_id,
+            command_id=gate.command_id,
+            command_expires_at=command_expires_at,
+            bom_digest=gate.bom_digest,
+            component_sha=gate.component_sha,
+            release_sequence=gate.release_sequence,
+            product_model=self.binding.product_model,
+            platform_profile=self.binding.platform_profile,
+            hardware_revision=self.binding.hardware_revision,
+            architecture=self.binding.architecture,
+        )
 
     def _rollback_failed(self, command_id: str, exc: Exception) -> UpdateState:
         stop_detail = ""

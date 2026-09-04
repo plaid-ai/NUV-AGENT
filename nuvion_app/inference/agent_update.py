@@ -11,6 +11,9 @@ from nuvion_app.inference.command_inbox import (
 )
 from nuvion_app.inference.effect_reconciler import ReconcileDeferred
 from nuvion_app.inference.fleet_command import VerifiedFleetCommand
+from nuvion_app.runtime.update_health_attestation import (
+    UpdateHealthAttestationError,
+)
 from nuvion_app.runtime.updater_client import UpdaterClient, UpdaterClientError
 
 
@@ -24,6 +27,14 @@ _TRANSIENT_UPDATER_CODES = frozenset(
 )
 _FULL_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_COMPACT_JWS = re.compile(
+    r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z"
+)
+
+HealthAttestationProvider = Callable[
+    [VerifiedFleetCommand, Mapping[str, Any], Mapping[str, Any]],
+    Mapping[str, Any],
+]
 
 
 class AgentUpdateReconciler:
@@ -37,9 +48,13 @@ class AgentUpdateReconciler:
         client: UpdaterClient,
         *,
         readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
+        commit_readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
+        health_attestation_provider: HealthAttestationProvider | None = None,
     ) -> None:
         self.client = client
         self.readiness_provider = readiness_provider
+        self.commit_readiness_provider = commit_readiness_provider
+        self.health_attestation_provider = health_attestation_provider
 
     @property
     def ready(self) -> bool:
@@ -49,7 +64,8 @@ class AgentUpdateReconciler:
             else self.client.capability_status()
         )
         return bool(
-            status.get("capabilityAvailable") is True
+            self.health_attestation_provider is not None
+            and status.get("capabilityAvailable") is True
             and status.get("authenticatedHelper") is True
         )
 
@@ -91,7 +107,38 @@ class AgentUpdateReconciler:
                 )
                 return self._deferred(command, update, restart_expected=True)
             if phase == "FUNCTIONAL_HEALTHY":
-                update = self.client.commit(command.command_id)
+                commit_readiness = self._commit_readiness()
+                if commit_readiness.get("ready") is not True:
+                    return self._deferred(
+                        command,
+                        update,
+                        restart_expected=False,
+                        detail=str(
+                            commit_readiness.get("reason")
+                            or "RUNTIME_READINESS_UNAVAILABLE"
+                        ),
+                    )
+                if self.health_attestation_provider is None:
+                    return self._deferred(
+                        command,
+                        update,
+                        restart_expected=False,
+                        detail="HEALTH_ATTESTATION_UNAVAILABLE",
+                    )
+                gate = self.client.begin_commit_gate(command.command_id)
+                attestation = self._health_attestation(command, update, gate)
+                update = self.client.commit(
+                    command.command_id,
+                    gate_id=str(gate["gateId"]),
+                    health_attestation_jws=str(attestation["compactJws"]),
+                )
+        except UpdateHealthAttestationError as exc:
+            return self._deferred(
+                command,
+                update,
+                restart_expected=False,
+                detail=exc.code,
+            )
         except UpdaterClientError as exc:
             if exc.code in _TRANSIENT_UPDATER_CODES:
                 return self._deferred(
@@ -144,6 +191,81 @@ class AgentUpdateReconciler:
                 reported_state=self._reported(command, update),
             )
         return self._deferred(command, update, restart_expected=False)
+
+    def _health_attestation(
+        self,
+        command: VerifiedFleetCommand,
+        update: Mapping[str, Any],
+        gate: Mapping[str, Any] | object,
+    ) -> Mapping[str, Any]:
+        if self.health_attestation_provider is None or not isinstance(gate, Mapping):
+            raise UpdateHealthAttestationError(
+                "HEALTH_ATTESTATION_UNAVAILABLE",
+                "health attestation provider or root commit gate is unavailable",
+            )
+        try:
+            attestation = self.health_attestation_provider(command, update, gate)
+        except UpdateHealthAttestationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - watchdog remains the rollback boundary.
+            raise UpdateHealthAttestationError(
+                "HEALTH_ATTESTATION_UNAVAILABLE",
+                "health attestation provider failed",
+            ) from exc
+        if not isinstance(attestation, Mapping):
+            raise UpdateHealthAttestationError(
+                "HEALTH_ATTESTATION_INVALID",
+                "health attestation response is invalid",
+            )
+        compact_jws = attestation.get("compactJws")
+        if (
+            not isinstance(compact_jws, str)
+            or len(compact_jws) > 32 * 1024
+            or not _COMPACT_JWS.fullmatch(compact_jws)
+        ):
+            raise UpdateHealthAttestationError(
+                "HEALTH_ATTESTATION_INVALID",
+                "health attestation compact JWS is invalid",
+            )
+        return attestation
+
+    def _commit_readiness(self) -> Mapping[str, Any]:
+        if self.commit_readiness_provider is None:
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        try:
+            readiness = self.commit_readiness_provider()
+        except Exception:  # noqa: BLE001 - malformed runtime evidence fails closed.
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        if not isinstance(readiness, Mapping):
+            return {
+                "ready": False,
+                "reason": "RUNTIME_READINESS_UNAVAILABLE",
+            }
+        reason = readiness.get("reason")
+        if (
+            readiness.get("ready") is not True
+            or not isinstance(reason, str)
+            or not reason
+            or len(reason) > 100
+            or not reason.replace("_", "").isalnum()
+        ):
+            return {
+                "ready": False,
+                "reason": (
+                    reason
+                    if isinstance(reason, str)
+                    and 0 < len(reason) <= 100
+                    and reason.replace("_", "").isalnum()
+                    else "RUNTIME_READINESS_UNAVAILABLE"
+                ),
+            }
+        return readiness
 
     def _deferred(
         self,
@@ -277,6 +399,8 @@ def configure_agent_update_reconciler(
     registry: Any,
     *,
     client: UpdaterClient | None = None,
+    commit_readiness_provider: Callable[[], Mapping[str, Any]] | None = None,
+    health_attestation_provider: HealthAttestationProvider | None = None,
 ) -> dict[str, Any]:
     """Install the durable handler while gating admission on live readiness.
 
@@ -289,5 +413,11 @@ def configure_agent_update_reconciler(
 
     updater_client = client or UpdaterClient()
     status = updater_client.capability_status()
-    registry.register(AgentUpdateReconciler(updater_client))
+    registry.register(
+        AgentUpdateReconciler(
+            updater_client,
+            commit_readiness_provider=commit_readiness_provider,
+            health_attestation_provider=health_attestation_provider,
+        )
+    )
     return status

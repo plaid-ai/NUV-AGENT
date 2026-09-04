@@ -4,6 +4,8 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 After=network-online.target
 Wants=network-online.target
+Requires=nuvion-fleet-e2e-reconcile.service
+After=nuvion-fleet-e2e-reconcile.service
 
 [Service]
 Type=simple
@@ -26,6 +28,13 @@ ExecStartPre=/opt/nuv-agent/current/venv/bin/python -s -c 'from nuvion_app.confi
 ExecStart=/usr/bin/nuv-agent run
 Restart=always
 RestartSec=3
+# A leaking camera/media path must be replaced before it can exhaust unified
+# board memory. Percentage limits retain consistent host headroom across SKUs.
+MemoryHigh=50%
+MemoryMax=60%
+MemorySwapMax=0
+LimitCORE=0
+OOMPolicy=stop
 User=nuvion
 Group=nuvion
 SupplementaryGroups=video dialout

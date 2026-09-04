@@ -79,7 +79,12 @@ class UpdaterProtocol:
     def __init__(self, controller: UpdaterController) -> None:
         self.controller = controller
 
-    def dispatch(self, request: dict[str, Any]) -> dict[str, object]:
+    def dispatch(
+        self,
+        request: dict[str, Any],
+        *,
+        peer: PeerCredentials | None = None,
+    ) -> dict[str, object]:
         if not isinstance(request, dict):
             raise UpdaterSecurityError("INVALID_REQUEST", "request must be an object")
         if request.get("schemaVersion") != PROTOCOL_SCHEMA_VERSION:
@@ -111,7 +116,46 @@ class UpdaterProtocol:
             command_id = self._optional_command_id(request.get("commandId"))
             return self.controller.status(command_id)
 
-        if operation in {"ACTIVATE", "COMMIT", "ROLLBACK"}:
+        if operation == "BEGIN_COMMIT_GATE":
+            self._exact_fields(
+                request, {"schemaVersion", "operation", "commandId"}
+            )
+            command_id = self._command_id(request.get("commandId"))
+            peer_pid = self._peer_pid(peer)
+            return self.controller.begin_commit_gate(
+                command_id, peer_pid=peer_pid
+            ).public_dict()
+
+        if operation == "COMMIT":
+            self._exact_fields(
+                request,
+                {
+                    "schemaVersion",
+                    "operation",
+                    "commandId",
+                    "gateId",
+                    "healthAttestationJws",
+                },
+            )
+            command_id = self._command_id(request.get("commandId"))
+            gate_id = self._command_id(request.get("gateId"))
+            compact_jws = request.get("healthAttestationJws")
+            if (
+                not isinstance(compact_jws, str)
+                or not compact_jws
+                or len(compact_jws) > 32 * 1024
+            ):
+                raise UpdaterSecurityError(
+                    "INVALID_REQUEST", "healthAttestationJws is invalid"
+                )
+            return self.controller.commit(
+                command_id,
+                gate_id=gate_id,
+                health_attestation_jws=compact_jws,
+                peer_pid=self._peer_pid(peer),
+            ).public_dict()
+
+        if operation in {"ACTIVATE", "ROLLBACK"}:
             allowed = {"schemaVersion", "operation", "commandId"}
             if operation == "ROLLBACK" and "reason" in request:
                 allowed.add("reason")
@@ -119,8 +163,6 @@ class UpdaterProtocol:
             command_id = self._command_id(request.get("commandId"))
             if operation == "ACTIVATE":
                 return self.controller.activate(command_id).public_dict()
-            if operation == "COMMIT":
-                return self.controller.commit(command_id).public_dict()
             reason = self._detail(request.get("reason")) or "OPERATOR_REQUEST"
             return self.controller.rollback(command_id, reason=reason).public_dict()
 
@@ -189,6 +231,15 @@ class UpdaterProtocol:
             )
         return value
 
+    @staticmethod
+    def _peer_pid(peer: PeerCredentials | None) -> int:
+        if peer is None or peer.pid is None or peer.pid < 1:
+            raise UpdaterSecurityError(
+                "PEER_PID_UNAVAILABLE",
+                "Linux SO_PEERCRED pid is required for commit gating",
+            )
+        return peer.pid
+
 
 class UpdaterUnixServer:
     def __init__(
@@ -252,7 +303,7 @@ class UpdaterUnixServer:
                     "OPERATOR_AUTH_REQUIRED",
                     "explicit rollback requires the root peer",
                 )
-            result = self.protocol.dispatch(request)
+            result = self.protocol.dispatch(request, peer=peer)
             response: dict[str, object] = {"ok": True, "result": result}
         except UpdaterError as exc:
             response = {

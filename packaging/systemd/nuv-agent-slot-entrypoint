@@ -2,7 +2,8 @@
 set -euo pipefail
 export PYTHONNOUSERSITE=1
 
-readonly SLOT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SLOT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly SLOT_ROOT
 
 prepend_path() {
   local key="$1"

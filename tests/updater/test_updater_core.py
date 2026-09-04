@@ -29,10 +29,14 @@ from nuvion_app.runtime.release_bom import (
 )
 from nuvion_updater.controller import UpdaterController
 from nuvion_updater.errors import UpdaterError, UpdaterSecurityError
+from nuvion_updater.health_attestation import (
+    CommitProcessIdentity,
+    HealthAttestationVerifier,
+)
 from nuvion_updater.protocol import UpdaterProtocol
 from nuvion_updater.repository import ContentAddressedReleaseRepository
 from nuvion_updater.slots import ReleaseSlotManager
-from nuvion_updater.store import UpdatePhase, UpdaterStore
+from nuvion_updater.store import CommitGate, UpdatePhase, UpdaterStore
 from nuvion_updater.trust import DeviceBinding
 
 
@@ -65,6 +69,15 @@ class UpdaterCoreTest(unittest.TestCase):
             format=serialization.PublicFormat.Raw,
         )
         self.release_keyring = ReleaseKeyring({"release-test": release_public})
+        self.health_key = Ed25519PrivateKey.generate()
+        health_public = self.health_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.health_verifier = HealthAttestationVerifier(
+            keyring=Ed25519Keyring({"health-test": health_public}),
+            clock=lambda: datetime.now(timezone.utc),
+        )
         self.binding = DeviceBinding(
             trust_domain="production",
             device_id="sp-3-device-1",
@@ -191,6 +204,7 @@ class UpdaterCoreTest(unittest.TestCase):
         *,
         sequence: int = 10,
         device_id: str | None = None,
+        expires_at: datetime | None = None,
         extra_payload: dict[str, object] | None = None,
     ) -> tuple[str, str]:
         command_id = str(uuid.uuid4())
@@ -210,7 +224,7 @@ class UpdaterCoreTest(unittest.TestCase):
             "type": "AGENT_UPDATE",
             "schemaVersion": 1,
             "issuedAt": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "expiresAt": (now + timedelta(minutes=10))
+            "expiresAt": (expires_at or now + timedelta(minutes=10))
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
             "sequence": sequence,
@@ -230,6 +244,73 @@ class UpdaterCoreTest(unittest.TestCase):
             f"{protected_segment}.{claims_segment}".encode("ascii")
         )
         return command_id, f"{protected_segment}.{claims_segment}.{_b64url(signature)}"
+
+    def _health_attestation(
+        self,
+        gate: CommitGate,
+        *,
+        claims_override: dict[str, object] | None = None,
+        protected_override: dict[str, object] | None = None,
+        issued_at: datetime | None = None,
+        expires_at: datetime | None = None,
+    ) -> str:
+        now = issued_at or datetime.now(timezone.utc)
+        claims = {
+            "schemaVersion": 1,
+            "jti": str(uuid.uuid4()),
+            "aud": "nuvion-updater",
+            "purpose": "agent-update-commit",
+            "trustDomain": self.binding.trust_domain,
+            "gateId": gate.gate_id,
+            "challenge": gate.challenge,
+            "deviceId": self.binding.device_id,
+            "commandId": gate.command_id,
+            "commandExpiresAt": gate.command_expires_at,
+            "bomDigest": gate.bom_digest,
+            "componentSha": gate.component_sha,
+            "releaseSequence": gate.release_sequence,
+            "productModel": self.binding.product_model,
+            "platformProfile": self.binding.platform_profile,
+            "hardwareRevision": self.binding.hardware_revision,
+            "architecture": self.binding.architecture,
+            "health": "HEALTHY",
+            "issuedAt": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "expiresAt": (expires_at or now + timedelta(seconds=30))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"),
+        }
+        protected = {
+            "alg": "EdDSA",
+            "kid": "health-test",
+            "typ": "nuvion-update-health+jws",
+        }
+        claims.update(claims_override or {})
+        protected.update(protected_override or {})
+        protected_segment = _b64url(
+            json.dumps(protected, sort_keys=True, separators=(",", ":")).encode()
+        )
+        claims_segment = _b64url(
+            json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()
+        )
+        signature = self.health_key.sign(
+            f"{protected_segment}.{claims_segment}".encode("ascii")
+        )
+        return f"{protected_segment}.{claims_segment}.{_b64url(signature)}"
+
+    def _attested_commit(
+        self,
+        controller: UpdaterController,
+        command_id: str,
+        *,
+        peer_pid: int = 4242,
+    ):
+        gate = controller.begin_commit_gate(command_id, peer_pid=peer_pid)
+        return controller.commit(
+            command_id,
+            gate_id=gate.gate_id,
+            health_attestation_jws=self._health_attestation(gate),
+            peer_pid=peer_pid,
+        )
 
     def _controller(
         self,
@@ -256,6 +337,7 @@ class UpdaterCoreTest(unittest.TestCase):
             allow_file_url=True,
             disk_reserve_bytes=0,
         )
+        active_slots = slots or self.slots
         return UpdaterController(
             store=store or self.store,
             slots=slots or self.slots,
@@ -279,6 +361,13 @@ class UpdaterCoreTest(unittest.TestCase):
                 if functional_callback is not None
                 else lambda _state: (functional_health, "functional-fake")
             ),  # type: ignore[arg-type]
+            commit_process_check=lambda state, pid: CommitProcessIdentity(
+                pid=pid,
+                start_ticks=123456,
+                boot_id="00000000-0000-4000-8000-000000000123",
+                active_slot=active_slots.relative_target(state.candidate_slot),
+            ),
+            health_attestation_verifier=self.health_verifier,
             rollback_boot_health_check=lambda _slot: (
                 rollback_boot_health,
                 "rollback-boot-fake",
@@ -316,7 +405,7 @@ class UpdaterCoreTest(unittest.TestCase):
             controller.report_functional_health(command_id, healthy=True).phase,
             UpdatePhase.FUNCTIONAL_HEALTHY,
         )
-        committed = controller.commit(command_id)
+        committed = self._attested_commit(controller, command_id)
 
         self.assertEqual(committed.phase, UpdatePhase.COMMITTED)
         evidence = committed.public_dict()
@@ -340,6 +429,155 @@ class UpdaterCoreTest(unittest.TestCase):
         self.assertEqual(
             (self.agent_state / "events.sqlite3").read_bytes(),
             b"durable-event-sentinel",
+        )
+
+    def test_commit_gate_is_process_bound_idempotent_and_single_use(self) -> None:
+        payload, _ = self._publish()
+        command_id, command = self._command(payload)
+        controller = self._controller()
+        controller.authorize_and_stage(command)
+        controller.activate(command_id)
+        controller.report_boot_health(command_id, healthy=True)
+        functional = controller.report_functional_health(command_id, healthy=True)
+
+        with self.assertRaises(UpdaterSecurityError) as missing:
+            controller.commit(
+                command_id,
+                gate_id=str(uuid.uuid4()),
+                health_attestation_jws="a.b.c",
+                peer_pid=4242,
+            )
+        self.assertEqual(missing.exception.code, "COMMIT_GATE_REQUIRED")
+
+        gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+        self.assertEqual(len(gate.challenge), 43)
+        self.assertEqual(len(base64.urlsafe_b64decode(gate.challenge + "=")), 32)
+        self.assertEqual(gate.health_deadline, functional.health_deadline)
+        self.assertEqual(gate.command_expires_at, self.store.get(command_id).command_expires_at)
+        self.assertEqual(
+            controller.begin_commit_gate(command_id, peer_pid=4242), gate
+        )
+        with self.assertRaises(UpdaterSecurityError) as wrong_peer:
+            controller.begin_commit_gate(command_id, peer_pid=4243)
+        self.assertEqual(
+            wrong_peer.exception.code, "COMMIT_GATE_BINDING_MISMATCH"
+        )
+
+        compact_jws = self._health_attestation(gate)
+        committed = controller.commit(
+            command_id,
+            gate_id=gate.gate_id,
+            health_attestation_jws=compact_jws,
+            peer_pid=4242,
+        )
+        self.assertEqual(committed.phase, UpdatePhase.COMMITTED)
+        consumed = self.store.commit_gate(command_id)
+        assert consumed is not None
+        self.assertIsNotNone(consumed.consumed_at)
+        self.assertEqual(
+            controller.commit(
+                command_id,
+                gate_id=gate.gate_id,
+                health_attestation_jws=compact_jws,
+                peer_pid=4242,
+            ).phase,
+            UpdatePhase.COMMITTED,
+        )
+        with self.assertRaises(UpdaterSecurityError) as replay:
+            controller.commit(
+                command_id,
+                gate_id=gate.gate_id,
+                health_attestation_jws=self._health_attestation(gate),
+                peer_pid=4242,
+            )
+        self.assertEqual(replay.exception.code, "HEALTH_ATTESTATION_REPLAY")
+
+    def test_commit_rejects_domain_identity_challenge_and_ttl_mismatch(self) -> None:
+        payload, _ = self._publish()
+        command_id, command = self._command(payload)
+        controller = self._controller()
+        controller.authorize_and_stage(command)
+        controller.activate(command_id)
+        controller.report_boot_health(command_id, healthy=True)
+        controller.report_functional_health(command_id, healthy=True)
+        gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+        valid_for_tamper = self._health_attestation(gate)
+        protected, claims, encoded_signature = valid_for_tamper.split(".")
+        signature = bytearray(
+            base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        )
+        signature[0] ^= 1
+        tampered_signature = f"{protected}.{claims}.{_b64url(bytes(signature))}"
+
+        cases = (
+            (
+                "tampered-signature",
+                tampered_signature,
+                "INVALID_HEALTH_ATTESTATION_SIGNATURE",
+            ),
+            (
+                "wrong-domain",
+                self._health_attestation(
+                    gate, claims_override={"aud": "some-other-service"}
+                ),
+                "INVALID_HEALTH_ATTESTATION_DOMAIN",
+            ),
+            (
+                "wrong-challenge",
+                self._health_attestation(
+                    gate, claims_override={"challenge": "A" * 43}
+                ),
+                "HEALTH_ATTESTATION_CHALLENGE_MISMATCH",
+            ),
+            (
+                "wrong-component",
+                self._health_attestation(
+                    gate, claims_override={"componentSha": "b" * 40}
+                ),
+                "HEALTH_ATTESTATION_MISMATCH",
+            ),
+            (
+                "wrong-command-expiry",
+                self._health_attestation(
+                    gate,
+                    claims_override={
+                        "commandExpiresAt": (
+                            datetime.now(timezone.utc) + timedelta(hours=1)
+                        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                    },
+                ),
+                "HEALTH_ATTESTATION_MISMATCH",
+            ),
+            (
+                "cross-protocol-jws",
+                self._health_attestation(
+                    gate, protected_override={"typ": "nuvion-command+jws"}
+                ),
+                "INVALID_HEALTH_ATTESTATION_DOMAIN",
+            ),
+            (
+                "expired",
+                self._health_attestation(
+                    gate,
+                    issued_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                    expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                ),
+                "HEALTH_ATTESTATION_EXPIRED",
+            ),
+        )
+        for name, compact_jws, code in cases:
+            with self.subTest(name=name), self.assertRaises(
+                UpdaterSecurityError
+            ) as raised:
+                controller.commit(
+                    command_id,
+                    gate_id=gate.gate_id,
+                    health_attestation_jws=compact_jws,
+                    peer_pid=4242,
+                )
+            self.assertEqual(raised.exception.code, code)
+        self.assertEqual(
+            self.store.get(command_id).phase, UpdatePhase.FUNCTIONAL_HEALTHY
         )
 
     def test_duplicate_command_is_idempotent_and_cross_device_is_rejected(self) -> None:
@@ -389,7 +627,7 @@ class UpdaterCoreTest(unittest.TestCase):
         connection.close()
 
         with self.assertRaises(sqlite3.DatabaseError):
-            controller.commit(command_id)
+            self._attested_commit(controller, command_id)
 
         reopened = UpdaterStore(self.state_path, require_root_owner=False)
         persisted = reopened.get(command_id)
@@ -397,6 +635,10 @@ class UpdaterCoreTest(unittest.TestCase):
         self.assertEqual(persisted.phase, UpdatePhase.FUNCTIONAL_HEALTHY)
         self.assertEqual(reopened.current_release_sequence(), 1)
         self.assertEqual(reopened.current_bom_digest(), "sha256:" + "0" * 64)
+        persisted_gate = reopened.commit_gate(command_id)
+        assert persisted_gate is not None
+        self.assertIsNone(persisted_gate.attestation_id)
+        self.assertIsNone(persisted_gate.consumed_at)
 
     def test_tampered_signature_wrong_target_and_downgrade_fail_before_activation(self) -> None:
         cases: list[tuple[str, dict[str, object], Path]] = []
@@ -548,6 +790,7 @@ class UpdaterCoreTest(unittest.TestCase):
             compact_jws=compact,
             target_version=str(verified.payload["targetVersion"]),
             bom_digest=str(verified.payload["bomDigest"]),
+            command_expires_at=verified.expires_at,
         )
         self.store.transition(
             command_id,
@@ -562,6 +805,161 @@ class UpdaterCoreTest(unittest.TestCase):
 
         self.assertEqual(reopened.phase, UpdatePhase.VERIFIED)
         self.assertEqual(reopened.command_id, command_id)
+        self.assertEqual(reopened.command_expires_at, verified.expires_at)
+
+    def test_restart_refuses_an_expired_download_from_the_root_journal(self) -> None:
+        payload, _ = self._publish(version="0.1.135", release_sequence=15)
+        command_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+        command_id, compact = self._command(
+            payload,
+            sequence=51,
+            expires_at=command_expiry,
+        )
+        verified = self.verifier.verify(compact)
+        self.store.authorize(
+            command_id=command_id,
+            sequence=verified.sequence,
+            compact_jws=compact,
+            target_version=str(verified.payload["targetVersion"]),
+            bom_digest=str(verified.payload["bomDigest"]),
+            command_expires_at=verified.expires_at,
+        )
+        self.store.transition(
+            command_id,
+            UpdatePhase.DOWNLOADING,
+            allowed_from={UpdatePhase.AUTHORIZED},
+        )
+
+        recovered = self._controller(
+            store=UpdaterStore(self.state_path, require_root_owner=False),
+            slots=ReleaseSlotManager(self.install_root, require_root_owner=False),
+            clock=lambda: command_expiry,
+        ).recover()
+
+        assert recovered is not None
+        self.assertEqual(recovered.phase, UpdatePhase.FAILED)
+        self.assertEqual(recovered.error_code, "COMMAND_EXPIRED")
+
+    def test_commit_wall_clock_expiry_rolls_back_before_attestation_consumption(self) -> None:
+        payload, _ = self._publish(version="0.1.136", release_sequence=16)
+        command_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+        command_id, command = self._command(
+            payload,
+            sequence=52,
+            expires_at=command_expiry,
+        )
+        controller = self._controller()
+        controller.authorize_and_stage(command)
+        controller.activate(command_id)
+        controller.report_boot_health(command_id, healthy=True)
+        controller.report_functional_health(command_id, healthy=True)
+        gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+        compact_jws = self._health_attestation(gate)
+
+        expired = self._controller(clock=lambda: command_expiry)
+        with self.assertRaises(UpdaterError) as raised:
+            expired.commit(
+                command_id,
+                gate_id=gate.gate_id,
+                health_attestation_jws=compact_jws,
+                peer_pid=4242,
+            )
+
+        self.assertEqual(raised.exception.code, "INVALID_PHASE")
+        rolled_back = self.store.get(command_id)
+        assert rolled_back is not None
+        self.assertEqual(rolled_back.phase, UpdatePhase.ROLLED_BACK)
+        self.assertEqual(rolled_back.message, "COMMAND_EXPIRED")
+        persisted_gate = self.store.commit_gate(command_id)
+        assert persisted_gate is not None
+        self.assertIsNone(persisted_gate.consumed_at)
+
+    def test_atomic_commit_rechecks_all_deadlines_after_process_inspection(self) -> None:
+        cases = (
+            ("command", 5, 120, 5, "COMMAND_EXPIRED"),
+            ("health", 300, 5, 30, "COMMIT_TIMEOUT"),
+            ("attestation", 300, 120, 5, "HEALTH_ATTESTATION_EXPIRED"),
+        )
+        for index, (
+            name,
+            command_ttl,
+            commit_ttl,
+            attestation_ttl,
+            expected_code,
+        ) in enumerate(cases, start=1):
+            with self.subTest(deadline=name):
+                now = [datetime.now(timezone.utc)]
+                atomic_store = UpdaterStore(
+                    self.state_path,
+                    require_root_owner=False,
+                    clock=lambda: now[0]
+                    .isoformat(timespec="milliseconds")
+                    .replace("+00:00", "Z"),
+                )
+                self.health_verifier.clock = lambda: now[0]
+                payload, _ = self._publish(
+                    version=f"0.1.{140 + index}",
+                    release_sequence=20 + index,
+                )
+                command_id, command = self._command(
+                    payload,
+                    sequence=60 + index,
+                    expires_at=now[0] + timedelta(seconds=command_ttl),
+                )
+                controller = self._controller(
+                    store=atomic_store,
+                    clock=lambda: now[0],
+                    commit_timeout_seconds=commit_ttl,
+                )
+                controller.authorize_and_stage(command)
+                controller.activate(command_id)
+                controller.report_boot_health(command_id, healthy=True)
+                controller.report_functional_health(command_id, healthy=True)
+                gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+                attestation = self._health_attestation(
+                    gate,
+                    issued_at=now[0],
+                    expires_at=now[0] + timedelta(seconds=attestation_ttl),
+                )
+
+                process_checks = 0
+
+                def process_after_delay(state, pid):
+                    nonlocal process_checks
+                    process_checks += 1
+                    identity = CommitProcessIdentity(
+                        pid=pid,
+                        start_ticks=123456,
+                        boot_id="00000000-0000-4000-8000-000000000123",
+                        active_slot=self.slots.relative_target(state.candidate_slot),
+                    )
+                    # The first call in commit validates the peer before JWS
+                    # verification. Advance only in the second inspection so
+                    # the signed proof is initially valid but stale at the
+                    # atomic journal boundary.
+                    if process_checks == 2:
+                        now[0] += timedelta(seconds=10)
+                    return identity
+
+                controller.commit_process_check = process_after_delay
+                with self.assertRaises(UpdaterError) as raised:
+                    controller.commit(
+                        command_id,
+                        gate_id=gate.gate_id,
+                        health_attestation_jws=attestation,
+                        peer_pid=4242,
+                    )
+
+                self.assertEqual(raised.exception.code, expected_code)
+                rolled_back = atomic_store.get(command_id)
+                assert rolled_back is not None
+                self.assertEqual(rolled_back.phase, UpdatePhase.ROLLED_BACK)
+                self.assertEqual(rolled_back.message, expected_code)
+                persisted_gate = atomic_store.commit_gate(command_id)
+                assert persisted_gate is not None
+                self.assertIsNone(persisted_gate.attestation_id)
+                self.assertIsNone(persisted_gate.consumed_at)
+                self.assertEqual(atomic_store.current_release_sequence(), 1)
 
     def test_recovery_cleans_cache_left_after_verified_transition_crash(self) -> None:
         payload, _ = self._publish(version="0.1.134", release_sequence=14)
@@ -619,7 +1017,7 @@ class UpdaterCoreTest(unittest.TestCase):
         self,
     ) -> None:
         payload, _ = self._publish(version="0.1.128", release_sequence=8)
-        command_id, command = self._command(payload, sequence=46)
+        _command_id, command = self._command(payload, sequence=46)
         now = [datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)]
         controller = self._controller(
             clock=lambda: now[0],
@@ -650,6 +1048,8 @@ class UpdaterCoreTest(unittest.TestCase):
         controller.report_boot_health(command_id, healthy=True)
         functional = controller.report_functional_health(command_id, healthy=True)
         self.assertEqual(functional.phase, UpdatePhase.FUNCTIONAL_HEALTHY)
+        gate = controller.begin_commit_gate(command_id, peer_pid=4242)
+        self.assertEqual(gate.health_deadline, functional.health_deadline)
 
         now[0] += timedelta(seconds=2)
         rolled_back = controller.watchdog_tick()
@@ -791,9 +1191,21 @@ class UpdaterCoreTest(unittest.TestCase):
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(updater_command)")
         }
+        gate_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(updater_commit_gate)")
+        }
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         connection.close()
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 4)
+        self.assertIn("updater_commit_gate", tables)
+        self.assertIn("command_expires_at", gate_columns)
         self.assertTrue(
             {
                 "artifact_digest",
@@ -801,6 +1213,7 @@ class UpdaterCoreTest(unittest.TestCase):
                 "config_schema",
                 "bom_verification_status",
                 "previous_version",
+                "command_expires_at",
             }.issubset(columns)
         )
 
@@ -847,6 +1260,13 @@ class UpdaterCoreTest(unittest.TestCase):
             activation_callback=lambda _slot: None,
             boot_health_check=lambda _state: (True, "ok"),
             functional_health_check=lambda _state: (True, "ok"),
+            commit_process_check=lambda state, pid: CommitProcessIdentity(
+                pid=pid,
+                start_ticks=123456,
+                boot_id="00000000-0000-4000-8000-000000000123",
+                active_slot=self.slots.relative_target(state.candidate_slot),
+            ),
+            health_attestation_verifier=self.health_verifier,
             rollback_boot_health_check=lambda _slot: (True, "ok"),
             safe_stop_callback=lambda: None,
         )

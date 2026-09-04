@@ -1,11 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ulimit -S -c 0
+ulimit -H -c 0
 
 readonly INSTALL_ROOT="/opt/nuv-agent"
 readonly BOOTSTRAP_ROOT="$INSTALL_ROOT/bootstrap"
 readonly BOOTSTRAP_BUNDLE="$INSTALL_ROOT/share/bootstrap-agent-bundle.tar.gz"
 readonly BOOTSTRAP_BUNDLE_DIGEST="$INSTALL_ROOT/share/bootstrap-agent-bundle.sha256"
 readonly DEPTHAI_VERSION="2.32.0.0"
+readonly FLEET_MAINTENANCE=/var/lib/nuvion-fleet-e2e/package-maintenance.json
+readonly LEGACY_BOARD_TOOL=/var/lib/nuvion-fleet-e2e/legacy-board-tool.preinst
+
+ensure_fleet_maintenance_marker() {
+  /usr/bin/python3 -I - "$FLEET_MAINTENANCE" "$FLEET_MAINTENANCE.postinst.$$" <<'PY'
+import json
+import os
+import resource
+import stat
+import sys
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+path, temporary = sys.argv[1:]
+payload = (json.dumps({
+    "schemaVersion": 1,
+    "kind": "nuvion-package-maintenance",
+    "active": True,
+}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if os.path.lexists(path):
+    metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 4096
+    ):
+        raise SystemExit("existing package maintenance marker is unsafe")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        existing = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    ) or existing != payload:
+        raise SystemExit("existing package maintenance marker is invalid")
+    raise SystemExit(0)
+fd = os.open(
+    temporary,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+    0o600,
+)
+try:
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(temporary, path)
+directory = os.open(
+    os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+}
 
 package_version="$(dpkg-query -W -f='${Version}' nuv-agent 2>/dev/null || true)"
 package_version="${package_version#*:}"
@@ -102,6 +165,47 @@ atomic_slot_link() {
 if ! id -u nuvion >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin nuvion
 fi
+if ! getent group nuvion >/dev/null 2>&1; then
+  echo "The required nuvion group is unavailable" >&2
+  exit 1
+fi
+install -d -m 0700 -o root -g root \
+  /var/lib/nuvion-fleet-e2e \
+  /var/lib/nuvion-fleet-e2e/runs \
+  /var/lib/nuvion-fleet-e2e/recovery
+install -d -m 0755 -o root -g root "$INSTALL_ROOT/candidates"
+install -d -m 0755 -o root -g root /run/lock
+exec {maintenance_lock_fd}>/run/lock/nuvion-fleet-e2e.lock
+flock --exclusive --timeout 30 "$maintenance_lock_fd"
+systemctl daemon-reload
+systemctl stop \
+  nuv-agent.service \
+  nuv-agent-updater.socket \
+  nuv-agent-updater.service || true
+for protected_unit in \
+  nuv-agent.service \
+  nuv-agent-updater.socket \
+  nuv-agent-updater.service; do
+  protected_state="$(systemctl is-active "$protected_unit" 2>/dev/null || true)"
+  case "$protected_state" in
+    inactive|failed|unknown) ;;
+    *)
+      echo "Cannot quiesce protected runtime before package configuration" >&2
+      exit 1
+      ;;
+  esac
+done
+ensure_fleet_maintenance_marker
+flock --unlock "$maintenance_lock_fd"
+# SocketGroup controls only control.sock, not its parent. tmpfiles.d is the
+# authoritative boot-persistent owner/mode contract for path traversal by the
+# unprivileged Agent. Apply it now as well, before the socket can be started.
+/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/nuvion-updater.conf
+runtime_directory_identity="$(stat -c '%U:%G:%a' /run/nuvion-updater)"
+if [ "$runtime_directory_identity" != "root:nuvion:750" ]; then
+  echo "Unsafe updater runtime directory identity: $runtime_directory_identity" >&2
+  exit 1
+fi
 if getent group video >/dev/null 2>&1; then
   usermod -a -G video nuvion || true
 fi
@@ -111,6 +215,17 @@ fi
 # Load the package's new units before auditing/stopping legacy processes. This
 # also makes a first upgrade from a package without the updater units safe.
 systemctl daemon-reload
+# The packaged reconciler is the only authority allowed to make an unfinished
+# Fleet transaction safe across package replacement.  Protected endpoints
+# remain down until the new fixed-path helper has completed successfully.
+if ! systemctl stop \
+  nuv-agent.service \
+  nuv-agent-updater.socket \
+  nuv-agent-updater.service; then
+  echo "Cannot stop protected runtime before Fleet reconciliation" >&2
+  exit 1
+fi
+systemctl enable nuvion-fleet-e2e-reconcile.service
 # docker.sock is root-equivalent. The Agent must never retain this group.
 if getent group docker >/dev/null 2>&1; then
   docker_gid="$(getent group docker | awk -F: 'NR == 1 {print $3}')"
@@ -289,7 +404,137 @@ elif [ "$old_current" != "bootstrap/$package_version" ]; then
   atomic_slot_link current "bootstrap/$package_version"
 fi
 
+# Reconcile with the still-durable maintenance barrier, then atomically commit
+# package activation under the Fleet lock. The normal boot unit is rerun after
+# marker removal while that same lock excludes every Fleet operation. Keep the
+# lock through protected-endpoint activation so no Fleet APPLY can interleave.
+package_activation_complete=false
+stop_partial_package_activation() {
+  if [ "$package_activation_complete" != true ]; then
+    for protected_unit in \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service; do
+      systemctl stop "$protected_unit" || true
+    done
+    for protected_service in \
+      nuv-agent.service \
+      nuv-agent-updater.service; do
+      protected_state="$(systemctl is-active "$protected_service" 2>/dev/null || true)"
+      case "$protected_state" in
+        inactive|failed|unknown) ;;
+        *)
+          systemctl kill \
+            --kill-who=all --signal=SIGKILL "$protected_service" || true
+          systemctl stop "$protected_service" || true
+          ;;
+      esac
+    done
+    systemctl stop nuv-agent-updater.socket || true
+    partial_stop_failed=false
+    for protected_unit in \
+      nuv-agent.service \
+      nuv-agent-updater.socket \
+      nuv-agent-updater.service; do
+      protected_state="$(systemctl is-active "$protected_unit" 2>/dev/null || true)"
+      case "$protected_state" in
+        inactive|failed|unknown) ;;
+        *) partial_stop_failed=true ;;
+      esac
+    done
+    # dpkg --configure -a must be able to resume safely after a failure that
+    # occurred after the marker commit point. Recreate the durable barrier
+    # before this process releases the Fleet lock on exit.
+    if ! ensure_fleet_maintenance_marker; then
+      echo "Cannot restore Fleet package-maintenance barrier" >&2
+    fi
+    if [ "$partial_stop_failed" = true ]; then
+      echo "Protected runtime remained active after package failure" >&2
+      return 1
+    fi
+  fi
+}
+trap stop_partial_package_activation EXIT
+trap 'exit 143' TERM
+/usr/bin/python3 -I \
+  /usr/local/libexec/nuvion/iq9075-board-e2e.py \
+  boot-reconcile --package-maintenance
+exec {package_lock_fd}>/run/lock/nuvion-fleet-e2e.lock
+flock --exclusive --timeout 30 "$package_lock_fd"
+/usr/bin/python3 -I - "$FLEET_MAINTENANCE" "$LEGACY_BOARD_TOOL" <<'PY'
+import json
+import os
+import resource
+import stat
+import sys
+
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+marker, legacy_tool = sys.argv[1:]
+metadata = os.lstat(marker)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or metadata.st_uid != 0
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_size > 4096
+):
+    raise SystemExit("package maintenance finalization is unsafe")
+fd = os.open(marker, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    opened = os.fstat(fd)
+    payload = os.read(fd, 4097)
+finally:
+    os.close(fd)
+expected = (json.dumps({
+    "schemaVersion": 1,
+    "kind": "nuvion-package-maintenance",
+    "active": True,
+}, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if (opened.st_dev, opened.st_ino, opened.st_size) != (
+    metadata.st_dev, metadata.st_ino, metadata.st_size
+) or payload != expected:
+    raise SystemExit("package maintenance finalization identity is invalid")
+if os.path.lexists(legacy_tool):
+    legacy_metadata = os.lstat(legacy_tool)
+    if (
+        not stat.S_ISREG(legacy_metadata.st_mode)
+        or stat.S_ISLNK(legacy_metadata.st_mode)
+        or legacy_metadata.st_uid != 0
+        or stat.S_IMODE(legacy_metadata.st_mode) != 0o700
+        or legacy_metadata.st_size > 2 * 1024 * 1024
+    ):
+        raise SystemExit("legacy Fleet recovery backup is unsafe")
+    os.unlink(legacy_tool)
+    legacy_directory = os.open(
+        os.path.dirname(legacy_tool),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        os.fsync(legacy_directory)
+    finally:
+        os.close(legacy_directory)
+os.unlink(marker)
+directory = os.open(os.path.dirname(marker), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+if ! systemctl restart nuvion-fleet-e2e-reconcile.service; then
+  echo "Fleet E2E recovery gate did not converge" >&2
+  exit 1
+fi
 reload_oak_udev_rules
+if [ -f /etc/nuvion-updater/device-binding.json ] \
+  && [ -f /etc/nuvion-updater/command-keyring.json ] \
+  && [ -f /etc/nuvion-updater/release-keyring.json ] \
+  && [ -f /etc/nuvion-updater/health-attestation-keyring.json ]; then
+  systemctl enable --now nuv-agent-updater.socket
+  systemctl try-restart nuv-agent-updater.service || true
+else
+  systemctl disable --now nuv-agent-updater.socket || true
+fi
+
 if [ "$install_autostart" = true ]; then
   systemctl enable nuv-agent.service
   # Always restart after the docker-group audit so the process obtains a fresh
@@ -298,15 +543,9 @@ if [ "$install_autostart" = true ]; then
 else
   systemctl disable --now nuv-agent.service || true
 fi
-
-if [ -f /etc/nuvion-updater/device-binding.json ] \
-  && [ -f /etc/nuvion-updater/command-keyring.json ] \
-  && [ -f /etc/nuvion-updater/release-keyring.json ]; then
-  systemctl enable --now nuv-agent-updater.socket
-  systemctl try-restart nuv-agent-updater.service || true
-else
-  systemctl disable --now nuv-agent-updater.socket || true
-fi
+package_activation_complete=true
+flock --unlock "$package_lock_fd"
+trap - EXIT TERM
 
 echo
 print_nuv_agent_banner

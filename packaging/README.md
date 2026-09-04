@@ -6,7 +6,7 @@ This directory contains packaging templates for Homebrew and Debian/Ubuntu.
 The pinned wheel set targets Apple Silicon macOS (`arm64`). Intel macOS developers
 must use a source/virtualenv install until a separately pinned x86_64 resource set exists.
 
-1. Create a tap repo (e.g., `plaid-ai/homebrew-NUV-agent-homebrew`).
+1. Create a tap repo (e.g., `plaid-ai/homebrew-NUV-AGENT-HOMEBREW`).
 2. Copy `packaging/homebrew/nuv-agent.rb` into `Formula/nuv-agent.rb`.
 3. Replace `__URL__` and `__SHA256__` with the release tarball URL and SHA256.
 4. Tag a release matching the formula version.
@@ -25,13 +25,27 @@ Demo mode:
 Build the IQ9075 base bundle and package on a native arm64 Docker host. Both
 builders execute in digest-pinned containers:
 ```bash
-export COMPONENT_SHA=<full-stamped-source-sha>
-export SOURCE_DATE_EPOCH=<source-commit-epoch>
-packaging/release/build-agent-bundle.sh \
-  0.1.120 dist/nuv-agent_0.1.120_iq9075-aarch64.agent-bundle.tar.gz
-BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.120_iq9075-aarch64.agent-bundle.tar.gz \
-  packaging/deb/build-deb.sh
+SOURCE_TREE=/path/to/clean/nuv-agent-checkout
+COMPONENT_SHA=$(git -C "$SOURCE_TREE" rev-parse HEAD)
+SOURCE_DATE_EPOCH=$(git -C "$SOURCE_TREE" show -s --format=%ct "$COMPONENT_SHA")
+STAGED_SOURCE=$(mktemp -d /tmp/nuv-agent-stamped-source.XXXXXX)
+git -C "$SOURCE_TREE" archive --format=tar "$COMPONENT_SHA" | \
+  tar -xf - -C "$STAGED_SOURCE"
+python3 "$STAGED_SOURCE/packaging/release/stamp-build-info.py" \
+  --sha "$COMPONENT_SHA" --version 0.1.121
+(
+  cd "$STAGED_SOURCE"
+  export COMPONENT_SHA SOURCE_DATE_EPOCH VERSION=0.1.121 ARCH=arm64
+  packaging/release/build-agent-bundle.sh \
+    0.1.121 dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz
+  BOOTSTRAP_BUNDLE_PATH=dist/nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz \
+    OUTPUT_DEB=dist/nuv-agent_0.1.121_arm64.deb packaging/deb/build-deb.sh
+)
 ```
+
+The archive step copies only committed bytes and the stamp changes only that
+disposable source tree. Do not build an immutable candidate from an unstamped
+checkout or alter the component worktree solely to manufacture the stamp.
 
 This script:
 - Embeds the exact hash-locked bundle and its SHA-256; `postinst` performs no
@@ -55,6 +69,9 @@ This script:
   The `nuvion` account is explicitly removed from the root-equivalent Docker
   group. Docker/Triton profiles remain OTA fail-closed until their separate
   privileged runtime helper and product health adapter are installed.
+- Requires a separate root-owned health-attestation keyring and a short-lived,
+  BE-signed commit proof before an OTA candidate can become permanent. See
+  [`agent-update-health-attestation-v1.md`](agent-update-health-attestation-v1.md).
 - Demo mode uses the public MVTec dataset bucket and local cache at runtime.
 
 Python requirement: Ubuntu 24.04 system CPython 3.12.
@@ -109,6 +126,38 @@ NUVION_DEPTHAI_READ_TIMEOUT_SEC=2
 NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS=3
 ```
 
+The physical release test builds the same raw-analysis, overlay/H264, rotating
+clip, RTP tee, and disposable `webrtcbin` topology used by the Agent. It creates
+a real local SDP offer, deliberately leaves it unanswered, waits for the
+production answer watchdog to expire, and proves that the terminal STOP, queue,
+request pads, and `webrtcbin` cleanup all belong to that exact generation before
+a post-teardown OAK soak. The default gate is
+120 measured seconds after a 20-second warm-up. It requires at least 27 raw FPS,
+continued splitmux rotation, bounded two-frame live queues, zero GStreamer
+errors, anonymous-RSS OLS slope at most 2 MiB/min, and post-warm-up RSS range at
+most 32 MiB. Administrators may make the proof longer or stricter with
+`NUVION_IQ9075_OAK_SOAK_SECONDS`,
+`NUVION_IQ9075_OAK_MAX_RSS_SLOPE_MIB_PER_MIN`, and
+`NUVION_IQ9075_OAK_MAX_RSS_RANGE_MIB`; the harness does not accept values below
+the release-safe minimums.
+
+The privileged updater does not reuse this version-specific topology test for
+every OTA or rollback. Its fixed `probe-iq9075-oak.sh` opens the active slot's
+hash-pinned `depthai==2.32.0.0` runtime, captures one `640x480` RGB frame as the
+non-root `nuvion` user, and exits within a process-group timeout. This stable
+primitive works for both the v0.1.121 candidate and the restored v0.1.120 LKG;
+the updater validates the exact active slot both before and after it. The full
+120-second WebRTC/clip/RSS topology remains a separately signed release gate,
+not a per-device rollback dependency.
+
+Native GStreamer 1.28.2 probes additionally cover unanswered offer timeout,
+incompatible remote-answer promise failure, and valid-answer/no-ICE connection
+timeout. Each path removed the queue and `webrtcbin`, released every tee request
+pad, reached NULL, and emitted terminal STOP. Cleanup failures receive three
+bounded retries and then request a supervisor restart. The systemd unit adds
+`MemoryHigh=50%`, `MemoryMax=60%`, and zero swap as a final board-level guard
+against any future camera/media leak.
+
 Existing UVC deployments remain supported. Select the old auto-discovered V4L2
 path explicitly and use the matching release test:
 
@@ -130,6 +179,41 @@ nor OAK camera is attached; remove `NUVION_GST_SOURCE` before the physical-camer
 release gate. Once credentials and the selected camera test pass, enable the
 service with `sudo systemctl enable --now nuv-agent.service`.
 
+### IQ9075 Fleet E2E harness
+
+Release administrators must complete
+[`release/v0.1.121-release-runbook.md`](release/v0.1.121-release-runbook.md)
+before pushing a release tag. Tag pushes are credential-free requests; only the
+protected default-branch publisher may access channel or signing credentials.
+
+`packaging/dev/run-iq9075-fleet-e2e.py` drives the root-owned board primitive
+installed at `/usr/local/libexec/nuvion/iq9075-board-e2e.py`. It accepts only the
+pinned `iq9075-dev` command/release/health keyring schemas and the fixed
+IQ9075 device-binding tuple. Remote trust destinations cannot be supplied by a
+caller. SSH uses a single pinned host key, ignores user/system SSH config, disables
+proxy/control/forwarding, and accepts passwords only through already-open file
+descriptors.
+
+An Agent package that introduces updater `0.2.0` must first be installed with the
+explicit `bootstrap-updater` subcommand. This is an out-of-band prerequisite and
+writes `bootstrap-evidence.json` with `otaEvidence=false`; it is never counted as
+an OTA pass. The subsequent `run` subcommand performs the physical Ubuntu/arm64/
+QCS9075/OAK preflight, stops writers for a verified emergency backup, installs
+trust transactionally, proves the authenticated live updater is exactly `0.2.0`,
+and waits for either exact `COMMITTED` evidence or an exact fault-induced
+`ROLLED_BACK` tuple. Use `--help` on each subcommand for the required immutable
+release and command fields. The matching signed command must be issued through
+the authorized dev control plane while the bounded wait is active; the harness
+does not create commands or accept dashboard/API credentials.
+
+Each run uses a canonical UUIDv4 and a caller-owned `0700` output directory whose
+basename is that UUID. The resulting `immutable-manifest.json` and final
+`evidence.json` are byte-immutable. Only one persistent board run lease may exist;
+finish with the `cleanup` subcommand before starting another run. OAK fault tests
+are bound to USB path `2-1`, VID:PID `03e7:f63b`, the kernel `usb` driver, and a
+negotiated speed of at least 5 Gbps. A systemd deadman performs the same exact-port
+check before it disarms recovery.
+
 Runtime privilege boundary:
 - The Agent service runs without `docker.sock` access and without a Docker
   systemd dependency.
@@ -142,8 +226,10 @@ Runtime privilege boundary:
 - `packaging/release/build-agent-bundle.sh`: IQ9075 OTA용 self-contained immutable
   slot bundle을 만들며, symlink 없는 tar.gz, CPython 3.12/Linux aarch64
   hash-lock, pinned DepthAI wheel, stamped component SHA를 강제합니다. 직접 실행할
-  때는 `SOURCE_DATE_EPOCH=<commit epoch> COMPONENT_SHA=<full commit SHA>
-  packaging/release/build-agent-bundle.sh <version> <output>`을 사용합니다.
+  때도 위 절차처럼 exact commit의 disposable archive에서
+  `stamp-build-info.py`를 먼저 실행한 뒤 `SOURCE_DATE_EPOCH`와
+  `COMPONENT_SHA`를 전달해야 합니다. 환경 변수만 지정한 unstamped source는
+  의도적으로 거부됩니다.
 - `packaging/release/generate-release-bom.py`: v1 telemetry BOM 또는 exact product
   target, release sequence, minimum updater version, detached Ed25519 signature를
   가진 release-bom-v2를 생성합니다.
@@ -172,13 +258,27 @@ OTA activation은 publisher-signed release-bom-v2만 허용하며 signed
 `releases/by-bom-sha256/<bom digest>/`에 exact artifact 및 detached signature와
 함께 create-only로 저장하고 업로드 전후 byte-compare합니다. APT job은 OTA signing
 key를 받지 않으며 OTA build/signing job은 APT GPG key를 받지 않습니다.
-GitHub release asset은 기존 동일 이름을 덮어쓰지 않도록 설정되어 있으므로, 이미 발행된
-version을 변경해야 할 때는 새 patch version을 발행해야 합니다.
+GitHub release는 sdist/BOM/source-plan을 모두 검증한 뒤 live channel보다 먼저 immutable로
+finalize합니다. 이후 Homebrew와 APT를 idempotent하게 승격하고, 양쪽 성공 뒤에만
+create-only distribution promotion marker를 기록합니다. Repository release immutability가
+preflight에서 확인되므로 publish 이후 tag와 asset은 수정/삭제할 수 없습니다. 이미 발행된
+version을 변경해야 할 때는 새 signed patch version을 발행해야 합니다.
 
 Required secrets:
-- `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/NUV-agent-homebrew`)
+- `HOMEBREW_TAP_TOKEN` (PAT with push access to `plaid-ai/homebrew-NUV-AGENT-HOMEBREW`)
 - `IQ9075_RELEASE_SIGNING_PRIVATE_KEY` (Ed25519 private publisher key)
-- `IQ9075_RELEASE_SIGNING_KEY_ID`
-- `IQ9075_RELEASE_PUBLIC_KEYRING_JSON` (`trustDomain=iq9075-dev`)
+- Publisher key ID is pinned in `release-security-policy.json`, not a secret
+- `packaging/release/trusted-release-keyrings/iq9075-dev.json` is public,
+  protected-main verification material; it is deliberately not a secret
+
+모든 credential job은 24시간 이내 platform-admin signed settings attestation을
+protected environment 진입 직후와 GitHub/APT/GCP/signing/ambient credential의 각 접근 직전에
+다시 검증합니다. Attestation은 exact trusted publisher commit의 전체 tracked surface와
+default-branch workflow bytes를 묶습니다. 일반 writer는 CODEOWNER approval 1개와 strict
+`agent-release-gate`가 필요하고, Platform-Admin 팀만 exact `pull_request` bypass를 사용합니다.
+Face artifact GCP 권한은 별도 `face-artifacts-release` exact-main environment에만 두며,
+allowlisted Platform-Admin이 서명한 tag/commit/model/channel/artifact digest manifest 없이는
+GCP 인증 전에 fail closed 합니다. 따라서 별도 2인 environment 승인은 요구하지 않습니다.
+Unsigned legacy tag(v0.1.120 포함)는 이 publisher에서 지원하지 않습니다.
 
 To host an APT repo, use a tool like `aptly` or `reprepro`, then publish the generated `.deb`.

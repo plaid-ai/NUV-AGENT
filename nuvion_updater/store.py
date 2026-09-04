@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 
 from nuvion_updater.errors import UpdaterError, UpdaterSecurityError
+from nuvion_updater.health_attestation import CommitProcessIdentity
 from nuvion_updater.util import ensure_directory
 
 
@@ -50,6 +51,7 @@ class UpdateState:
     compact_jws_sha256: str
     target_version: str
     bom_digest: str
+    command_expires_at: str | None
     phase: UpdatePhase
     candidate_slot: str | None
     previous_slot: str | None
@@ -81,6 +83,7 @@ class UpdateState:
             "updatedAt": self.updated_at,
         }
         optional = {
+            "commandExpiresAt": self.command_expires_at,
             "candidateSlot": self.candidate_slot,
             "previousSlot": self.previous_slot,
             "previousVersion": self.previous_version,
@@ -114,6 +117,52 @@ class UpdateState:
             result["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
         result.update({key: value for key, value in optional.items() if value is not None})
         return result
+
+
+@dataclass(frozen=True)
+class CommitGate:
+    command_id: str
+    command_expires_at: str
+    gate_id: str
+    challenge: str
+    peer_pid: int
+    agent_start_ticks: int
+    boot_id: str
+    candidate_slot: str
+    bom_digest: str
+    component_sha: str
+    release_sequence: int
+    health_deadline: str
+    created_at: str
+    attestation_id: str | None
+    attestation_jws_sha256: str | None
+    consumed_at: str | None
+
+    @property
+    def process(self) -> CommitProcessIdentity:
+        return CommitProcessIdentity(
+            pid=self.peer_pid,
+            start_ticks=self.agent_start_ticks,
+            boot_id=self.boot_id,
+            active_slot=self.candidate_slot,
+        )
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "gateId": self.gate_id,
+            "challenge": self.challenge,
+            "commandId": self.command_id,
+            "commandExpiresAt": self.command_expires_at,
+            "bomDigest": self.bom_digest,
+            "componentSha": self.component_sha,
+            "releaseSequence": self.release_sequence,
+            "candidateSlot": self.candidate_slot,
+            "agentPid": self.peer_pid,
+            "agentStartTicks": self.agent_start_ticks,
+            "bootId": self.boot_id,
+            "expiresAt": self.health_deadline,
+        }
 
 
 def utc_now() -> str:
@@ -189,7 +238,7 @@ class UpdaterStore:
                 schema_version = int(
                     connection.execute("PRAGMA user_version").fetchone()[0]
                 )
-                if schema_version not in {0, 1, 2}:
+                if schema_version not in {0, 1, 2, 3, 4}:
                     raise UpdaterSecurityError(
                         "UNSUPPORTED_JOURNAL_SCHEMA",
                         f"unsupported updater journal schema: {schema_version}",
@@ -203,6 +252,7 @@ class UpdaterStore:
                         compact_jws_sha256 TEXT NOT NULL,
                         target_version TEXT NOT NULL,
                         bom_digest TEXT NOT NULL,
+                        command_expires_at TEXT NOT NULL,
                         phase TEXT NOT NULL,
                         candidate_slot TEXT,
                         previous_slot TEXT,
@@ -236,8 +286,34 @@ class UpdaterStore:
                         meta_value TEXT NOT NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS updater_commit_gate (
+                        command_id TEXT PRIMARY KEY,
+                        command_expires_at TEXT NOT NULL,
+                        gate_id TEXT NOT NULL UNIQUE,
+                        challenge TEXT NOT NULL UNIQUE,
+                        peer_pid INTEGER NOT NULL CHECK (peer_pid > 0),
+                        agent_start_ticks INTEGER NOT NULL
+                            CHECK (agent_start_ticks > 0),
+                        boot_id TEXT NOT NULL,
+                        candidate_slot TEXT NOT NULL,
+                        bom_digest TEXT NOT NULL,
+                        component_sha TEXT NOT NULL,
+                        release_sequence INTEGER NOT NULL
+                            CHECK (release_sequence > 0),
+                        health_deadline TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        attestation_id TEXT UNIQUE,
+                        attestation_jws_sha256 TEXT,
+                        consumed_at TEXT,
+                        FOREIGN KEY (command_id)
+                            REFERENCES updater_command(command_id)
+                    );
+
                     CREATE INDEX IF NOT EXISTS idx_updater_command_sequence
                     ON updater_command(sequence DESC);
+
+                    CREATE INDEX IF NOT EXISTS idx_updater_commit_gate_attestation
+                    ON updater_commit_gate(attestation_id);
                     """
                 )
                 columns = {
@@ -247,6 +323,7 @@ class UpdaterStore:
                     ).fetchall()
                 }
                 migrations = {
+                    "command_expires_at": "TEXT",
                     "previous_version": "TEXT",
                     "artifact_digest": "TEXT",
                     "component_sha": "TEXT",
@@ -259,7 +336,18 @@ class UpdaterStore:
                         connection.execute(
                             f"ALTER TABLE updater_command ADD COLUMN {column} {declaration}"
                         )
-                connection.execute("PRAGMA user_version = 2")
+                gate_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(updater_commit_gate)"
+                    ).fetchall()
+                }
+                if "command_expires_at" not in gate_columns:
+                    connection.execute(
+                        "ALTER TABLE updater_commit_gate "
+                        "ADD COLUMN command_expires_at TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 4")
                 connection.commit()
             finally:
                 connection.close()
@@ -278,6 +366,7 @@ class UpdaterStore:
         compact_jws: str,
         target_version: str,
         bom_digest: str,
+        command_expires_at: str,
     ) -> tuple[UpdateState, bool]:
         digest = hashlib.sha256(compact_jws.encode("ascii")).hexdigest()
         now = self._clock()
@@ -292,6 +381,7 @@ class UpdaterStore:
                     or state.compact_jws_sha256 != digest
                     or state.target_version != target_version
                     or state.bom_digest != bom_digest
+                    or state.command_expires_at != command_expires_at
                 ):
                     raise UpdaterSecurityError(
                         "COMMAND_COLLISION",
@@ -327,8 +417,9 @@ class UpdaterStore:
                 """
                 INSERT INTO updater_command (
                     command_id, sequence, compact_jws, compact_jws_sha256,
-                    target_version, bom_digest, phase, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    target_version, bom_digest, command_expires_at, phase,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -337,6 +428,7 @@ class UpdaterStore:
                     digest,
                     target_version,
                     bom_digest,
+                    command_expires_at,
                     UpdatePhase.AUTHORIZED.value,
                     now,
                     now,
@@ -585,6 +677,103 @@ class UpdaterStore:
             ).fetchone()
         return str(row[0]) if row is not None else None
 
+    def begin_commit_gate(
+        self,
+        *,
+        command_id: str,
+        gate_id: str,
+        challenge: str,
+        process: CommitProcessIdentity,
+        bom_digest: str,
+        component_sha: str,
+        release_sequence: int,
+        health_deadline: str,
+        command_expires_at: str,
+    ) -> CommitGate:
+        """Create one immutable process-bound gate without extending its lease."""
+
+        now = self._clock()
+        with self._lock, self._transaction(immediate=True) as connection:
+            command = connection.execute(
+                "SELECT * FROM updater_command WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if command is None:
+                raise UpdaterError("UPDATE_NOT_FOUND", "update command is not journaled")
+            state = self._row(command)
+            if state.phase != UpdatePhase.FUNCTIONAL_HEALTHY:
+                raise UpdaterError(
+                    "INVALID_PHASE",
+                    "FUNCTIONAL_HEALTHY is required before commit gate",
+                )
+            existing = connection.execute(
+                "SELECT * FROM updater_commit_gate WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if existing is not None:
+                gate = self._gate_row(existing)
+                expected = (
+                    process.pid,
+                    process.start_ticks,
+                    process.boot_id,
+                    process.active_slot,
+                    bom_digest,
+                    component_sha,
+                    release_sequence,
+                    health_deadline,
+                    command_expires_at,
+                )
+                actual = (
+                    gate.peer_pid,
+                    gate.agent_start_ticks,
+                    gate.boot_id,
+                    gate.candidate_slot,
+                    gate.bom_digest,
+                    gate.component_sha,
+                    gate.release_sequence,
+                    gate.health_deadline,
+                    gate.command_expires_at,
+                )
+                if actual != expected:
+                    raise UpdaterSecurityError(
+                        "COMMIT_GATE_BINDING_MISMATCH",
+                        "commit gate is already bound to another runtime identity",
+                    )
+                return gate
+            connection.execute(
+                """
+                INSERT INTO updater_commit_gate (
+                    command_id, gate_id, challenge, peer_pid, agent_start_ticks,
+                    boot_id, candidate_slot, bom_digest, component_sha,
+                    release_sequence, health_deadline, command_expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command_id,
+                    gate_id,
+                    challenge,
+                    process.pid,
+                    process.start_ticks,
+                    process.boot_id,
+                    process.active_slot,
+                    bom_digest,
+                    component_sha,
+                    release_sequence,
+                    health_deadline,
+                    command_expires_at,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM updater_commit_gate WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            return self._gate_row(row)
+
+    def commit_gate(self, command_id: str) -> CommitGate | None:
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM updater_commit_gate WHERE command_id = ?", (command_id,)
+            ).fetchone()
+        return self._gate_row(row) if row is not None else None
+
     def commit_release_sequence(self, sequence: int) -> None:
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
             raise ValueError("release sequence must be a positive integer")
@@ -632,10 +821,18 @@ class UpdaterStore:
                 ),
             )
 
-    def commit_command(self, command_id: str) -> UpdateState:
-        """Commit command phase and installed-release identity in one transaction."""
+    def commit_command_attested(
+        self,
+        command_id: str,
+        *,
+        gate_id: str,
+        process: CommitProcessIdentity,
+        attestation_id: str,
+        attestation_jws_sha256: str,
+        attestation_expires_at: datetime,
+    ) -> UpdateState:
+        """Atomically consume one attestation and commit installed identity."""
 
-        now = self._clock()
         with self._lock, self._transaction(immediate=True) as connection:
             row = connection.execute(
                 "SELECT * FROM updater_command WHERE command_id = ?", (command_id,)
@@ -643,8 +840,43 @@ class UpdaterStore:
             if row is None:
                 raise UpdaterError("UPDATE_NOT_FOUND", "update command is not journaled")
             current = self._row(row)
-            if current.phase == UpdatePhase.COMMITTED:
-                return current
+            gate_row = connection.execute(
+                "SELECT * FROM updater_commit_gate WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if gate_row is None:
+                raise UpdaterSecurityError(
+                    "COMMIT_GATE_REQUIRED", "commit gate was not durably created"
+                )
+            gate = self._gate_row(gate_row)
+            if gate.gate_id != gate_id:
+                raise UpdaterSecurityError(
+                    "COMMIT_GATE_MISMATCH", "gateId does not match the durable gate"
+                )
+            if gate.process != process:
+                raise UpdaterSecurityError(
+                    "COMMIT_PROCESS_MISMATCH",
+                    "live Agent process does not match the durable commit gate",
+                )
+            if gate.attestation_id is not None:
+                if (
+                    current.phase == UpdatePhase.COMMITTED
+                    and gate.attestation_id == attestation_id
+                    and gate.attestation_jws_sha256 == attestation_jws_sha256
+                ):
+                    return current
+                raise UpdaterSecurityError(
+                    "HEALTH_ATTESTATION_REPLAY",
+                    "commit gate already consumed another health attestation",
+                )
+            replay = connection.execute(
+                "SELECT command_id FROM updater_commit_gate WHERE attestation_id = ?",
+                (attestation_id,),
+            ).fetchone()
+            if replay is not None:
+                raise UpdaterSecurityError(
+                    "HEALTH_ATTESTATION_REPLAY",
+                    "health attestation was already consumed",
+                )
             if current.phase != UpdatePhase.FUNCTIONAL_HEALTHY:
                 raise UpdaterError(
                     "INVALID_PHASE",
@@ -652,6 +884,39 @@ class UpdaterStore:
                 )
             if current.release_sequence is None:
                 raise UpdaterError("INVALID_JOURNAL", "release sequence is missing")
+            if (
+                current.command_expires_at != gate.command_expires_at
+                or current.health_deadline != gate.health_deadline
+            ):
+                raise UpdaterSecurityError(
+                    "COMMIT_GATE_BINDING_MISMATCH",
+                    "commit gate deadlines no longer match the update journal",
+                )
+
+            command_expires_at = self._parse_timestamp(
+                gate.command_expires_at,
+                code="COMMIT_GATE_BINDING_MISMATCH",
+                field="command expiry",
+            )
+            health_deadline = self._parse_timestamp(
+                gate.health_deadline,
+                code="COMMIT_GATE_BINDING_MISMATCH",
+                field="health deadline",
+            )
+            if (
+                attestation_expires_at.tzinfo is None
+                or attestation_expires_at.utcoffset() is None
+            ):
+                raise UpdaterSecurityError(
+                    "INVALID_HEALTH_ATTESTATION",
+                    "health attestation expiry must be timezone-aware",
+                )
+            attestation_deadline = attestation_expires_at.astimezone(timezone.utc)
+            if attestation_deadline > command_expires_at:
+                raise UpdaterSecurityError(
+                    "INVALID_HEALTH_ATTESTATION_TTL",
+                    "health attestation expires after the accepted command",
+                )
 
             committed_sequence = connection.execute(
                 "SELECT meta_value FROM updater_meta "
@@ -679,6 +944,32 @@ class UpdaterStore:
                     "release sequence is already bound to another BOM",
                 )
 
+            # Read the authoritative wall clock only after all potentially
+            # slow validation and immediately before the durable writes. The
+            # strict boundary deliberately does not apply verifier clock skew:
+            # no proof or lease may be consumed at or after its signed expiry.
+            now = self._clock()
+            observed_at = self._parse_timestamp(
+                now,
+                code="INVALID_JOURNAL_CLOCK",
+                field="journal clock",
+            )
+            if observed_at >= command_expires_at:
+                raise UpdaterError(
+                    "COMMAND_EXPIRED",
+                    "accepted command expired before atomic commit",
+                )
+            if observed_at >= health_deadline:
+                raise UpdaterError(
+                    "COMMIT_TIMEOUT",
+                    "commit health deadline expired before atomic commit",
+                )
+            if observed_at >= attestation_deadline:
+                raise UpdaterSecurityError(
+                    "HEALTH_ATTESTATION_EXPIRED",
+                    "health attestation expired before atomic commit",
+                )
+
             connection.executemany(
                 """
                 INSERT INTO updater_meta(meta_key, meta_value) VALUES (?, ?)
@@ -689,6 +980,18 @@ class UpdaterStore:
                     ("currentBomDigest", current.bom_digest),
                 ),
             )
+            updated_gate = connection.execute(
+                """
+                UPDATE updater_commit_gate SET
+                    attestation_id = ?, attestation_jws_sha256 = ?, consumed_at = ?
+                WHERE command_id = ? AND attestation_id IS NULL
+                """,
+                (attestation_id, attestation_jws_sha256, now, command_id),
+            )
+            if updated_gate.rowcount != 1:
+                raise UpdaterSecurityError(
+                    "HEALTH_ATTESTATION_REPLAY", "health attestation was already consumed"
+                )
             connection.execute(
                 """
                 UPDATE updater_command SET
@@ -716,6 +1019,16 @@ class UpdaterStore:
             ).fetchone()
             return self._row(updated)
 
+    @staticmethod
+    def _parse_timestamp(value: str, *, code: str, field: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise UpdaterSecurityError(code, f"{field} is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise UpdaterSecurityError(code, f"{field} must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
     def transitions(self, command_id: str) -> list[tuple[str | None, str]]:
         with self._transaction() as connection:
             rows = connection.execute(
@@ -736,6 +1049,7 @@ class UpdaterStore:
             compact_jws_sha256=str(row["compact_jws_sha256"]),
             target_version=str(row["target_version"]),
             bom_digest=str(row["bom_digest"]),
+            command_expires_at=row["command_expires_at"],
             phase=UpdatePhase(str(row["phase"])),
             candidate_slot=row["candidate_slot"],
             previous_slot=row["previous_slot"],
@@ -755,4 +1069,25 @@ class UpdaterStore:
             message=row["message"],
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _gate_row(row: sqlite3.Row) -> CommitGate:
+        return CommitGate(
+            command_id=str(row["command_id"]),
+            command_expires_at=str(row["command_expires_at"]),
+            gate_id=str(row["gate_id"]),
+            challenge=str(row["challenge"]),
+            peer_pid=int(row["peer_pid"]),
+            agent_start_ticks=int(row["agent_start_ticks"]),
+            boot_id=str(row["boot_id"]),
+            candidate_slot=str(row["candidate_slot"]),
+            bom_digest=str(row["bom_digest"]),
+            component_sha=str(row["component_sha"]),
+            release_sequence=int(row["release_sequence"]),
+            health_deadline=str(row["health_deadline"]),
+            created_at=str(row["created_at"]),
+            attestation_id=row["attestation_id"],
+            attestation_jws_sha256=row["attestation_jws_sha256"],
+            consumed_at=row["consumed_at"],
         )

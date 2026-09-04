@@ -349,7 +349,7 @@ class SettingsReconcilerTest(unittest.TestCase):
         repaired = self._reconciler(_Runtime(), "process-c").reconcile(command)
         self.assertEqual(repaired.status, "ROLLED_BACK")
 
-    def test_durable_waiting_restart_resumes_and_observes_monotonic_terminal(self) -> None:
+    def test_waiting_restart_uses_lifecycle_until_succeeded_observation(self) -> None:
         command = _command(12, activation="RESTART")
         db_path = self.root / "commands.sqlite3"
         inbox = DurableCommandInbox(db_path)
@@ -373,7 +373,7 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(first.processed, 1)
         self.assertEqual(store.get_job(command.command_id).phase, JOB_PHASE_WAITING_RESTART)
         self.assertEqual(inbox.get(command.command_id).status, "IN_PROGRESS")
-        self.assertEqual([item.revision for item in observations.pending()], [1])
+        self.assertEqual(observations.pending(), [])
 
         reopened_inbox = DurableCommandInbox(db_path)
         reopened_observations = DurableCommandObservationOutbox(reopened_inbox)
@@ -396,8 +396,30 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(second.processed, 1)
         self.assertEqual(second.terminal_acks[0].status, "SUCCEEDED")
         pending = reopened_observations.pending()
-        self.assertEqual([item.revision for item in pending], [1, 2])
+        self.assertEqual([item.revision for item in pending], [1])
         self.assertEqual(pending[-1].reported_state["health"], "FUNCTIONAL_HEALTHY")
+
+    def test_manual_observation_is_ignored_until_command_succeeds(self) -> None:
+        command = _command(121)
+        inbox = DurableCommandInbox(self.root / "observation-guard.sqlite3")
+        observations = DurableCommandObservationOutbox(inbox)
+        store = DurableReconcileStore(inbox, observation_outbox=observations)
+        inbox.accept(command)
+        inbox.transition(command.command_id, "IN_PROGRESS")
+
+        store.observe_state(command=command, reported_state={"health": "EARLY"})
+        self.assertEqual(observations.pending(), [])
+
+        inbox.transition(
+            command.command_id,
+            "SUCCEEDED",
+            reported_state={"health": "FUNCTIONAL_HEALTHY"},
+        )
+        store.observe_state(
+            command=command,
+            reported_state={"health": "FUNCTIONAL_HEALTHY"},
+        )
+        self.assertEqual(len(observations.pending()), 1)
 
     def test_restart_without_supervisor_support_fails_before_settings_mutation(self) -> None:
         command = _command(13, activation="RESTART")

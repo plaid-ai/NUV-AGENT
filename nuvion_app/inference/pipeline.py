@@ -11,6 +11,7 @@ import time
 import queue
 import warnings
 import random
+import signal
 import string
 import asyncio
 import logging
@@ -26,6 +27,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -42,7 +44,10 @@ from nuvion_app.inference.command_runtime import (
 )
 from nuvion_app.inference.agent_update import AgentUpdateReconciler
 from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
-from nuvion_app.inference.fleet_command import COMMAND_CAPABILITY_BY_TYPE
+from nuvion_app.inference.fleet_command import (
+    COMMAND_CAPABILITY_BY_TYPE,
+    VerifiedFleetCommand,
+)
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.depthai_gst import DepthAIGStreamerBridge
@@ -120,10 +125,14 @@ from nuvion_app.inference.webrtc_signaling import (
     WEBRTC_UPLINK_START,
     WEBRTC_UPLINK_STATE,
     WEBRTC_UPLINK_STOP_DEST,
+    h264_level_from_profile_level_id,
     negotiate_stomp_send_interval_ms,
     parse_command_payload,
 )
-from nuvion_app.inference.webrtc_uplink import WebRTCUplinkController
+from nuvion_app.inference.webrtc_uplink import (
+    WebRTCSignalingToken,
+    WebRTCUplinkController,
+)
 
 # Python 3.14에서 third-party stomper 패키지의 legacy regex 문자열로
 # SyntaxWarning(invalid escape sequence)가 발생한다. 런타임 동작에는 영향이 없어
@@ -138,7 +147,8 @@ import stomper
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gst, GLib, GLibUnix
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.inference.video_source import build_video_source_pipeline
@@ -153,6 +163,11 @@ from nuvion_app.runtime.inference_mode import (
 )
 from nuvion_app.model_store import DEFAULT_MODEL_POINTER
 from nuvion_app.runtime.model_guard import resolve_effective_profile, resolve_model_dir
+from nuvion_app.runtime.platform_identity import (
+    IDENTITY_STATUS_DEV,
+    IDENTITY_STATUS_VERIFIED,
+    resolve_platform_identity,
+)
 from nuvion_app.runtime.telemetry import (
     build_runtime_telemetry,
     merge_runtime_public_state,
@@ -162,6 +177,13 @@ from nuvion_app.runtime.settings_overlay import resolve_settings_state_dir
 from nuvion_app.runtime.updater_client import (
     UpdaterClient,
     build_updater_capability_telemetry,
+)
+from nuvion_app.runtime.update_commit_readiness import (
+    evaluate_update_commit_readiness,
+)
+from nuvion_app.runtime.update_health_attestation import (
+    build_health_attestation_request,
+    request_health_attestation,
 )
 
 try:
@@ -297,6 +319,7 @@ DEMO_LOOP = is_truthy(os.getenv("NUVION_DEMO_LOOP", "true"))
 DEMO_TAG = ((os.getenv("NUVION_DEMO_TAG", "[DEMO]") or "").strip() or "[DEMO]")
 
 WEBRTC_FORCE_RELAY = is_truthy(os.getenv("NUVION_WEBRTC_FORCE_RELAY", "false"))
+WEBRTC_UPNP_ENABLED = is_truthy(os.getenv("NUVION_WEBRTC_UPNP_ENABLED", "false"))
 RTP_SSRC_ENV = os.getenv("NUVION_RTP_SSRC", None)
 H264_PROFILE_LEVEL_ID_ENV = os.getenv("NUVION_H264_PROFILE_LEVEL_ID", "42e01f")
 H264_PROFILE_ENV = os.getenv("NUVION_H264_PROFILE", "constrained-baseline")
@@ -412,6 +435,23 @@ UPDATER_TELEMETRY_TTL_SEC = parse_float(
     os.getenv("NUVION_UPDATER_TELEMETRY_TTL_SEC"),
     15.0,
 )
+UPDATE_COMMIT_STABLE_SEC = max(
+    10.0,
+    min(
+        parse_float(os.getenv("NUVION_UPDATE_COMMIT_STABLE_SEC"), 15.0),
+        60.0,
+    ),
+)
+UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC = max(
+    5.0,
+    min(
+        parse_float(
+            os.getenv("NUVION_UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC"),
+            20.0,
+        ),
+        60.0,
+    ),
+)
 EVENT_OUTBOX_MAX_ROWS = parse_int_with_default(
     os.getenv("NUVION_EVENT_OUTBOX_MAX_ROWS"),
     DEFAULT_OUTBOX_MAX_ROWS,
@@ -451,20 +491,45 @@ AGENT_RETRY_DESTINATIONS = {
     WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
     WEBRTC_UPLINK_STOP_DEST,
 }
+WEBRTC_SIGNALING_DESTINATIONS = frozenset(
+    {
+        WEBRTC_UPLINK_OFFER_DEST,
+        WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+        WEBRTC_UPLINK_STOP_DEST,
+    }
+)
 
 websocket: websockets.WebSocketClientProtocol | None = None
 g_app = None
 signaling_loop: asyncio.AbstractEventLoop | None = None
-outbound_queue: asyncio.Queue | None = None
+@dataclass(frozen=True)
+class _OutboundMessage:
+    destination: str
+    payload: dict
+    event_id: str | None = None
+    signaling_token: WebRTCSignalingToken | None = None
+
+
+@dataclass(frozen=True)
+class _CachedPayload:
+    payload: dict
+    signaling_token: WebRTCSignalingToken | None = None
+
+
+outbound_queue: asyncio.Queue[_OutboundMessage] | None = None
 auth_token: str | None = None
 auth_token_lock = threading.Lock()
 agent_uplink_blocked = False
 agent_uplink_block_reason = ""
 agent_uplink_lock = threading.Lock()
-agent_retry_attempts: dict[str, int] = {}
+_AgentRetryKey = tuple[str, WebRTCSignalingToken | None]
+
+
+agent_retry_attempts: dict[_AgentRetryKey, int] = {}
 agent_retry_lock = threading.Lock()
-last_sent_payloads: dict[str, dict] = {}
+last_sent_payloads: dict[str, _CachedPayload] = {}
 last_sent_payloads_lock = threading.Lock()
+webrtc_retry_tasks: dict[_AgentRetryKey, asyncio.Task[None]] = {}
 critical_event_delivery: DurableEventDelivery | None = None
 critical_event_outbox_init_attempted = False
 critical_event_outbox_lock = threading.Lock()
@@ -489,6 +554,11 @@ updater_telemetry_cache_updated_at = 0.0
 updater_telemetry_cache_lock = threading.Lock()
 updater_public_state_provider: Callable[[], Mapping[str, object]] | None = None
 updater_public_state_lock = threading.Lock()
+update_commit_signaling_ready_since: float | None = None
+update_commit_stomp_last_send_at: float | None = None
+update_commit_signaling_lock = threading.Lock()
+agent_update_identity_cache: dict[str, object] | None = None
+agent_update_identity_lock = threading.Lock()
 FLEET_PROCESS_INSTANCE_ID = str(uuid.uuid4())
 CLIP_SEGMENTS_DIR = os.path.join(CLIP_OUTPUT_DIR, "segments")
 CLIP_CLIPS_DIR = os.path.join(CLIP_OUTPUT_DIR, "clips")
@@ -638,6 +708,7 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
     target = int(bitrate_kbps)
     if target < 100 or target > 20_000:
         raise ValueError("encoder bitrate must be in [100, 20000] Kbps")
+    h264_level = h264_level_from_profile_level_id(H264_PROFILE_LEVEL_ID_ENV)
     return (
         "videoconvert ! "
         "video/x-raw,format=I420 ! "
@@ -652,7 +723,27 @@ def build_x264_encoder_pipeline(element_name: str, *, bitrate_kbps: int = 1000) 
         "sliced-threads=true "
         "pass=cbr "
         "! "
-        f"video/x-h264,profile={H264_PROFILE_ENV} ! "
+        f"video/x-h264,profile={H264_PROFILE_ENV},level=(string){h264_level} ! "
+    )
+
+
+def build_bounded_live_queue(
+    *, max_buffers: int = 2, element_name: str | None = None
+) -> str:
+    """Bound one live raw-video branch independently and prefer fresh frames."""
+
+    buffers = int(max_buffers)
+    if buffers <= 0 or buffers > 60:
+        raise ValueError("live queue max_buffers must be in [1, 60]")
+    name_property = ""
+    if element_name is not None:
+        normalized_name = str(element_name or "").strip()
+        if not normalized_name.replace("_", "").isalnum():
+            raise ValueError("live queue element_name must be alphanumeric/underscore")
+        name_property = f" name={normalized_name}"
+    return (
+        f"queue{name_property} max-size-buffers={buffers} "
+        "max-size-bytes=0 max-size-time=0 leaky=downstream"
     )
 
 
@@ -674,21 +765,23 @@ def build_uplink_pipeline(
             f"{encoder_pipeline}"
             f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
             "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-            "webrtc_uplink."
+            "tee name=webrtc_uplink_tee allow-not-linked=true"
         )
 
     segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
     segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
     clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
+    live_queue = build_bounded_live_queue(element_name="uplink_live_queue")
+    clip_queue = build_bounded_live_queue(element_name="clip_live_queue")
     return (
         "tee name=stream_split "
-        "stream_split. ! queue ! "
+        f"stream_split. ! {live_queue} ! "
         f"{encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
         "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
-        "webrtc_uplink. "
-        "stream_split. ! queue ! "
+        "tee name=webrtc_uplink_tee allow-not-linked=true "
+        f"stream_split. ! {clip_queue} ! "
         f"{clip_encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
@@ -845,19 +938,208 @@ def _clone_payload(payload: dict) -> dict:
     return json.loads(json.dumps(payload))
 
 
-def _remember_last_payload(destination: str, payload: dict) -> None:
+def _remember_last_payload(
+    destination: str,
+    payload: dict,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> None:
     if destination not in AGENT_RETRY_DESTINATIONS:
         return
     with last_sent_payloads_lock:
-        last_sent_payloads[destination] = _clone_payload(payload)
+        last_sent_payloads[destination] = _CachedPayload(
+            _clone_payload(payload),
+            signaling_token,
+        )
+    if destination in WEBRTC_SIGNALING_DESTINATIONS and signaling_token is not None:
+        _retire_stale_webrtc_retries(destination, signaling_token)
 
 
-def _get_last_payload(destination: str) -> dict | None:
+def _get_last_payload(destination: str) -> _CachedPayload | None:
     with last_sent_payloads_lock:
-        payload = last_sent_payloads.get(destination)
-        if payload is None:
+        cached = last_sent_payloads.get(destination)
+        if cached is None:
             return None
-        return _clone_payload(payload)
+        return _CachedPayload(
+            _clone_payload(cached.payload),
+            cached.signaling_token,
+        )
+
+
+def _is_signaling_token_current(token: WebRTCSignalingToken | None) -> bool:
+    if token is None:
+        return True
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    validator = getattr(controller, "is_signaling_token_current", None)
+    return bool(callable(validator) and validator(token))
+
+
+def _agent_retry_key(
+    destination: str,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> _AgentRetryKey:
+    return destination, signaling_token
+
+
+def _cancel_webrtc_retry(key: _AgentRetryKey) -> None:
+    task = webrtc_retry_tasks.pop(key, None)
+    if task is not None:
+        task.cancel()
+
+
+def _retire_stale_webrtc_retries(
+    destination: str,
+    signaling_token: WebRTCSignalingToken,
+) -> None:
+    current_key = _agent_retry_key(destination, signaling_token)
+    with agent_retry_lock:
+        stale_attempt_keys = tuple(
+            key
+            for key in agent_retry_attempts
+            if key[0] == destination and key != current_key
+        )
+        for key in stale_attempt_keys:
+            agent_retry_attempts.pop(key, None)
+    for key in tuple(webrtc_retry_tasks):
+        if key[0] == destination and key != current_key:
+            _cancel_webrtc_retry(key)
+
+
+def _correlated_webrtc_error(
+    payload: dict,
+    path: str,
+) -> _CachedPayload | None:
+    """Return only the live generation explicitly named by an error envelope."""
+
+    error_session_id = str(payload.get("sessionId") or "").strip()
+    if not error_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] ignored uncorrelated signaling error path=%s",
+            path,
+        )
+        return None
+    cached = _get_last_payload(path)
+    if cached is not None and cached.signaling_token is not None:
+        cached_session_id = str(cached.payload.get("sessionId") or "").strip()
+        if error_session_id != cached_session_id:
+            log.warning(
+                "[WEBRTC-UPLINK] ignored stale signaling error "
+                "path=%s errorSessionId=%s currentSessionId=%s",
+                path,
+                error_session_id,
+                cached_session_id or "<missing>",
+            )
+            return None
+    else:
+        controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+        resolver = getattr(controller, "signaling_token_for_session", None)
+        token = (
+            resolver(
+                error_session_id,
+                terminal=path == WEBRTC_UPLINK_STOP_DEST,
+            )
+            if callable(resolver)
+            else None
+        )
+        if not isinstance(token, WebRTCSignalingToken):
+            log.warning(
+                "[WEBRTC-UPLINK] ignored signaling error without current generation "
+                "path=%s sessionId=%s",
+                path,
+                error_session_id,
+            )
+            return None
+        cached = _CachedPayload({"sessionId": error_session_id}, token)
+    if not _is_signaling_token_current(cached.signaling_token):
+        log.warning(
+            "[WEBRTC-UPLINK] ignored signaling error for inactive generation "
+            "path=%s sessionId=%s generation=%s",
+            path,
+            error_session_id,
+            cached.signaling_token.generation,
+        )
+        return None
+    return cached
+
+
+def _purge_webrtc_outbound_queue() -> int:
+    """Drop only volatile WebRTC frames; durable event envelopes are retained."""
+
+    pending = outbound_queue
+    if pending is None:
+        return 0
+    retained: list[_OutboundMessage] = []
+    dropped = 0
+    while True:
+        try:
+            item = pending.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item.destination in WEBRTC_SIGNALING_DESTINATIONS:
+            dropped += 1
+        else:
+            retained.append(item)
+        pending.task_done()
+    for item in retained:
+        pending.put_nowait(item)
+    return dropped
+
+
+def _reset_webrtc_signaling_transport() -> None:
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    if controller is not None:
+        controller.on_signaling_reset()
+    with last_sent_payloads_lock:
+        for destination in WEBRTC_SIGNALING_DESTINATIONS:
+            last_sent_payloads.pop(destination, None)
+    for task in tuple(webrtc_retry_tasks.values()):
+        task.cancel()
+    webrtc_retry_tasks.clear()
+    dropped = _purge_webrtc_outbound_queue()
+    if dropped:
+        log.info("[WEBRTC-UPLINK] discarded stale queued signaling frames=%d", dropped)
+
+
+def _reject_current_webrtc_offer(
+    payload: dict,
+    *,
+    reason: str,
+    correlated: _CachedPayload | None = None,
+) -> bool:
+    """Bind a server rejection to the exact active signaling generation."""
+
+    path = str(payload.get("path") or "")
+    if path not in {WEBRTC_UPLINK_OFFER_DEST, WEBRTC_UPLINK_ICE_CANDIDATE_DEST}:
+        return False
+    cached = correlated or _get_last_payload(path)
+    if cached is None or cached.signaling_token is None:
+        return False
+    rejected_session_id = str(payload.get("sessionId") or "").strip()
+    cached_session_id = str(cached.payload.get("sessionId") or "").strip()
+    if not rejected_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] uncorrelated signaling rejection deferred to watchdog"
+        )
+        return False
+    if rejected_session_id != cached_session_id:
+        log.warning(
+            "[WEBRTC-UPLINK] ignored stale correlated signaling rejection "
+            "rejectedSessionId=%s currentSessionId=%s",
+            rejected_session_id,
+            cached_session_id,
+        )
+        return False
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    reject = getattr(controller, "reject_signaling", None)
+    if not callable(reject) or not reject(cached.signaling_token, reason=reason):
+        return False
+    with last_sent_payloads_lock:
+        current = last_sent_payloads.get(path)
+        if current is not None and current.signaling_token == cached.signaling_token:
+            last_sent_payloads.pop(path, None)
+    retry_key = _agent_retry_key(path, cached.signaling_token)
+    _cancel_webrtc_retry(retry_key)
+    _reset_agent_retry_attempt(retry_key)
+    return True
 
 
 def _set_agent_uplink_blocked(blocked: bool, reason: str = "") -> None:
@@ -881,27 +1163,121 @@ def _is_agent_uplink_blocked(destination: str) -> bool:
         return True
 
 
-def _reset_agent_retry_attempt(destination: str) -> None:
+def _reset_agent_retry_attempt(key: _AgentRetryKey) -> None:
     with agent_retry_lock:
-        if destination in agent_retry_attempts:
-            agent_retry_attempts[destination] = 0
+        agent_retry_attempts.pop(key, None)
 
 
-def _next_agent_retry_attempt(destination: str) -> int:
+def _reset_agent_retry_attempts_for_destination(destination: str) -> None:
     with agent_retry_lock:
-        attempt = agent_retry_attempts.get(destination, 0) + 1
-        agent_retry_attempts[destination] = attempt
+        for key in tuple(agent_retry_attempts):
+            if key[0] == destination:
+                agent_retry_attempts.pop(key, None)
+
+
+def _next_agent_retry_attempt(key: _AgentRetryKey) -> int:
+    with agent_retry_lock:
+        attempt = agent_retry_attempts.get(key, 0) + 1
+        agent_retry_attempts[key] = attempt
         return attempt
 
 
 def _reset_agent_ws_state() -> None:
+    _set_update_commit_signaling_ready(False)
     _set_agent_uplink_blocked(False, "")
     with agent_retry_lock:
         agent_retry_attempts.clear()
     if critical_event_delivery is not None:
         critical_event_delivery.reset_for_reconnect()
-    if g_app and getattr(g_app, "webrtc_uplink", None):
-        g_app.webrtc_uplink.on_signaling_reset()
+    _reset_webrtc_signaling_transport()
+
+
+def _set_update_commit_signaling_ready(ready: bool) -> None:
+    global update_commit_signaling_ready_since, update_commit_stomp_last_send_at
+    with update_commit_signaling_lock:
+        update_commit_signaling_ready_since = time.monotonic() if ready else None
+        update_commit_stomp_last_send_at = None
+
+
+def _mark_update_commit_stomp_send() -> None:
+    global update_commit_stomp_last_send_at
+    with update_commit_signaling_lock:
+        if update_commit_signaling_ready_since is not None:
+            update_commit_stomp_last_send_at = time.monotonic()
+
+
+def build_update_commit_readiness() -> dict[str, object]:
+    with update_commit_signaling_lock:
+        signaling_ready_since = update_commit_signaling_ready_since
+        stomp_last_send_at = update_commit_stomp_last_send_at
+    controller = getattr(g_app, "webrtc_uplink", None) if g_app else None
+    user_data = getattr(g_app, "user_data", None) if g_app else None
+    health_provider = getattr(controller, "runtime_health_snapshot", None)
+    with agent_uplink_lock:
+        stomp_blocked = agent_uplink_blocked
+    return evaluate_update_commit_readiness(
+        now_monotonic=time.monotonic(),
+        signaling_ready_since=signaling_ready_since,
+        stomp_last_send_at=stomp_last_send_at,
+        min_stable_seconds=UPDATE_COMMIT_STABLE_SEC,
+        max_evidence_age_seconds=UPDATE_COMMIT_MAX_EVIDENCE_AGE_SEC,
+        pipeline_running=(
+            g_app is not None
+            and getattr(g_app, "pipeline", None) is not None
+            and bool(getattr(user_data, "running", False))
+        ),
+        pipeline_last_frame_at=getattr(user_data, "last_frame_monotonic", None),
+        webrtc_health=(
+            health_provider() if callable(health_provider) else {}
+        ),
+        stomp_blocked=stomp_blocked,
+        event_outbox_health=build_event_outbox_runtime_health(),
+        command_outbox_health=build_command_observation_runtime_health(),
+    )
+
+
+def _agent_update_platform_identity() -> dict[str, object]:
+    global agent_update_identity_cache
+    with agent_update_identity_lock:
+        if agent_update_identity_cache is None:
+            identity = resolve_platform_identity()
+            if identity.identity_status not in {
+                IDENTITY_STATUS_VERIFIED,
+                IDENTITY_STATUS_DEV,
+            }:
+                raise RuntimeError("platform identity is not verified for Agent update")
+            agent_update_identity_cache = {
+                "productModel": identity.product_model,
+                "platformProfile": identity.platform_profile,
+                "hardwareRevision": identity.hardware_revision,
+                "architecture": identity.architecture,
+            }
+        return dict(agent_update_identity_cache)
+
+
+def request_agent_update_health_attestation(
+    command: VerifiedFleetCommand,
+    update: Mapping[str, Any],
+    gate: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    request = build_health_attestation_request(
+        device_id=command.device_id,
+        command_id=command.command_id,
+        expected_bom_digest=str(command.payload.get("bomDigest") or ""),
+        expected_component_sha=str(update.get("componentSha") or ""),
+        expected_release_sequence=update.get("releaseSequence"),
+        gate=gate,
+        identity=_agent_update_platform_identity(),
+    )
+    return request_health_attestation(
+        request,
+        transport=lambda payload: api_request(
+            "POST",
+            "/devices/me/agent-update-health-attestations",
+            payload,
+            timeout=10,
+        ),
+    )
 
 
 def initialize_durable_event_outbox() -> DurableEventDelivery | None:
@@ -945,7 +1321,14 @@ def initialize_durable_event_outbox() -> DurableEventDelivery | None:
         return critical_event_delivery
 
 
-def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None = None) -> bool:
+def _try_enqueue_outbound(
+    destination: str,
+    payload: dict,
+    event_id: str | None = None,
+    *,
+    signaling_token: WebRTCSignalingToken | None = None,
+    remember: bool = False,
+) -> bool:
     if outbound_queue is None or signaling_loop is None:
         return False
     completed = threading.Event()
@@ -954,9 +1337,19 @@ def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None 
 
     def _enqueue() -> None:
         try:
-            if cancelled.is_set():
+            if cancelled.is_set() or not _is_signaling_token_current(signaling_token):
+                enqueued.append(False)
                 return
-            outbound_queue.put_nowait((destination, _clone_payload(payload), event_id))
+            outbound_queue.put_nowait(
+                _OutboundMessage(
+                    destination,
+                    _clone_payload(payload),
+                    event_id,
+                    signaling_token,
+                )
+            )
+            if remember:
+                _remember_last_payload(destination, payload, signaling_token)
             enqueued.append(True)
         except asyncio.QueueFull:
             enqueued.append(False)
@@ -980,14 +1373,28 @@ def _try_enqueue_outbound(destination: str, payload: dict, event_id: str | None 
     return bool(enqueued and enqueued[0])
 
 
-def enqueue_stomp_message(destination: str, payload: dict, remember: bool = True) -> bool:
+def enqueue_stomp_message(
+    destination: str,
+    payload: dict,
+    remember: bool = True,
+    signaling_token: WebRTCSignalingToken | None = None,
+) -> bool:
     if _is_agent_uplink_blocked(destination):
         return False
-    if not _try_enqueue_outbound(destination, payload):
+    if destination in WEBRTC_SIGNALING_DESTINATIONS and signaling_token is None:
+        log.error("[STOMP] unscoped WebRTC signaling frame rejected=%s", destination)
+        return False
+    if signaling_token is not None and destination not in WEBRTC_SIGNALING_DESTINATIONS:
+        log.error("[STOMP] signaling token used for non-WebRTC destination=%s", destination)
+        return False
+    if not _try_enqueue_outbound(
+        destination,
+        payload,
+        signaling_token=signaling_token,
+        remember=remember,
+    ):
         log.warning("[STOMP] outbound unavailable or full for %s", destination)
         return False
-    if remember:
-        _remember_last_payload(destination, payload)
     return True
 
 
@@ -1003,6 +1410,10 @@ def initialize_fleet_command_runtime() -> FleetCommandRuntime | None:
                     AgentUpdateReconciler(
                         fleet_updater_client,
                         readiness_provider=_cached_agent_update_status,
+                        commit_readiness_provider=build_update_commit_readiness,
+                        health_attestation_provider=(
+                            request_agent_update_health_attestation
+                        ),
                     )
                 )
             fleet_command_runtime = build_fleet_command_runtime_from_env(
@@ -1424,7 +1835,17 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
     if outbound_queue is None:
         return
     while True:
-        destination, payload, event_id = await outbound_queue.get()
+        message = await outbound_queue.get()
+        destination = message.destination
+        payload = message.payload
+        event_id = message.event_id
+        if not _is_signaling_token_current(message.signaling_token):
+            outbound_queue.task_done()
+            log.info(
+                "[WEBRTC-UPLINK] dropped stale signaling frame before send destination=%s",
+                destination,
+            )
+            continue
         if (
             event_id
             and critical_event_delivery is not None
@@ -1436,6 +1857,7 @@ async def outbound_sender(ws: websockets.WebSocketClientProtocol):
         frame_str = build_send_frame(destination, payload)
         try:
             await ws.send(json.dumps([frame_str]))
+            _mark_update_commit_stomp_send()
             if event_id and critical_event_delivery is not None:
                 critical_event_delivery.mark_sent(event_id)
         except Exception as exc:
@@ -1504,6 +1926,7 @@ async def stomp_heartbeat_sender(
         await asyncio.sleep(interval_sec)
         try:
             await ws.send(json.dumps(["\n"]))
+            _mark_update_commit_stomp_send()
         except Exception as exc:
             log.warning("[SIGNALING] STOMP heartbeat send failed: %s", exc)
             raise
@@ -1554,9 +1977,15 @@ async def _enqueue_retry_after_delay(
     attempt: int,
     max_attempts: int,
     code: str,
+    signaling_token: WebRTCSignalingToken | None = None,
 ) -> None:
     await asyncio.sleep(delay_sec)
-    enqueued = enqueue_stomp_message(destination, payload, remember=False)
+    enqueued = enqueue_stomp_message(
+        destination,
+        payload,
+        remember=False,
+        signaling_token=signaling_token,
+    )
     if enqueued:
         log.warning(
             "[AGENT-ERROR] retry sent destination=%s code=%s attempt=%d/%d",
@@ -1615,6 +2044,58 @@ async def handle_agent_error(body: str) -> None:
         log.error("[OUTBOX] %s; critical replay stopped for operator action", reason)
         return
 
+    if not retryable and status_int in (401, 403):
+        # Authentication is transport-wide, unlike a WebRTC negotiation
+        # failure. Preserve the existing fail-closed behavior even when a
+        # candidate/stop frame was intentionally not cached for retry.
+        _reset_agent_retry_attempts_for_destination(path)
+        if path in WEBRTC_SIGNALING_DESTINATIONS:
+            _reset_webrtc_signaling_transport()
+        reason = f"{code} {message}".strip()
+        _set_agent_uplink_blocked(True, reason)
+        log.error(
+            "[AGENT-ERROR][auth] uplink blocked. code=%s status=%s path=%s message=%s detail=%s",
+            code,
+            status_int,
+            path,
+            message,
+            detail,
+        )
+        return
+
+    cached: _CachedPayload | None = None
+    retry_key = _agent_retry_key(path)
+    if path in WEBRTC_SIGNALING_DESTINATIONS:
+        # Server errors are delivered asynchronously and can outlive the
+        # generation that emitted the frame. A path-only or stale error must
+        # never consume the retry budget or tear down a newer session; the
+        # controller's bounded watchdog owns uncorrelated failures.
+        cached = _correlated_webrtc_error(payload, path)
+        if cached is None or cached.signaling_token is None:
+            return
+        retry_key = _agent_retry_key(path, cached.signaling_token)
+        if path != WEBRTC_UPLINK_OFFER_DEST:
+            # ICE candidates are intentionally volatile and STOP is already a
+            # terminal local transition. Neither can be replayed safely. An
+            # exact active candidate rejection tears down its branch; a STOP
+            # rejection is logged after the branch has already been released.
+            _reset_agent_retry_attempt(retry_key)
+            rejected = _reject_current_webrtc_offer(
+                payload,
+                reason=f"signaling frame rejected: {code} status={status_int}",
+                correlated=cached,
+            )
+            log.warning(
+                "[WEBRTC-UPLINK] terminal signaling rejection path=%s "
+                "sessionId=%s disposed=%s code=%s status=%s",
+                path,
+                str(payload.get("sessionId") or ""),
+                rejected,
+                code,
+                status_int,
+            )
+            return
+
     if retryable:
         if path not in AGENT_RETRY_DESTINATIONS:
             log.warning(
@@ -1625,8 +2106,9 @@ async def handle_agent_error(body: str) -> None:
             )
             return
 
-        last_payload = _get_last_payload(path)
-        if last_payload is None:
+        if cached is None:
+            cached = _get_last_payload(path)
+        if cached is None:
             log.warning(
                 "[AGENT-ERROR][retryable] no cached payload. code=%s path=%s message=%s",
                 code,
@@ -1635,7 +2117,22 @@ async def handle_agent_error(body: str) -> None:
             )
             return
 
-        attempt = _next_agent_retry_attempt(path)
+        if path == WEBRTC_UPLINK_OFFER_DEST:
+            pending_retry = webrtc_retry_tasks.get(retry_key)
+            if pending_retry is not None and not pending_retry.done():
+                log.warning(
+                    "[AGENT-ERROR][retryable] coalesced duplicate WebRTC error "
+                    "path=%s sessionId=%s",
+                    path,
+                    cached.signaling_token.session_id
+                    if cached.signaling_token is not None
+                    else "<missing>",
+                )
+                return
+            if pending_retry is not None:
+                webrtc_retry_tasks.pop(retry_key, None)
+
+        attempt = _next_agent_retry_attempt(retry_key)
         if attempt > AGENT_ERROR_MAX_RETRIES:
             log.error(
                 "[AGENT-ERROR] retry exhausted. code=%s path=%s max=%d detail=%s",
@@ -1643,6 +2140,11 @@ async def handle_agent_error(body: str) -> None:
                 path,
                 AGENT_ERROR_MAX_RETRIES,
                 detail,
+            )
+            _reject_current_webrtc_offer(
+                payload,
+                reason=f"offer retry exhausted: {code}",
+                correlated=cached,
             )
             return
 
@@ -1658,32 +2160,47 @@ async def handle_agent_error(body: str) -> None:
             message,
             detail,
         )
-        asyncio.create_task(
+        retry_task = asyncio.create_task(
             _enqueue_retry_after_delay(
                 destination=path,
-                payload=last_payload,
+                payload=cached.payload,
                 delay_sec=delay_sec,
                 attempt=attempt,
                 max_attempts=AGENT_ERROR_MAX_RETRIES,
                 code=code,
+                signaling_token=cached.signaling_token,
             )
         )
+        if path in WEBRTC_SIGNALING_DESTINATIONS:
+            previous = webrtc_retry_tasks.get(retry_key)
+            if previous is not None and previous is not retry_task:
+                previous.cancel()
+            webrtc_retry_tasks[retry_key] = retry_task
+
+            def _remove_completed_webrtc_retry(
+                completed: asyncio.Task[None],
+                *,
+                key: _AgentRetryKey = retry_key,
+            ) -> None:
+                if webrtc_retry_tasks.get(key) is completed:
+                    webrtc_retry_tasks.pop(key, None)
+
+            retry_task.add_done_callback(_remove_completed_webrtc_retry)
         return
 
-    _reset_agent_retry_attempt(path)
-    if status_int in (401, 403):
-        reason = f"{code} {message}".strip()
-        _set_agent_uplink_blocked(True, reason)
-        log.error(
-            "[AGENT-ERROR][auth] uplink blocked. code=%s status=%s path=%s message=%s detail=%s",
+    _reset_agent_retry_attempt(retry_key)
+    offer_rejected = _reject_current_webrtc_offer(
+        payload,
+        reason=f"non-retryable server rejection: {code} status={status_int}",
+        correlated=cached,
+    )
+    if offer_rejected:
+        log.warning(
+            "[WEBRTC-UPLINK] disposed locally rejected offer path=%s code=%s status=%s",
+            path,
             code,
             status_int,
-            path,
-            message,
-            detail,
         )
-        return
-
     if status_int is not None and 400 <= status_int < 500:
         log.warning(
             "[AGENT-ERROR][client] dropped. code=%s status=%s path=%s message=%s detail=%s",
@@ -1947,8 +2464,10 @@ async def signaling_client_main():
                     connectivity_task = asyncio.create_task(device_connectivity_sender(reporter))
 
                 if command_runtime is not None:
+                    command_runtime_connected = False
                     try:
                         reconciled = await command_runtime.on_connected()
+                        command_runtime_connected = True
                         log.info(
                             "[FLEET-COMMAND] reconnect reconciliation complete count=%d",
                             reconciled,
@@ -1959,6 +2478,8 @@ async def signaling_client_main():
                             type(exc).__name__,
                             str(exc)[:500],
                         )
+                    if command_runtime_connected:
+                        _set_update_commit_signaling_ready(True)
                     fleet_command_poll_task = asyncio.create_task(
                         fleet_command_poll_sender(command_runtime)
                     )
@@ -1997,6 +2518,11 @@ async def signaling_client_main():
         except Exception as exc:
             log.error("[SIGNALING] WebSocket error: %s", exc)
         finally:
+            _set_update_commit_signaling_ready(False)
+            # A transport reconnect is an exact WebRTC generation boundary.
+            # Invalidate the media branch and every volatile signaling envelope,
+            # cache entry and delayed retry before a new socket can consume them.
+            _reset_webrtc_signaling_transport()
             websocket = None
             if "sender_task" in locals():
                 sender_task.cancel()
@@ -2039,6 +2565,7 @@ class NuvionEventState:
         self.last_sent_status = None
         self.last_sent_at = 0.0
         self.latest_frame = LatestFrameBuffer()
+        self.last_frame_monotonic: float | None = None
         self.clip_enabled = CLIP_ENABLED
         self.demo_mode = DEMO_MODE
         self.demo_tag = DEMO_TAG
@@ -2278,6 +2805,7 @@ class NuvionEventState:
 
     def remember_latest_frame(self, frame_rgb: np.ndarray) -> None:
         self.latest_frame.remember(frame_rgb)
+        self.last_frame_monotonic = time.monotonic()
 
     def capture_snapshot_upload(self) -> str | None:
         if not SNAPSHOT_ENABLED:
@@ -2882,6 +3410,11 @@ class GStreamerInferenceApp:
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
             default_force_relay=WEBRTC_FORCE_RELAY,
+            h264_profile_level_id=H264_PROFILE_LEVEL_ID_ENV,
+            h264_packetization_mode=H264_PACKETIZATION_MODE_ENV,
+            h264_level_asymmetry_allowed=H264_LEVEL_ASYMMETRY_ALLOWED_ENV,
+            on_fatal_cleanup=self._on_webrtc_cleanup_failure,
+            enable_upnp=WEBRTC_UPNP_ENABLED,
         )
 
         self.pipeline = None
@@ -2995,32 +3528,31 @@ class GStreamerInferenceApp:
             clip_segments_dir=CLIP_SEGMENTS_DIR,
             video_bitrate_kbps=VIDEO_BITRATE_KBPS,
         )
+        live_queue = build_bounded_live_queue()
 
         if LOCAL_DISPLAY:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 f"{overlay_pipeline}"
                 "tee name=dt "
-                "dt. ! queue ! "
+                f"dt. ! {live_queue} ! "
                 f"{uplink_pipeline} "
-                "dt. ! queue ! videoconvert ! autovideosink sync=false"
+                f"dt. ! {live_queue} ! videoconvert ! autovideosink sync=false"
             )
         else:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
-                "t. ! queue ! "
+                f"t. ! {live_queue} ! "
                 f"{overlay_pipeline}"
                 f"{uplink_pipeline}"
             )
-
-        pipeline_string = f"{pipeline_string} webrtcbin name=webrtc_uplink bundle-policy=max-bundle latency=0"
 
         log.info("[PIPELINE] %s", pipeline_string)
         self.pipeline = Gst.parse_launch(pipeline_string)
@@ -3182,6 +3714,14 @@ class GStreamerInferenceApp:
             )
             return True
 
+    def _on_webrtc_cleanup_failure(self, reason: str) -> bool:
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+        log.critical(
+            "[WEBRTC-UPLINK] unreleased media branch requires process recovery: %s",
+            str(reason)[:500],
+        )
+        return self.request_supervisor_restart()
+
     def _on_depthai_failure(self, exc: BaseException) -> None:
         log.error(
             "[DEPTHAI] capture failed type=%s detail=%s",
@@ -3226,8 +3766,19 @@ class GStreamerInferenceApp:
             self.shutdown()
         return True
 
-    def send_webrtc_signal(self, destination: str, payload: dict, remember: bool) -> bool:
-        return enqueue_stomp_message(destination, payload, remember=remember)
+    def send_webrtc_signal(
+        self,
+        destination: str,
+        payload: dict,
+        remember: bool,
+        signaling_token: WebRTCSignalingToken,
+    ) -> bool:
+        return enqueue_stomp_message(
+            destination,
+            payload,
+            remember=remember,
+            signaling_token=signaling_token,
+        )
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()
@@ -3293,6 +3844,22 @@ class GStreamerInferenceApp:
     def run(self):
         def _start():
             log.info("Starting GStreamer main loop...")
+            sigterm_source = GLibUnix.signal_source_new(signal.SIGTERM)
+            if sigterm_source is None:
+                raise RuntimeError("GLib SIGTERM source is unavailable")
+
+            def _handle_sigterm(*_args):
+                log.info("SIGTERM received; requesting graceful shutdown.")
+                if self.loop:
+                    self.loop.quit()
+                # Keep consuming SIGTERM until shutdown has released the camera.
+                return True
+
+            sigterm_source.set_callback(_handle_sigterm)
+            source_id = sigterm_source.attach(self.loop.get_context())
+            if not source_id:
+                sigterm_source.destroy()
+                raise RuntimeError("GLib SIGTERM source could not be attached")
             try:
                 state_result = self.pipeline.set_state(Gst.State.PLAYING)
                 if state_result == Gst.StateChangeReturn.FAILURE:
@@ -3315,13 +3882,18 @@ class GStreamerInferenceApp:
                 get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
                 raise
             finally:
-                self.shutdown()
+                try:
+                    self.shutdown()
+                finally:
+                    sigterm_source.destroy()
 
         if LOCAL_DISPLAY and sys.platform == "darwin":
             log.info("Using Gst.macos_main() for local display on macOS...")
+
             def _macos_main(_argc, _argv, _data):
                 _start()
                 return 0
+
             Gst.macos_main(_macos_main, sys.argv, "")
         else:
             _start()

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ORG=${ORG:-plaid-ai}
-REPO=${REPO:-homebrew-NUV-agent-homebrew}
+REPO=${REPO:-homebrew-NUV-AGENT-HOMEBREW}
 FORMULA_SRC=${FORMULA_SRC:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../homebrew" && pwd)/nuv-agent.rb"}
 VISIBILITY=${VISIBILITY:-public}
 
@@ -22,7 +22,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 if gh repo view "$ORG/$REPO" >/dev/null 2>&1; then
   echo "Repo exists: $ORG/$REPO"
 else
-  gh repo create "$ORG/$REPO" --$VISIBILITY --confirm
+  gh repo create "$ORG/$REPO" --"$VISIBILITY" --confirm
 fi
 
 git clone "https://github.com/$ORG/$REPO.git" "$TMP_DIR/tap"

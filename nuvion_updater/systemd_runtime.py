@@ -4,6 +4,8 @@ import json
 import os
 import stat
 import subprocess
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from nuvion_app.runtime.release_bom import (
     ReleaseBomValidationError,
     load_release_bom,
 )
+from nuvion_updater.health_attestation import CommitProcessIdentity
 from nuvion_updater.secure_io import read_fixed_regular_file
 from nuvion_updater.slots import SLOT_MARKER, ReleaseSlotManager
 from nuvion_updater.store import UpdateState
@@ -18,8 +21,9 @@ from nuvion_updater.trust import DeviceBinding
 
 AGENT_SERVICE = "nuv-agent.service"
 SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
 CURRENT_AGENT = "/usr/bin/nuv-agent"
-IQ9075_PROBE = "/usr/lib/nuvion-updater/test-iq9075.sh"
+IQ9075_PROBE = "/usr/lib/nuvion-updater/probe-iq9075-oak.sh"
 BASH = "/usr/bin/bash"
 RUNUSER = "/usr/sbin/runuser"
 PROC_ROOT = Path("/proc")
@@ -27,8 +31,12 @@ PROC_ROOT = Path("/proc")
 SYSTEMCTL_TIMEOUT_SECONDS = 30
 DOCTOR_TIMEOUT_SECONDS = 120
 IQ9075_PROBE_TIMEOUT_SECONDS = 300
+PROBE_UNIT_STOP_GRACE_SECONDS = 7.0
+PROBE_UNIT_STATUS_TIMEOUT_SECONDS = 5
 MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 64 * 1024
+MAX_PROC_STAT_BYTES = 16 * 1024
+MAX_BOOT_ID_BYTES = 128
 
 _COMMAND_ENV = {
     "LANG": "C",
@@ -101,14 +109,15 @@ class SystemdRuntime:
 
     def rollback_boot_health_check(self, expected_slot: str) -> tuple[bool, str]:
         try:
-            if self.slots.current_slot() != expected_slot:
-                raise RuntimeError("ROLLBACK_ACTIVE_SLOT_MISMATCH")
-            first_pid = self._main_pid()
-            active_slot = self._active_slot_from_environ(first_pid)
-            if self._main_pid() != first_pid:
-                raise RuntimeError("ROLLBACK_MAIN_PID_CHANGED")
-            if active_slot != expected_slot:
-                raise RuntimeError("ROLLBACK_ACTIVE_SLOT_ENV_MISMATCH")
+            self._validate_rollback_boot(expected_slot)
+            if self.binding.platform_profile == "iq9075_dev":
+                healthy, detail = self._iq9075_functional_check()
+                if not healthy:
+                    raise RuntimeError(detail)
+                # The physical probe deliberately stops and restarts the
+                # restored service. Rebind the result to the exact slot and
+                # process instance after that restart as well.
+                self._validate_rollback_boot(expected_slot)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return self._failed_check(self._reason(exc, "ROLLBACK_BOOT_FAILED"))
         return True, "ROLLBACK_BOOT_HEALTHY"
@@ -150,6 +159,37 @@ class SystemdRuntime:
             return self._failed_check(self._reason(exc, "FUNCTIONAL_HEALTH_FAILED"))
         return True, "FUNCTIONAL_HEALTHY"
 
+    def commit_process_identity(
+        self,
+        state: UpdateState,
+        peer_pid: int,
+    ) -> CommitProcessIdentity:
+        """Bind the Unix peer to the exact systemd candidate process instance."""
+
+        if isinstance(peer_pid, bool) or not isinstance(peer_pid, int) or peer_pid < 1:
+            raise RuntimeError("COMMIT_PEER_PID_UNAVAILABLE")
+        expected_slot = self._validate_staged_state(state)
+        first_main_pid = self._main_pid()
+        if first_main_pid != peer_pid:
+            raise RuntimeError("COMMIT_PEER_MAIN_PID_MISMATCH")
+        first_start_ticks = self._process_start_ticks(peer_pid)
+        active_slot = self._active_slot_from_environ(peer_pid)
+        boot_id = self._boot_id()
+        second_start_ticks = self._process_start_ticks(peer_pid)
+        second_main_pid = self._main_pid()
+        if second_main_pid != first_main_pid:
+            raise RuntimeError("COMMIT_MAIN_PID_CHANGED")
+        if second_start_ticks != first_start_ticks:
+            raise RuntimeError("COMMIT_PROCESS_INSTANCE_CHANGED")
+        if self.slots.current_slot() != expected_slot or active_slot != expected_slot:
+            raise RuntimeError("COMMIT_ACTIVE_SLOT_MISMATCH")
+        return CommitProcessIdentity(
+            pid=peer_pid,
+            start_ticks=first_start_ticks,
+            boot_id=boot_id,
+            active_slot=expected_slot,
+        )
+
     def _iq9075_functional_check(self) -> tuple[bool, str]:
         try:
             self._validate_fixed_probe()
@@ -159,8 +199,8 @@ class SystemdRuntime:
             )
             if stop_result.returncode != 0:
                 raise RuntimeError("FUNCTIONAL_SERVICE_STOP_FAILED")
-            probe_result = self._run(
-                (BASH, IQ9075_PROBE, "--camera", "oak"),
+            probe_result = self._run_probe_control_group(
+                (BASH, IQ9075_PROBE),
                 timeout=IQ9075_PROBE_TIMEOUT_SECONDS,
             )
             if probe_result.returncode != 0:
@@ -179,6 +219,15 @@ class SystemdRuntime:
         return True, "FUNCTIONAL_HEALTHY"
 
     def _reset_agent_start_limit(self) -> None:
+        # reset-failed returns an error for a clean inactive/not-yet-loaded
+        # unit on IQ9075 even though a subsequent start succeeds. Query the
+        # predicate first and reset only an actual failed unit.
+        failed_state = self._run(
+            (SYSTEMCTL, "is-failed", "--quiet", AGENT_SERVICE),
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+        )
+        if failed_state.returncode != 0:
+            return
         result = self._run(
             (SYSTEMCTL, "reset-failed", AGENT_SERVICE),
             timeout=SYSTEMCTL_TIMEOUT_SECONDS,
@@ -186,6 +235,16 @@ class SystemdRuntime:
         if result.returncode != 0:
             self._stop_after_failure()
             raise RuntimeError("SYSTEMD_RESET_FAILED")
+
+    def _validate_rollback_boot(self, expected_slot: str) -> None:
+        if self.slots.current_slot() != expected_slot:
+            raise RuntimeError("ROLLBACK_ACTIVE_SLOT_MISMATCH")
+        first_pid = self._main_pid()
+        active_slot = self._active_slot_from_environ(first_pid)
+        if self._main_pid() != first_pid:
+            raise RuntimeError("ROLLBACK_MAIN_PID_CHANGED")
+        if active_slot != expected_slot:
+            raise RuntimeError("ROLLBACK_ACTIVE_SLOT_ENV_MISMATCH")
 
     def _validate_staged_state(self, state: UpdateState) -> str:
         if state.candidate_slot is None:
@@ -289,6 +348,78 @@ class SystemdRuntime:
             raise RuntimeError("BOOT_ACTIVE_SLOT_ENV_MISMATCH")
         return value
 
+    @staticmethod
+    def _process_start_ticks(pid: int) -> int:
+        raw = SystemdRuntime._read_proc_file(
+            PROC_ROOT / str(pid) / "stat",
+            max_bytes=MAX_PROC_STAT_BYTES,
+            error="COMMIT_PROCESS_STAT_INVALID",
+        )
+        try:
+            text = raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID") from exc
+        prefix = f"{pid} ("
+        closing = text.rfind(") ")
+        if not text.startswith(prefix) or closing < len(prefix):
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        fields_from_state = text[closing + 2 :].split()
+        # /proc/<pid>/stat field 3 is the first token after comm; starttime is
+        # field 22, therefore token index 19 in this suffix.
+        if len(fields_from_state) <= 19:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        raw_ticks = fields_from_state[19]
+        if not raw_ticks.isascii() or not raw_ticks.isdecimal():
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        ticks = int(raw_ticks, 10)
+        if ticks < 1:
+            raise RuntimeError("COMMIT_PROCESS_STAT_INVALID")
+        return ticks
+
+    @staticmethod
+    def _boot_id() -> str:
+        raw = SystemdRuntime._read_proc_file(
+            PROC_ROOT / "sys" / "kernel" / "random" / "boot_id",
+            max_bytes=MAX_BOOT_ID_BYTES,
+            error="COMMIT_BOOT_ID_INVALID",
+        )
+        try:
+            value = raw.decode("ascii").strip()
+            normalized = str(uuid.UUID(value))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("COMMIT_BOOT_ID_INVALID") from exc
+        if normalized != value:
+            raise RuntimeError("COMMIT_BOOT_ID_INVALID")
+        return value
+
+    @staticmethod
+    def _read_proc_file(path: Path, *, max_bytes: int, error: str) -> bytes:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as exc:
+            raise RuntimeError(error) from exc
+        try:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(4096, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError(error)
+            return b"".join(chunks)
+        except OSError as exc:
+            raise RuntimeError(error) from exc
+        finally:
+            os.close(descriptor)
+
     def _validate_fixed_probe(self) -> None:
         probe = Path(IQ9075_PROBE)
         parent_metadata = probe.parent.lstat()
@@ -372,3 +503,132 @@ class SystemdRuntime:
             cwd="/",
             env=_COMMAND_ENV,
         )
+
+    @classmethod
+    def _probe_unit_active(
+        cls,
+        unit: str,
+    ) -> bool:
+        result = cls._run(
+            (SYSTEMCTL, "--no-ask-password", "is-active", unit),
+            timeout=PROBE_UNIT_STATUS_TIMEOUT_SECONDS,
+        )
+        state = result.stdout.strip()
+        if state in {"active", "activating", "deactivating", "reloading"}:
+            return True
+        if state in {"inactive", "failed", "unknown"}:
+            return False
+        if not state and result.returncode in {3, 4}:
+            # A collected transient unit is no longer addressable.
+            return False
+        raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_STATUS_UNVERIFIED")
+
+    @classmethod
+    def _terminate_probe_unit(
+        cls,
+        unit: str,
+    ) -> bool:
+        # setpgid()/setsid() can escape a POSIX process group but cannot leave
+        # this systemd-owned cgroup. KillMode=control-group plus an explicit
+        # all-process SIGKILL therefore bounds every nested timeout/runuser/OAK
+        # descendant, including a child that ignores SIGTERM.
+        for argv in (
+            (
+                SYSTEMCTL,
+                "--no-ask-password",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                unit,
+            ),
+            (SYSTEMCTL, "--no-ask-password", "stop", unit),
+        ):
+            try:
+                cls._run(argv, timeout=SYSTEMCTL_TIMEOUT_SECONDS)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        deadline = time.monotonic() + PROBE_UNIT_STOP_GRACE_SECONDS
+        while True:
+            try:
+                active = cls._probe_unit_active(unit)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                active = True
+            if not active:
+                try:
+                    cls._run(
+                        (SYSTEMCTL, "--no-ask-password", "reset-failed", unit),
+                        timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    @classmethod
+    def _run_probe_control_group(
+        cls,
+        argv: tuple[str, ...],
+        *,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int)
+            or not 1 <= timeout <= IQ9075_PROBE_TIMEOUT_SECONDS
+            or not argv
+            or any(not isinstance(value, str) or not value for value in argv)
+        ):
+            raise ValueError("invalid bounded IQ9075 probe invocation")
+        unit = f"nuvion-iq9075-probe-{uuid.uuid4().hex}.service"
+        command = (
+            SYSTEMD_RUN,
+            f"--unit={unit}",
+            "--collect",
+            "--wait",
+            "--quiet",
+            "--no-ask-password",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            f"--property=RuntimeMaxSec={timeout}s",
+            "--property=TimeoutStopSec=5s",
+            "--property=SendSIGKILL=yes",
+            # The compatibility probe reads one OAK frame and never loads an
+            # inference model. Keep it in a separate, bounded cgroup so a
+            # native-driver regression cannot exhaust unified device memory.
+            "--property=MemoryHigh=1G",
+            "--property=MemoryMax=2G",
+            "--property=MemorySwapMax=0",
+            "--property=OOMPolicy=stop",
+            "--property=StandardInput=null",
+            "--property=StandardOutput=null",
+            "--property=StandardError=null",
+            "--property=WorkingDirectory=/",
+            "--setenv=LANG=C",
+            "--setenv=LC_ALL=C",
+            "--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--setenv=NUV_AGENT_CONFIG=/etc/nuv-agent/agent.env",
+            "--",
+            *argv,
+        )
+        try:
+            result = cls._run(
+                command,
+                timeout=timeout + SYSTEMCTL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if not cls._terminate_probe_unit(unit):
+                raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED") from exc
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_TIMEOUT") from exc
+        try:
+            active = cls._probe_unit_active(unit)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            cls._terminate_probe_unit(unit)
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED") from exc
+        if active:
+            cls._terminate_probe_unit(unit)
+            raise RuntimeError("FUNCTIONAL_IQ9075_PROBE_ORPHANED")
+        return subprocess.CompletedProcess(argv, result.returncode, "", "")

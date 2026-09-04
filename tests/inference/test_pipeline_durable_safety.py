@@ -25,6 +25,7 @@ def _install_gi_stub_when_native_bindings_are_unavailable() -> None:
     gi.require_version = lambda *_args, **_kwargs: None
     repository = types.ModuleType("gi.repository")
     repository.GLib = types.SimpleNamespace()
+    repository.GLibUnix = types.SimpleNamespace()
     repository.Gst = types.SimpleNamespace(
         Pipeline=object,
         Element=object,
@@ -64,6 +65,486 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_update_commit_readiness_uses_live_pipeline_stomp_rtp_and_outboxes(self) -> None:
+        class _Controller:
+            @staticmethod
+            def runtime_health_snapshot() -> dict[str, object]:
+                return {
+                    "hasPipeline": True,
+                    "sessionId": "canary-session",
+                    "generation": 4,
+                    "connectionState": "connected",
+                    "iceConnectionState": "completed",
+                    "connectedSince": 100.0,
+                    "iceConnectedSince": 100.0,
+                    "outboundProgressSamples": 3,
+                    "lastOutboundProgressAt": 128.0,
+                }
+
+        app = types.SimpleNamespace(
+            pipeline=object(),
+            user_data=types.SimpleNamespace(
+                running=True,
+                last_frame_monotonic=129.0,
+            ),
+            webrtc_uplink=_Controller(),
+        )
+        event_health = {
+            "capacityState": "HEALTHY",
+            "blockedRows": 0,
+            "unsavedCriticalEvents": 0,
+            "safetyStop": False,
+            "protocolStop": False,
+        }
+        command_health = {
+            "capacityState": "HEALTHY",
+            "dlqBlockedRows": 0,
+            "retentionPressure": False,
+        }
+        with (
+            mock.patch.object(pipeline, "g_app", app),
+            mock.patch.object(
+                pipeline,
+                "update_commit_signaling_ready_since",
+                100.0,
+            ),
+            mock.patch.object(
+                pipeline,
+                "update_commit_stomp_last_send_at",
+                125.0,
+            ),
+            mock.patch.object(pipeline, "agent_uplink_blocked", False),
+            mock.patch.object(
+                pipeline,
+                "build_event_outbox_runtime_health",
+                return_value=event_health,
+            ),
+            mock.patch.object(
+                pipeline,
+                "build_command_observation_runtime_health",
+                return_value=command_health,
+            ),
+            mock.patch.object(pipeline.time, "monotonic", return_value=130.0),
+        ):
+            readiness = pipeline.build_update_commit_readiness()
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["webrtcSessionId"], "canary-session")
+
+    def test_stomp_send_evidence_belongs_to_current_connection(self) -> None:
+        with mock.patch.object(
+            pipeline.time,
+            "monotonic",
+            side_effect=(100.0, 105.0, 110.0),
+        ):
+            pipeline._set_update_commit_signaling_ready(True)
+            pipeline._mark_update_commit_stomp_send()
+            self.assertEqual(pipeline.update_commit_signaling_ready_since, 100.0)
+            self.assertEqual(pipeline.update_commit_stomp_last_send_at, 105.0)
+            pipeline._set_update_commit_signaling_ready(False)
+
+        self.assertIsNone(pipeline.update_commit_signaling_ready_since)
+        self.assertIsNone(pipeline.update_commit_stomp_last_send_at)
+
+    def test_signaling_reset_purges_only_volatile_webrtc_transport_state(self) -> None:
+        async def scenario() -> None:
+            token = pipeline.WebRTCSignalingToken(7, "session-old")
+            pending: asyncio.Queue[pipeline._OutboundMessage] = asyncio.Queue()
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    {"sessionId": "session-old"},
+                    signaling_token=token,
+                )
+            )
+            durable = pipeline._OutboundMessage(
+                "/app/device/state",
+                {"state": "RUNNING"},
+                event_id="durable-event-1",
+            )
+            pending.put_nowait(durable)
+            retry = asyncio.create_task(asyncio.sleep(60))
+            controller = types.SimpleNamespace(
+                reset_count=0,
+                on_signaling_reset=lambda: setattr(
+                    controller, "reset_count", controller.reset_count + 1
+                ),
+            )
+            with (
+                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(pipeline, "outbound_queue", pending),
+                mock.patch.object(pipeline, "last_sent_payloads", {}),
+                mock.patch.object(
+                    pipeline,
+                    "webrtc_retry_tasks",
+                    {
+                        pipeline._agent_retry_key(
+                            pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                            token,
+                        ): retry
+                    },
+                ),
+            ):
+                pipeline._remember_last_payload(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    {"sessionId": "session-old"},
+                    token,
+                )
+                pipeline._remember_last_payload(
+                    "/app/device/state",
+                    {"state": "RUNNING"},
+                )
+
+                pipeline._reset_webrtc_signaling_transport()
+                await asyncio.sleep(0)
+
+                self.assertEqual(controller.reset_count, 1)
+                self.assertTrue(retry.cancelled())
+                self.assertNotIn(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    pipeline.last_sent_payloads,
+                )
+                self.assertIn("/app/device/state", pipeline.last_sent_payloads)
+                self.assertIs(pending.get_nowait(), durable)
+                self.assertTrue(pending.empty())
+
+        asyncio.run(scenario())
+
+    def test_unscoped_webrtc_signaling_cannot_bypass_generation_validation(self) -> None:
+        self.assertFalse(
+            pipeline.enqueue_stomp_message(
+                pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                {"sessionId": "unscoped"},
+            )
+        )
+
+    def test_correlated_terminal_offer_rejection_disposes_exact_session(self) -> None:
+        token = pipeline.WebRTCSignalingToken(7, "session-current")
+        controller = mock.Mock()
+        controller.reject_signaling.return_value = True
+        cached = {
+            pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
+                {"sessionId": "session-current"},
+                token,
+            )
+        }
+        body = json.dumps(
+            {
+                "path": pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                "sessionId": "session-current",
+                "status": 400,
+                "retryable": False,
+                "code": "WEBRTC_OFFER_REJECTED",
+            }
+        )
+
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", cached),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", {}),
+        ):
+            asyncio.run(pipeline.handle_agent_error(body))
+
+        controller.reject_signaling.assert_called_once_with(
+            token,
+            reason="non-retryable server rejection: WEBRTC_OFFER_REJECTED status=400",
+        )
+        self.assertEqual(cached, {})
+
+    def test_uncorrelated_or_stale_offer_rejection_waits_for_exact_watchdog(self) -> None:
+        token = pipeline.WebRTCSignalingToken(9, "session-current")
+        controller = mock.Mock()
+        cached = {
+            pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
+                {"sessionId": "session-current"},
+                token,
+            )
+        }
+        base = {
+            "path": pipeline.WEBRTC_UPLINK_OFFER_DEST,
+            "status": 400,
+            "retryable": False,
+            "code": "WEBRTC_OFFER_REJECTED",
+        }
+
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", cached),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", {}),
+        ):
+            asyncio.run(pipeline.handle_agent_error(json.dumps(base)))
+            asyncio.run(
+                pipeline.handle_agent_error(
+                    json.dumps({**base, "sessionId": "session-stale"})
+                )
+            )
+
+        controller.reject_signaling.assert_not_called()
+        self.assertIn(pipeline.WEBRTC_UPLINK_OFFER_DEST, cached)
+
+    def test_stale_retryable_webrtc_errors_cannot_exhaust_new_session_budget(self) -> None:
+        async def scenario() -> None:
+            current = pipeline.WebRTCSignalingToken(10, "session-new")
+            controller = mock.Mock()
+            controller.is_signaling_token_current.side_effect = (
+                lambda token: token == current
+            )
+            cached = {
+                pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
+                    {"sessionId": "session-new", "sdp": "v=0\r\n"},
+                    current,
+                )
+            }
+            retry_started = asyncio.Event()
+            release_retry = asyncio.Event()
+
+            async def pending_retry(*_args: object, **_kwargs: object) -> None:
+                retry_started.set()
+                await release_retry.wait()
+
+            error = {
+                "path": pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                "status": 503,
+                "retryable": True,
+                "code": "WEBRTC_OFFER_TEMPORARY_FAILURE",
+            }
+            attempts: dict[pipeline._AgentRetryKey, int] = {}
+            tasks: dict[
+                pipeline._AgentRetryKey,
+                asyncio.Task[None],
+            ] = {}
+            with (
+                mock.patch.object(
+                    pipeline,
+                    "g_app",
+                    types.SimpleNamespace(webrtc_uplink=controller),
+                ),
+                mock.patch.object(pipeline, "last_sent_payloads", cached),
+                mock.patch.object(pipeline, "agent_retry_attempts", attempts),
+                mock.patch.object(pipeline, "webrtc_retry_tasks", tasks),
+                mock.patch.object(
+                    pipeline,
+                    "_enqueue_retry_after_delay",
+                    side_effect=pending_retry,
+                ),
+            ):
+                for _ in range(pipeline.AGENT_ERROR_MAX_RETRIES + 1):
+                    await pipeline.handle_agent_error(
+                        json.dumps({**error, "sessionId": "session-old"})
+                    )
+
+                self.assertEqual(attempts, {})
+                self.assertEqual(tasks, {})
+                controller.reject_signaling.assert_not_called()
+
+                await pipeline.handle_agent_error(
+                    json.dumps({**error, "sessionId": "session-new"})
+                )
+                await asyncio.wait_for(retry_started.wait(), timeout=1)
+
+                current_key = pipeline._agent_retry_key(
+                    pipeline.WEBRTC_UPLINK_OFFER_DEST,
+                    current,
+                )
+                self.assertEqual(attempts, {current_key: 1})
+                self.assertEqual(tuple(tasks), (current_key,))
+                first_retry = tasks[current_key]
+                for _ in range(pipeline.AGENT_ERROR_MAX_RETRIES + 1):
+                    await pipeline.handle_agent_error(
+                        json.dumps({**error, "sessionId": "session-new"})
+                    )
+                self.assertEqual(attempts, {current_key: 1})
+                self.assertIs(tasks[current_key], first_retry)
+                controller.reject_signaling.assert_not_called()
+                release_retry.set()
+                await asyncio.gather(*tasks.values())
+
+        asyncio.run(scenario())
+
+    def test_uncached_webrtc_auth_rejection_blocks_transport_and_tears_down(self) -> None:
+        controller = mock.Mock()
+        attempts = {
+            pipeline._agent_retry_key(
+                pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                pipeline.WebRTCSignalingToken(4, "session-old"),
+            ): 2
+        }
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", {}),
+            mock.patch.object(pipeline, "agent_retry_attempts", attempts),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", {}),
+            mock.patch.object(pipeline, "agent_uplink_blocked", False),
+            mock.patch.object(pipeline, "agent_uplink_block_reason", ""),
+        ):
+            asyncio.run(
+                pipeline.handle_agent_error(
+                    json.dumps(
+                        {
+                            "path": pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                            "status": 403,
+                            "retryable": False,
+                            "code": "FORBIDDEN",
+                            "message": "token rejected",
+                        }
+                    )
+                )
+            )
+
+            self.assertTrue(pipeline.agent_uplink_blocked)
+            self.assertEqual(pipeline.agent_uplink_block_reason, "FORBIDDEN token rejected")
+            self.assertEqual(attempts, {})
+            controller.on_signaling_reset.assert_called_once_with()
+
+    def test_exact_uncached_candidate_rejection_disposes_current_generation(self) -> None:
+        token = pipeline.WebRTCSignalingToken(12, "session-current")
+        controller = mock.Mock()
+        controller.signaling_token_for_session.return_value = token
+        controller.is_signaling_token_current.side_effect = lambda value: value == token
+        controller.reject_signaling.return_value = True
+        body = json.dumps(
+            {
+                "path": pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                "sessionId": "session-current",
+                "status": 429,
+                "retryable": True,
+                "code": "WEBRTC_SIGNALING_CAPACITY",
+            }
+        )
+
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", {}),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", {}),
+        ):
+            asyncio.run(pipeline.handle_agent_error(body))
+
+        controller.signaling_token_for_session.assert_called_once_with(
+            "session-current",
+            terminal=False,
+        )
+        controller.reject_signaling.assert_called_once_with(
+            token,
+            reason="signaling frame rejected: WEBRTC_SIGNALING_CAPACITY status=429",
+        )
+
+    def test_stale_uncached_candidate_rejection_cannot_dispose_current_session(self) -> None:
+        controller = mock.Mock()
+        controller.signaling_token_for_session.return_value = None
+        with (
+            mock.patch.object(
+                pipeline,
+                "g_app",
+                types.SimpleNamespace(webrtc_uplink=controller),
+            ),
+            mock.patch.object(pipeline, "last_sent_payloads", {}),
+            mock.patch.object(pipeline, "agent_retry_attempts", {}),
+            mock.patch.object(pipeline, "webrtc_retry_tasks", {}),
+        ):
+            asyncio.run(
+                pipeline.handle_agent_error(
+                    json.dumps(
+                        {
+                            "path": pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                            "sessionId": "session-stale",
+                            "status": 400,
+                            "retryable": False,
+                            "code": "INVALID_ICE",
+                        }
+                    )
+                )
+            )
+
+        controller.reject_signaling.assert_not_called()
+
+    def test_outbound_sender_revalidates_token_without_dropping_durable_event(self) -> None:
+        async def scenario() -> None:
+            stale = pipeline.WebRTCSignalingToken(3, "session-old")
+            pending: asyncio.Queue[pipeline._OutboundMessage] = asyncio.Queue()
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    pipeline.WEBRTC_UPLINK_ICE_CANDIDATE_DEST,
+                    {"sessionId": "session-old"},
+                    signaling_token=stale,
+                )
+            )
+            pending.put_nowait(
+                pipeline._OutboundMessage(
+                    "/app/device/state",
+                    {"state": "RUNNING"},
+                    event_id="durable-event-1",
+                )
+            )
+            sent = asyncio.Event()
+
+            class _WebSocket:
+                def __init__(self) -> None:
+                    self.frames: list[str] = []
+
+                async def send(self, frame: str) -> None:
+                    self.frames.append(frame)
+                    sent.set()
+
+            class _Outbox:
+                @staticmethod
+                def is_pending(_event_id: str) -> bool:
+                    return True
+
+            class _Delivery:
+                outbox = _Outbox()
+
+                def __init__(self) -> None:
+                    self.marked: list[str] = []
+
+                def mark_sent(self, event_id: str) -> None:
+                    self.marked.append(event_id)
+
+                @staticmethod
+                def release(_event_id: str) -> None:
+                    return None
+
+            delivery = _Delivery()
+            controller = types.SimpleNamespace(
+                is_signaling_token_current=lambda _token: False
+            )
+            websocket = _WebSocket()
+            with (
+                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(pipeline, "outbound_queue", pending),
+                mock.patch.object(pipeline, "critical_event_delivery", delivery),
+            ):
+                sender = asyncio.create_task(pipeline.outbound_sender(websocket))
+                await asyncio.wait_for(sent.wait(), timeout=1)
+                sender.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await sender
+
+            self.assertEqual(len(websocket.frames), 1)
+            self.assertIn("/app/device/state", websocket.frames[0])
+            self.assertNotIn("session-old", websocket.frames[0])
+            self.assertEqual(delivery.marked, ["durable-event-1"])
+
+        asyncio.run(scenario())
+
     def test_config_label_array_storage_round_trips_without_csv_loss(self) -> None:
         labels = ["scratch,edge", "한글 label"]
         encoded = config_env_updates(
@@ -86,14 +567,20 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         )
 
         self.assertIn("tee name=stream_split", description)
+        self.assertIn(
+            "tee name=webrtc_uplink_tee allow-not-linked=true",
+            description,
+        )
+        self.assertNotIn("webrtcbin", description)
         self.assertEqual(description.count("x264enc"), 2)
         self.assertIn("x264enc name=video_encoder", description)
         self.assertIn("name=video_encoder tune=zerolatency speed-preset=faster bitrate=1750", description)
         self.assertIn("x264enc name=clip_encoder", description)
+        self.assertEqual(description.count("level=(string)3.1"), 2)
+        self.assertEqual(description.count("max-size-buffers=2"), 2)
+        self.assertEqual(description.count("leaky=downstream"), 2)
         self.assertLess(
-            description.index("stream_split. ! queue ! x264enc")
-            if "stream_split. ! queue ! x264enc" in description
-            else description.index("name=video_encoder"),
+            description.index("name=video_encoder"),
             description.index("name=clip_encoder"),
         )
 
@@ -257,6 +744,88 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(len(callbacks), 1)
         callbacks[0]()
         self.assertEqual(shutdown_calls, ["shutdown"])
+
+    def test_sigterm_quits_main_loop_and_runs_graceful_shutdown(self) -> None:
+        class _SignalSource:
+            def __init__(self) -> None:
+                self.callback = None
+                self.context = None
+                self.destroy_calls = 0
+
+            def set_callback(self, callback) -> None:
+                self.callback = callback
+
+            def attach(self, context) -> int:
+                self.context = context
+                return 7
+
+            def destroy(self) -> None:
+                self.destroy_calls += 1
+
+        class _Loop:
+            def __init__(self) -> None:
+                self.running = True
+                self.quit_calls = 0
+
+            def run(self) -> None:
+                self.running = True
+                self.source_callback_result = source.callback()
+
+            def is_running(self) -> bool:
+                return self.running
+
+            def quit(self) -> None:
+                self.quit_calls += 1
+                self.running = False
+
+            def get_context(self):
+                return context
+
+        success = object()
+        failure = object()
+        context = object()
+        source = _SignalSource()
+        loop = _Loop()
+        app = object.__new__(pipeline.GStreamerInferenceApp)
+        app.pipeline = types.SimpleNamespace(set_state=lambda _state: success)
+        app.depthai_bridge = None
+        app.loop = loop
+        app.shutdown = mock.Mock()
+
+        with (
+            mock.patch.object(pipeline, "LOCAL_DISPLAY", False),
+            mock.patch.object(
+                pipeline.GLibUnix,
+                "signal_source_new",
+                return_value=source,
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.Gst,
+                "State",
+                types.SimpleNamespace(PLAYING=object()),
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.Gst,
+                "StateChangeReturn",
+                types.SimpleNamespace(FAILURE=failure),
+                create=True,
+            ),
+            mock.patch.object(
+                pipeline.threading,
+                "Thread",
+                return_value=types.SimpleNamespace(start=lambda: None),
+            ),
+            mock.patch.object(pipeline, "get_device_state_coordinator"),
+        ):
+            app.run()
+
+        self.assertEqual(loop.quit_calls, 1)
+        self.assertTrue(loop.source_callback_result)
+        self.assertIs(source.context, context)
+        self.assertEqual(source.destroy_calls, 1)
+        app.shutdown.assert_called_once_with()
 
     def test_unavailable_outbox_retains_anomaly_in_gate_and_enters_stop(self) -> None:
         gate = CriticalEventSafetyGate(max_attempts=1, retry_delay_seconds=0)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PKG_NAME="nuv-agent"
-VERSION="${VERSION:-0.1.120}"
+VERSION="${VERSION:-0.1.121}"
 ARCH="${ARCH:-arm64}"
 BUILD_ROOT="${BUILD_ROOT:-}"
 SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-}"
@@ -82,7 +82,9 @@ PKG_DIR="$BUILD_ROOT/${PKG_NAME}_${VERSION}_${ARCH}"
 mkdir -p "$PKG_DIR/DEBIAN" \
          "$PKG_DIR/opt/nuv-agent" \
          "$PKG_DIR/usr/bin" \
+         "$PKG_DIR/usr/local/libexec/nuvion" \
          "$PKG_DIR/usr/lib/udev/rules.d" \
+         "$PKG_DIR/usr/lib/tmpfiles.d" \
          "$PKG_DIR/lib/systemd/system" \
          "$PKG_DIR/etc/nuv-agent" \
          "$PKG_DIR/etc/nuvion-updater" \
@@ -101,11 +103,13 @@ Description: Nuvion on-device agent
 CONTROL
 
 cp "$ROOT_DIR/packaging/deb/postinst" "$PKG_DIR/DEBIAN/postinst"
+cp "$ROOT_DIR/packaging/deb/preinst" "$PKG_DIR/DEBIAN/preinst"
 cp "$ROOT_DIR/packaging/deb/prerm" "$PKG_DIR/DEBIAN/prerm"
 cp "$ROOT_DIR/packaging/deb/postrm" "$PKG_DIR/DEBIAN/postrm"
 cp "$ROOT_DIR/packaging/deb/conffiles" "$PKG_DIR/DEBIAN/conffiles"
 chmod 0755 \
   "$PKG_DIR/DEBIAN/postinst" \
+  "$PKG_DIR/DEBIAN/preinst" \
   "$PKG_DIR/DEBIAN/prerm" \
   "$PKG_DIR/DEBIAN/postrm"
 chmod 0644 "$PKG_DIR/DEBIAN/conffiles"
@@ -122,6 +126,12 @@ find "$PKG_DIR/usr/lib/nuvion-updater" -depth -type d \
 install -m 0755 \
   "$ROOT_DIR/packaging/dev/test-iq9075.sh" \
   "$PKG_DIR/usr/lib/nuvion-updater/test-iq9075.sh"
+install -m 0755 \
+  "$ROOT_DIR/packaging/dev/probe-iq9075-oak.sh" \
+  "$PKG_DIR/usr/lib/nuvion-updater/probe-iq9075-oak.sh"
+install -m 0755 \
+  "$ROOT_DIR/packaging/dev/iq9075-board-e2e.py" \
+  "$PKG_DIR/usr/local/libexec/nuvion/iq9075-board-e2e.py"
 
 cp "$ROOT_DIR/nuvion_app/config_template.env" "$PKG_DIR/opt/nuv-agent/share/agent.env.example"
 bundle_path="${BOOTSTRAP_BUNDLE_PATH:-}"
@@ -153,9 +163,13 @@ install -m 0755 \
 install -m 0644 \
   "$ROOT_DIR/packaging/udev/80-movidius.rules" \
   "$PKG_DIR/usr/lib/udev/rules.d/80-movidius.rules"
+install -m 0644 \
+  "$ROOT_DIR/packaging/tmpfiles/nuvion-updater.conf" \
+  "$PKG_DIR/usr/lib/tmpfiles.d/nuvion-updater.conf"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent.service" "$PKG_DIR/lib/systemd/system/nuv-agent.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.service" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.service"
 cp "$ROOT_DIR/packaging/systemd/nuv-agent-updater.socket" "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket"
+cp "$ROOT_DIR/packaging/systemd/nuvion-fleet-e2e-reconcile.service" "$PKG_DIR/lib/systemd/system/nuvion-fleet-e2e-reconcile.service"
 install -m 0644 \
   "$ROOT_DIR/packaging/systemd/updater.env.example" \
   "$PKG_DIR/etc/nuvion-updater/updater.env"
@@ -167,7 +181,8 @@ install -m 0755 \
 chmod 0644 \
   "$PKG_DIR/lib/systemd/system/nuv-agent.service" \
   "$PKG_DIR/lib/systemd/system/nuv-agent-updater.service" \
-  "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket"
+  "$PKG_DIR/lib/systemd/system/nuv-agent-updater.socket" \
+  "$PKG_DIR/lib/systemd/system/nuvion-fleet-e2e-reconcile.service"
 
 OUTPUT_DEB="${OUTPUT_DEB:-${ROOT_DIR}/dist/${PKG_NAME}_${VERSION}_${ARCH}.deb}"
 mkdir -p "$(dirname "$OUTPUT_DEB")"
