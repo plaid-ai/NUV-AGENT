@@ -15,15 +15,16 @@ import sys
 import tempfile
 import unittest
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
+from nuvion_app.runtime import stable_file as STABLE_FILE
 from nuvion_app.runtime.release_bom import (
     ReleaseTarget,
     build_release_bom_v2_payload,
     canonical_release_bom_json,
 )
-from nuvion_app.runtime import stable_file as STABLE_FILE
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,9 +38,7 @@ def load_script(name: str, relative: str):
     return module
 
 
-PUBLISHER_TRUST = load_script(
-    "publisher_trust", "packaging/release/publisher_trust.py"
-)
+PUBLISHER_TRUST = load_script("publisher_trust", "packaging/release/publisher_trust.py")
 VERIFY_SOURCE = load_script(
     "verify_release_source", "packaging/release/verify-release-source.py"
 )
@@ -171,9 +170,7 @@ def candidate_execution_proof(run_id: str) -> dict[str, object]:
                 "stableScans": 2,
             },
         },
-        "systemdProperties": dict(
-            FLEET_E2E.CANDIDATE_SYSTEMD_EXPECTED_PROPERTIES
-        ),
+        "systemdProperties": dict(FLEET_E2E.CANDIDATE_SYSTEMD_EXPECTED_PROPERTIES),
         "mountSandbox": {
             "temporaryFilesystems": temporary,
             "readOnlyPaths": {
@@ -198,12 +195,8 @@ def candidate_execution_proof(run_id: str) -> dict[str, object]:
                 }
                 for index, path in enumerate(FLEET_E2E.CANDIDATE_INACCESSIBLE_PATHS)
             },
-            "totalTmpfsBytes": sum(
-                item["sizeBytes"] for item in temporary.values()
-            ),
-            "totalTmpfsInodes": sum(
-                item["inodeLimit"] for item in temporary.values()
-            ),
+            "totalTmpfsBytes": sum(item["sizeBytes"] for item in temporary.values()),
+            "totalTmpfsInodes": sum(item["inodeLimit"] for item in temporary.values()),
         },
     }
 
@@ -315,7 +308,9 @@ def production_restoration_evidence(
         "schemaVersion": 1,
         "transactionPhase": "RESTORED",
         "manifestSha256": hashlib.sha256(
-            (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
         ).hexdigest(),
         "files": {
             path: {
@@ -348,15 +343,15 @@ def production_restoration_evidence(
 
 class ReleaseSecurityWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.publish = (
-            ROOT / ".github/workflows/release-publish.yml"
-        ).read_text(encoding="utf-8")
-        self.request = (
-            ROOT / ".github/workflows/release-request.yml"
-        ).read_text(encoding="utf-8")
-        self.face = (
-            ROOT / ".github/workflows/publish-face-artifacts.yml"
-        ).read_text(encoding="utf-8")
+        self.publish = (ROOT / ".github/workflows/release-publish.yml").read_text(
+            encoding="utf-8"
+        )
+        self.request = (ROOT / ".github/workflows/release-request.yml").read_text(
+            encoding="utf-8"
+        )
+        self.face = (ROOT / ".github/workflows/publish-face-artifacts.yml").read_text(
+            encoding="utf-8"
+        )
 
     def test_fleet_validators_execute_verified_bytes_not_reopened_paths(
         self,
@@ -386,10 +381,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
     def _job(self, name: str) -> str:
         start = self.publish.index(f"  {name}:")
-        following = re.search(r"^  [a-z0-9-]+:\s*$", self.publish[start + 1 :], re.MULTILINE)
-        return self.publish[start:] if following is None else self.publish[
-            start : start + 1 + following.start()
-        ]
+        following = re.search(
+            r"^  [a-z0-9-]+:\s*$", self.publish[start + 1 :], re.MULTILINE
+        )
+        return (
+            self.publish[start:]
+            if following is None
+            else self.publish[start : start + 1 + following.start()]
+        )
 
     def _steps(self, section: str) -> list[str]:
         return re.split(r"^      - name: ", section, flags=re.MULTILINE)[1:]
@@ -413,9 +412,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("verify-release-settings-attestation.py", previous)
         self.assertIn("--publisher-root publisher", previous)
         if require_live_authorization:
-            self.assertIn(
-                "revalidate-live-release-authorization.sh", previous
-            )
+            self.assertIn("revalidate-live-release-authorization.sh", previous)
 
     @staticmethod
     def _physical_fixture(
@@ -427,9 +424,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         manifest_path = root / "iq9075-v0.1.121-harness-manifest.json"
         result_path = root / "iq9075-v0.1.121-harness-result.json"
         oak_soak_path = root / "iq9075-v0.1.121-oak-soak-result.json"
-        artifact_path = (
-            root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
-        )
+        artifact_path = root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
         artifact_path.write_bytes(b"exact deterministic candidate bundle")
         artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         bom_path = root / "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json"
@@ -494,17 +489,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             scenario_type="oak-fault-rollback",
             expected_command_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             expected_bom_digest=bom["bomDigest"],
-            expected_candidate_slot=(
-                "/opt/nuv-agent/releases/" + bom["bomDigest"][7:]
-            ),
+            expected_candidate_slot=("/opt/nuv-agent/releases/" + bom["bomDigest"][7:]),
             expected_previous_slot="releases/" + baseline_digest,
             expected_previous_version="0.1.120",
             hold_seconds=10,
             release=fleet_release,
         )
         fleet_manifest_path.write_text(
-            json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":"))
-            + "\n",
+            json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         candidate_relative = "releases/" + bom["bomDigest"][7:]
@@ -611,8 +603,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             },
         }
         fleet_evidence_path.write_text(
-            json.dumps(fleet_evidence, sort_keys=True, separators=(",", ":"))
-            + "\n",
+            json.dumps(fleet_evidence, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
         manifest = {
@@ -622,20 +613,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "agentVersion": "0.1.121",
             "componentSha": component_sha,
             "harnessSha256": hashlib.sha256(harness.read_bytes()).hexdigest(),
-            "fleetRunnerSha256": hashlib.sha256(
-                fleet_runner.read_bytes()
-            ).hexdigest(),
+            "fleetRunnerSha256": hashlib.sha256(fleet_runner.read_bytes()).hexdigest(),
             "fleetManifest": {
                 "file": fleet_manifest_path.name,
-                "sha256": hashlib.sha256(
-                    fleet_manifest_path.read_bytes()
-                ).hexdigest(),
+                "sha256": hashlib.sha256(fleet_manifest_path.read_bytes()).hexdigest(),
             },
             "fleetEvidence": {
                 "file": fleet_evidence_path.name,
-                "sha256": hashlib.sha256(
-                    fleet_evidence_path.read_bytes()
-                ).hexdigest(),
+                "sha256": hashlib.sha256(fleet_evidence_path.read_bytes()).hexdigest(),
             },
             "testedArtifact": {
                 "name": artifact_path.name,
@@ -955,9 +940,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "runId": run_id,
             "generatedAt": "2026-09-03T10:06:00Z",
             "source": {
-                "manifestSha256": hashlib.sha256(
-                    canonical_bytes(manifest)
-                ).hexdigest(),
+                "manifestSha256": hashlib.sha256(canonical_bytes(manifest)).hexdigest(),
                 "otaEvidenceSha256": hashlib.sha256(
                     canonical_bytes(fleet_evidence)
                 ).hexdigest(),
@@ -1134,9 +1117,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         source.mkdir(mode=0o700)
         rollback_run_id = "12345678-1234-4abc-8def-123456789abc"
         commit_run_id = "87654321-4321-4cba-8fed-cba987654321"
-        artifact_path = (
-            source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
-        )
+        artifact_path = source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
         artifact_path.write_bytes(b"exact deterministic candidate bundle")
         artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         deb_path = source / "nuv-agent_0.1.121_arm64.deb"
@@ -1163,6 +1144,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             built_at="2026-09-03T09:00:00Z",
         )
         bom_path.write_bytes(canonical_bytes(bom))
+        bom_signature_path = source / (
+            "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json.sig"
+        )
+        bom_signature = {
+            "schemaVersion": 1,
+            "keyId": "release-iq9075-dev-2026-09-01",
+            "algorithm": "Ed25519",
+            "signature": (
+                "KMi5WXAywCuJ1m5PPF02iDiC2jEh5wW/2/L4/2e6A8FY16xLZpDr3PQidcYOd7OC"
+                "5qt8Jow6hXDVt4iGOzp4Dw=="
+            ),
+        }
+        bom_signature_path.write_bytes(canonical_bytes(bom_signature))
         baseline_digest = (
             "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
         )
@@ -1365,9 +1359,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "current": candidate_slot if committed else baseline_slot,
                     "previous": baseline_slot if committed else candidate_slot,
                     "currentVersion": "0.1.121" if committed else "0.1.120",
-                    "release": candidate_release
-                    if committed
-                    else baseline_release,
+                    "release": candidate_release if committed else baseline_release,
                     "previousRelease": baseline_release
                     if committed
                     else candidate_release,
@@ -1442,6 +1434,152 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "boardToolIdentityVerified": True,
         }
 
+        release_id = "10000000-0000-4000-8000-000000000001"
+        rollback_rollout_id = "20000000-0000-4000-8000-000000000001"
+        commit_rollout_id = "20000000-0000-4000-8000-000000000002"
+        release_record = {
+            "releaseId": release_id,
+            "bomDigest": bom["bomDigest"],
+            "releaseSequence": bom["releaseSequence"],
+            "agentVersion": bom["agentVersion"],
+            "componentSha": bom["componentSha"],
+            "configSchema": bom["configSchema"],
+            "minUpdaterVersion": bom["minUpdaterVersion"],
+            "targets": bom["targets"],
+            "artifact": bom["artifact"],
+            "publisherKeyId": fleet_release["publisherKeyId"],
+            "createdAt": "2026-09-03T09:59:30.123456Z",
+        }
+        release_registration = {
+            "schemaVersion": 1,
+            "kind": "nuvion-agent-release-registration",
+            "apiOrigin": "https://api.nuvion-dev.plaidlabs.ai",
+            "spaceId": identity["spaceId"],
+            "bomFileSha256": hashlib.sha256(canonical_bytes(bom)).hexdigest(),
+            "signatureFileSha256": hashlib.sha256(
+                canonical_bytes(bom_signature)
+            ).hexdigest(),
+            "release": release_record,
+        }
+        release_registration_raw = canonical_bytes(release_registration)
+        rollout_policy = {
+            "preCommitSoakSeconds": 30,
+            "commandTtlSeconds": 3600,
+            "maxFailurePercent": 0,
+        }
+
+        def command_record(
+            command_id: str, sequence: int, status: str, issued_at: str
+        ) -> dict[str, object]:
+            return {
+                "commandId": command_id,
+                "sequence": sequence,
+                "type": "AGENT_UPDATE",
+                "status": status,
+                "issuedAt": issued_at,
+                "expiresAt": "2026-09-03T11:00:00.000000Z",
+                "payloadHash": "7" * 64,
+                "actor": "operator@plaid.ai.kr",
+                "authorizationContext": "SPACE_ADMIN",
+                "keyId": "command-iq9075-dev-2026-09-01",
+            }
+
+        def rollout_chain(
+            purpose: str,
+            rollout_id: str,
+            physical: dict[str, object],
+            created_at: str,
+            issued_at: str,
+            terminal_at: str,
+        ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+            terminal_status = "ROLLED_BACK" if purpose == "rollback" else "SUCCEEDED"
+            client_request_id = str(
+                (rollback_manifest if purpose == "rollback" else commit_manifest)[
+                    "runId"
+                ]
+            )
+            created = {
+                "schemaVersion": 1,
+                "kind": "nuvion-agent-rollout-created",
+                "apiOrigin": "https://api.nuvion-dev.plaidlabs.ai",
+                "purpose": purpose,
+                "spaceId": identity["spaceId"],
+                "deviceId": identity["deviceId"],
+                "releaseEvidenceSha256": hashlib.sha256(
+                    release_registration_raw
+                ).hexdigest(),
+                "release": release_record,
+                "rolloutId": rollout_id,
+                "clientRequestId": client_request_id,
+                "policy": rollout_policy,
+                "createdAt": created_at,
+            }
+            created_raw = canonical_bytes(created)
+            active_command = command_record(
+                physical["commandId"], physical["sequence"], "QUEUED", issued_at
+            )
+            issuance = {
+                "schemaVersion": 1,
+                "kind": "nuvion-agent-rollout-issuance",
+                "apiOrigin": "https://api.nuvion-dev.plaidlabs.ai",
+                "purpose": purpose,
+                "spaceId": identity["spaceId"],
+                "deviceId": identity["deviceId"],
+                "releaseEvidenceSha256": hashlib.sha256(
+                    release_registration_raw
+                ).hexdigest(),
+                "createdEvidenceSha256": hashlib.sha256(created_raw).hexdigest(),
+                "release": release_record,
+                "rolloutId": rollout_id,
+                "clientRequestId": client_request_id,
+                "policy": rollout_policy,
+                "command": active_command,
+                "createdAt": created_at,
+                "commandIssuedAt": issued_at,
+            }
+            issuance_raw = canonical_bytes(issuance)
+            terminal_command = {**active_command, "status": terminal_status}
+            reported = dict(physical)
+            if purpose == "commit":
+                reported["agentVersion"] = release_record["agentVersion"]
+            terminal = {
+                "schemaVersion": 1,
+                "kind": "nuvion-agent-rollout-terminal",
+                "apiOrigin": "https://api.nuvion-dev.plaidlabs.ai",
+                "purpose": purpose,
+                "spaceId": identity["spaceId"],
+                "deviceId": identity["deviceId"],
+                "issuanceEvidenceSha256": hashlib.sha256(issuance_raw).hexdigest(),
+                "release": release_record,
+                "rolloutId": rollout_id,
+                "clientRequestId": client_request_id,
+                "rolloutStatus": "HALTED" if purpose == "rollback" else "SUCCEEDED",
+                "targetStatus": terminal_status,
+                "command": terminal_command,
+                "reportedEvidence": reported,
+                "createdAt": created_at,
+                "updatedAt": terminal_at,
+                "terminalAt": terminal_at,
+            }
+            return created, issuance, terminal
+
+        rollback_created, rollback_issuance, rollback_terminal = rollout_chain(
+            "rollback",
+            rollback_rollout_id,
+            rollback_evidence["updater"]["update"],
+            "2026-09-03T10:00:30.123456Z",
+            "2026-09-03T10:01:00Z",
+            "2026-09-03T10:03:00Z",
+        )
+        commit_created, commit_issuance, commit_terminal = rollout_chain(
+            "commit",
+            commit_rollout_id,
+            commit_evidence["updater"]["update"],
+            "2026-09-03T10:04:10.123456Z",
+            "2026-09-03T10:04:30Z",
+            "2026-09-03T10:05:00Z",
+        )
+
         paths: dict[str, Path] = {
             "rollback_manifest": source / "rollback-manifest.json",
             "rollback_evidence": source / "rollback-evidence.json",
@@ -1451,9 +1589,17 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "commit_cleanup_evidence": source / "commit-cleanup.json",
             "config_stream_evidence": source / "config-stream-evidence.json",
             "bootstrap_evidence": source / "bootstrap-evidence.json",
+            "release_registration": source / "release-registration.json",
+            "rollback_rollout_created": source / "rollback-rollout-created.json",
+            "rollback_rollout_issuance": source / "rollback-rollout-issuance.json",
+            "rollback_rollout_terminal": source / "rollback-rollout-terminal.json",
+            "commit_rollout_created": source / "commit-rollout-created.json",
+            "commit_rollout_issuance": source / "commit-rollout-issuance.json",
+            "commit_rollout_terminal": source / "commit-rollout-terminal.json",
             "artifact": artifact_path,
             "deb": deb_path,
             "bom": bom_path,
+            "bom_signature": bom_signature_path,
         }
         for key, value in (
             ("rollback_manifest", rollback_manifest),
@@ -1463,6 +1609,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ("commit_evidence", commit_evidence),
             ("commit_cleanup_evidence", commit_cleanup),
             ("bootstrap_evidence", bootstrap_evidence),
+            ("release_registration", release_registration),
+            ("rollback_rollout_created", rollback_created),
+            ("rollback_rollout_issuance", rollback_issuance),
+            ("rollback_rollout_terminal", rollback_terminal),
+            ("commit_rollout_created", commit_created),
+            ("commit_rollout_issuance", commit_issuance),
+            ("commit_rollout_terminal", commit_terminal),
             (
                 "config_stream_evidence",
                 cls._config_stream_fixture(
@@ -1476,6 +1629,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         ):
             paths[key].write_bytes(canonical_bytes(value))
         return paths
+
+    @staticmethod
+    def _rollout_assembly_inputs(inputs: dict[str, Path]) -> dict[str, Path]:
+        return {
+            "release_registration_path": inputs["release_registration"],
+            "rollback_rollout_created_path": inputs["rollback_rollout_created"],
+            "rollback_rollout_issuance_path": inputs["rollback_rollout_issuance"],
+            "rollback_rollout_terminal_path": inputs["rollback_rollout_terminal"],
+            "commit_rollout_created_path": inputs["commit_rollout_created"],
+            "commit_rollout_issuance_path": inputs["commit_rollout_issuance"],
+            "commit_rollout_terminal_path": inputs["commit_rollout_terminal"],
+            "candidate_rollout_control": ROOT
+            / "packaging/dev/run-iq9075-agent-rollout-control.py",
+            "bom_signature_path": inputs["bom_signature"],
+        }
 
     @classmethod
     def _candidate_physical_fixture(
@@ -1495,9 +1663,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         bom_digest = fleet_manifest["scenario"]["expectedBomDigest"]
         candidate_slot = f"/opt/nuv-agent/candidates/{run_id}-{bom_digest[7:]}"
         control_sha = "c" * 64
-        soak.update(
-            {"schemaVersion": 3, "runId": run_id, "slotKind": "candidate"}
-        )
+        soak.update({"schemaVersion": 3, "runId": run_id, "slotKind": "candidate"})
         soak["startedAt"] = "2026-09-03T10:04:00Z"
         soak["runtimeIdentity"].update(
             {
@@ -1514,9 +1680,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             json.dumps(soak, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
-        artifact_path = (
-            root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
-        )
+        artifact_path = root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
         bom_path = root / manifest["testedBom"]["file"]
         slots = {
             "current": fleet_evidence["slots"]["current"],
@@ -1583,9 +1747,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "executionProof": candidate_execution_proof(run_id),
             "collectorProof": candidate_collector_proof(run_id),
             "terminationProof": candidate_termination_proof(run_id),
-            "productionRestoration": production_restoration_evidence(
-                fleet_manifest
-            ),
+            "productionRestoration": production_restoration_evidence(fleet_manifest),
             "pre": {
                 "slots": slots,
                 "antiReplay": anti_replay,
@@ -1632,7 +1794,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             json.dumps(cleanup, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
-        manifest["oakSoak"]["sha256"] = hashlib.sha256(soak_path.read_bytes()).hexdigest()
+        manifest["oakSoak"]["sha256"] = hashlib.sha256(
+            soak_path.read_bytes()
+        ).hexdigest()
         manifest["candidateSoak"] = {
             "file": candidate_path.name,
             "sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
@@ -1652,7 +1816,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         result["cleanupEvidenceSha256"] = hashlib.sha256(
             cleanup_path.read_bytes()
         ).hexdigest()
-        result["manifestSha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        result["manifestSha256"] = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
         result_path.write_text(
             json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
@@ -1676,7 +1842,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', self.publish.split("jobs:", 1)[0])
         trigger = self.publish.split("jobs:", maxsplit=1)[0]
         self.assertNotIn("  push:\n", trigger)
-        self.assertIn('publisher workflow_dispatch must run from main', self.publish)
+        self.assertIn("publisher workflow_dispatch must run from main", self.publish)
         self.assertIn("github.event.workflow_run.head_sha", self.publish)
         self.assertIn("ref: ${{ github.workflow_sha }}", self.publish)
         self.assertIn('[ "$WORKFLOW_SHA" = "$DEFAULT_BRANCH_SHA" ]', self.publish)
@@ -1699,9 +1865,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 cursor = index + 1
                 while cursor < len(lines):
                     candidate = lines[cursor]
-                    if candidate.strip() and len(candidate) - len(
-                        candidate.lstrip()
-                    ) <= indentation:
+                    if (
+                        candidate.strip()
+                        and len(candidate) - len(candidate.lstrip()) <= indentation
+                    ):
                         break
                     if candidate.strip() and not candidate.lstrip().startswith("#"):
                         patterns.append(candidate.strip())
@@ -1879,9 +2046,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         for name in job_names:
             section = self._job(name)
             with self.subTest(job=name):
-                self.assertIn(
-                    f"environment: {expected_environment[name]}", section
-                )
+                self.assertIn(f"environment: {expected_environment[name]}", section)
                 self.assertIn("Checkout trusted publisher only", section)
                 self.assertIn(
                     "ref: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}",
@@ -1914,7 +2079,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     self.assertNotIn("GITHUB_RELEASE_TOKEN", section)
                 else:
                     self.assertNotIn("contents: write", section)
-                self.assertNotIn("ref: ${{ needs.release-preflight.outputs.release_tag }}", section)
+                self.assertNotIn(
+                    "ref: ${{ needs.release-preflight.outputs.release_tag }}", section
+                )
                 self.assertNotIn("build-agent-bundle.sh", section)
 
         credential_steps = {
@@ -1945,8 +2112,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
         self.assertEqual(
             self.publish.count(
-                "publisher/packaging/release/"
-                "revalidate-live-release-authorization.sh"
+                "publisher/packaging/release/revalidate-live-release-authorization.sh"
             ),
             13,
         )
@@ -1955,21 +2121,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         homebrew = self._job("homebrew-publish")
         self.assertNotIn("x-access-token:${GH_TOKEN}@", homebrew)
         self.assertNotIn("git remote set-url", homebrew)
+        self.assertIn('git clone "https://github.com/${TAP_REPO}.git" tap', homebrew)
         self.assertIn(
-            'git clone "https://github.com/${TAP_REPO}.git" tap', homebrew
-        )
-        self.assertIn(
-            '[ "$(git remote get-url origin)" = '
-            '"https://github.com/${TAP_REPO}.git" ]',
+            '[ "$(git remote get-url origin)" = "https://github.com/${TAP_REPO}.git" ]',
             homebrew,
         )
         self.assertIn('askpass="$(mktemp ', homebrew)
-        self.assertIn("chmod 0700 \"$askpass\"", homebrew)
+        self.assertIn('chmod 0700 "$askpass"', homebrew)
         self.assertIn("trap cleanup_askpass EXIT", homebrew)
         self.assertIn("GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=", homebrew)
-        self.assertIn('*Password*) printf \'%s\\n\' "${GH_TOKEN:?}"', homebrew)
+        self.assertIn("*Password*) printf '%s\\n' \"${GH_TOKEN:?}\"", homebrew)
 
-    def test_face_publisher_is_main_only_pinned_and_revalidates_each_credential(self) -> None:
+    def test_face_publisher_is_main_only_pinned_and_revalidates_each_credential(
+        self,
+    ) -> None:
         self.assertIn("environment: face-artifacts-release", self.face)
         self.assertIn("group: face-artifacts-global-publisher", self.face)
         self.assertIn('[ "$GITHUB_REF" = "refs/heads/main" ]', self.face)
@@ -1981,9 +2146,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertEqual(self.face.count("face-artifact-manifest.py verify"), 2)
         self.assertIn("face-artifact-manifest.json.asc", self.face)
         self.assertIn("immutable face release asset set is not exact", self.face)
-        self.assertEqual(
-            self.face.count("verify-release-settings-attestation.py"), 5
-        )
+        self.assertEqual(self.face.count("verify-release-settings-attestation.py"), 5)
         for name in (
             "Checkout signed face release source as data",
             "Download exact face artifacts from immutable GitHub release",
@@ -2001,9 +2164,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
     def test_apt_signing_uses_owned_mode_0600_passphrase_file(self) -> None:
         apt_job = self._job("apt-publish")
-        apt_script = (ROOT / "packaging/apt/publish-gcs.sh").read_text(
-            encoding="utf-8"
-        )
+        apt_script = (ROOT / "packaging/apt/publish-gcs.sh").read_text(encoding="utf-8")
         self.assertEqual(apt_job.count("secrets.APT_GPG_PASSPHRASE"), 1)
         self.assertIn('chmod 0600 "$passphrase_file"', apt_job)
         self.assertIn('--passphrase-file "$passphrase_file"', apt_job)
@@ -2012,7 +2173,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("trap - EXIT", apt_job)
         self.assertIn("trap cleanup_passphrase EXIT", apt_job)
         self.assertIn("Remove APT passphrase file on every exit path", apt_job)
-        self.assertIn('APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime', apt_job)
+        self.assertIn("APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime", apt_job)
         self.assertIn('file_mode" != "600"', apt_script)
         self.assertIn('file_owner" != "$(id -u)"', apt_script)
         self.assertEqual(
@@ -2020,7 +2181,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             2,
         )
 
-    def test_apt_import_failure_removes_passphrase_before_environment_handoff(self) -> None:
+    def test_apt_import_failure_removes_passphrase_before_environment_handoff(
+        self,
+    ) -> None:
         apt_job = self._job("apt-publish")
         import_step = next(
             step
@@ -2049,7 +2212,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             fake_gpg.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                "if [[ \" $* \" == *\" --sign \"* ]]; then exit 19; fi\n"
+                'if [[ " $* " == *" --sign "* ]]; then exit 19; fi\n'
                 "cat >/dev/null\n",
                 encoding="utf-8",
             )
@@ -2087,9 +2250,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertNotIn("--phase stage", self.publish)
         self.assertIn("distribution-source-plan", github)
         self.assertIn("needs: [release-preflight, github-release-publish]", homebrew)
-        self.assertIn("homebrewFormula", (
-            ROOT / "packaging/release/generate-release-promotion.py"
-        ).read_text(encoding="utf-8"))
+        self.assertIn(
+            "homebrewFormula",
+            (ROOT / "packaging/release/generate-release-promotion.py").read_text(
+                encoding="utf-8"
+            ),
+        )
         self.assertIn("github-release-publish, homebrew-publish", apt)
         self.assertIn('NAME="nuv_agent-${VERSION}-distribution-promotion.json"', apt)
         self.assertIn("releases/promotions/distribution/${VERSION}.json", apt)
@@ -2098,7 +2264,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.publish.index("  homebrew-publish:"),
         )
         self.assertLess(
-            self.publish.index("  homebrew-publish:"), self.publish.index("  apt-publish:")
+            self.publish.index("  homebrew-publish:"),
+            self.publish.index("  apt-publish:"),
         )
         self.assertNotIn("softprops/action-gh-release", self.publish)
         self.assertIn(
@@ -2114,11 +2281,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn("verify-release-readiness.py", preflight)
         self.assertIn("release-readiness.json", preflight)
         self.assertIn("verify-agent-release-gate.py", preflight)
-        self.assertIn("--component-sha \"$COMPONENT_SHA\"", preflight)
+        self.assertIn('--component-sha "$COMPONENT_SHA"', preflight)
         self.assertIn("checks: read", preflight)
         self.assertIn("--candidate-workflow release-source/", preflight)
         self.assertIn("--trusted-workflow publisher/", preflight)
-        self.assertIn("--gate-workflow-sha256 \"$GATE_WORKFLOW_SHA256\"", preflight)
+        self.assertIn('--gate-workflow-sha256 "$GATE_WORKFLOW_SHA256"', preflight)
         self.assertIn("--signer-directory publisher/packaging/release/", preflight)
         self.assertIn(
             "--candidate-fleet-runner release-source/packaging/dev/"
@@ -2131,8 +2298,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             preflight,
         )
         self.assertIn(
-            "--candidate-board-tool release-source/packaging/dev/"
-            "iq9075-board-e2e.py",
+            "--candidate-board-tool release-source/packaging/dev/iq9075-board-e2e.py",
             preflight,
         )
         self.assertLess(
@@ -2220,9 +2386,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertEqual(evidence["checkSuiteId"], 6001)
 
         for event, branch in (("pull_request", "main"), ("workflow_dispatch", "dev")):
-            with self.subTest(event=event, branch=branch), self.assertRaisesRegex(
-                RELEASE_GATE.ReleaseGateError,
-                "exact release workflow run",
+            with (
+                self.subTest(event=event, branch=branch),
+                self.assertRaisesRegex(
+                    RELEASE_GATE.ReleaseGateError,
+                    "exact release workflow run",
+                ),
             ):
                 RELEASE_GATE.verify_release_gate(
                     repository=repository,
@@ -2259,8 +2428,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             {**evidence, "workflowSha256": "b" * 64},
         )
         for mutation in mutations:
-            with self.subTest(mutation=mutation), self.assertRaises(
-                RELEASE_GATE.ReleaseGateError
+            with (
+                self.subTest(mutation=mutation),
+                self.assertRaises(RELEASE_GATE.ReleaseGateError),
             ):
                 RELEASE_GATE.verify_expected_evidence(
                     mutation,
@@ -2270,10 +2440,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     workflow_sha256="a" * 64,
                 )
 
-        helper = (
-            ROOT
-            / "packaging/release/revalidate-live-release-authorization.sh"
-        )
+        helper = ROOT / "packaging/release/revalidate-live-release-authorization.sh"
         self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
         script = helper.read_text(encoding="utf-8")
         self.assertIn("verify-agent-release-gate.py", script)
@@ -2286,6 +2453,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "--candidate-fleet-runner",
             "--candidate-config-stream-runner",
             "--candidate-board-tool",
+            "--candidate-rollout-control",
         ):
             self.assertIn(option, script)
 
@@ -2376,36 +2544,28 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         component_sha = "a" * 40
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            inputs = self._fleet_runtime_fixture(
-                root, component_sha=component_sha
-            )
+            inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
             config_stream = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             config_stream["cleanup"]["idempotent"] = True
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(config_stream)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(config_stream))
             output = root / "output"
             output.mkdir(mode=0o700)
             assembled = FLEET_RUNTIME_EVIDENCE.assemble(
                 rollback_manifest_path=inputs["rollback_manifest"],
                 rollback_evidence_path=inputs["rollback_evidence"],
-                rollback_cleanup_evidence_path=inputs[
-                    "rollback_cleanup_evidence"
-                ],
+                rollback_cleanup_evidence_path=inputs["rollback_cleanup_evidence"],
                 commit_manifest_path=inputs["commit_manifest"],
                 commit_evidence_path=inputs["commit_evidence"],
                 config_stream_evidence_path=inputs["config_stream_evidence"],
-                commit_cleanup_evidence_path=inputs[
-                    "commit_cleanup_evidence"
-                ],
+                commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                 bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                **self._rollout_assembly_inputs(inputs),
                 artifact_path=inputs["artifact"],
                 deb_path=inputs["deb"],
                 bom_path=inputs["bom"],
-                candidate_fleet_runner=ROOT
-                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
@@ -2416,19 +2576,17 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 version="0.1.121",
                 component_sha=component_sha,
             )
-            self.assertEqual(len(list(output.iterdir())), 10)
+            self.assertEqual(len(list(output.iterdir())), 18)
             summary_path = Path(assembled["summary"])
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            self.assertEqual(summary["schemaVersion"], 3)
+            self.assertEqual(summary["schemaVersion"], 4)
             gate = summary["runtimeGate"]
             self.assertEqual(gate["rollback"]["terminalPhase"], "ROLLED_BACK")
             self.assertEqual(gate["commit"]["terminalPhase"], "COMMITTED")
             self.assertEqual(
                 gate["rollback"]["antiReplay"]["maximumCommandSequence"], 2
             )
-            self.assertEqual(
-                gate["commit"]["antiReplay"]["maximumCommandSequence"], 3
-            )
+            self.assertEqual(gate["commit"]["antiReplay"]["maximumCommandSequence"], 3)
             self.assertEqual(
                 gate["rollback"]["antiReplay"]["currentReleaseSequence"], "1"
             )
@@ -2450,16 +2608,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(
                 gate["rollback"]["cleanup"]["fleetEvidenceSha256"],
-                hashlib.sha256(
-                    inputs["rollback_evidence"].read_bytes()
-                ).hexdigest(),
+                hashlib.sha256(inputs["rollback_evidence"].read_bytes()).hexdigest(),
             )
             self.assertEqual(
                 summary["configStreamRunnerSha256"],
                 hashlib.sha256(
                     (
-                        ROOT
-                        / "packaging/dev/run-iq9075-config-stream-e2e.py"
+                        ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py"
                     ).read_bytes()
                 ).hexdigest(),
             )
@@ -2468,6 +2623,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 component_sha,
             )
             self.assertTrue(all(gate["configStream"]["gates"].values()))
+            self.assertEqual(gate["rolloutControl"]["rollback"]["sequence"], 2)
+            self.assertEqual(gate["rolloutControl"]["commit"]["sequence"], 3)
             self.assertTrue(config_stream["cleanup"]["idempotent"])
             serialized = json.dumps(summary, sort_keys=True)
             for forbidden in (
@@ -2490,8 +2647,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 component_sha=component_sha,
                 summary=summary,
                 security=security,
-                candidate_fleet_runner=ROOT
-                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
@@ -2518,43 +2674,36 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
                     candidate_config_stream_runner=ROOT
                     / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
-                    candidate_installer=ROOT
-                    / "packaging/dev/install-iq9075.sh",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
+                    candidate_rollout_control=ROOT
+                    / "packaging/dev/run-iq9075-agent-rollout-control.py",
                 )
 
     def test_fleet_runtime_bootstrap_is_exactly_cross_bound(self) -> None:
         component_sha = "a" * 40
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            inputs = self._fleet_runtime_fixture(
-                root, component_sha=component_sha
-            )
+            inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
             output = root / "output"
             output.mkdir(mode=0o700)
             assembled = FLEET_RUNTIME_EVIDENCE.assemble(
                 rollback_manifest_path=inputs["rollback_manifest"],
                 rollback_evidence_path=inputs["rollback_evidence"],
-                rollback_cleanup_evidence_path=inputs[
-                    "rollback_cleanup_evidence"
-                ],
+                rollback_cleanup_evidence_path=inputs["rollback_cleanup_evidence"],
                 commit_manifest_path=inputs["commit_manifest"],
                 commit_evidence_path=inputs["commit_evidence"],
                 config_stream_evidence_path=inputs["config_stream_evidence"],
-                commit_cleanup_evidence_path=inputs[
-                    "commit_cleanup_evidence"
-                ],
+                commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                 bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                **self._rollout_assembly_inputs(inputs),
                 artifact_path=inputs["artifact"],
                 deb_path=inputs["deb"],
                 bom_path=inputs["bom"],
-                candidate_fleet_runner=ROOT
-                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                candidate_board_tool=ROOT
-                / "packaging/dev/iq9075-board-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                 candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
@@ -2562,24 +2711,18 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 version="0.1.121",
                 component_sha=component_sha,
             )
-            summary = json.loads(
-                Path(assembled["summary"]).read_text(encoding="utf-8")
-            )
+            summary = json.loads(Path(assembled["summary"]).read_text(encoding="utf-8"))
             security = json.loads(
-                (
-                    ROOT / "packaging/release/release-security-policy.json"
-                ).read_text(encoding="utf-8")
+                (ROOT / "packaging/release/release-security-policy.json").read_text(
+                    encoding="utf-8"
+                )
             )
             bootstrap_path = output / summary["bootstrapEvidence"]["file"]
             original = json.loads(bootstrap_path.read_text(encoding="utf-8"))
 
             mutations = {
-                "component": lambda value: value.__setitem__(
-                    "componentSha", "b" * 40
-                ),
-                "deb": lambda value: value.__setitem__(
-                    "packageSha256", "b" * 64
-                ),
+                "component": lambda value: value.__setitem__("componentSha", "b" * 40),
+                "deb": lambda value: value.__setitem__("packageSha256", "b" * 64),
                 "baseline-before": lambda value: value.__setitem__(
                     "currentSlotBefore", "releases/" + "c" * 64
                 ),
@@ -2600,9 +2743,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     mutate(candidate)
                     bootstrap_path.write_bytes(canonical_bytes(candidate))
                     candidate_summary = copy.deepcopy(summary)
-                    candidate_summary["bootstrapEvidence"]["sha256"] = (
-                        hashlib.sha256(bootstrap_path.read_bytes()).hexdigest()
-                    )
+                    candidate_summary["bootstrapEvidence"]["sha256"] = hashlib.sha256(
+                        bootstrap_path.read_bytes()
+                    ).hexdigest()
                     candidate_summary["runtimeGate"]["bootstrap"] = (
                         READINESS._bootstrap_runtime_gate(candidate)
                     )
@@ -2628,8 +2771,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
             drifted_installer = root / "install-iq9075.sh"
             drifted_installer.write_bytes(
-                (ROOT / "packaging/dev/install-iq9075.sh").read_bytes()
-                + b"\n"
+                (ROOT / "packaging/dev/install-iq9075.sh").read_bytes() + b"\n"
             )
             with self.assertRaisesRegex(
                 READINESS.ReadinessError, "bootstrap installer"
@@ -2644,8 +2786,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
                     candidate_config_stream_runner=ROOT
                     / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                     candidate_installer=drifted_installer,
                 )
 
@@ -2660,7 +2801,15 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "config_stream_evidence",
             "commit_cleanup_evidence",
             "bootstrap_evidence",
+            "release_registration",
+            "rollback_rollout_created",
+            "rollback_rollout_issuance",
+            "rollback_rollout_terminal",
+            "commit_rollout_created",
+            "commit_rollout_issuance",
+            "commit_rollout_terminal",
             "bom",
+            "bom_signature",
         ):
             for encoding in ("key-order", "indent", "trailing-whitespace"):
                 with (
@@ -2703,11 +2852,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             config_stream_evidence_path=inputs[
                                 "config_stream_evidence"
                             ],
-                           commit_cleanup_evidence_path=inputs[
-                               "commit_cleanup_evidence"
-                           ],
+                            commit_cleanup_evidence_path=inputs[
+                                "commit_cleanup_evidence"
+                            ],
                             bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                           artifact_path=inputs["artifact"],
+                            **self._rollout_assembly_inputs(inputs),
+                            artifact_path=inputs["artifact"],
                             deb_path=inputs["deb"],
                             bom_path=inputs["bom"],
                             candidate_fleet_runner=ROOT
@@ -2735,9 +2885,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             output.mkdir(mode=0o700)
             candidate_runner = root / "run-iq9075-config-stream-e2e.py"
             candidate_runner.write_bytes(
-                (
-                    ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py"
-                ).read_bytes()
+                (ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py").read_bytes()
                 + b"\n"
             )
             with self.assertRaisesRegex(
@@ -2747,28 +2895,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 FLEET_RUNTIME_EVIDENCE.assemble(
                     rollback_manifest_path=inputs["rollback_manifest"],
                     rollback_evidence_path=inputs["rollback_evidence"],
-                    rollback_cleanup_evidence_path=inputs[
-                        "rollback_cleanup_evidence"
-                    ],
+                    rollback_cleanup_evidence_path=inputs["rollback_cleanup_evidence"],
                     commit_manifest_path=inputs["commit_manifest"],
                     commit_evidence_path=inputs["commit_evidence"],
-                    config_stream_evidence_path=inputs[
-                        "config_stream_evidence"
-                    ],
-                   commit_cleanup_evidence_path=inputs[
-                       "commit_cleanup_evidence"
-                   ],
+                    config_stream_evidence_path=inputs["config_stream_evidence"],
+                    commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                     bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                   artifact_path=inputs["artifact"],
+                    **self._rollout_assembly_inputs(inputs),
+                    artifact_path=inputs["artifact"],
                     deb_path=inputs["deb"],
                     bom_path=inputs["bom"],
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
                     candidate_config_stream_runner=candidate_runner,
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
-                    candidate_installer=ROOT
-                    / "packaging/dev/install-iq9075.sh",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                     security_policy_path=ROOT
                     / "packaging/release/release-security-policy.json",
                     output_directory=output,
@@ -2822,9 +2963,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
-                inputs = self._fleet_runtime_fixture(
-                    root, component_sha=component_sha
-                )
+                inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
                 commit_manifest = json.loads(
                     inputs["commit_manifest"].read_text(encoding="utf-8")
                 )
@@ -2837,12 +2976,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     commit_evidence,
                     completed_at="2026-09-03T10:07:00Z",
                 )
-                inputs["commit_manifest"].write_bytes(
-                    canonical_bytes(commit_manifest)
-                )
-                inputs["commit_evidence"].write_bytes(
-                    canonical_bytes(commit_evidence)
-                )
+                inputs["commit_manifest"].write_bytes(canonical_bytes(commit_manifest))
+                inputs["commit_evidence"].write_bytes(canonical_bytes(commit_evidence))
                 inputs["commit_cleanup_evidence"].write_bytes(
                     canonical_bytes(commit_cleanup)
                 )
@@ -2853,14 +2988,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             commit_evidence,
                             commit_cleanup,
                             json.loads(
-                                inputs["rollback_manifest"].read_text(
-                                    encoding="utf-8"
-                                )
+                                inputs["rollback_manifest"].read_text(encoding="utf-8")
                             ),
                             json.loads(
-                                inputs["rollback_evidence"].read_text(
-                                    encoding="utf-8"
-                                )
+                                inputs["rollback_evidence"].read_text(encoding="utf-8")
                             ),
                         )
                     )
@@ -2876,24 +3007,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         ],
                         commit_manifest_path=inputs["commit_manifest"],
                         commit_evidence_path=inputs["commit_evidence"],
-                        config_stream_evidence_path=inputs[
-                            "config_stream_evidence"
-                        ],
-                       commit_cleanup_evidence_path=inputs[
-                           "commit_cleanup_evidence"
-                       ],
+                        config_stream_evidence_path=inputs["config_stream_evidence"],
+                        commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                         bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                       artifact_path=inputs["artifact"],
+                        **self._rollout_assembly_inputs(inputs),
+                        artifact_path=inputs["artifact"],
                         deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
                         candidate_config_stream_runner=ROOT
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                        candidate_board_tool=ROOT
-                        / "packaging/dev/iq9075-board-e2e.py",
-                        candidate_installer=ROOT
-                        / "packaging/dev/install-iq9075.sh",
+                        candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -2930,9 +3056,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 tempfile.TemporaryDirectory() as raw_root,
             ):
                 root = Path(raw_root)
-                inputs = self._fleet_runtime_fixture(
-                    root, component_sha=component_sha
-                )
+                inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
                 cleanup = json.loads(
                     inputs["rollback_cleanup_evidence"].read_text(encoding="utf-8")
                 )
@@ -2951,24 +3075,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         ],
                         commit_manifest_path=inputs["commit_manifest"],
                         commit_evidence_path=inputs["commit_evidence"],
-                        config_stream_evidence_path=inputs[
-                            "config_stream_evidence"
-                        ],
-                       commit_cleanup_evidence_path=inputs[
-                           "commit_cleanup_evidence"
-                       ],
+                        config_stream_evidence_path=inputs["config_stream_evidence"],
+                        commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                         bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                       artifact_path=inputs["artifact"],
+                        **self._rollout_assembly_inputs(inputs),
+                        artifact_path=inputs["artifact"],
                         deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
                         candidate_config_stream_runner=ROOT
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                        candidate_board_tool=ROOT
-                        / "packaging/dev/iq9075-board-e2e.py",
-                        candidate_installer=ROOT
-                        / "packaging/dev/install-iq9075.sh",
+                        candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -2995,7 +3114,15 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "configStreamEvidence",
             "commitCleanupEvidence",
             "bootstrapEvidence",
+            "releaseRegistration",
+            "rollbackRolloutCreated",
+            "rollbackRolloutIssuance",
+            "rollbackRolloutTerminal",
+            "commitRolloutCreated",
+            "commitRolloutIssuance",
+            "commitRolloutTerminal",
             "testedBom",
+            "testedBomSignature",
         )
         for reference in references:
             for encoding in ("key-order", "indent", "trailing-whitespace"):
@@ -3017,24 +3144,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         ],
                         commit_manifest_path=inputs["commit_manifest"],
                         commit_evidence_path=inputs["commit_evidence"],
-                        config_stream_evidence_path=inputs[
-                            "config_stream_evidence"
-                        ],
-                       commit_cleanup_evidence_path=inputs[
-                           "commit_cleanup_evidence"
-                       ],
+                        config_stream_evidence_path=inputs["config_stream_evidence"],
+                        commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                         bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                       artifact_path=inputs["artifact"],
+                        **self._rollout_assembly_inputs(inputs),
+                        artifact_path=inputs["artifact"],
                         deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
                         candidate_config_stream_runner=ROOT
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                        candidate_board_tool=ROOT
-                        / "packaging/dev/iq9075-board-e2e.py",
-                        candidate_installer=ROOT
-                        / "packaging/dev/install-iq9075.sh",
+                        candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -3065,9 +3187,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     summary[reference]["sha256"] = hashlib.sha256(
                         path.read_bytes()
                     ).hexdigest()
-                    with self.assertRaisesRegex(
-                        READINESS.ReadinessError, "canonical"
-                    ):
+                    with self.assertRaisesRegex(READINESS.ReadinessError, "canonical"):
                         READINESS._validate_fleet_runtime_documents(
                             policy_path=output / "release-readiness.json",
                             version="0.1.121",
@@ -3147,18 +3267,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["stream"]["poor"]["queue"]["observationDlqRows"] = 1
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_order(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["generatedAt"] = "2026-09-03T10:04:01Z"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_ack(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
@@ -3168,45 +3284,35 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "RECEIVED",
                 "SUCCEEDED",
             ]
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_source(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["source"]["componentSha"] = "b" * 40
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_api_origin(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["source"]["apiOrigin"] = "https://relay.example.invalid"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_prior_rollback_command(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["priorRollbackCommand"]["sequence"] = 1
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_release_command_status(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["releaseCommand"]["status"] = "QUEUED"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_expired_predecessor_time(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
@@ -3221,18 +3327,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "expiresAt": "2026-09-03T10:06:01Z",
                 }
             ]
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_expired_predecessor_absent(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["expiredPredecessors"] = []
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_sequence_gap(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
@@ -3241,27 +3343,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             evidence["config"]["restore"]["sequence"] = 6
             evidence["stream"]["adaptiveCommand"]["sequence"] = 7
             evidence["stream"]["disabled"]["sequence"] = 8
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_projection_shape(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["stream"]["poor"]["projectionShape"] = "domained"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_runtime_identity(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["source"]["runtimeIdentity"]["buildInfoSha256"] = "0" * 64
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_coordinated_runtime_identity(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
@@ -3273,9 +3369,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ):
                 location["buildInfoSha256"] = "0" * 64
                 location["releaseMarkerSha256"] = "1" * 64
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_adaptive_command_binding(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
@@ -3284,20 +3378,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             evidence["stream"]["adaptiveCommand"]["commandId"] = (
                 "88888888-8888-4888-8888-888888888888"
             )
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_adaptive_reason_substring(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
-            evidence["stream"]["poor"]["lastAdjustmentReason"] = (
-                "not_connectivity_poor"
-            )
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            evidence["stream"]["poor"]["lastAdjustmentReason"] = "not_connectivity_poor"
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_commit_issue_before_rollback_cleanup(
             inputs: dict[str, Path],
@@ -3306,29 +3394,105 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["releaseCommand"]["issuedAt"] = "2026-09-03T10:03:59Z"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_cleanup_after_parent(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
             evidence["cleanup"]["completedAt"] = "2026-09-03T10:07:01Z"
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
-            )
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
 
         def mutate_config_cleanup_no_restart(inputs: dict[str, Path]) -> None:
             evidence = json.loads(
                 inputs["config_stream_evidence"].read_text(encoding="utf-8")
             )
-            evidence["cleanup"]["runtimeIdentity"]["servicePid"] = evidence[
-                "source"
-            ]["runtimeIdentity"]["servicePid"]
-            inputs["config_stream_evidence"].write_bytes(
-                canonical_bytes(evidence)
+            evidence["cleanup"]["runtimeIdentity"]["servicePid"] = evidence["source"][
+                "runtimeIdentity"
+            ]["servicePid"]
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_space(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["release_registration"].read_text(encoding="utf-8")
             )
+            evidence["spaceId"] = 999
+            inputs["release_registration"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_command(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["commit_rollout_issuance"].read_text(encoding="utf-8")
+            )
+            evidence["command"]["commandId"] = "99999999-9999-4999-8999-999999999999"
+            inputs["commit_rollout_issuance"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_actor(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["commit_rollout_terminal"].read_text(encoding="utf-8")
+            )
+            evidence["command"]["actor"] = "different-operator@plaid.ai.kr"
+            inputs["commit_rollout_terminal"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_authorization(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["commit_rollout_issuance"].read_text(encoding="utf-8")
+            )
+            evidence["command"]["authorizationContext"] = "DEVICE_OPERATOR"
+            inputs["commit_rollout_issuance"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_client_request(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["commit_rollout_terminal"].read_text(encoding="utf-8")
+            )
+            evidence["clientRequestId"] = "49999999-9999-4999-8999-999999999999"
+            inputs["commit_rollout_terminal"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_physical_run_binding(inputs: dict[str, Path]) -> None:
+            replacement = "49999999-9999-4999-8999-999999999999"
+            created = json.loads(
+                inputs["commit_rollout_created"].read_text(encoding="utf-8")
+            )
+            issuance = json.loads(
+                inputs["commit_rollout_issuance"].read_text(encoding="utf-8")
+            )
+            terminal = json.loads(
+                inputs["commit_rollout_terminal"].read_text(encoding="utf-8")
+            )
+            created["clientRequestId"] = replacement
+            created_raw = canonical_bytes(created)
+            issuance["clientRequestId"] = replacement
+            issuance["createdEvidenceSha256"] = hashlib.sha256(created_raw).hexdigest()
+            issuance_raw = canonical_bytes(issuance)
+            terminal["clientRequestId"] = replacement
+            terminal["issuanceEvidenceSha256"] = hashlib.sha256(
+                issuance_raw
+            ).hexdigest()
+            for path, value in (
+                (inputs["commit_rollout_created"], created),
+                (inputs["commit_rollout_issuance"], issuance),
+                (inputs["commit_rollout_terminal"], terminal),
+            ):
+                path.write_bytes(canonical_bytes(value))
+
+        def mutate_rollout_terminal(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["rollback_rollout_terminal"].read_text(encoding="utf-8")
+            )
+            evidence["rolloutStatus"] = "SUCCEEDED"
+            inputs["rollback_rollout_terminal"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_rollout_release_binding(inputs: dict[str, Path]) -> None:
+            evidence = json.loads(
+                inputs["commit_rollout_terminal"].read_text(encoding="utf-8")
+            )
+            evidence["reportedEvidence"]["publisherKeyId"] = "untrusted-key"
+            evidence["reportedEvidence"]["candidateSlot"] = "releases/" + "0" * 64
+            inputs["commit_rollout_terminal"].write_bytes(canonical_bytes(evidence))
+
+        def mutate_bom_signature(inputs: dict[str, Path]) -> None:
+            signature = json.loads(inputs["bom_signature"].read_text(encoding="utf-8"))
+            signature["signature"] = base64.b64encode(b"\x01" * 64).decode("ascii")
+            inputs["bom_signature"].write_bytes(canonical_bytes(signature))
 
         def mutate_to_valid_commit(inputs: dict[str, Path]) -> None:
             manifest = json.loads(
@@ -3425,13 +3589,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ),
             ("config-cleanup-after-parent", mutate_config_cleanup_after_parent),
             ("config-cleanup-no-restart", mutate_config_cleanup_no_restart),
+            ("rollout-space", mutate_rollout_space),
+            ("rollout-command", mutate_rollout_command),
+            ("rollout-actor", mutate_rollout_actor),
+            ("rollout-authorization", mutate_rollout_authorization),
+            ("rollout-client-request", mutate_rollout_client_request),
+            ("rollout-physical-run-binding", mutate_rollout_physical_run_binding),
+            ("rollout-terminal", mutate_rollout_terminal),
+            ("rollout-release-binding", mutate_rollout_release_binding),
+            ("bom-signature", mutate_bom_signature),
             ("commit-does-not-prove-rollback", mutate_to_valid_commit),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
                 root = Path(raw_root)
-                inputs = self._fleet_runtime_fixture(
-                    root, component_sha=component_sha
-                )
+                inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
                 mutation(inputs)
                 if label == "commit-does-not-prove-rollback":
                     FLEET_E2E.validate_final_evidence(
@@ -3444,9 +3615,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     )
                 output = root / "output"
                 output.mkdir(mode=0o700)
-                with self.assertRaises(
-                    FLEET_RUNTIME_EVIDENCE.AssemblyError
-                ) as caught:
+                with self.assertRaises(FLEET_RUNTIME_EVIDENCE.AssemblyError) as caught:
                     FLEET_RUNTIME_EVIDENCE.assemble(
                         rollback_manifest_path=inputs["rollback_manifest"],
                         rollback_evidence_path=inputs["rollback_evidence"],
@@ -3455,24 +3624,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         ],
                         commit_manifest_path=inputs["commit_manifest"],
                         commit_evidence_path=inputs["commit_evidence"],
-                        config_stream_evidence_path=inputs[
-                            "config_stream_evidence"
-                        ],
-                       commit_cleanup_evidence_path=inputs[
-                           "commit_cleanup_evidence"
-                       ],
+                        config_stream_evidence_path=inputs["config_stream_evidence"],
+                        commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                         bootstrap_evidence_path=inputs["bootstrap_evidence"],
-                       artifact_path=inputs["artifact"],
+                        **self._rollout_assembly_inputs(inputs),
+                        artifact_path=inputs["artifact"],
                         deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
                         candidate_config_stream_runner=ROOT
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                        candidate_board_tool=ROOT
-                        / "packaging/dev/iq9075-board-e2e.py",
-                        candidate_installer=ROOT
-                        / "packaging/dev/install-iq9075.sh",
+                        candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -3481,7 +3645,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     )
                 if label == "commit-does-not-prove-rollback":
                     self.assertIn(
-                        "does not prove terminal rollback",
+                        "reported evidence differs from physical ACK",
                         str(caught.exception.__cause__),
                     )
                 self.assertEqual(list(output.iterdir()), [])
@@ -3501,29 +3665,23 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            inputs = self._fleet_runtime_fixture(
-                root, component_sha=component_sha
-            )
+            inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
             output = root / "output"
             output.mkdir(mode=0o700)
             assembled = FLEET_RUNTIME_EVIDENCE.assemble(
                 rollback_manifest_path=inputs["rollback_manifest"],
                 rollback_evidence_path=inputs["rollback_evidence"],
-                rollback_cleanup_evidence_path=inputs[
-                    "rollback_cleanup_evidence"
-                ],
+                rollback_cleanup_evidence_path=inputs["rollback_cleanup_evidence"],
                 commit_manifest_path=inputs["commit_manifest"],
                 commit_evidence_path=inputs["commit_evidence"],
                 config_stream_evidence_path=inputs["config_stream_evidence"],
-                commit_cleanup_evidence_path=inputs[
-                    "commit_cleanup_evidence"
-                ],
+                commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
                 bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                **self._rollout_assembly_inputs(inputs),
                 artifact_path=inputs["artifact"],
                 deb_path=inputs["deb"],
                 bom_path=inputs["bom"],
-                candidate_fleet_runner=ROOT
-                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
@@ -3579,25 +3737,24 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     gate_evidence=gate_evidence,
                     security_policy=ROOT
                     / "packaging/release/release-security-policy.json",
-                    signer_directory=ROOT
-                    / "packaging/release/trusted-tag-signers",
+                    signer_directory=ROOT / "packaging/release/trusted-tag-signers",
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
                     candidate_config_stream_runner=ROOT
                     / "packaging/dev/run-iq9075-config-stream-e2e.py",
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
-                    candidate_installer=ROOT
-                    / "packaging/dev/install-iq9075.sh",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
+                    candidate_rollout_control=ROOT
+                    / "packaging/dev/run-iq9075-agent-rollout-control.py",
                 )
             self.assertEqual(
                 verified["runtime_artifact_sha256"], assembled["artifactSha256"]
             )
 
             readiness_payload = json.loads(readiness.read_text(encoding="utf-8"))
-            readiness_payload["releases"]["0.1.121"]["evidence"][
-                "iq9075Physical"
-            ] = signed_identity
+            readiness_payload["releases"]["0.1.121"]["evidence"]["iq9075Physical"] = (
+                signed_identity
+            )
             readiness.write_text(
                 json.dumps(readiness_payload, sort_keys=True, separators=(",", ":"))
                 + "\n",
@@ -3613,8 +3770,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     gate_evidence=gate_evidence,
                     security_policy=ROOT
                     / "packaging/release/release-security-policy.json",
-                    signer_directory=ROOT
-                    / "packaging/release/trusted-tag-signers",
+                    signer_directory=ROOT / "packaging/release/trusted-tag-signers",
                     candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                 )
 
@@ -3639,9 +3795,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "failed-outcome": lambda result: result["outcome"].update(
                 status="failed", error="RSS gate failed"
             ),
-            "raw-frame-shortfall": lambda result: result["soak"].update(
-                rawSamples=100
-            ),
+            "raw-frame-shortfall": lambda result: result["soak"].update(rawSamples=100),
             "gstreamer-error": lambda result: result["soak"].update(
                 gstreamerErrors=["pipeline-error"]
             ),
@@ -3649,9 +3803,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "too-few-rss-samples": lambda result: result["soak"].update(
                 rssAnonSamples=result["soak"]["rssAnonSamples"][:3]
             ),
-            "duplicate-rss-time": lambda result: result["soak"][
-                "rssAnonSamples"
-            ][1].update(elapsedSec=0.0),
+            "duplicate-rss-time": lambda result: result["soak"]["rssAnonSamples"][
+                1
+            ].update(elapsedSec=0.0),
             "large-rss-gap": lambda result: result["soak"].update(
                 rssAnonSamples=[
                     {"elapsedSec": 0.0, "rssAnonKiB": 131072},
@@ -3771,20 +3925,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 validate(root, summary)
 
         for mutation in ("omitted", "byte-drift"):
-            with self.subTest(cleanup_receipt=mutation), tempfile.TemporaryDirectory() as raw_root:
+            with (
+                self.subTest(cleanup_receipt=mutation),
+                tempfile.TemporaryDirectory() as raw_root,
+            ):
                 root = Path(raw_root)
                 summary, _manifest_path, _result_path = (
-                    self._candidate_physical_fixture(
-                        root, component_sha="a" * 40
-                    )
+                    self._candidate_physical_fixture(root, component_sha="a" * 40)
                 )
                 if mutation == "omitted":
                     summary.pop("cleanupEvidence")
                 else:
                     cleanup_path = root / summary["cleanupEvidence"]["file"]
-                    cleanup_value = json.loads(
-                        cleanup_path.read_text(encoding="utf-8")
-                    )
+                    cleanup_value = json.loads(cleanup_path.read_text(encoding="utf-8"))
                     cleanup_path.write_text(
                         json.dumps(cleanup_value, indent=2) + "\n",
                         encoding="utf-8",
@@ -3842,9 +3995,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             fleet_manifest_path = root / manifest["fleetManifest"]["file"]
-            fleet_manifest = json.loads(
-                fleet_manifest_path.read_text(encoding="utf-8")
-            )
+            fleet_manifest = json.loads(fleet_manifest_path.read_text(encoding="utf-8"))
             fleet_manifest["toolSha256"] = "f" * 64
             fleet_manifest_path.write_text(
                 json.dumps(fleet_manifest, sort_keys=True, separators=(",", ":"))
@@ -3883,9 +4034,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         def mutate_publisher_key(manifest, evidence) -> None:
             manifest["scenario"]["release"]["publisherKeyId"] = "attacker-key"
             evidence["updater"]["update"]["publisherKeyId"] = "attacker-key"
-            evidence["slots"]["previousRelease"]["publisherKeyId"] = (
-                "attacker-key"
-            )
+            evidence["slots"]["previousRelease"]["publisherKeyId"] = "attacker-key"
 
         def mutate_config_schema(manifest, evidence) -> None:
             manifest["scenario"]["release"]["configSchema"] = "99"
@@ -3960,14 +4109,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             evidence["generatedAt"] = "2026-09-03T10:01:59Z"
 
         def mutate_rollback_update_after_generated(_manifest, evidence) -> None:
-            evidence["updater"]["update"]["updatedAt"] = (
-                "2026-09-03T10:03:01Z"
-            )
+            evidence["updater"]["update"]["updatedAt"] = "2026-09-03T10:03:01Z"
 
         def mutate_rollback_health_deadline(_manifest, evidence) -> None:
-            evidence["updater"]["update"]["healthDeadline"] = (
-                "2026-09-03T10:30:00Z"
-            )
+            evidence["updater"]["update"]["healthDeadline"] = "2026-09-03T10:30:00Z"
 
         for label, mutate in {
             "release-keyring": mutate_release_sha,
@@ -4004,12 +4149,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 physical_manifest = json.loads(
                     manifest_path.read_text(encoding="utf-8")
                 )
-                fleet_manifest_path = (
-                    root / physical_manifest["fleetManifest"]["file"]
-                )
-                fleet_evidence_path = (
-                    root / physical_manifest["fleetEvidence"]["file"]
-                )
+                fleet_manifest_path = root / physical_manifest["fleetManifest"]["file"]
+                fleet_evidence_path = root / physical_manifest["fleetEvidence"]["file"]
                 fleet_manifest = json.loads(
                     fleet_manifest_path.read_text(encoding="utf-8")
                 )
@@ -4033,9 +4174,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     fleet_evidence_path.read_bytes()
                 ).hexdigest()
                 manifest_path.write_text(
-                    json.dumps(
-                        physical_manifest, sort_keys=True, separators=(",", ":")
-                    )
+                    json.dumps(physical_manifest, sort_keys=True, separators=(",", ":"))
                     + "\n",
                     encoding="utf-8",
                 )
@@ -4044,8 +4183,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     manifest_path.read_bytes()
                 ).hexdigest()
                 result_path.write_text(
-                    json.dumps(result, sort_keys=True, separators=(",", ":"))
-                    + "\n",
+                    json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n",
                     encoding="utf-8",
                 )
                 summary["harnessManifest"]["sha256"] = hashlib.sha256(
@@ -4070,15 +4208,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             with oversize.open("wb") as output:
                 output.truncate(READINESS.MAX_EVIDENCE_BYTES + 1)
             for path in (link, fifo, oversize):
-                with self.subTest(path=path.name), self.assertRaises(
-                    READINESS.ReadinessError
+                with (
+                    self.subTest(path=path.name),
+                    self.assertRaises(READINESS.ReadinessError),
                 ):
                     READINESS._regular_bytes(path)
 
     def test_evidence_readers_reject_swap_to_symlink_races(self) -> None:
         for label, reader, error in (
             ("readiness", READINESS._regular_bytes, READINESS.ReadinessError),
-            ("assembler", PHYSICAL_EVIDENCE._regular_bytes, PHYSICAL_EVIDENCE.AssemblyError),
+            (
+                "assembler",
+                PHYSICAL_EVIDENCE._regular_bytes,
+                PHYSICAL_EVIDENCE.AssemblyError,
+            ),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw_root:
                 root = Path(raw_root)
@@ -4099,11 +4242,16 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         victim.unlink()
                         backup.rename(victim)
 
-                with mock.patch.object(
-                    STABLE_FILE.os, "open", side_effect=swap_before_open
-                ), self.assertRaises(error):
+                with (
+                    mock.patch.object(
+                        STABLE_FILE.os, "open", side_effect=swap_before_open
+                    ),
+                    self.assertRaises(error),
+                ):
                     reader(victim)
-                self.assertEqual(victim.read_text(encoding="utf-8"), '{"trusted":true}\n')
+                self.assertEqual(
+                    victim.read_text(encoding="utf-8"), '{"trusted":true}\n'
+                )
 
     def test_iq9075_legacy_physical_evidence_is_rejected_atomically(self) -> None:
         component_sha = "a" * 40
@@ -4118,8 +4266,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "fleet_manifest_path": source / manifest["fleetManifest"]["file"],
                 "fleet_evidence_path": source / manifest["fleetEvidence"]["file"],
                 "artifact_path": (
-                    source
-                    / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
+                    source / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
                 ),
                 "bom_path": source / manifest["testedBom"]["file"],
                 "candidate_harness": ROOT / "packaging/dev/test-iq9075.sh",
@@ -4162,9 +4309,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 PHYSICAL_EVIDENCE.AssemblyError,
                 "requires schema-v3 candidate soak evidence",
             ):
-                PHYSICAL_EVIDENCE.assemble(
-                    **arguments, output_directory=output
-                )
+                PHYSICAL_EVIDENCE.assemble(**arguments, output_directory=output)
             self.assertEqual(list(output.iterdir()), [])
 
         def corrupt_artifact(arguments: dict[str, object]) -> None:
@@ -4242,9 +4387,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 arguments = inputs(source)
                 corrupt(arguments)
                 with self.assertRaises(PHYSICAL_EVIDENCE.AssemblyError) as caught:
-                    PHYSICAL_EVIDENCE.assemble(
-                        **arguments, output_directory=output
-                    )
+                    PHYSICAL_EVIDENCE.assemble(**arguments, output_directory=output)
                 self.assertEqual(list(output.iterdir()), [])
 
         with tempfile.TemporaryDirectory() as raw_root:
@@ -4274,9 +4417,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 PHYSICAL_EVIDENCE.AssemblyError, "symbolic link"
             ):
-                PHYSICAL_EVIDENCE.assemble(
-                    **arguments, output_directory=output_link
-                )
+                PHYSICAL_EVIDENCE.assemble(**arguments, output_directory=output_link)
             self.assertEqual(list(real_output.iterdir()), [])
 
     def test_candidate_soak_chain_orders_rollback_before_soak_and_restore(self) -> None:
@@ -4292,19 +4433,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             fleet_manifest_path = source / manifest["fleetManifest"]["file"]
             fleet_evidence_path = source / manifest["fleetEvidence"]["file"]
-            fleet_manifest = json.loads(
-                fleet_manifest_path.read_text(encoding="utf-8")
-            )
-            fleet_evidence = json.loads(
-                fleet_evidence_path.read_text(encoding="utf-8")
-            )
+            fleet_manifest = json.loads(fleet_manifest_path.read_text(encoding="utf-8"))
+            fleet_evidence = json.loads(fleet_evidence_path.read_text(encoding="utf-8"))
             soak_path = source / manifest["oakSoak"]["file"]
             soak = json.loads(soak_path.read_text(encoding="utf-8"))
             run_id = fleet_manifest["runId"]
             bom_digest = fleet_manifest["scenario"]["expectedBomDigest"]
-            candidate_slot = (
-                f"/opt/nuv-agent/candidates/{run_id}-{bom_digest[7:]}"
-            )
+            candidate_slot = f"/opt/nuv-agent/candidates/{run_id}-{bom_digest[7:]}"
             control_sha = "c" * 64
             soak.update(
                 {
@@ -4348,9 +4483,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "semanticSha256": "0" * 64,
                 "maximumCommandSequence": 2,
                 "currentReleaseSequence": "1",
-                "currentBomDigest": fleet_evidence["slots"]["release"][
-                    "bomDigest"
-                ],
+                "currentBomDigest": fleet_evidence["slots"]["release"]["bomDigest"],
                 "latest": {
                     "commandId": fleet_manifest["scenario"]["expectedCommandId"],
                     "sequence": 2,
@@ -4401,21 +4534,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 ),
                 "pre": {
                     "slots": slots,
-                        "antiReplay": anti_replay,
-                        "oak": fleet_evidence["oak"],
-                        "runtime": before_runtime,
-                        "persistentState": persistent_state_evidence(),
-                        "releaseTrees": release_tree_evidence(slots),
-                    },
-                    "post": {
+                    "antiReplay": anti_replay,
+                    "oak": fleet_evidence["oak"],
+                    "runtime": before_runtime,
+                    "persistentState": persistent_state_evidence(),
+                    "releaseTrees": release_tree_evidence(slots),
+                },
+                "post": {
                     "restoredAt": "2026-09-03T10:06:00Z",
                     "slots": slots,
                     "antiReplay": anti_replay,
-                        "oak": fleet_evidence["oak"],
-                        "runtime": after_runtime,
-                        "persistentState": persistent_state_evidence(),
-                        "releaseTrees": release_tree_evidence(slots),
-                    },
+                    "oak": fleet_evidence["oak"],
+                    "runtime": after_runtime,
+                    "persistentState": persistent_state_evidence(),
+                    "releaseTrees": release_tree_evidence(slots),
+                },
                 "gates": {
                     "signedRollbackTerminal": True,
                     "candidateBound": True,
@@ -4440,9 +4573,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             }
             candidate_path = source / "candidate-soak-evidence.json"
             candidate_path.write_text(
-                json.dumps(
-                    candidate_evidence, sort_keys=True, separators=(",", ":")
-                )
+                json.dumps(candidate_evidence, sort_keys=True, separators=(",", ":"))
                 + "\n",
                 encoding="utf-8",
             )
@@ -4453,8 +4584,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 artifact_path=artifact_path,
                 bom_path=bom_path,
                 candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
-                candidate_fleet_runner=ROOT
-                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
@@ -4496,9 +4626,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             for label, mutation in cleanup_mutations:
                 with self.subTest(cleanup_evidence=label):
                     candidate_path.write_text(
-                        json.dumps(
-                            mutation, sort_keys=True, separators=(",", ":")
-                        )
+                        json.dumps(mutation, sort_keys=True, separators=(",", ":"))
                         + "\n",
                         encoding="utf-8",
                     )
@@ -4525,9 +4653,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         )
                     self.assertEqual(list(cleanup_rejected.iterdir()), [])
             candidate_path.write_text(
-                json.dumps(
-                    candidate_evidence, sort_keys=True, separators=(",", ":")
-                )
+                json.dumps(candidate_evidence, sort_keys=True, separators=(",", ":"))
                 + "\n",
                 encoding="utf-8",
             )
@@ -4577,8 +4703,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                     security_policy_path=ROOT
                     / "packaging/release/release-security-policy.json",
                     output_directory=rejected_output,
@@ -4589,9 +4714,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.assertEqual(list(rejected_output.iterdir()), [])
 
             candidate_path.write_text(
-                json.dumps(
-                    candidate_evidence, sort_keys=True, separators=(",", ":")
-                )
+                json.dumps(candidate_evidence, sort_keys=True, separators=(",", ":"))
                 + "\n",
                 encoding="utf-8",
             )
@@ -4615,8 +4738,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     bom_path=bom_path,
                     candidate_harness=ROOT / "packaging/dev/test-iq9075.sh",
                     candidate_fleet_runner=untrusted_runner,
-                    candidate_board_tool=ROOT
-                    / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
                     security_policy_path=ROOT
                     / "packaging/release/release-security-policy.json",
                     output_directory=untrusted_output,
@@ -4627,7 +4749,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.assertFalse(execution_marker.exists())
             self.assertEqual(list(untrusted_output.iterdir()), [])
 
-    def test_physical_evidence_assembler_isolated_mode_blocks_source_shadow(self) -> None:
+    def test_physical_evidence_assembler_isolated_mode_blocks_source_shadow(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             fake = root / "nuvion_app/runtime"
@@ -4642,8 +4766,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     sys.executable,
                     "-I",
                     str(
-                        ROOT
-                        / "packaging/release/assemble-iq9075-physical-evidence.py"
+                        ROOT / "packaging/release/assemble-iq9075-physical-evidence.py"
                     ),
                     "--help",
                 ],
@@ -4660,6 +4783,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "assemble-iq9075-physical-evidence.py",
                 "assemble-iq9075-fleet-runtime-evidence.py",
                 "verify-release-readiness.py",
+                "../dev/run-iq9075-agent-rollout-control.py",
             ):
                 with self.subTest(script=script):
                     nonisolated = subprocess.run(
@@ -4682,9 +4806,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
     def test_iq9075_runbook_uses_camera_independent_release_evidence_and_keeps_optional_soak_isolated(
         self,
     ) -> None:
-        runbook = (
-            ROOT / "packaging/release/v0.1.121-release-runbook.md"
-        ).read_text(encoding="utf-8")
+        runbook = (ROOT / "packaging/release/v0.1.121-release-runbook.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             "When a release explicitly claims OAK media stability, use the reviewed",
             runbook,
@@ -4726,11 +4850,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn('--bootstrap-evidence "$bootstrap_evidence"', runbook)
         self.assertIn('--deb "$candidate_deb"', runbook)
         self.assertIn(
-            '--candidate-installer "$component_root/packaging/dev/'
-            'install-iq9075.sh"',
+            '--candidate-installer "$component_root/packaging/dev/install-iq9075.sh"',
             runbook,
         )
-        self.assertIn("ten-file", runbook)
+        self.assertIn("eighteen-file", runbook)
+        self.assertIn('--bom-signature "$CANDIDATE_BOM_SIGNATURE"', runbook)
         bootstrap_call = runbook.index(
             '--run-id "$bootstrap_run_id" --output-dir "$bootstrap_run_dir" '
             "bootstrap-updater"
@@ -4739,21 +4863,39 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             'bootstrap_evidence="$bootstrap_run_dir/bootstrap-evidence.json"',
             bootstrap_call,
         )
+        release_registration = runbook.index("register-release", bootstrap_complete)
         rollback_command_issued = runbook.index(
-            "issue the fresh rollback BE command now", bootstrap_complete
+            "--purpose rollback", release_registration
         )
         rollback_call = runbook.index("--scenario oak-fault-rollback")
+        rollback_terminal = runbook.index(
+            '--issuance-evidence "$rollback_rollout_issuance"', rollback_call
+        )
         rollback_cleanup_call = runbook.index(
             '--run-id "$rollback_run_id" --output-dir "$rollback_run_dir" cleanup',
-            rollback_call,
+            rollback_terminal,
         )
-        commit_call = runbook.index("--scenario commit", rollback_cleanup_call)
+        rollback_terminal_recheck = runbook.index(
+            '--issuance-evidence "$rollback_rollout_issuance"',
+            rollback_cleanup_call,
+        )
+        commit_command_issued = runbook.index(
+            "--purpose commit", rollback_terminal_recheck
+        )
+        commit_call = runbook.index("--scenario commit", commit_command_issued)
+        commit_terminal = runbook.index(
+            '--issuance-evidence "$commit_rollout_issuance"', commit_call
+        )
         config_stream_call = runbook.index(
-            "run-iq9075-config-stream-e2e.py", commit_call
+            "run-iq9075-config-stream-e2e.py", commit_terminal
         )
         runtime_cleanup_call = runbook.index(
             '--run-id "$commit_run_id" --output-dir "$commit_run_dir" cleanup',
             config_stream_call,
+        )
+        commit_terminal_recheck = runbook.index(
+            '--issuance-evidence "$commit_rollout_issuance"',
+            runtime_cleanup_call,
         )
         assembly_call = runbook.index(
             "assemble-iq9075-fleet-runtime-evidence.py", rollback_call
@@ -4766,7 +4908,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             evidence_signature,
         )
         exact_gate_run_binding = runbook.index(
-            '.workflowRunId == $run', gate_evidence_capture
+            ".workflowRunId == $run", gate_evidence_capture
         )
         readiness_generation = runbook.index(
             'runtime_readiness="$runtime_stage/release-readiness.json"',
@@ -4779,7 +4921,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             'verify_runtime_readiness "$runtime_readiness"', readiness_validation
         )
         readiness_install = runbook.index(
-            'readiness_target=packaging/release/release-readiness.json',
+            "readiness_target=packaging/release/release-readiness.json",
             staged_readiness_validation,
         )
         worktree_readiness_validation = runbook.index(
@@ -4796,12 +4938,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             soak_call,
         )
         self.assertLess(bootstrap_call, bootstrap_complete)
-        self.assertLess(bootstrap_complete, rollback_command_issued)
+        self.assertLess(bootstrap_complete, release_registration)
+        self.assertLess(release_registration, rollback_command_issued)
         self.assertLess(rollback_command_issued, rollback_call)
+        self.assertLess(rollback_call, rollback_terminal)
+        self.assertLess(rollback_terminal, rollback_cleanup_call)
+        self.assertLess(rollback_cleanup_call, rollback_terminal_recheck)
+        self.assertLess(rollback_terminal_recheck, commit_command_issued)
         self.assertLess(rollback_call, rollback_cleanup_call)
-        self.assertLess(rollback_cleanup_call, commit_call)
+        self.assertLess(commit_command_issued, commit_call)
+        self.assertLess(commit_call, commit_terminal)
+        self.assertLess(commit_terminal, config_stream_call)
         self.assertLess(commit_call, config_stream_call)
         self.assertLess(config_stream_call, runtime_cleanup_call)
+        self.assertLess(runtime_cleanup_call, commit_terminal_recheck)
+        self.assertLess(commit_terminal_recheck, assembly_call)
         self.assertLess(runtime_cleanup_call, assembly_call)
         self.assertLess(assembly_call, evidence_signature)
         self.assertLess(evidence_signature, gate_evidence_capture)
@@ -4815,6 +4966,34 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertLess(exact_staged_delta, soak_call)
         self.assertLess(assembly_call, soak_call)
         self.assertLess(soak_call, cleanup_call)
+        self.assertIn(
+            'rollout_control="$component_root/packaging/dev/'
+            'run-iq9075-agent-rollout-control.py"',
+            runbook,
+        )
+        self.assertIn('--previous-terminal "$rollback_rollout_terminal"', runbook)
+        self.assertIn(
+            'test "$commit_command_sequence" -eq "$((rollback_command_sequence + 1))"',
+            runbook,
+        )
+        cleanup_definition = runbook.index("cleanup_fleet_workdirs() {")
+        cleanup_trap = runbook.index(
+            "trap cleanup_fleet_workdirs EXIT", cleanup_definition
+        )
+        component_worktree_add = runbook.index(
+            'git worktree add --detach "$component_root" "$release_sha"'
+        )
+        completion_marker = runbook.index("fleet_run_complete=1", assembly_call)
+        self.assertLess(cleanup_definition, cleanup_trap)
+        self.assertLess(cleanup_trap, component_worktree_add)
+        self.assertLess(exact_staged_delta, completion_marker)
+        cleanup_body = runbook[cleanup_definition:cleanup_trap]
+        self.assertIn('if test "$fleet_run_complete" -ne 1', cleanup_body)
+        self.assertIn('--output "$abort_path" >/dev/null || true', cleanup_body)
+        self.assertIn("recovery evidence preserved", cleanup_body)
+        self.assertNotIn('rm -rf -- "$control_stage"', cleanup_body.split("fi", 1)[0])
+        self.assertNotIn("issue the fresh rollback BE command now", runbook)
+        self.assertNotIn("issue the fresh commit BE command now", runbook)
         self.assertIn(
             'GITHUB_TOKEN="$(gh auth token)" python3 -I',
             runbook[gate_evidence_capture:readiness_generation],
@@ -4875,9 +5054,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("sudo -n env -u PYTHONPATH NUVION_AGENT_PYTHON", runbook)
         self.assertNotIn('scp -F /dev/null -P "$board_port"', runbook)
-        self.assertIn(
-            '"$candidate_bom" "$release_sha" <<\'PY\'', runbook
-        )
+        self.assertIn('"$candidate_bom" "$release_sha" <<\'PY\'', runbook)
         self.assertNotIn("--device-id sp-3-nuvion-iq9075 --space-id 3", runbook)
         self.assertIn('--device-id "$device_id" --space-id "$space_id"', runbook)
         reboot_recovery = runbook.index("--recover-after-reboot")
@@ -4894,17 +5071,17 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertGreaterEqual(
             runbook.count("env -u PYTHONPATH PYTHONNOUSERSITE=1"), 4
         )
-        self.assertIn('test ! -e "$evidence_target" -a ! -L "$evidence_target"', runbook)
+        self.assertIn(
+            'test ! -e "$evidence_target" -a ! -L "$evidence_target"', runbook
+        )
 
     def test_iq9075_runbook_initializes_final_publisher_only_after_ready_evidence(
         self,
     ) -> None:
-        runbook = (
-            ROOT / "packaging/release/v0.1.121-release-runbook.md"
-        ).read_text(encoding="utf-8")
-        component_a_capture = runbook.index(
-            'release_sha="$(git rev-parse HEAD)"'
+        runbook = (ROOT / "packaging/release/v0.1.121-release-runbook.md").read_text(
+            encoding="utf-8"
         )
+        component_a_capture = runbook.index('release_sha="$(git rev-parse HEAD)"')
         exact_main_gate = runbook.index(
             "gh workflow run agent-release-gate.yml", component_a_capture
         )
@@ -4925,9 +5102,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         ready_validation = runbook.index(
             'verify_runtime_readiness "$readiness_target"', gate_evidence_capture
         )
-        live_gate_validation = runbook.index(
-            "verify-agent-release-gate.py", evidence_b
-        )
+        live_gate_validation = runbook.index("verify-agent-release-gate.py", evidence_b)
         full_readiness_validation = runbook.index(
             "verify-release-readiness.py", live_gate_validation
         )
@@ -4949,9 +5124,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             'A="$(git show "${B}:packaging/release/release-readiness.json"',
             attestation_c,
         )
-        component_a_rebind = runbook.index(
-            'release_sha="$A"', component_a_recovery
-        )
+        component_a_rebind = runbook.index('release_sha="$A"', component_a_recovery)
         final_release_tag = runbook.index(
             "git tag -s -u 13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
             component_a_rebind,
@@ -4979,15 +5152,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             runbook.count("gh variable set RELEASE_TRUSTED_PUBLISHER_SHA"), 1
         )
         self.assertEqual(runbook.count('release_sha="$(git rev-parse HEAD)"'), 1)
-        self.assertEqual(
-            runbook.count('release_sha="$(git rev-parse origin/main)"'), 1
-        )
+        self.assertEqual(runbook.count('release_sha="$(git rev-parse origin/main)"'), 1)
         self.assertEqual(runbook.count('release_sha="$A"'), 1)
         self.assertEqual(runbook.rfind("release_sha="), component_a_rebind)
         self.assertLess(
-            runbook.rfind(
-                'select(.name == "RELEASE_TRUSTED_PUBLISHER_SHA")'
-            ),
+            runbook.rfind('select(.name == "RELEASE_TRUSTED_PUBLISHER_SHA")'),
             publisher_initialization,
         )
         self.assertIn(
@@ -4996,7 +5165,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             runbook,
         )
         self.assertIn('test "$A" = "$release_sha"', runbook)
-        self.assertIn('git merge-base --is-ancestor "$component_sha" "$publisher_sha"', runbook)
+        self.assertIn(
+            'git merge-base --is-ancestor "$component_sha" "$publisher_sha"', runbook
+        )
         expected_changes_match = re.search(
             r"expected_b_changes=\"\$\(LC_ALL=C sort <<'EOF'\n(.*?)\nEOF\n\)\"",
             runbook,
@@ -5011,13 +5182,21 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "A\tpackaging/release/iq9075-v0.1.121-commit-cleanup-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-commit-fleet-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-commit-fleet-manifest.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-rollout-created.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-rollout-issuance.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-rollout-terminal.json",
                 "A\tpackaging/release/iq9075-v0.1.121-config-stream-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-fleet-runtime-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-fleet-runtime-evidence.json.asc",
                 "A\tpackaging/release/iq9075-v0.1.121-rollback-cleanup-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-rollback-fleet-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-rollback-fleet-manifest.json",
+                "A\tpackaging/release/iq9075-v0.1.121-release-registration.json",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-rollout-created.json",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-rollout-issuance.json",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-rollout-terminal.json",
                 "A\tpackaging/release/nuv-agent_0.1.121_iq9075-aarch64.release-bom.json",
+                "A\tpackaging/release/nuv-agent_0.1.121_iq9075-aarch64.release-bom.json.sig",
                 "M\tpackaging/release/release-readiness.json",
             },
         )
@@ -5028,9 +5207,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn('test "$actual_b_changes" = "$expected_b_changes"', runbook)
         self.assertIn('--expected-run-id "$gate_run_id"', runbook)
         self.assertIn('--candidate-fleet-runner "$validation_dir/component/', runbook)
-        self.assertIn(
-            'test "$previous_attestation" = "$previous_signature"', runbook
-        )
+        self.assertIn('test "$previous_attestation" = "$previous_signature"', runbook)
         self.assertIn(
             'git merge-base --is-ancestor "$publisher_sha" "$audited_main_sha"',
             runbook,
@@ -5148,7 +5325,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ):
                 RELEASE_GATE.verify_workflow_identity(candidate, trusted)
 
-    def test_ota_sequence_failure_precedes_private_key_and_uses_global_cas(self) -> None:
+    def test_ota_sequence_failure_precedes_private_key_and_uses_global_cas(
+        self,
+    ) -> None:
         ota = self.publish.split("  iq9075-ota-publish:", maxsplit=1)[1]
         self.assertIn("group: iq9075-ota-global-publisher", ota)
         self.assertLess(
@@ -5215,9 +5394,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             with self.subTest(role=role):
                 path = policy_path.parent / descriptor["file"]
                 raw = path.read_bytes()
-                self.assertEqual(
-                    hashlib.sha256(raw).hexdigest(), descriptor["sha256"]
-                )
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), descriptor["sha256"])
                 keyring = json.loads(raw)
                 self.assertEqual(keyring["trustDomain"], "iq9075-dev")
                 self.assertEqual(set(keyring["keys"]), {descriptor["keyId"]})
@@ -5463,13 +5640,15 @@ class SequenceAndPromotionTest(unittest.TestCase):
             artifact = root / "nuv-agent_0.1.121_iq9075-aarch64.agent-bundle.tar.gz"
             artifact.write_bytes(b"new release")
             keyring = (
-                ROOT
-                / "packaging/release/trusted-release-keyrings/iq9075-dev.json"
+                ROOT / "packaging/release/trusted-release-keyrings/iq9075-dev.json"
             )
-            with mock.patch.object(
-                PLAN_OTA, "list_version_boms", return_value={"0.1.120": "1"}
-            ), mock.patch.object(
-                PLAN_OTA, "_load_remote_signed_bom", return_value=published
+            with (
+                mock.patch.object(
+                    PLAN_OTA, "list_version_boms", return_value={"0.1.120": "1"}
+                ),
+                mock.patch.object(
+                    PLAN_OTA, "_load_remote_signed_bom", return_value=published
+                ),
             ):
                 reservation, output = PLAN_OTA.plan_sequence(
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
@@ -5484,10 +5663,13 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 )
                 self.assertEqual(reservation["releaseSequence"], 2)
                 self.assertEqual(output["latest_sequence"], "1")
-                self.assertEqual(output["reservation_object"], "releases/reservations/iq9075/2.json")
+                self.assertEqual(
+                    output["reservation_object"], "releases/reservations/iq9075/2.json"
+                )
                 with self.assertRaises(PLAN_OTA.SequencePlanError):
                     PLAN_OTA.plan_sequence(
-                        policy_path=ROOT / "packaging/release/release-security-policy.json",
+                        policy_path=ROOT
+                        / "packaging/release/release-security-policy.json",
                         keyring_path=keyring,
                         artifact_path=artifact,
                         version="0.1.121",
@@ -5545,9 +5727,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
             self.assertEqual(first["releaseGate"]["workflowRunId"], 101)
             self.assertEqual(first["releaseGate"]["checkRunId"], 102)
             self.assertEqual(first["releaseGate"]["workflowSha256"], "d" * 64)
-            self.assertEqual(
-                first["artifacts"]["homebrewFormula"]["name"], "formula"
-            )
+            self.assertEqual(first["artifacts"]["homebrewFormula"]["name"], "formula")
             self.assertRegex(first["sourcePlanDigest"], r"^sha256:[0-9a-f]{64}$")
             self.assertEqual(
                 first["rollbackPackage"],
@@ -5632,8 +5812,11 @@ class SequenceAndPromotionTest(unittest.TestCase):
                 keyring=root / "keyring.json",
                 trust_domain="iq9075-dev",
             )
-            with mock.patch.object(PROMOTION, "load_release_keyring"), mock.patch.object(
-                PROMOTION, "load_signed_release_bom", return_value=bom
+            with (
+                mock.patch.object(PROMOTION, "load_release_keyring"),
+                mock.patch.object(
+                    PROMOTION, "load_signed_release_bom", return_value=bom
+                ),
             ):
                 result = PROMOTION.build_ota(ota_arguments)
                 self.assertEqual(result["releaseSequence"], 2)
@@ -5674,9 +5857,7 @@ SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             + " 123 main/binary-arm64/Packages.gz\n"
         )
         self.assertEqual(
-            PREPARE_APT.parse_release_sha256(
-                release, "main/binary-arm64/Packages.gz"
-            ),
+            PREPARE_APT.parse_release_sha256(release, "main/binary-arm64/Packages.gz"),
             ("c" * 64, 123),
         )
 
@@ -5760,7 +5941,9 @@ esac
             environment["FAKE_GCLOUD_CP_RC"] = "1"
             subprocess.run(command, check=True, capture_output=True, env=environment)
             remote.write_text("different\n", encoding="utf-8")
-            failed = subprocess.run(command, check=False, capture_output=True, env=environment)
+            failed = subprocess.run(
+                command, check=False, capture_output=True, env=environment
+            )
             self.assertNotEqual(failed.returncode, 0)
 
     def test_ota_discovery_is_last_and_every_partial_stage_is_rerunnable(self) -> None:
@@ -5806,21 +5989,36 @@ esac
                 [
                     sys.executable,
                     str(ROOT / "packaging/release/generate-release-bom.py"),
-                    "--schema-version", "2",
-                    "--bom-id", "nuv-agent-0.1.121-iq9075-aarch64",
-                    "--version", "0.1.121",
-                    "--component-sha", "a" * 40,
-                    "--config-schema", "12",
-                    "--release-sequence", "2",
-                    "--min-updater-version", "0.1.0",
-                    "--target", "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64",
-                    "--artifact", str(artifact),
-                    "--artifact-kind", "agent-bundle",
-                    "--built-at", "2026-09-02T00:00:00Z",
-                    "--output", str(bom),
-                    "--signature-output", str(signature),
-                    "--signing-key-id", "test-release",
-                    "--signing-private-key-env", "TEST_RELEASE_PRIVATE_KEY",
+                    "--schema-version",
+                    "2",
+                    "--bom-id",
+                    "nuv-agent-0.1.121-iq9075-aarch64",
+                    "--version",
+                    "0.1.121",
+                    "--component-sha",
+                    "a" * 40,
+                    "--config-schema",
+                    "12",
+                    "--release-sequence",
+                    "2",
+                    "--min-updater-version",
+                    "0.1.0",
+                    "--target",
+                    "IQ9075_DEV:iq9075_dev:QCS9075-EVK:aarch64",
+                    "--artifact",
+                    str(artifact),
+                    "--artifact-kind",
+                    "agent-bundle",
+                    "--built-at",
+                    "2026-09-02T00:00:00Z",
+                    "--output",
+                    str(bom),
+                    "--signature-output",
+                    str(signature),
+                    "--signing-key-id",
+                    "test-release",
+                    "--signing-private-key-env",
+                    "TEST_RELEASE_PRIVATE_KEY",
                 ],
                 check=True,
                 capture_output=True,
@@ -5889,22 +6087,37 @@ esac
                         str(artifact),
                     ]
                     first = subprocess.run(
-                        command, check=False, capture_output=True, text=True, env=environment
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
                     )
                     self.assertNotEqual(first.returncode, 0)
                     environment["FAKE_FAIL_STAGE"] = "0"
                     second = subprocess.run(
-                        command, check=False, capture_output=True, text=True, env=environment
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
                     )
                     self.assertEqual(second.returncode, 0, second.stderr)
                     third = subprocess.run(
-                        command, check=False, capture_output=True, text=True, env=environment
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
                     )
                     self.assertEqual(third.returncode, 0, third.stderr)
-                    objects = sorted(path for path in remote.rglob("*") if path.is_file())
+                    objects = sorted(
+                        path for path in remote.rglob("*") if path.is_file()
+                    )
                     self.assertEqual(len(objects), 6)
                     cp_lines = [
-                        line for line in log.read_text(encoding="utf-8").splitlines()
+                        line
+                        for line in log.read_text(encoding="utf-8").splitlines()
                         if line.startswith("storage cp ")
                     ]
                     self.assertTrue(cp_lines)
@@ -5916,7 +6129,9 @@ esac
 
 
 class SettingsPolicyTest(unittest.TestCase):
-    def test_general_writers_require_hardened_review_with_pinned_admin_roster(self) -> None:
+    def test_general_writers_require_hardened_review_with_pinned_admin_roster(
+        self,
+    ) -> None:
         policy = json.loads(
             (ROOT / "packaging/release/release-security-policy.json").read_text(
                 encoding="utf-8"
@@ -5978,7 +6193,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 environment["deploymentBranchPolicies"],
                 (
                     [{"name": "candidate-publisher-v1", "type": "tag"}]
-                    if name in {
+                    if name
+                    in {
                         "iq9075-candidate-sign",
                         "iq9075-candidate-stage",
                     }
@@ -6005,7 +6221,9 @@ class SettingsPolicyTest(unittest.TestCase):
             ],
         )
 
-    def test_settings_audit_accepts_no_environment_wait_and_rejects_reviewer_rule(self) -> None:
+    def test_settings_audit_accepts_no_environment_wait_and_rejects_reviewer_rule(
+        self,
+    ) -> None:
         branch_ruleset = {
             "id": 1,
             "name": "protected-main",
@@ -6013,9 +6231,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "source_type": "Repository",
             "target": "branch",
             "enforcement": "active",
-            "conditions": {
-                "ref_name": {"include": ["refs/heads/main"], "exclude": []}
-            },
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
             "bypass_actors": [
                 {
                     "actor_id": 16128529,
@@ -6065,9 +6281,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "source_type": "Repository",
             "target": "tag",
             "enforcement": "active",
-            "conditions": {
-                "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
-            },
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
             "bypass_actors": [
                 {
                     "actor_id": 16128529,
@@ -6233,21 +6447,19 @@ class SettingsPolicyTest(unittest.TestCase):
         responses[
             "/repos/plaid-ai/NUV-AGENT/actions/variables/RELEASE_TRUSTED_PUBLISHER_SHA"
         ] = {"value": "a" * 40}
-        responses[
-            "/repos/plaid-ai/NUV-AGENT/actions/secrets?per_page=100&page=1"
-        ] = {"total_count": 0, "secrets": []}
-        responses[
-            "/orgs/plaid-ai/actions/secrets?per_page=100&page=1"
-        ] = {"total_count": 0, "secrets": []}
+        responses["/repos/plaid-ai/NUV-AGENT/actions/secrets?per_page=100&page=1"] = {
+            "total_count": 0,
+            "secrets": [],
+        }
+        responses["/orgs/plaid-ai/actions/secrets?per_page=100&page=1"] = {
+            "total_count": 0,
+            "secrets": [],
+        }
         environment_inventory = [
             {"id": index, "name": name}
-            for index, name in enumerate(
-                policy["requiredEnvironments"], start=1
-            )
+            for index, name in enumerate(policy["requiredEnvironments"], start=1)
         ]
-        responses[
-            "/repos/plaid-ai/NUV-AGENT/environments?per_page=100&page=1"
-        ] = {
+        responses["/repos/plaid-ai/NUV-AGENT/environments?per_page=100&page=1"] = {
             "total_count": len(environment_inventory),
             "environments": environment_inventory,
         }
@@ -6264,19 +6476,20 @@ class SettingsPolicyTest(unittest.TestCase):
         fake_api = mock.Mock()
         fake_api.get.side_effect = lambda path: responses[path]
         fake_api.get_optional.return_value = SETTINGS.API_NOT_FOUND
-        with mock.patch.object(
-            SETTINGS, "GitHubApi", return_value=fake_api
-        ), mock.patch.object(
-            SETTINGS,
-            "_verify_local_candidate_publisher",
-            return_value={
-                "candidate_publisher_tag": "candidate-publisher-v1",
-                "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
-                "candidate_publisher_tag_object_sha": "c" * 40,
-                "candidate_publisher_sha": "9" * 40,
-                "component_sha": "b" * 40,
-                "tag_signer_fingerprint": "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
-            },
+        with (
+            mock.patch.object(SETTINGS, "GitHubApi", return_value=fake_api),
+            mock.patch.object(
+                SETTINGS,
+                "_verify_local_candidate_publisher",
+                return_value={
+                    "candidate_publisher_tag": "candidate-publisher-v1",
+                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                    "candidate_publisher_tag_object_sha": "c" * 40,
+                    "candidate_publisher_sha": "9" * 40,
+                    "component_sha": "b" * 40,
+                    "tag_signer_fingerprint": "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
+                },
+            ),
         ):
             result = SETTINGS.verify_settings(
                 repository="plaid-ai/NUV-AGENT",
@@ -6289,9 +6502,7 @@ class SettingsPolicyTest(unittest.TestCase):
             )
             self.assertEqual(result["governance"]["pullRequestApprovals"], 1)
             self.assertEqual(result["auditedMainSha"], "b" * 40)
-            self.assertEqual(
-                result["candidatePublisher"]["audited_main_sha"], "b" * 40
-            )
+            self.assertEqual(result["candidatePublisher"]["audited_main_sha"], "b" * 40)
             result = SETTINGS.verify_settings(
                 repository="plaid-ai/NUV-AGENT",
                 token="admin-metadata-only",
@@ -6358,9 +6569,7 @@ class SettingsPolicyTest(unittest.TestCase):
                     include_secret_scopes=False,
                 )
             responses[team_path][0]["permission"] = "push"
-            roster_path = (
-                "/orgs/plaid-ai/teams/platform-admin/members?role=all&per_page=100&page=1"
-            )
+            roster_path = "/orgs/plaid-ai/teams/platform-admin/members?role=all&per_page=100&page=1"
             responses[roster_path].append(
                 {
                     "id": 999,
@@ -6411,9 +6620,9 @@ class SettingsPolicyTest(unittest.TestCase):
                     include_secret_scopes=False,
                 )
             responses[swifts_permission_path]["permission"] = "admin"
-            responses[
-                "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
-            ]["protection_rules"].append({"type": "required_reviewers"})
+            responses["/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"][
+                "protection_rules"
+            ].append({"type": "required_reviewers"})
             with self.assertRaises(SETTINGS.SettingsError):
                 SETTINGS.verify_settings(
                     repository="plaid-ai/NUV-AGENT",
@@ -6424,9 +6633,9 @@ class SettingsPolicyTest(unittest.TestCase):
                     trusted_publisher_sha="a" * 40,
                     include_secret_scopes=False,
                 )
-            responses[
-                "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
-            ]["protection_rules"].pop()
+            responses["/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"][
+                "protection_rules"
+            ].pop()
             fake_api.get_optional.return_value = {
                 "required_pull_request_reviews": None,
                 "required_status_checks": None,
@@ -6530,7 +6739,9 @@ class SettingsPolicyTest(unittest.TestCase):
             member="secrets",
             label="secrets",
         )
-        self.assertIn("GCP_SA_KEY", SETTINGS._secret_names(paginated_secrets, label="secrets"))
+        self.assertIn(
+            "GCP_SA_KEY", SETTINGS._secret_names(paginated_secrets, label="secrets")
+        )
         fake_api.get.side_effect = lambda path: {
             "/branch-policies?per_page=100&page=1": {
                 "total_count": 2,
@@ -6548,9 +6759,7 @@ class SettingsPolicyTest(unittest.TestCase):
         fake_api.get.side_effect = lambda path: {
             "/orgs/plaid-ai/actions/secrets/GCP_SA_KEY/repositories?per_page=100&page=1": {
                 "total_count": 1,
-                "repositories": [
-                    {"id": 1149331364, "full_name": "plaid-ai/NUV-AGENT"}
-                ],
+                "repositories": [{"id": 1149331364, "full_name": "plaid-ai/NUV-AGENT"}],
             }
         }[path]
         self.assertTrue(
@@ -6589,12 +6798,15 @@ class SettingsPolicyTest(unittest.TestCase):
         denied = SETTINGS.urllib.error.HTTPError(
             "https://api.github.test/protection", 403, "forbidden", None, None
         )
-        with mock.patch.object(
-            SETTINGS.urllib.request, "urlopen", side_effect=denied
-        ), self.assertRaises(SETTINGS.SettingsError):
+        with (
+            mock.patch.object(SETTINGS.urllib.request, "urlopen", side_effect=denied),
+            self.assertRaises(SETTINGS.SettingsError),
+        ):
             api.get_optional("/repos/plaid-ai/NUV-AGENT/branches/main/protection")
 
-    def test_publisher_surface_binds_every_tracked_helper_and_workflow_bytes(self) -> None:
+    def test_publisher_surface_binds_every_tracked_helper_and_workflow_bytes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             repository = root / "publisher"
@@ -6607,11 +6819,31 @@ class SettingsPolicyTest(unittest.TestCase):
             face_workflow.write_text("name: trusted-face\n", encoding="utf-8")
             helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             helper.chmod(0o755)
-            subprocess.run(["git", "init", "-b", "main", repository], check=True, capture_output=True)
-            subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
-            subprocess.run(["git", "-C", repository, "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(
+                ["git", "init", "-b", "main", repository],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", repository, "config", "user.name", "Test"], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
             subprocess.run(["git", "-C", repository, "add", "."], check=True)
-            subprocess.run(["git", "-C", repository, "commit", "-m", "publisher"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", repository, "commit", "-m", "publisher"],
+                check=True,
+                capture_output=True,
+            )
             commit = subprocess.check_output(
                 ["git", "-C", repository, "rev-parse", "HEAD"], text=True
             ).strip()
@@ -6752,7 +6984,7 @@ class SettingsPolicyTest(unittest.TestCase):
                                     "context": "agent-release-gate",
                                     "integration_id": 15368,
                                 }
-                            ]
+                            ],
                         },
                     },
                 ],
@@ -6777,20 +7009,90 @@ class SettingsPolicyTest(unittest.TestCase):
         mutations = [
             ("name", lambda value: value[0].update(name="almost-protected-main")),
             ("source", lambda value: value[0].update(source_type="Organization")),
-            ("exclude", lambda value: value[0]["conditions"]["ref_name"].update(exclude=["refs/heads/main-hotfix"])),
-            ("approval-count", lambda value: value[0]["rules"][2]["parameters"].update(required_approving_review_count=2)),
-            ("dismiss-stale", lambda value: value[0]["rules"][2]["parameters"].update(dismiss_stale_reviews_on_push=False)),
-            ("code-owner", lambda value: value[0]["rules"][2]["parameters"].update(require_code_owner_review=False)),
-            ("last-push", lambda value: value[0]["rules"][2]["parameters"].update(require_last_push_approval=False)),
-            ("unattributed", lambda value: value[0]["rules"][2]["parameters"].update(require_extra_approval_for_unattributed_changes=False)),
-            ("merge-method", lambda value: value[0]["rules"][2]["parameters"]["allowed_merge_methods"].remove("rebase")),
-            ("fixed-reviewer", lambda value: value[0]["rules"][2]["parameters"]["required_reviewers"].append({"type": "User", "id": 1})),
-            ("resolve-threads", lambda value: value[0]["rules"][2]["parameters"].update(required_review_thread_resolution=False)),
-            ("strict", lambda value: value[0]["rules"][3]["parameters"].update(strict_required_status_checks_policy=False)),
-            ("create", lambda value: value[0]["rules"][3]["parameters"].update(do_not_enforce_on_create=True)),
-            ("integration", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"][0].update(integration_id=1)),
-            ("context", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"][0].update(context="nonexistent-check")),
-            ("extra-check", lambda value: value[0]["rules"][3]["parameters"]["required_status_checks"].append({"context": "extra", "integration_id": 15368})),
+            (
+                "exclude",
+                lambda value: value[0]["conditions"]["ref_name"].update(
+                    exclude=["refs/heads/main-hotfix"]
+                ),
+            ),
+            (
+                "approval-count",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    required_approving_review_count=2
+                ),
+            ),
+            (
+                "dismiss-stale",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    dismiss_stale_reviews_on_push=False
+                ),
+            ),
+            (
+                "code-owner",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    require_code_owner_review=False
+                ),
+            ),
+            (
+                "last-push",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    require_last_push_approval=False
+                ),
+            ),
+            (
+                "unattributed",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    require_extra_approval_for_unattributed_changes=False
+                ),
+            ),
+            (
+                "merge-method",
+                lambda value: value[0]["rules"][2]["parameters"][
+                    "allowed_merge_methods"
+                ].remove("rebase"),
+            ),
+            (
+                "fixed-reviewer",
+                lambda value: value[0]["rules"][2]["parameters"][
+                    "required_reviewers"
+                ].append({"type": "User", "id": 1}),
+            ),
+            (
+                "resolve-threads",
+                lambda value: value[0]["rules"][2]["parameters"].update(
+                    required_review_thread_resolution=False
+                ),
+            ),
+            (
+                "strict",
+                lambda value: value[0]["rules"][3]["parameters"].update(
+                    strict_required_status_checks_policy=False
+                ),
+            ),
+            (
+                "create",
+                lambda value: value[0]["rules"][3]["parameters"].update(
+                    do_not_enforce_on_create=True
+                ),
+            ),
+            (
+                "integration",
+                lambda value: value[0]["rules"][3]["parameters"][
+                    "required_status_checks"
+                ][0].update(integration_id=1),
+            ),
+            (
+                "context",
+                lambda value: value[0]["rules"][3]["parameters"][
+                    "required_status_checks"
+                ][0].update(context="nonexistent-check"),
+            ),
+            (
+                "extra-check",
+                lambda value: value[0]["rules"][3]["parameters"][
+                    "required_status_checks"
+                ].append({"context": "extra", "integration_id": 15368}),
+            ),
         ]
         for label, mutate in mutations:
             candidate = json.loads(json.dumps(rulesets))
@@ -6847,7 +7149,9 @@ class SettingsPolicyTest(unittest.TestCase):
             audited_main_sha = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=repository, text=True
             ).strip()
-            (repository / "evidence.txt").write_text("signed evidence\n", encoding="utf-8")
+            (repository / "evidence.txt").write_text(
+                "signed evidence\n", encoding="utf-8"
+            )
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             subprocess.run(
                 ["git", "commit", "-m", "refresh evidence"],
@@ -6941,23 +7245,26 @@ class SettingsPolicyTest(unittest.TestCase):
             )
             signature = root / "attestation.json.asc"
             signature.write_text("test-signature\n", encoding="utf-8")
-            with mock.patch.object(
-                SETTINGS_ATTESTATION,
-                "_verify_signature",
-                return_value="13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
-            ), mock.patch.object(
-                SETTINGS_ATTESTATION,
-                "publisher_surface",
-                return_value={
-                    "publisherTreeSha256": "b" * 64,
-                    "workflowSha256": "c" * 64,
-                },
-            ), mock.patch.object(
-                SETTINGS_ATTESTATION, "verify_executing_workflow"
-            ), mock.patch.object(
-                SETTINGS_ATTESTATION,
-                "_verify_audited_main_lineage",
-                return_value="f" * 40,
+            with (
+                mock.patch.object(
+                    SETTINGS_ATTESTATION,
+                    "_verify_signature",
+                    return_value="13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
+                ),
+                mock.patch.object(
+                    SETTINGS_ATTESTATION,
+                    "publisher_surface",
+                    return_value={
+                        "publisherTreeSha256": "b" * 64,
+                        "workflowSha256": "c" * 64,
+                    },
+                ),
+                mock.patch.object(SETTINGS_ATTESTATION, "verify_executing_workflow"),
+                mock.patch.object(
+                    SETTINGS_ATTESTATION,
+                    "_verify_audited_main_lineage",
+                    return_value="f" * 40,
+                ),
             ):
                 result = SETTINGS_ATTESTATION.verify_attestation(
                     attestation_path=path,
@@ -6983,7 +7290,8 @@ class SettingsPolicyTest(unittest.TestCase):
                         repository="plaid-ai/NUV-AGENT",
                         trusted_publisher_sha="b" * 40,
                         publisher_root=ROOT,
-                        executing_workflow=ROOT / ".github/workflows/release-publish.yml",
+                        executing_workflow=ROOT
+                        / ".github/workflows/release-publish.yml",
                         now=now,
                     )
                 with self.assertRaises(SETTINGS_ATTESTATION.AttestationError):
@@ -6995,7 +7303,8 @@ class SettingsPolicyTest(unittest.TestCase):
                         repository="plaid-ai/NUV-AGENT",
                         trusted_publisher_sha="a" * 40,
                         publisher_root=ROOT,
-                        executing_workflow=ROOT / ".github/workflows/release-publish.yml",
+                        executing_workflow=ROOT
+                        / ".github/workflows/release-publish.yml",
                         now=now + dt.timedelta(days=1),
                     )
 
@@ -7082,7 +7391,8 @@ class SettingsPolicyTest(unittest.TestCase):
             policy_payload["trustedTagSignerFingerprints"] = [fingerprint]
             policy = root / "policy.json"
             policy.write_text(
-                json.dumps(policy_payload, sort_keys=True, separators=(",", ":")) + "\n",
+                json.dumps(policy_payload, sort_keys=True, separators=(",", ":"))
+                + "\n",
                 encoding="utf-8",
             )
             attestation_payload = {
@@ -7142,19 +7452,21 @@ class SettingsPolicyTest(unittest.TestCase):
                     env=environment,
                 )
             )
-            with mock.patch.object(
-                SETTINGS_ATTESTATION,
-                "publisher_surface",
-                return_value={
-                    "publisherTreeSha256": "b" * 64,
-                    "workflowSha256": "c" * 64,
-                },
-            ), mock.patch.object(
-                SETTINGS_ATTESTATION, "verify_executing_workflow"
-            ), mock.patch.object(
-                SETTINGS_ATTESTATION,
-                "_verify_audited_main_lineage",
-                return_value="f" * 40,
+            with (
+                mock.patch.object(
+                    SETTINGS_ATTESTATION,
+                    "publisher_surface",
+                    return_value={
+                        "publisherTreeSha256": "b" * 64,
+                        "workflowSha256": "c" * 64,
+                    },
+                ),
+                mock.patch.object(SETTINGS_ATTESTATION, "verify_executing_workflow"),
+                mock.patch.object(
+                    SETTINGS_ATTESTATION,
+                    "_verify_audited_main_lineage",
+                    return_value="f" * 40,
+                ),
             ):
                 result = SETTINGS_ATTESTATION.verify_attestation(
                     attestation_path=attestation,
@@ -7380,7 +7692,9 @@ class FaceArtifactManifestTest(unittest.TestCase):
                 )
             manifest.write_bytes(original_manifest)
 
-            manifest.write_text(json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8")
+            manifest.write_text(
+                json.dumps(manifest_payload, indent=2) + "\n", encoding="utf-8"
+            )
             noncanonical_signature = root / "noncanonical.asc"
             subprocess.run(
                 [
@@ -7625,8 +7939,12 @@ class HomebrewPromotionTest(unittest.TestCase):
             root = Path(raw_root)
             current = root / "current.rb"
             candidate = root / "candidate.rb"
-            current.write_text('class Nuv < Formula\n  version "0.1.120"\nend\n', encoding="utf-8")
-            candidate.write_text('class Nuv < Formula\n  version "0.1.121"\nend\n', encoding="utf-8")
+            current.write_text(
+                'class Nuv < Formula\n  version "0.1.120"\nend\n', encoding="utf-8"
+            )
+            candidate.write_text(
+                'class Nuv < Formula\n  version "0.1.121"\nend\n', encoding="utf-8"
+            )
             result = HOMEBREW_PROMOTION.verify_promotion(
                 current, candidate, requested_version="0.1.121"
             )
