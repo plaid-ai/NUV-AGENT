@@ -27,23 +27,7 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  trusted-publisher-pin-required:
-    name: Block candidate dispatch until trusted reusable workflow is SHA-pinned
-    if: >-
-      github.repository == 'plaid-ai/NUV-AGENT' &&
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    permissions: {}
-    steps:
-      - name: Refuse an unpinned candidate publisher
-        shell: bash
-        run: |
-          echo "candidate signing and staging are disabled until a follow-up commit calls the trusted reusable workflow at this commit's literal SHA" >&2
-          exit 1
-
   build:
-    needs: trusted-publisher-pin-required
     name: Build exact secretless arm64 candidate
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
@@ -202,3 +186,30 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 2
+
+  trusted-sign-and-stage:
+    name: Sign and stage through immutable trusted publisher
+    needs: build
+    if: >-
+      github.repository == 'plaid-ai/NUV-AGENT' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      needs.build.result == 'success'
+    permissions:
+      contents: read
+      id-token: write
+    uses: plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@7732095f206c11eb4e4b15eb0a8c7391c4cc7534
+    with:
+      trusted_workflow_sha: 7732095f206c11eb4e4b15eb0a8c7391c4cc7534
+      component_sha: ${{ inputs.component_sha }}
+      version: ${{ inputs.version }}
+      release_sequence: ${{ inputs.release_sequence }}
+      bundle_name: ${{ needs.build.outputs.bundle_name }}
+      bundle_sha256: ${{ needs.build.outputs.bundle_sha256 }}
+      bundle_size: ${{ needs.build.outputs.bundle_size }}
+      deb_name: ${{ needs.build.outputs.deb_name }}
+      deb_sha256: ${{ needs.build.outputs.deb_sha256 }}
+      deb_size: ${{ needs.build.outputs.deb_size }}
+      built_at: ${{ needs.build.outputs.built_at }}
+      config_schema: ${{ needs.build.outputs.config_schema }}
+      min_updater_version: ${{ needs.build.outputs.min_updater_version }}

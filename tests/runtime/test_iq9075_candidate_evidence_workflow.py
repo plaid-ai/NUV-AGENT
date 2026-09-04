@@ -24,6 +24,7 @@ TRUSTED_WORKFLOW = (
     ROOT / ".github/workflows/iq9075-candidate-trusted-publish.yml"
 )
 RUNBOOK = ROOT / "packaging/release/v0.1.121-release-runbook.md"
+TRUSTED_PUBLISHER_SHA = "7732095f206c11eb4e4b15eb0a8c7391c4cc7534"
 
 
 class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
@@ -31,7 +32,10 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.header, cls.jobs = cls.workflow.split("jobs:", maxsplit=1)
-        cls.blocker, cls.build = cls.jobs.split("  build:", maxsplit=1)
+        _, build_and_trusted_call = cls.jobs.split("  build:", maxsplit=1)
+        cls.build, cls.trusted_call = build_and_trusted_call.split(
+            "  trusted-sign-and-stage:", maxsplit=1
+        )
         cls.trusted_workflow = TRUSTED_WORKFLOW.read_text(encoding="utf-8")
         cls.trusted_header, trusted_jobs = cls.trusted_workflow.split(
             "jobs:", maxsplit=1
@@ -79,14 +83,44 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             self.trusted_workflow.count("git/ref/heads/main"), 2
         )
 
-    def test_current_dispatch_is_explicitly_blocked_until_literal_pin(self) -> None:
-        self.assertIn("trusted-publisher-pin-required:", self.blocker)
-        self.assertIn("exit 1", self.blocker)
-        self.assertIn("needs: trusted-publisher-pin-required", self.build)
-        self.assertNotIn("iq9075-candidate-trusted-publish.yml@", self.workflow)
+    def test_dispatch_uses_only_the_literal_trusted_publisher_pin(self) -> None:
+        self.assertNotIn("trusted-publisher-pin-required:", self.workflow)
+        self.assertNotIn("needs: trusted-publisher-pin-required", self.build)
+        reusable_call = re.search(
+            r"uses: plaid-ai/NUV-AGENT/\.github/workflows/"
+            r"iq9075-candidate-trusted-publish\.yml@([0-9a-f]{40})",
+            self.trusted_call,
+        )
+        self.assertIsNotNone(reusable_call)
+        assert reusable_call is not None
+        self.assertEqual(reusable_call.group(1), TRUSTED_PUBLISHER_SHA)
+        self.assertEqual(self.workflow.count(TRUSTED_PUBLISHER_SHA), 2)
+        self.assertIn(
+            f"trusted_workflow_sha: {TRUSTED_PUBLISHER_SHA}",
+            self.trusted_call,
+        )
+        self.assertIn("needs: build", self.trusted_call)
+        self.assertIn("id-token: write", self.trusted_call)
+        self.assertNotIn("runs-on:", self.trusted_call)
+        self.assertNotIn("steps:", self.trusted_call)
         self.assertNotIn("${{ secrets.", self.workflow)
         self.assertNotIn("environment:", self.workflow)
         self.assertNotIn("secrets:", self.workflow)
+        for output_name in (
+            "bundle_name",
+            "bundle_sha256",
+            "bundle_size",
+            "deb_name",
+            "deb_sha256",
+            "deb_size",
+            "built_at",
+            "config_schema",
+            "min_updater_version",
+        ):
+            self.assertIn(
+                f"${{{{ needs.build.outputs.{output_name} }}}}",
+                self.trusted_call,
+            )
 
     def test_secretless_native_arm_build_is_separate_from_signing(self) -> None:
         self.assertIn("runs-on: ubuntu-24.04-arm", self.build)
