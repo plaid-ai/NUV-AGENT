@@ -107,17 +107,27 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         sentinel = "${{ secrets.GITHUB_TOKEN }}"
         self.assertEqual(self.workflow.count(sentinel), 3)
         caller_without_sentinels = self.workflow.replace(sentinel, "")
+        secret_context = re.compile(
+            r"\$\{\{[^}]*\bsecrets\b",
+            flags=re.IGNORECASE,
+        )
         self.assertNotRegex(
             caller_without_sentinels,
-            r"\$\{\{[^}]*\bsecrets\b",
+            secret_context,
         )
         self.assertEqual(
             re.findall(
                 r"\$\{\{\s*secrets\.([A-Z0-9_]+)\s*\}\}",
                 self.workflow,
+                flags=re.IGNORECASE,
             ),
             ["GITHUB_TOKEN", "GITHUB_TOKEN", "GITHUB_TOKEN"],
         )
+        for forbidden_reference in (
+            "${{ Secrets.REPOSITORY_RELEASE_KEY }}",
+            "${{ secrets['REPOSITORY_RELEASE_KEY'] }}",
+        ):
+            self.assertRegex(forbidden_reference, secret_context)
         for secret_name in (
             "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
             "GCP_PROJECT_ID",
