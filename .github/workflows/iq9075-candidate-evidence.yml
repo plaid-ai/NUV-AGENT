@@ -198,9 +198,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@7732095f206c11eb4e4b15eb0a8c7391c4cc7534
+    uses: plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@59a073eaecbdbfdc79b8be728ac1dc778947410d
     with:
-      trusted_workflow_sha: 7732095f206c11eb4e4b15eb0a8c7391c4cc7534
+      trusted_workflow_sha: 59a073eaecbdbfdc79b8be728ac1dc778947410d
       component_sha: ${{ inputs.component_sha }}
       version: ${{ inputs.version }}
       release_sequence: ${{ inputs.release_sequence }}
