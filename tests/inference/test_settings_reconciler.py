@@ -49,14 +49,36 @@ def _stream_reconciler(encoder: object) -> StreamPolicyReconciler:
     )
 
 
+def _healthy_event_outbox() -> dict[str, object]:
+    return {
+        "capacityState": "HEALTHY",
+        "unsavedCriticalEvents": 0,
+        "safetyStop": False,
+        "protocolStop": False,
+        "durableSafetyRetained": False,
+        "blockedRows": 0,
+        "dlqRows": 0,
+    }
+
+
+def _healthy_command_outbox() -> dict[str, object]:
+    return {
+        "capacityState": "HEALTHY",
+        "retentionPressure": False,
+        "dlqBlockedRows": 0,
+        "dlqRows": 0,
+    }
+
+
 def _command(
     sequence: int,
     *,
+    config_version: int | None = None,
     activation: str = "IMMEDIATE",
     sections: dict[str, object] | None = None,
 ) -> VerifiedFleetCommand:
     payload: dict[str, object] = {
-        "configVersion": sequence,
+        "configVersion": config_version if config_version is not None else sequence,
         "activation": activation,
         **(
             sections
@@ -143,11 +165,13 @@ class _Runtime:
         self.healthy = True
         self.unsupported = False
         self.restore_calls = 0
+        self.apply_calls = 0
 
     def snapshot(self) -> dict[str, object]:
         return copy.deepcopy(self.state)
 
     def apply_immediate(self, desired) -> dict[str, object]:
+        self.apply_calls += 1
         if self.unsupported:
             raise UnsupportedSettingsEffect("effect is not live-reconfigurable")
         for section in ("model", "labels", "clip", "video"):
@@ -203,11 +227,16 @@ class SettingsReconcilerTest(unittest.TestCase):
         self,
         runtime: _Runtime,
         process_id: str,
+        *,
+        event_outbox_health_provider=_healthy_event_outbox,
+        command_outbox_health_provider=_healthy_command_outbox,
     ) -> SettingsReconciler:
         return SettingsReconciler(
             store=AtomicSettingsStore(self.config_path, self.root / "state"),
             runtime=runtime,
             process_instance_id=process_id,
+            event_outbox_health_provider=event_outbox_health_provider,
+            command_outbox_health_provider=command_outbox_health_provider,
         )
 
     def test_immediate_apply_proves_readback_and_signed_payload_superset(self) -> None:
@@ -285,6 +314,123 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(runtime.state, before)
         self.assertEqual(self.config_path.read_bytes(), self.original)
         self.assertEqual((self.root / "state" / "active.env").read_bytes(), b"")
+
+    def test_outbox_health_is_a_fail_closed_functional_success_gate(self) -> None:
+        event_health = _healthy_event_outbox()
+        event_health["durableSafetyRetained"] = True
+        runtime = _Runtime()
+
+        outcome = self._reconciler(
+            runtime,
+            "process-a",
+            event_outbox_health_provider=lambda: event_health,
+        ).reconcile(_command(91))
+
+        self.assertEqual(outcome.status, "ROLLED_BACK")
+        self.assertEqual(outcome.code, "FUNCTIONAL_HEALTH_ROLLBACK")
+        self.assertIn("CRITICAL_SAFETY_RETAINED", outcome.message)
+        self.assertEqual(runtime.apply_calls, 1)
+        self.assertEqual(runtime.restore_calls, 1)
+
+    def test_functional_health_reasons_require_every_outbox_safety_field(self) -> None:
+        event_failures = (
+            ({"capacityState": "PRESSURE"}, "EVENT_OUTBOX_UNHEALTHY"),
+            ({"unsavedCriticalEvents": 1}, "CRITICAL_EVENT_NOT_DURABLE"),
+            ({"safetyStop": True}, "CRITICAL_EVENT_SAFETY_STOP"),
+            ({"protocolStop": True}, "EVENT_PROTOCOL_STOP"),
+            ({"durableSafetyRetained": True}, "CRITICAL_SAFETY_RETAINED"),
+            ({"blockedRows": 1}, "EVENT_OUTBOX_BLOCKED"),
+            ({"dlqRows": 1}, "EVENT_OUTBOX_DLQ_PRESENT"),
+        )
+        command_failures = (
+            ({"capacityState": "BACKPRESSURE"}, "COMMAND_OUTBOX_UNHEALTHY"),
+            ({"retentionPressure": True}, "COMMAND_OUTBOX_RETENTION_PRESSURE"),
+            ({"dlqBlockedRows": 1}, "COMMAND_OUTBOX_BLOCKED"),
+            ({"dlqRows": 1}, "COMMAND_OUTBOX_DLQ_PRESENT"),
+        )
+
+        for update, reason in event_failures:
+            with self.subTest(event_reason=reason):
+                health = _healthy_event_outbox()
+                health.update(update)
+                reconciler = self._reconciler(
+                    _Runtime(),
+                    f"event-{reason}",
+                    event_outbox_health_provider=lambda health=health: health,
+                )
+                self.assertEqual(reconciler._functional_health_failure_reason(), reason)
+
+        for update, reason in command_failures:
+            with self.subTest(command_reason=reason):
+                health = _healthy_command_outbox()
+                health.update(update)
+                reconciler = self._reconciler(
+                    _Runtime(),
+                    f"command-{reason}",
+                    command_outbox_health_provider=lambda health=health: health,
+                )
+                self.assertEqual(reconciler._functional_health_failure_reason(), reason)
+
+    def test_missing_outbox_health_provider_fails_closed(self) -> None:
+        reconciler = SettingsReconciler(
+            store=AtomicSettingsStore(self.config_path, self.root / "missing-health"),
+            runtime=_Runtime(),
+            process_instance_id="process-a",
+        )
+
+        self.assertEqual(
+            reconciler._functional_health_failure_reason(),
+            "EVENT_OUTBOX_HEALTH_UNAVAILABLE",
+        )
+
+    def test_config_version_rejects_higher_sequence_before_external_effect_and_restart(
+        self,
+    ) -> None:
+        db_path = self.root / "monotonic.sqlite3"
+        inbox = DurableCommandInbox(db_path)
+        store = DurableReconcileStore(inbox)
+        runtime = _Runtime()
+        registry = ReconcilerRegistry()
+        registry.register(self._reconciler(runtime, "process-a"))
+        coordinator = FleetEffectCoordinator(
+            inbox=inbox,
+            store=store,
+            registry=registry,
+            process_instance_id="process-a",
+        )
+        current = _command(100, config_version=500)
+        inbox.accept(current)
+        inbox.transition(current.command_id, "IN_PROGRESS")
+        inbox.run_transactional_effect(
+            current.command_id,
+            lambda connection: store.stage_verified(current, connection),
+        )
+        self.assertEqual(coordinator.run_once().terminal_acks[0].status, "SUCCEEDED")
+        self.assertEqual(runtime.apply_calls, 1)
+
+        reopened_inbox = DurableCommandInbox(db_path)
+        reopened_store = DurableReconcileStore(reopened_inbox)
+        stale = _command(101, config_version=500)
+        reopened_inbox.accept(stale)
+        reopened_inbox.transition(stale.command_id, "IN_PROGRESS")
+        ack, effect_applied = reopened_inbox.run_transactional_effect(
+            stale.command_id,
+            lambda connection: reopened_store.stage_verified(stale, connection),
+        )
+
+        # The short SQLite handler transaction commits the terminal rejection,
+        # but no reconcile job is staged, so no external runtime effect exists.
+        self.assertTrue(effect_applied)
+        self.assertEqual(ack.status, "FAILED")
+        self.assertEqual(ack.code, "STALE_CONFIG_VERSION")
+        self.assertEqual(ack.reported_state["currentConfigVersion"], 500)
+        self.assertIsNone(reopened_store.get_job(stale.command_id))
+        self.assertEqual(
+            reopened_store.applied_state("CONFIG_APPLY").payload["configVersion"],
+            500,
+        )
+        self.assertTrue(reopened_inbox.accept(stale).duplicate)
+        self.assertEqual(reopened_inbox.get(stale.command_id).code, "STALE_CONFIG_VERSION")
 
     def test_restart_requires_new_process_and_actual_model_digest(self) -> None:
         requested_model = {

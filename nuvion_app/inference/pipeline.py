@@ -3683,6 +3683,10 @@ class GStreamerInferenceApp:
                         ),
                         runtime=settings_runtime,
                         process_instance_id=FLEET_PROCESS_INSTANCE_ID,
+                        event_outbox_health_provider=build_event_outbox_runtime_health,
+                        command_outbox_health_provider=(
+                            build_command_observation_runtime_health
+                        ),
                     )
                 )
                 log.info("[CONFIG-APPLY] transactional reconciler registered")

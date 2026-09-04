@@ -422,14 +422,28 @@ class SettingsReconciler:
         runtime: SettingsRuntimeAdapter,
         process_instance_id: str | None = None,
         config_schema: str = DEFAULT_CONFIG_SCHEMA,
+        event_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
+        command_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.store = store
         self.runtime = runtime
         self.process_instance_id = str(process_instance_id or uuid.uuid4())
         self.config_schema = str(config_schema)
+        self._event_outbox_health_provider = event_outbox_health_provider
+        self._command_outbox_health_provider = command_outbox_health_provider
         self._effect_fence: Callable[[], None] = lambda: None
         if not self.config_schema.isdigit() or int(self.config_schema) < 1:
             raise ValueError("config_schema must be a positive integer string")
+        if (
+            self._event_outbox_health_provider is not None
+            and not callable(self._event_outbox_health_provider)
+        ):
+            raise TypeError("event_outbox_health_provider must be callable")
+        if (
+            self._command_outbox_health_provider is not None
+            and not callable(self._command_outbox_health_provider)
+        ):
+            raise TypeError("command_outbox_health_provider must be callable")
 
     def set_effect_fence(self, fence_check: Callable[[], None]) -> None:
         if not callable(fence_check):
@@ -566,8 +580,7 @@ class SettingsReconciler:
             self._verify_runtime_readback(command.payload, readback)
             if not self.store.readback_matches(command.payload):
                 raise RuntimeError("activated config file readback mismatch")
-            if not self.runtime.functional_health():
-                raise RuntimeError("functional health gate failed")
+            self._require_functional_health()
             self._ensure_fence()
             self.store.commit()
             return CommandEffectOutcome.succeeded(
@@ -644,10 +657,90 @@ class SettingsReconciler:
         }
 
     def _functional_health(self) -> bool:
+        return self._functional_health_failure_reason() is None
+
+    def _require_functional_health(self) -> None:
+        reason = self._functional_health_failure_reason()
+        if reason is not None:
+            raise RuntimeError(f"functional health gate failed: {reason}")
+
+    def _functional_health_failure_reason(self) -> str | None:
         try:
-            return self.runtime.functional_health() is True
+            if self.runtime.functional_health() is not True:
+                return "PIPELINE_OR_ENCODER_UNHEALTHY"
         except Exception:  # noqa: BLE001 - health evidence is fail-closed.
-            return False
+            return "PIPELINE_OR_ENCODER_HEALTH_UNAVAILABLE"
+
+        event_health = self._health_from_provider(
+            self._event_outbox_health_provider,
+            unavailable="EVENT_OUTBOX_HEALTH_UNAVAILABLE",
+        )
+        if isinstance(event_health, str):
+            return event_health
+        event_reason = self._event_outbox_failure_reason(event_health)
+        if event_reason is not None:
+            return event_reason
+
+        command_health = self._health_from_provider(
+            self._command_outbox_health_provider,
+            unavailable="COMMAND_OUTBOX_HEALTH_UNAVAILABLE",
+        )
+        if isinstance(command_health, str):
+            return command_health
+        return self._command_outbox_failure_reason(command_health)
+
+    @staticmethod
+    def _health_from_provider(
+        provider: Callable[[], Mapping[str, Any]] | None,
+        *,
+        unavailable: str,
+    ) -> Mapping[str, Any] | str:
+        if provider is None:
+            return unavailable
+        try:
+            health = provider()
+        except Exception:  # noqa: BLE001 - telemetry must be fail-closed.
+            return unavailable
+        return health if isinstance(health, Mapping) else unavailable
+
+    @staticmethod
+    def _zero(health: Mapping[str, Any], key: str) -> bool:
+        value = health.get(key)
+        return not isinstance(value, bool) and isinstance(value, int) and value == 0
+
+    def _event_outbox_failure_reason(
+        self,
+        health: Mapping[str, Any],
+    ) -> str | None:
+        if health.get("capacityState") != "HEALTHY":
+            return "EVENT_OUTBOX_UNHEALTHY"
+        if not self._zero(health, "unsavedCriticalEvents"):
+            return "CRITICAL_EVENT_NOT_DURABLE"
+        if health.get("safetyStop") is not False:
+            return "CRITICAL_EVENT_SAFETY_STOP"
+        if health.get("protocolStop") is not False:
+            return "EVENT_PROTOCOL_STOP"
+        if health.get("durableSafetyRetained") is not False:
+            return "CRITICAL_SAFETY_RETAINED"
+        if not self._zero(health, "blockedRows"):
+            return "EVENT_OUTBOX_BLOCKED"
+        if not self._zero(health, "dlqRows"):
+            return "EVENT_OUTBOX_DLQ_PRESENT"
+        return None
+
+    def _command_outbox_failure_reason(
+        self,
+        health: Mapping[str, Any],
+    ) -> str | None:
+        if health.get("capacityState") != "HEALTHY":
+            return "COMMAND_OUTBOX_UNHEALTHY"
+        if health.get("retentionPressure") is not False:
+            return "COMMAND_OUTBOX_RETENTION_PRESSURE"
+        if not self._zero(health, "dlqBlockedRows"):
+            return "COMMAND_OUTBOX_BLOCKED"
+        if not self._zero(health, "dlqRows"):
+            return "COMMAND_OUTBOX_DLQ_PRESENT"
+        return None
 
     def _verify_runtime_readback(
         self,

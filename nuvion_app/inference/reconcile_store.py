@@ -255,6 +255,34 @@ class DurableReconcileStore:
         if current is not None and str(current["command_id"]) == command.command_id:
             return CommandEffectOutcome.deferred()
 
+        if command.command_type == "CONFIG_APPLY":
+            current_config_version = self._current_config_version_in_transaction(
+                connection
+            )
+            requested_config_version = int(command.payload["configVersion"])
+            if (
+                current_config_version is not None
+                and requested_config_version <= current_config_version
+            ):
+                # This is deliberately checked inside the same IMMEDIATE
+                # transaction that would otherwise supersede desired state.
+                # A higher transport sequence must never replay or roll back a
+                # newer durable configuration version before an external
+                # settings/pipeline effect begins.
+                return CommandEffectOutcome(
+                    status=COMMAND_STATUS_FAILED,
+                    code="STALE_CONFIG_VERSION",
+                    message=(
+                        "CONFIG_APPLY configVersion must be greater than the "
+                        f"durable desired/applied version={current_config_version}"
+                    ),
+                    reported_state={
+                        **command.payload,
+                        "health": "NOT_APPLIED",
+                        "currentConfigVersion": current_config_version,
+                    },
+                )
+
         if current is not None and int(current["sequence"]) >= command.sequence:
             self._insert_job_if_missing(
                 connection,
@@ -418,6 +446,43 @@ class DurableReconcileStore:
                 now=now,
             )
         return CommandEffectOutcome.deferred()
+
+    @staticmethod
+    def _current_config_version_in_transaction(
+        connection: sqlite3.Connection,
+    ) -> int | None:
+        """Return the monotonic CONFIG_APPLY high-water mark from durable state.
+
+        Desired state survives a failed/rolled-back attempt intentionally, while
+        applied state records the last successful runtime effect.  Comparing
+        both prevents a later transport sequence from reusing an older config
+        version after either path, including process restarts.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT payload_json FROM fleet_desired_state
+            WHERE command_type = 'CONFIG_APPLY'
+            UNION ALL
+            SELECT payload_json FROM fleet_applied_state
+            WHERE command_type = 'CONFIG_APPLY'
+            """
+        ).fetchall()
+        versions: list[int] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("durable CONFIG_APPLY payload is invalid") from exc
+            version = payload.get("configVersion") if isinstance(payload, dict) else None
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version < 1
+            ):
+                raise RuntimeError("durable CONFIG_APPLY configVersion is invalid")
+            versions.append(version)
+        return max(versions) if versions else None
 
     def _insert_job_if_missing(
         self,
