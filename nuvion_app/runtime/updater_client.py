@@ -15,6 +15,9 @@ _UPDATER_VERSION = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
+_SLOT_TARGET = re.compile(
+    r"^(?:releases/[0-9a-f]{64}|bootstrap/[0-9A-Za-z][0-9A-Za-z._+-]{0,99})$"
+)
 _ROOT_UPDATE_PHASE_TO_PUBLIC = {
     "AUTHORIZED": "STAGED",
     "DOWNLOADING": "STAGED",
@@ -122,6 +125,15 @@ class UpdaterClient:
         )
         if updater_version is None:
             available = False
+        raw_active_slot = status.get("activeSlot")
+        raw_previous_slot = status.get("previousSlot")
+        slots_are_valid = all(
+            value is None
+            or (isinstance(value, str) and _SLOT_TARGET.fullmatch(value) is not None)
+            for value in (raw_active_slot, raw_previous_slot)
+        )
+        if not slots_are_valid:
+            available = False
         raw_update = status.get("update")
         update: dict[str, Any] | None = None
         if raw_update is not None:
@@ -132,10 +144,7 @@ class UpdaterClient:
                     key: value
                     for key, value in raw_update.items()
                     if key in _UPDATE_EVIDENCE_KEYS
-                    and (
-                        value is None
-                        or isinstance(value, (str, int, bool, float))
-                    )
+                    and (value is None or isinstance(value, (str, int, bool, float)))
                 }
         result: dict[str, Any] = {
             "capabilityAvailable": available,
@@ -146,10 +155,14 @@ class UpdaterClient:
             "reason": str(
                 "INVALID_UPDATER_VERSION"
                 if updater_version is None
+                else "INVALID_SLOT_STATUS"
+                if not slots_are_valid
                 else status.get("capabilityReason")
                 or ("READY" if available else "UPDATER_NOT_READY")
             )[:100],
             "updaterVersion": updater_version or "unknown",
+            "activeSlot": raw_active_slot if slots_are_valid else None,
+            "previousSlot": raw_previous_slot if slots_are_valid else None,
         }
         if raw_update is not None and update is None:
             result["reason"] = "INVALID_UPDATE_STATUS"
@@ -248,7 +261,9 @@ class UpdaterClient:
             + "\n"
         ).encode("utf-8")
         if len(payload) > 256 * 1024:
-            raise UpdaterClientError("REQUEST_TOO_LARGE", "updater request exceeds limit")
+            raise UpdaterClientError(
+                "REQUEST_TOO_LARGE", "updater request exceeds limit"
+            )
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(self.timeout_seconds)
             connection.connect(str(self.socket_path))
@@ -292,7 +307,9 @@ class UpdaterClient:
         try:
             metadata = self.socket_path.lstat()
         except OSError as exc:
-            raise UpdaterClientError("UPDATER_UNAVAILABLE", "updater socket is unavailable") from exc
+            raise UpdaterClientError(
+                "UPDATER_UNAVAILABLE", "updater socket is unavailable"
+            ) from exc
         if not stat.S_ISSOCK(metadata.st_mode):
             raise UpdaterClientError(
                 "UNSAFE_UPDATER_SOCKET", "updater endpoint must be a Unix socket"
