@@ -4803,6 +4803,148 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         self.assertIn('test ! -e "$evidence_target" -a ! -L "$evidence_target"', runbook)
 
+    def test_iq9075_runbook_initializes_final_publisher_only_after_ready_evidence(
+        self,
+    ) -> None:
+        runbook = (
+            ROOT / "packaging/release/v0.1.121-release-runbook.md"
+        ).read_text(encoding="utf-8")
+        component_a_capture = runbook.index(
+            'release_sha="$(git rev-parse HEAD)"'
+        )
+        exact_main_gate = runbook.index(
+            "gh workflow run agent-release-gate.yml", component_a_capture
+        )
+        component_a_binding = runbook.index(
+            'A="$(git rev-parse origin/main)"', exact_main_gate
+        )
+        candidate_dispatch = runbook.index(
+            "gh workflow run iq9075-candidate-trusted-publish.yml",
+            component_a_binding,
+        )
+        evidence_assembly = runbook.index(
+            "assemble-iq9075-fleet-runtime-evidence.py", candidate_dispatch
+        )
+        evidence_b = runbook.index("as evidence-only commit B.", evidence_assembly)
+        live_gate_validation = runbook.index(
+            "verify-agent-release-gate.py", evidence_b
+        )
+        full_readiness_validation = runbook.index(
+            "verify-release-readiness.py", live_gate_validation
+        )
+        pin_race_recheck = runbook.index(
+            "# Close the validation-to-pin race", full_readiness_validation
+        )
+        publisher_initialization = runbook.index(
+            "gh variable set RELEASE_TRUSTED_PUBLISHER_SHA",
+            pin_race_recheck,
+        )
+        settings_audit = runbook.index(
+            "verify-github-release-settings.py", publisher_initialization
+        )
+        attestation_c = runbook.index(
+            "Commit **only** those two attestation files through the protected PR gate as C.",
+            settings_audit,
+        )
+        component_a_recovery = runbook.index(
+            'A="$(git show "${B}:packaging/release/release-readiness.json"',
+            attestation_c,
+        )
+        component_a_rebind = runbook.index(
+            'release_sha="$A"', component_a_recovery
+        )
+        final_release_tag = runbook.index(
+            "git tag -s -u 9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+            component_a_rebind,
+        )
+
+        self.assertLess(component_a_capture, exact_main_gate)
+        self.assertLess(exact_main_gate, component_a_binding)
+        self.assertLess(component_a_binding, candidate_dispatch)
+        self.assertLess(candidate_dispatch, evidence_assembly)
+        self.assertLess(evidence_assembly, evidence_b)
+        self.assertLess(evidence_b, live_gate_validation)
+        self.assertLess(live_gate_validation, full_readiness_validation)
+        self.assertLess(full_readiness_validation, pin_race_recheck)
+        self.assertLess(pin_race_recheck, publisher_initialization)
+        self.assertLess(evidence_b, publisher_initialization)
+        self.assertLess(publisher_initialization, settings_audit)
+        self.assertLess(settings_audit, attestation_c)
+        self.assertLess(attestation_c, component_a_recovery)
+        self.assertLess(component_a_recovery, component_a_rebind)
+        self.assertLess(component_a_rebind, final_release_tag)
+        self.assertEqual(
+            runbook.count("gh variable set RELEASE_TRUSTED_PUBLISHER_SHA"), 1
+        )
+        self.assertEqual(runbook.count('release_sha="$(git rev-parse HEAD)"'), 1)
+        self.assertEqual(
+            runbook.count('release_sha="$(git rev-parse origin/main)"'), 1
+        )
+        self.assertEqual(runbook.count('release_sha="$A"'), 1)
+        self.assertEqual(runbook.rfind("release_sha="), component_a_rebind)
+        self.assertLess(
+            runbook.rfind(
+                'select(.name == "RELEASE_TRUSTED_PUBLISHER_SHA")'
+            ),
+            publisher_initialization,
+        )
+        self.assertIn(
+            "The immutable candidate publisher P and the final release publisher B are\n"
+            "different trust roots.",
+            runbook,
+        )
+        self.assertIn('test "$A" = "$release_sha"', runbook)
+        self.assertIn('git merge-base --is-ancestor "$component_sha" "$publisher_sha"', runbook)
+        expected_changes_match = re.search(
+            r"expected_b_changes=\"\$\(LC_ALL=C sort <<'EOF'\n(.*?)\nEOF\n\)\"",
+            runbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(expected_changes_match)
+        assert expected_changes_match is not None
+        self.assertEqual(
+            set(expected_changes_match.group(1).splitlines()),
+            {
+                "A\tpackaging/release/iq9075-v0.1.121-bootstrap-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-cleanup-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-fleet-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-commit-fleet-manifest.json",
+                "A\tpackaging/release/iq9075-v0.1.121-config-stream-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-fleet-runtime-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-fleet-runtime-evidence.json.asc",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-cleanup-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-fleet-evidence.json",
+                "A\tpackaging/release/iq9075-v0.1.121-rollback-fleet-manifest.json",
+                "A\tpackaging/release/nuv-agent_0.1.121_iq9075-aarch64.release-bom.json",
+                "M\tpackaging/release/release-readiness.json",
+            },
+        )
+        self.assertIn(
+            'git diff --name-status --no-renames "$component_sha" "$publisher_sha"',
+            runbook,
+        )
+        self.assertIn('test "$actual_b_changes" = "$expected_b_changes"', runbook)
+        self.assertIn('--expected-run-id "$gate_run_id"', runbook)
+        self.assertIn('--candidate-fleet-runner "$validation_dir/component/', runbook)
+        self.assertIn(
+            'test "$previous_attestation" = "$previous_signature"', runbook
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "$publisher_sha" "$audited_main_sha"',
+            runbook,
+        )
+        self.assertNotIn('test "$audited_main_sha" = "$publisher_sha"', runbook)
+        self.assertIn(
+            'jq -e --arg publisher "$publisher_sha" --arg audited "$audited_main_sha"',
+            runbook,
+        )
+        self.assertIn('git merge-base --is-ancestor "$A" "$B"', runbook)
+        self.assertIn('git merge-base --is-ancestor "$B" "$C"', runbook)
+        self.assertIn(
+            'git diff --quiet "$B" "$C" -- .github/workflows/release-publish.yml',
+            runbook,
+        )
+
     def test_latest_failed_gate_supersedes_older_success(self) -> None:
         component_sha = "a" * 40
         base = {
