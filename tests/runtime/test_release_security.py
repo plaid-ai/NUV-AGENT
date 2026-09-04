@@ -2291,7 +2291,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
     def test_v0121_ready_decision_rejects_legacy_physical_evidence(self) -> None:
         component_sha = "a" * 40
-        fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+        fingerprint = "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8"
         gate_evidence = {
             "componentSha": component_sha,
             "workflow": ".github/workflows/agent-release-gate.yml",
@@ -3488,7 +3488,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
     def test_ready_decision_accepts_signed_fleet_runtime_evidence(self) -> None:
         component_sha = "a" * 40
-        fingerprint = "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
+        fingerprint = "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8"
         gate_evidence = {
             "componentSha": component_sha,
             "workflow": ".github/workflows/agent-release-gate.yml",
@@ -4953,7 +4953,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             'release_sha="$A"', component_a_recovery
         )
         final_release_tag = runbook.index(
-            "git tag -s -u 9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+            "git tag -s -u 13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
             component_a_rebind,
         )
 
@@ -6275,7 +6275,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 "candidate_publisher_tag_object_sha": "c" * 40,
                 "candidate_publisher_sha": "9" * 40,
                 "component_sha": "b" * 40,
-                "tag_signer_fingerprint": "9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+                "tag_signer_fingerprint": "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
             },
         ):
             result = SETTINGS.verify_settings(
@@ -6924,7 +6924,7 @@ class SettingsPolicyTest(unittest.TestCase):
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
-                        "tag_signer_fingerprint": "9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+                        "tag_signer_fingerprint": "13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
                     },
                     "defaultBranch": "main",
                     "governance": json.loads(policy.read_text(encoding="utf-8"))[
@@ -6944,7 +6944,7 @@ class SettingsPolicyTest(unittest.TestCase):
             with mock.patch.object(
                 SETTINGS_ATTESTATION,
                 "_verify_signature",
-                return_value="9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+                return_value="13E595FEFE933BBDDD4F04DEA340E2EB493D02E8",
             ), mock.patch.object(
                 SETTINGS_ATTESTATION,
                 "publisher_surface",
