@@ -103,9 +103,39 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("id-token: write", self.trusted_call)
         self.assertNotIn("runs-on:", self.trusted_call)
         self.assertNotIn("steps:", self.trusted_call)
-        self.assertNotIn("${{ secrets.", self.workflow)
         self.assertNotIn("environment:", self.workflow)
-        self.assertNotIn("secrets:", self.workflow)
+        sentinel = "${{ secrets.GITHUB_TOKEN }}"
+        self.assertEqual(self.workflow.count(sentinel), 3)
+        caller_without_sentinels = self.workflow.replace(sentinel, "")
+        self.assertNotRegex(
+            caller_without_sentinels,
+            r"\$\{\{[^}]*\bsecrets\b",
+        )
+        self.assertEqual(
+            re.findall(
+                r"\$\{\{\s*secrets\.([A-Z0-9_]+)\s*\}\}",
+                self.workflow,
+            ),
+            ["GITHUB_TOKEN", "GITHUB_TOKEN", "GITHUB_TOKEN"],
+        )
+        for secret_name in (
+            "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
+            "GCP_PROJECT_ID",
+            "GCP_SA_KEY",
+        ):
+            self.assertIn(
+                f"{secret_name}: ${{{{ secrets.GITHUB_TOKEN }}}}",
+                self.trusted_call,
+            )
+        bindings = self.trusted_call.split("    secrets:\n", maxsplit=1)[1]
+        self.assertEqual(
+            bindings.strip().splitlines(),
+            [
+                "IQ9075_RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.GITHUB_TOKEN }}",
+                "      GCP_PROJECT_ID: ${{ secrets.GITHUB_TOKEN }}",
+                "      GCP_SA_KEY: ${{ secrets.GITHUB_TOKEN }}",
+            ],
+        )
         for output_name in (
             "bundle_name",
             "bundle_sha256",
@@ -172,7 +202,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         ):
             self.assertEqual(declarations.count(f"      {name}:"), 1)
         self.assertNotIn("secrets: inherit", self.workflow + self.trusted_workflow)
-        self.assertNotIn("    secrets:", self.workflow)
+        self.assertEqual(self.trusted_call.count("    secrets:"), 1)
 
     def test_signing_is_bound_to_policy_key_and_downloaded_artifact(self) -> None:
         revalidate = self.sign.index(
