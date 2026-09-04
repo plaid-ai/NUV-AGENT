@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "trustDomain": "iq9075-dev",
+  "purpose": "agent-update-health-attestation",
+  "keys": {
+    "health-iq9075-dev-20260902-r1": "4pUSWOFlxR2B/8A/RWf3wMIXGHvi+cBagQON3+5eHlA="
+  }
+}

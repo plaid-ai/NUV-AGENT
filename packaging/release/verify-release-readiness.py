@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import json
@@ -41,6 +43,21 @@ MAX_EVIDENCE_BYTES = 1024 * 1024
 CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121"})
 FLEET_RUNTIME_REQUIRED_FROM = (0, 1, 121)
 IQ9075_QUALIFICATION_API_ORIGIN = "https://api.nuvion-dev.plaidlabs.ai"
+IQ9075_FLEET_TRUST_ROOTS = {
+    "command": {
+        "file": "trusted-fleet-keyrings/iq9075-dev-command.json",
+        "sha256": "35672171575a676888721b6c5048e4774750176771bf32c6ebdae6d3ed8081fe",
+        "keyId": "command-iq9075-dev-2026-09-01",
+        "trustDomain": "iq9075-dev",
+    },
+    "health": {
+        "file": "trusted-fleet-keyrings/iq9075-dev-health.json",
+        "sha256": "fad92b480dd513e0c7ccf397573d1e1e8d5c8a78fe3330469bc77a4ca9f3ac7c",
+        "keyId": "health-iq9075-dev-20260902-r1",
+        "trustDomain": "iq9075-dev",
+        "purpose": "agent-update-health-attestation",
+    },
+}
 MAX_APPSRC_BYTES = 640 * 480 * 3 * 2
 
 
@@ -408,6 +425,99 @@ def _fleet_runtime_gate(
             "proof": cleanup_evidence.get("proof"),
         },
     }
+
+
+def _bootstrap_runtime_gate(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Return only immutable updater-bootstrap facts signed by the summary."""
+
+    return {
+        "runId": evidence.get("runId"),
+        "completedAt": evidence.get("completedAt"),
+        "outOfBandBootstrap": evidence.get("outOfBandBootstrap"),
+        "otaEvidence": evidence.get("otaEvidence"),
+        "previousPackageVersion": evidence.get("previousPackageVersion"),
+        "installedPackageVersion": evidence.get("installedPackageVersion"),
+        "componentSha": evidence.get("componentSha"),
+        "packageSha256": evidence.get("packageSha256"),
+        "installerSha256": evidence.get("installerSha256"),
+        "updaterCodeVersion": evidence.get("updaterCodeVersion"),
+        "boardToolSha256": evidence.get("boardToolSha256"),
+        "boardToolIdentityVerified": evidence.get(
+            "boardToolIdentityVerified"
+        ),
+        "currentSlotBefore": evidence.get("currentSlotBefore"),
+        "currentSlot": evidence.get("currentSlot"),
+        "servicesInactive": evidence.get("servicesInactive"),
+    }
+
+
+def _validate_fleet_trust_roots(
+    *, policy_directory: Path, iq_policy: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    roots = iq_policy.get("fleetTrustRoots")
+    if not isinstance(roots, dict) or set(roots) != {"command", "health"}:
+        raise ReadinessError("IQ9075 Fleet trust-root policy is invalid")
+    validated: dict[str, dict[str, str]] = {}
+    for role, immutable in IQ9075_FLEET_TRUST_ROOTS.items():
+        descriptor = roots.get(role)
+        expected_fields = {"file", "sha256", "keyId", "trustDomain"}
+        if role == "health":
+            expected_fields.add("purpose")
+        if not isinstance(descriptor, dict) or set(descriptor) != expected_fields:
+            raise ReadinessError(f"IQ9075 {role} trust-root policy is invalid")
+        if descriptor != immutable:
+            raise ReadinessError(
+                f"IQ9075 {role} trust root differs from the reviewed pin"
+            )
+        raw = _regular_bytes(policy_directory / descriptor["file"])
+        if hashlib.sha256(raw).hexdigest() != descriptor["sha256"]:
+            raise ReadinessError(
+                f"IQ9075 {role} trust-root bytes differ from policy"
+            )
+        keyring = _strict_object(raw, label=f"IQ9075 {role} trust root")
+        try:
+            pretty = (
+                json.dumps(
+                    keyring,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ReadinessError(
+                f"IQ9075 {role} trust root is not canonical JSON data"
+            ) from exc
+        expected_keyring_fields = {"schemaVersion", "trustDomain", "keys"}
+        if role == "health":
+            expected_keyring_fields.add("purpose")
+        keys = keyring.get("keys")
+        if (
+            raw != pretty
+            or set(keyring) != expected_keyring_fields
+            or type(keyring.get("schemaVersion")) is not int
+            or keyring.get("schemaVersion") != 1
+            or keyring.get("trustDomain") != descriptor["trustDomain"]
+            or not isinstance(keys, dict)
+            or set(keys) != {descriptor["keyId"]}
+            or (
+                role == "health"
+                and keyring.get("purpose") != descriptor["purpose"]
+            )
+        ):
+            raise ReadinessError(f"IQ9075 {role} trust root is invalid")
+        encoded_key = keys[descriptor["keyId"]]
+        try:
+            decoded_key = base64.b64decode(encoded_key, validate=True)
+        except (binascii.Error, ValueError, TypeError) as exc:
+            raise ReadinessError(
+                f"IQ9075 {role} trust root key is invalid"
+            ) from exc
+        if len(decoded_key) != 32:
+            raise ReadinessError(f"IQ9075 {role} trust root key is invalid")
+        validated[role] = dict(descriptor)
+    return validated
 
 
 def _validated_config_stream_gate(
@@ -1361,6 +1471,7 @@ def _validate_fleet_runtime_documents(
     candidate_fleet_runner: Path,
     candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
+    candidate_installer: Path,
 ) -> dict[str, str]:
     """Validate two-run rollback and committed-component Fleet evidence."""
 
@@ -1372,6 +1483,7 @@ def _validate_fleet_runtime_documents(
         "fleetRunnerSha256",
         "configStreamRunnerSha256",
         "boardToolSha256",
+        "installerSha256",
         "rollbackManifest",
         "rollbackEvidence",
         "rollbackCleanupEvidence",
@@ -1379,8 +1491,10 @@ def _validate_fleet_runtime_documents(
         "commitEvidence",
         "configStreamEvidence",
         "commitCleanupEvidence",
+        "bootstrapEvidence",
         "testedArtifact",
         "testedBom",
+        "testedDeb",
         "runtimeGate",
     }
     if set(summary) != expected_summary_fields or (
@@ -1396,6 +1510,8 @@ def _validate_fleet_runtime_documents(
         or not SHA256.fullmatch(summary["configStreamRunnerSha256"])
         or not isinstance(summary.get("boardToolSha256"), str)
         or not SHA256.fullmatch(summary["boardToolSha256"])
+        or not isinstance(summary.get("installerSha256"), str)
+        or not SHA256.fullmatch(summary["installerSha256"])
     ):
         raise ReadinessError(
             "IQ9075 Fleet Runtime evidence does not match two-run schema v3"
@@ -1436,6 +1552,11 @@ def _validate_fleet_runtime_documents(
         summary.get("commitCleanupEvidence"),
         label="IQ9075 commit cleanup evidence",
     )
+    bootstrap_raw, _bootstrap_sha256 = _evidence_reference(
+        policy_path.parent,
+        summary.get("bootstrapEvidence"),
+        label="IQ9075 updater bootstrap evidence",
+    )
     bom_raw, tested_bom_sha256 = _evidence_reference(
         policy_path.parent,
         summary.get("testedBom"),
@@ -1463,6 +1584,9 @@ def _validate_fleet_runtime_documents(
     commit_cleanup = _strict_canonical_object(
         commit_cleanup_raw, label="IQ9075 commit cleanup evidence"
     )
+    bootstrap_evidence = _strict_canonical_object(
+        bootstrap_raw, label="IQ9075 updater bootstrap evidence"
+    )
     bom = _strict_canonical_object(
         bom_raw, label="IQ9075 Fleet Runtime tested BOM"
     )
@@ -1473,12 +1597,18 @@ def _validate_fleet_runtime_documents(
     publisher_board_tool = (
         Path(__file__).resolve().parents[1] / "dev/iq9075-board-e2e.py"
     )
+    publisher_installer = (
+        Path(__file__).resolve().parents[1] / "dev/install-iq9075.sh"
+    )
     publisher_fleet_runner_raw = _regular_bytes(publisher_fleet_runner)
     candidate_fleet_runner_raw = _regular_bytes(candidate_fleet_runner)
     publisher_board_tool_raw = _regular_bytes(publisher_board_tool)
     candidate_board_tool_raw = _regular_bytes(candidate_board_tool)
+    publisher_installer_raw = _regular_bytes(publisher_installer)
+    candidate_installer_raw = _regular_bytes(candidate_installer)
     fleet_runner_sha256 = hashlib.sha256(publisher_fleet_runner_raw).hexdigest()
     board_tool_sha256 = hashlib.sha256(publisher_board_tool_raw).hexdigest()
+    installer_sha256 = hashlib.sha256(publisher_installer_raw).hexdigest()
     if (
         candidate_fleet_runner_raw != publisher_fleet_runner_raw
         or summary.get("fleetRunnerSha256") != fleet_runner_sha256
@@ -1494,6 +1624,13 @@ def _validate_fleet_runtime_documents(
     ):
         raise ReadinessError(
             "IQ9075 board tool differs from either Fleet Runtime manifest"
+        )
+    if (
+        candidate_installer_raw != publisher_installer_raw
+        or summary.get("installerSha256") != installer_sha256
+    ):
+        raise ReadinessError(
+            "IQ9075 bootstrap installer differs from signed evidence"
         )
 
     module_name = "_nuvion_trusted_iq9075_fleet_runtime_validator"
@@ -1689,10 +1826,18 @@ def _validate_fleet_runtime_documents(
         summary.get("testedArtifact"),
         label="IQ9075 Fleet Runtime tested artifact",
     )
+    tested_deb = _artifact_identity(
+        summary.get("testedDeb"),
+        label="IQ9075 Fleet Runtime tested DEB",
+    )
     if tested_artifact["name"] != (
         f"nuv-agent_{version}_iq9075-aarch64.agent-bundle.tar.gz"
     ) or summary["testedBom"]["file"] != (
         f"nuv-agent_{version}_iq9075-aarch64.release-bom.json"
+    ) or summary["bootstrapEvidence"]["file"] != (
+        f"iq9075-v{version}-bootstrap-evidence.json"
+    ) or tested_deb["name"] != (
+        f"nuv-agent_{version}_arm64.deb"
     ):
         raise ReadinessError("IQ9075 Fleet Runtime artifact names are invalid")
 
@@ -1722,11 +1867,83 @@ def _validate_fleet_runtime_documents(
         or not isinstance(iq_policy.get("publisherKeyId"), str)
     ):
         raise ReadinessError("IQ9075 Fleet Runtime security policy is invalid")
+    fleet_trust_roots = _validate_fleet_trust_roots(
+        policy_directory=Path(__file__).resolve().parent,
+        iq_policy=iq_policy,
+    )
 
     expected_bom_digest = "sha256:" + verified_bom.bom_digest
     expected_candidate_slot = "/opt/nuv-agent/releases/" + verified_bom.bom_digest
     expected_relative_candidate_slot = "releases/" + verified_bom.bom_digest
     expected_previous_slot = "releases/" + baseline_policy["bomDigest"][7:]
+    expected_bootstrap_fields = {
+        "schemaVersion",
+        "protocolVersion",
+        "runId",
+        "outOfBandBootstrap",
+        "otaEvidence",
+        "previousPackageVersion",
+        "installedPackageVersion",
+        "componentSha",
+        "packageSha256",
+        "installerSha256",
+        "updaterCodeVersion",
+        "boardToolSha256",
+        "currentSlotBefore",
+        "currentSlot",
+        "servicesInactive",
+        "completedAt",
+        "boardToolIdentityVerified",
+    }
+    previous_package_version = bootstrap_evidence.get("previousPackageVersion")
+    bootstrap_completed = _timestamp(
+        bootstrap_evidence.get("completedAt"),
+        label="IQ9075 updater bootstrap completion",
+    )
+    rollback_generated = _timestamp(
+        rollback_evidence.get("generatedAt"),
+        label="IQ9075 rollback result generation",
+    )
+    rollback_command_issued = _timestamp(
+        config_stream_gate["priorRollbackCommand"].get("issuedAt"),
+        label="IQ9075 rollback command issue",
+    )
+    if (
+        set(bootstrap_evidence) != expected_bootstrap_fields
+        or type(bootstrap_evidence.get("schemaVersion")) is not int
+        or bootstrap_evidence.get("schemaVersion") != 1
+        or bootstrap_evidence.get("protocolVersion")
+        != fleet_validator.PROTOCOL_VERSION
+        or not isinstance(bootstrap_evidence.get("runId"), str)
+        or not RUN_ID.fullmatch(bootstrap_evidence["runId"])
+        or bootstrap_evidence["runId"]
+        in {rollback_manifest.get("runId"), commit_manifest.get("runId")}
+        or bootstrap_evidence.get("outOfBandBootstrap") is not True
+        or bootstrap_evidence.get("otaEvidence") is not False
+        or (
+            previous_package_version is not None
+            and (
+                not isinstance(previous_package_version, str)
+                or not 1 <= len(previous_package_version) <= 128
+                or not previous_package_version.isprintable()
+            )
+        )
+        or bootstrap_evidence.get("installedPackageVersion") != version
+        or bootstrap_evidence.get("componentSha") != component_sha
+        or bootstrap_evidence.get("packageSha256") != tested_deb["sha256"]
+        or bootstrap_evidence.get("installerSha256") != installer_sha256
+        or bootstrap_evidence.get("updaterCodeVersion") != "0.2.0"
+        or bootstrap_evidence.get("boardToolSha256") != board_tool_sha256
+        or bootstrap_evidence.get("boardToolIdentityVerified") is not True
+        or bootstrap_evidence.get("currentSlotBefore") != expected_previous_slot
+        or bootstrap_evidence.get("currentSlot") != expected_previous_slot
+        or bootstrap_evidence.get("servicesInactive") is not True
+        or bootstrap_completed > rollback_command_issued
+        or rollback_command_issued > rollback_generated
+    ):
+        raise ReadinessError(
+            "IQ9075 updater bootstrap does not bind component A and signed baseline"
+        )
     expected_release = {
         "agentVersion": version,
         "releaseSequence": verified_bom.release_sequence,
@@ -1790,6 +2007,10 @@ def _validate_fleet_runtime_documents(
         if (
             not isinstance(inputs, dict)
             or inputs.get("releaseSha256") != iq_policy["publicKeyringSha256"]
+            or inputs.get("commandSha256")
+            != fleet_trust_roots["command"]["sha256"]
+            or inputs.get("healthSha256")
+            != fleet_trust_roots["health"]["sha256"]
             or not isinstance(identity, dict)
             or {
                 key: identity.get(key)
@@ -1865,6 +2086,7 @@ def _validate_fleet_runtime_documents(
         )
 
     expected_runtime_gate = {
+        "bootstrap": _bootstrap_runtime_gate(bootstrap_evidence),
         "rollback": _fleet_runtime_gate(
             rollback_evidence, rollback_cleanup, rollback_manifest
         ),
@@ -1882,6 +2104,9 @@ def _validate_fleet_runtime_documents(
         "physical_bom_sha256": tested_bom_sha256,
         "runtime_artifact_sha256": verified_bom.artifact_sha256,
         "runtime_bom_sha256": tested_bom_sha256,
+        "tested_deb_name": tested_deb["name"],
+        "tested_deb_sha256": tested_deb["sha256"],
+        "tested_deb_size": str(tested_deb["sizeBytes"]),
     }
 
 def _validate_physical_documents(
@@ -2708,6 +2933,7 @@ def _validate_ready_evidence(
     candidate_fleet_runner: Path | None,
     candidate_config_stream_runner: Path | None,
     candidate_board_tool: Path | None,
+    candidate_installer: Path | None,
 ) -> dict[str, str]:
     common_fields = {"componentSha", "agentReleaseGate"}
     runtime_fields = common_fields | {"iq9075FleetRuntime"}
@@ -2791,6 +3017,7 @@ def _validate_ready_evidence(
                 candidate_fleet_runner is None
                 or candidate_config_stream_runner is None
                 or candidate_board_tool is None
+                or candidate_installer is None
             )
         )
         or (evidence_key == "iq9075Physical" and candidate_harness is None)
@@ -2844,6 +3071,7 @@ def _validate_ready_evidence(
         assert candidate_fleet_runner is not None
         assert candidate_config_stream_runner is not None
         assert candidate_board_tool is not None
+        assert candidate_installer is not None
         return _validate_fleet_runtime_documents(
             policy_path=policy_path,
             version=version,
@@ -2853,6 +3081,7 @@ def _validate_ready_evidence(
             candidate_fleet_runner=candidate_fleet_runner,
             candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
+            candidate_installer=candidate_installer,
         )
     assert candidate_harness is not None
     return _validate_physical_documents(
@@ -2877,6 +3106,7 @@ def verify_readiness(
     candidate_fleet_runner: Path | None = None,
     candidate_config_stream_runner: Path | None = None,
     candidate_board_tool: Path | None = None,
+    candidate_installer: Path | None = None,
 ) -> dict[str, str]:
     if not SEMVER.fullmatch(version):
         raise ReadinessError("release readiness version must be exact SemVer")
@@ -2928,6 +3158,7 @@ def verify_readiness(
         candidate_fleet_runner=candidate_fleet_runner,
         candidate_config_stream_runner=candidate_config_stream_runner,
         candidate_board_tool=candidate_board_tool,
+        candidate_installer=candidate_installer,
     )
 
 
@@ -2952,6 +3183,7 @@ def main() -> int:
     parser.add_argument("--candidate-fleet-runner", type=Path)
     parser.add_argument("--candidate-config-stream-runner", type=Path)
     parser.add_argument("--candidate-board-tool", type=Path)
+    parser.add_argument("--candidate-installer", type=Path)
     parser.add_argument("--github-output", type=Path)
     arguments = parser.parse_args()
     try:
@@ -2977,6 +3209,7 @@ def main() -> int:
                 arguments.candidate_config_stream_runner
             ),
             candidate_board_tool=arguments.candidate_board_tool,
+            candidate_installer=arguments.candidate_installer,
         )
         if arguments.github_output is not None:
             with arguments.github_output.open("a", encoding="utf-8") as output:

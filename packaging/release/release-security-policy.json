@@ -144,6 +144,21 @@
     "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
     "publicKeyringSha256": "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",
     "publisherKeyId": "release-iq9075-dev-2026-09-01",
+    "fleetTrustRoots": {
+      "command": {
+        "file": "trusted-fleet-keyrings/iq9075-dev-command.json",
+        "sha256": "35672171575a676888721b6c5048e4774750176771bf32c6ebdae6d3ed8081fe",
+        "keyId": "command-iq9075-dev-2026-09-01",
+        "trustDomain": "iq9075-dev"
+      },
+      "health": {
+        "file": "trusted-fleet-keyrings/iq9075-dev-health.json",
+        "sha256": "fad92b480dd513e0c7ccf397573d1e1e8d5c8a78fe3330469bc77a4ca9f3ac7c",
+        "keyId": "health-iq9075-dev-20260902-r1",
+        "trustDomain": "iq9075-dev",
+        "purpose": "agent-update-health-attestation"
+      }
+    },
     "target": {
       "productModel": "IQ9075_DEV",
       "platformProfile": "iq9075_dev",

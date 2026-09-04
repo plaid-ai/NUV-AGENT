@@ -320,6 +320,11 @@ class CandidateGcsCabTest(unittest.TestCase):
                         "name": artifact.name,
                         "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                     },
+                    "bootstrapDeb": {
+                        "name": "nuv-agent_0.1.121_arm64.deb",
+                        "sha256": "d" * 64,
+                        "sizeBytes": 4096,
+                    },
                     "bom": {
                         "name": bom.name,
                         "sha256": hashlib.sha256(bom.read_bytes()).hexdigest(),

@@ -57,6 +57,9 @@ jobs:
       bundle_name: ${{ steps.identity.outputs.bundle_name }}
       bundle_sha256: ${{ steps.identity.outputs.bundle_sha256 }}
       bundle_size: ${{ steps.identity.outputs.bundle_size }}
+      deb_name: ${{ steps.identity.outputs.deb_name }}
+      deb_sha256: ${{ steps.identity.outputs.deb_sha256 }}
+      deb_size: ${{ steps.identity.outputs.deb_size }}
       built_at: ${{ steps.source.outputs.built_at }}
       config_schema: ${{ steps.identity.outputs.config_schema }}
       min_updater_version: ${{ steps.identity.outputs.min_updater_version }}
@@ -122,15 +125,22 @@ jobs:
           bundle_name="nuv-agent_${VERSION}_iq9075-aarch64.agent-bundle.tar.gz"
           bundle_path="dist/$bundle_name"
           packaging/release/build-agent-bundle.sh "$VERSION" "$bundle_path"
+          deb_name="nuv-agent_${VERSION}_arm64.deb"
+          deb_path="dist/$deb_name"
+          BOOTSTRAP_BUNDLE_PATH="$bundle_path" OUTPUT_DEB="$deb_path" \
+            packaging/deb/build-deb.sh
           config_schema="$(python3 -c 'from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)')"
           min_updater_version="$(python3 -c 'from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)')"
           [[ "$config_schema" =~ ^[1-9][0-9]*$ ]]
           [[ "$min_updater_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           bundle_sha256="$(sha256sum "$bundle_path" | awk '{print $1}')"
           bundle_size="$(stat -c %s "$bundle_path")"
+          deb_sha256="$(sha256sum "$deb_path" | awk '{print $1}')"
+          deb_size="$(stat -c %s "$deb_path")"
           python3 - "$COMPONENT_SHA" "$VERSION" "$RELEASE_SEQUENCE" "$BUILT_AT" \
             "$bundle_name" "$bundle_sha256" "$bundle_size" "$config_schema" \
-            "$min_updater_version" > dist/candidate-build-manifest.json <<'PY'
+            "$min_updater_version" "$deb_name" "$deb_sha256" "$deb_size" \
+            > dist/candidate-build-manifest.json <<'PY'
           import json
           import sys
 
@@ -144,6 +154,9 @@ jobs:
               bundle_size,
               config_schema,
               min_updater_version,
+              deb_name,
+              deb_sha256,
+              deb_size,
           ) = sys.argv[1:]
           payload = {
               "schemaVersion": 1,
@@ -159,6 +172,11 @@ jobs:
                   "sha256": bundle_sha256,
                   "sizeBytes": int(bundle_size),
               },
+              "bootstrapDeb": {
+                  "name": deb_name,
+                  "sha256": deb_sha256,
+                  "sizeBytes": int(deb_size),
+              },
           }
           print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
           PY
@@ -166,6 +184,9 @@ jobs:
             echo "bundle_name=$bundle_name"
             echo "bundle_sha256=$bundle_sha256"
             echo "bundle_size=$bundle_size"
+            echo "deb_name=$deb_name"
+            echo "deb_sha256=$deb_sha256"
+            echo "deb_size=$deb_size"
             echo "config_schema=$config_schema"
             echo "min_updater_version=$min_updater_version"
           } >> "$GITHUB_OUTPUT"
@@ -176,6 +197,7 @@ jobs:
           name: iq9075-candidate-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/${{ steps.identity.outputs.bundle_name }}
+            dist/${{ steps.identity.outputs.deb_name }}
             dist/candidate-build-manifest.json
           if-no-files-found: error
           compression-level: 0

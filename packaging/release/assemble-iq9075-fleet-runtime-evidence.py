@@ -177,11 +177,14 @@ def _assemble_into(
     commit_evidence_path: Path,
     config_stream_evidence_path: Path,
     commit_cleanup_evidence_path: Path,
+    bootstrap_evidence_path: Path,
     artifact_path: Path,
+    deb_path: Path,
     bom_path: Path,
     candidate_fleet_runner: Path,
     candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
+    candidate_installer: Path,
     security_policy_path: Path,
     output_directory: Path,
     version: str,
@@ -224,6 +227,11 @@ def _assemble_into(
         label="Fleet Runtime commit cleanup evidence",
         require_canonical=True,
     )
+    bootstrap_evidence, bootstrap_evidence_raw = _object(
+        bootstrap_evidence_path,
+        label="Fleet updater bootstrap evidence",
+        require_canonical=True,
+    )
     _bom, bom_raw = _object(
         bom_path, label="release BOM", require_canonical=True
     )
@@ -232,6 +240,9 @@ def _assemble_into(
     )
     artifact_sha256, artifact_size = _regular_digest(
         artifact_path, maximum=MAX_ARTIFACT_BYTES
+    )
+    deb_sha256, deb_size = _regular_digest(
+        deb_path, maximum=MAX_ARTIFACT_BYTES
     )
 
     publisher_fleet_runner = (
@@ -244,11 +255,15 @@ def _assemble_into(
         Path(__file__).resolve().parents[1]
         / "dev/run-iq9075-config-stream-e2e.py"
     )
+    publisher_installer = (
+        Path(__file__).resolve().parents[1] / "dev/install-iq9075.sh"
+    )
     fleet_runner_sha256 = _digest(_regular_bytes(publisher_fleet_runner))
     config_stream_runner_sha256 = _digest(
         _regular_bytes(publisher_config_stream_runner)
     )
     board_tool_sha256 = _digest(_regular_bytes(publisher_board_tool))
+    installer_sha256 = _digest(_regular_bytes(publisher_installer))
 
     output_directory = _private_output_directory(output_directory)
     names = {
@@ -269,6 +284,7 @@ def _assemble_into(
         "commit_cleanup_evidence": (
             f"iq9075-v{version}-commit-cleanup-evidence.json"
         ),
+        "bootstrap_evidence": f"iq9075-v{version}-bootstrap-evidence.json",
         "bom": f"nuv-agent_{version}_iq9075-aarch64.release-bom.json",
         "summary": f"iq9075-v{version}-fleet-runtime-evidence.json",
     }
@@ -293,6 +309,11 @@ def _assemble_into(
             "commit_cleanup_evidence",
             commit_cleanup_evidence_raw,
         ),
+        (
+            bootstrap_evidence_path,
+            "bootstrap_evidence",
+            bootstrap_evidence_raw,
+        ),
         (bom_path, "bom", bom_raw),
     ):
         _copy_input(source, paths[key], raw)
@@ -315,6 +336,9 @@ def _assemble_into(
         if validated_config_stream_runner_sha256 != config_stream_runner_sha256:
             raise AssemblyError("config-stream runner digest changed during assembly")
         runtime_gate = {
+            "bootstrap": readiness._bootstrap_runtime_gate(
+                bootstrap_evidence
+            ),
             "rollback": readiness._fleet_runtime_gate(
                 rollback_evidence,
                 rollback_cleanup_evidence,
@@ -337,6 +361,7 @@ def _assemble_into(
         "fleetRunnerSha256": fleet_runner_sha256,
         "configStreamRunnerSha256": config_stream_runner_sha256,
         "boardToolSha256": board_tool_sha256,
+        "installerSha256": installer_sha256,
         "rollbackManifest": {
             "file": names["rollback_manifest"],
             "sha256": _digest(rollback_manifest_raw),
@@ -365,12 +390,21 @@ def _assemble_into(
             "file": names["commit_cleanup_evidence"],
             "sha256": _digest(commit_cleanup_evidence_raw),
         },
+        "bootstrapEvidence": {
+            "file": names["bootstrap_evidence"],
+            "sha256": _digest(bootstrap_evidence_raw),
+        },
         "testedArtifact": {
             "name": artifact_path.name,
             "sha256": artifact_sha256,
             "sizeBytes": artifact_size,
         },
         "testedBom": {"file": names["bom"], "sha256": _digest(bom_raw)},
+        "testedDeb": {
+            "name": deb_path.name,
+            "sha256": deb_sha256,
+            "sizeBytes": deb_size,
+        },
         "runtimeGate": runtime_gate,
     }
     summary_raw = _canonical(summary)
@@ -385,6 +419,7 @@ def _assemble_into(
             candidate_fleet_runner=candidate_fleet_runner,
             candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
+            candidate_installer=candidate_installer,
         )
     except Exception as exc:
         raise AssemblyError(
@@ -400,8 +435,11 @@ def _assemble_into(
         "commitEvidence": str(paths["commit_evidence"]),
         "configStreamEvidence": str(paths["config_stream_evidence"]),
         "commitCleanupEvidence": str(paths["commit_cleanup_evidence"]),
+        "bootstrapEvidence": str(paths["bootstrap_evidence"]),
         "artifactSha256": artifact_sha256,
         "bomSha256": _digest(bom_raw),
+        "debSha256": deb_sha256,
+        "debSize": str(deb_size),
     }
 
 
@@ -414,11 +452,14 @@ def assemble(
     commit_evidence_path: Path,
     config_stream_evidence_path: Path,
     commit_cleanup_evidence_path: Path,
+    bootstrap_evidence_path: Path,
     artifact_path: Path,
+    deb_path: Path,
     bom_path: Path,
     candidate_fleet_runner: Path,
     candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
+    candidate_installer: Path,
     security_policy_path: Path,
     output_directory: Path,
     version: str,
@@ -437,18 +478,21 @@ def assemble(
             commit_evidence_path=commit_evidence_path,
             config_stream_evidence_path=config_stream_evidence_path,
             commit_cleanup_evidence_path=commit_cleanup_evidence_path,
+            bootstrap_evidence_path=bootstrap_evidence_path,
             artifact_path=artifact_path,
+            deb_path=deb_path,
             bom_path=bom_path,
             candidate_fleet_runner=candidate_fleet_runner,
             candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
+            candidate_installer=candidate_installer,
             security_policy_path=security_policy_path,
             output_directory=staging,
             version=version,
             component_sha=component_sha,
         )
         staged_files = sorted(path for path in staging.iterdir() if path.is_file())
-        if len(staged_files) != 9:
+        if len(staged_files) != 10:
             raise AssemblyError("staged Fleet Runtime evidence file set is incomplete")
         final_paths = [_safe_output(final_root, path.name) for path in staged_files]
         published: list[Path] = []
@@ -478,6 +522,7 @@ def assemble(
             "commitEvidence",
             "configStreamEvidence",
             "commitCleanupEvidence",
+            "bootstrapEvidence",
         ):
             result[key] = str(final_root / Path(result[key]).name)
         return result
@@ -499,13 +544,16 @@ def main() -> int:
     parser.add_argument("--commit-evidence", required=True, type=Path)
     parser.add_argument("--config-stream-evidence", required=True, type=Path)
     parser.add_argument("--commit-cleanup-evidence", required=True, type=Path)
+    parser.add_argument("--bootstrap-evidence", required=True, type=Path)
     parser.add_argument("--artifact", required=True, type=Path)
+    parser.add_argument("--deb", required=True, type=Path)
     parser.add_argument("--bom", required=True, type=Path)
     parser.add_argument("--candidate-fleet-runner", required=True, type=Path)
     parser.add_argument(
         "--candidate-config-stream-runner", required=True, type=Path
     )
     parser.add_argument("--candidate-board-tool", required=True, type=Path)
+    parser.add_argument("--candidate-installer", required=True, type=Path)
     parser.add_argument("--security-policy", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--version", required=True)
@@ -524,13 +572,16 @@ def main() -> int:
             commit_cleanup_evidence_path=(
                 arguments.commit_cleanup_evidence
             ),
+            bootstrap_evidence_path=arguments.bootstrap_evidence,
             artifact_path=arguments.artifact,
+            deb_path=arguments.deb,
             bom_path=arguments.bom,
             candidate_fleet_runner=arguments.candidate_fleet_runner,
             candidate_config_stream_runner=(
                 arguments.candidate_config_stream_runner
             ),
             candidate_board_tool=arguments.candidate_board_tool,
+            candidate_installer=arguments.candidate_installer,
             security_policy_path=arguments.security_policy,
             output_directory=arguments.output_directory,
             version=arguments.version,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import datetime as dt
 import hashlib
@@ -1138,6 +1139,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         artifact_path.write_bytes(b"exact deterministic candidate bundle")
         artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        deb_path = source / "nuv-agent_0.1.121_arm64.deb"
+        deb_path.write_bytes(b"exact deterministic component A bootstrap deb")
+        deb_sha256 = hashlib.sha256(deb_path.read_bytes()).hexdigest()
         bom_path = source / "nuv-agent_0.1.121_iq9075-aarch64.release-bom.json"
         bom = build_release_bom_v2_payload(
             bom_id="nuv-agent-0.1.121-iq9075-aarch64",
@@ -1173,11 +1177,15 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "publisherKeyId": "release-iq9075-dev-2026-09-01",
         }
         input_digests = {
-            "commandSha256": "6" * 64,
+            "commandSha256": (
+                "35672171575a676888721b6c5048e4774750176771bf32c6ebdae6d3ed8081fe"
+            ),
             "releaseSha256": (
                 "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
             ),
-            "healthSha256": "8" * 64,
+            "healthSha256": (
+                "fad92b480dd513e0c7ccf397573d1e1e8d5c8a78fe3330469bc77a4ca9f3ac7c"
+            ),
             "bindingSha256": "9" * 64,
         }
         identity = {
@@ -1412,6 +1420,27 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             commit_evidence,
             completed_at="2026-09-03T10:07:00Z",
         )
+        bootstrap_evidence = {
+            "schemaVersion": 1,
+            "protocolVersion": FLEET_E2E.PROTOCOL_VERSION,
+            "runId": "11111111-2222-4333-8444-555555555555",
+            "outOfBandBootstrap": True,
+            "otaEvidence": False,
+            "previousPackageVersion": "0.1.121-dev-bootstrap",
+            "installedPackageVersion": "0.1.121",
+            "componentSha": component_sha,
+            "packageSha256": deb_sha256,
+            "installerSha256": hashlib.sha256(
+                (ROOT / "packaging/dev/install-iq9075.sh").read_bytes()
+            ).hexdigest(),
+            "updaterCodeVersion": "0.2.0",
+            "boardToolSha256": tool_sha,
+            "currentSlotBefore": baseline_slot,
+            "currentSlot": baseline_slot,
+            "servicesInactive": True,
+            "completedAt": "2026-09-03T09:59:00.000Z",
+            "boardToolIdentityVerified": True,
+        }
 
         paths: dict[str, Path] = {
             "rollback_manifest": source / "rollback-manifest.json",
@@ -1421,7 +1450,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "commit_evidence": source / "commit-evidence.json",
             "commit_cleanup_evidence": source / "commit-cleanup.json",
             "config_stream_evidence": source / "config-stream-evidence.json",
+            "bootstrap_evidence": source / "bootstrap-evidence.json",
             "artifact": artifact_path,
+            "deb": deb_path,
             "bom": bom_path,
         }
         for key, value in (
@@ -1431,6 +1462,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ("commit_manifest", commit_manifest),
             ("commit_evidence", commit_evidence),
             ("commit_cleanup_evidence", commit_cleanup),
+            ("bootstrap_evidence", bootstrap_evidence),
             (
                 "config_stream_evidence",
                 cls._config_stream_fixture(
@@ -2364,20 +2396,23 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 commit_cleanup_evidence_path=inputs[
                     "commit_cleanup_evidence"
                 ],
+                bootstrap_evidence_path=inputs["bootstrap_evidence"],
                 artifact_path=inputs["artifact"],
+                deb_path=inputs["deb"],
                 bom_path=inputs["bom"],
                 candidate_fleet_runner=ROOT
                 / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
                 output_directory=output,
                 version="0.1.121",
                 component_sha=component_sha,
             )
-            self.assertEqual(len(list(output.iterdir())), 9)
+            self.assertEqual(len(list(output.iterdir())), 10)
             summary_path = Path(assembled["summary"])
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(summary["schemaVersion"], 3)
@@ -2456,6 +2491,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
             )
             self.assertEqual(
                 verified["runtime_artifact_sha256"], assembled["artifactSha256"]
@@ -2480,6 +2516,133 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     / "packaging/dev/run-iq9075-config-stream-e2e.py",
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT
+                    / "packaging/dev/install-iq9075.sh",
+                )
+
+    def test_fleet_runtime_bootstrap_is_exactly_cross_bound(self) -> None:
+        component_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            inputs = self._fleet_runtime_fixture(
+                root, component_sha=component_sha
+            )
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            assembled = FLEET_RUNTIME_EVIDENCE.assemble(
+                rollback_manifest_path=inputs["rollback_manifest"],
+                rollback_evidence_path=inputs["rollback_evidence"],
+                rollback_cleanup_evidence_path=inputs[
+                    "rollback_cleanup_evidence"
+                ],
+                commit_manifest_path=inputs["commit_manifest"],
+                commit_evidence_path=inputs["commit_evidence"],
+                config_stream_evidence_path=inputs["config_stream_evidence"],
+                commit_cleanup_evidence_path=inputs[
+                    "commit_cleanup_evidence"
+                ],
+                bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                artifact_path=inputs["artifact"],
+                deb_path=inputs["deb"],
+                bom_path=inputs["bom"],
+                candidate_fleet_runner=ROOT
+                / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_config_stream_runner=ROOT
+                / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                candidate_board_tool=ROOT
+                / "packaging/dev/iq9075-board-e2e.py",
+                candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
+                security_policy_path=ROOT
+                / "packaging/release/release-security-policy.json",
+                output_directory=output,
+                version="0.1.121",
+                component_sha=component_sha,
+            )
+            summary = json.loads(
+                Path(assembled["summary"]).read_text(encoding="utf-8")
+            )
+            security = json.loads(
+                (
+                    ROOT / "packaging/release/release-security-policy.json"
+                ).read_text(encoding="utf-8")
+            )
+            bootstrap_path = output / summary["bootstrapEvidence"]["file"]
+            original = json.loads(bootstrap_path.read_text(encoding="utf-8"))
+
+            mutations = {
+                "component": lambda value: value.__setitem__(
+                    "componentSha", "b" * 40
+                ),
+                "deb": lambda value: value.__setitem__(
+                    "packageSha256", "b" * 64
+                ),
+                "baseline-before": lambda value: value.__setitem__(
+                    "currentSlotBefore", "releases/" + "c" * 64
+                ),
+                "baseline-after": lambda value: value.__setitem__(
+                    "currentSlot", "releases/" + "c" * 64
+                ),
+                "updater": lambda value: value.__setitem__(
+                    "updaterCodeVersion", "0.1.0"
+                ),
+                "ota": lambda value: value.__setitem__("otaEvidence", True),
+                "ordering": lambda value: value.__setitem__(
+                    "completedAt", "2026-09-03T10:01:00.001Z"
+                ),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    candidate = copy.deepcopy(original)
+                    mutate(candidate)
+                    bootstrap_path.write_bytes(canonical_bytes(candidate))
+                    candidate_summary = copy.deepcopy(summary)
+                    candidate_summary["bootstrapEvidence"]["sha256"] = (
+                        hashlib.sha256(bootstrap_path.read_bytes()).hexdigest()
+                    )
+                    candidate_summary["runtimeGate"]["bootstrap"] = (
+                        READINESS._bootstrap_runtime_gate(candidate)
+                    )
+                    with self.assertRaisesRegex(
+                        READINESS.ReadinessError, "updater bootstrap"
+                    ):
+                        READINESS._validate_fleet_runtime_documents(
+                            policy_path=output / "release-readiness.json",
+                            version="0.1.121",
+                            component_sha=component_sha,
+                            summary=candidate_summary,
+                            security=security,
+                            candidate_fleet_runner=ROOT
+                            / "packaging/dev/run-iq9075-fleet-e2e.py",
+                            candidate_config_stream_runner=ROOT
+                            / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                            candidate_board_tool=ROOT
+                            / "packaging/dev/iq9075-board-e2e.py",
+                            candidate_installer=ROOT
+                            / "packaging/dev/install-iq9075.sh",
+                        )
+            bootstrap_path.write_bytes(canonical_bytes(original))
+
+            drifted_installer = root / "install-iq9075.sh"
+            drifted_installer.write_bytes(
+                (ROOT / "packaging/dev/install-iq9075.sh").read_bytes()
+                + b"\n"
+            )
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "bootstrap installer"
+            ):
+                READINESS._validate_fleet_runtime_documents(
+                    policy_path=output / "release-readiness.json",
+                    version="0.1.121",
+                    component_sha=component_sha,
+                    summary=summary,
+                    security=security,
+                    candidate_fleet_runner=ROOT
+                    / "packaging/dev/run-iq9075-fleet-e2e.py",
+                    candidate_config_stream_runner=ROOT
+                    / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                    candidate_board_tool=ROOT
+                    / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=drifted_installer,
                 )
 
     def test_fleet_runtime_chain_rejects_noncanonical_raw_json(self) -> None:
@@ -2492,6 +2655,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "commit_evidence",
             "config_stream_evidence",
             "commit_cleanup_evidence",
+            "bootstrap_evidence",
             "bom",
         ):
             for encoding in ("key-order", "indent", "trailing-whitespace"):
@@ -2535,10 +2699,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             config_stream_evidence_path=inputs[
                                 "config_stream_evidence"
                             ],
-                            commit_cleanup_evidence_path=inputs[
-                                "commit_cleanup_evidence"
-                            ],
-                            artifact_path=inputs["artifact"],
+                           commit_cleanup_evidence_path=inputs[
+                               "commit_cleanup_evidence"
+                           ],
+                            bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                           artifact_path=inputs["artifact"],
+                            deb_path=inputs["deb"],
                             bom_path=inputs["bom"],
                             candidate_fleet_runner=ROOT
                             / "packaging/dev/run-iq9075-fleet-e2e.py",
@@ -2546,6 +2712,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             / "packaging/dev/run-iq9075-config-stream-e2e.py",
                             candidate_board_tool=ROOT
                             / "packaging/dev/iq9075-board-e2e.py",
+                            candidate_installer=ROOT
+                            / "packaging/dev/install-iq9075.sh",
                             security_policy_path=ROOT
                             / "packaging/release/release-security-policy.json",
                             output_directory=output,
@@ -2583,16 +2751,20 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     config_stream_evidence_path=inputs[
                         "config_stream_evidence"
                     ],
-                    commit_cleanup_evidence_path=inputs[
-                        "commit_cleanup_evidence"
-                    ],
-                    artifact_path=inputs["artifact"],
+                   commit_cleanup_evidence_path=inputs[
+                       "commit_cleanup_evidence"
+                   ],
+                    bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                   artifact_path=inputs["artifact"],
+                    deb_path=inputs["deb"],
                     bom_path=inputs["bom"],
                     candidate_fleet_runner=ROOT
                     / "packaging/dev/run-iq9075-fleet-e2e.py",
                     candidate_config_stream_runner=candidate_runner,
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT
+                    / "packaging/dev/install-iq9075.sh",
                     security_policy_path=ROOT
                     / "packaging/release/release-security-policy.json",
                     output_directory=output,
@@ -2622,6 +2794,13 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         ) -> None:
             manifest["inputs"]["commandSha256"] = "a" * 64
 
+        def change_health_keyring(
+            _inputs: dict[str, Path],
+            manifest: dict[str, object],
+            _evidence: dict[str, object],
+        ) -> None:
+            manifest["inputs"]["healthSha256"] = "a" * 64
+
         def reuse_rollback_sequence(
             _inputs: dict[str, Path],
             _manifest: dict[str, object],
@@ -2634,6 +2813,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         for label, mutation in (
             ("same-run", duplicate_run_id),
             ("different-keyring", change_command_keyring),
+            ("different-health-keyring", change_health_keyring),
             ("non-advancing-command", reuse_rollback_sequence),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
@@ -2695,10 +2875,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         config_stream_evidence_path=inputs[
                             "config_stream_evidence"
                         ],
-                        commit_cleanup_evidence_path=inputs[
-                            "commit_cleanup_evidence"
-                        ],
-                        artifact_path=inputs["artifact"],
+                       commit_cleanup_evidence_path=inputs[
+                           "commit_cleanup_evidence"
+                       ],
+                        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                       artifact_path=inputs["artifact"],
+                        deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
@@ -2706,6 +2888,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT
+                        / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -2766,10 +2950,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         config_stream_evidence_path=inputs[
                             "config_stream_evidence"
                         ],
-                        commit_cleanup_evidence_path=inputs[
-                            "commit_cleanup_evidence"
-                        ],
-                        artifact_path=inputs["artifact"],
+                       commit_cleanup_evidence_path=inputs[
+                           "commit_cleanup_evidence"
+                       ],
+                        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                       artifact_path=inputs["artifact"],
+                        deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
@@ -2777,6 +2963,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT
+                        / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -2802,6 +2990,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "commitEvidence",
             "configStreamEvidence",
             "commitCleanupEvidence",
+            "bootstrapEvidence",
             "testedBom",
         )
         for reference in references:
@@ -2827,10 +3016,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         config_stream_evidence_path=inputs[
                             "config_stream_evidence"
                         ],
-                        commit_cleanup_evidence_path=inputs[
-                            "commit_cleanup_evidence"
-                        ],
-                        artifact_path=inputs["artifact"],
+                       commit_cleanup_evidence_path=inputs[
+                           "commit_cleanup_evidence"
+                       ],
+                        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                       artifact_path=inputs["artifact"],
+                        deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
@@ -2838,6 +3029,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT
+                        / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -2883,6 +3076,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                             / "packaging/dev/run-iq9075-config-stream-e2e.py",
                             candidate_board_tool=ROOT
                             / "packaging/dev/iq9075-board-e2e.py",
+                            candidate_installer=ROOT
+                            / "packaging/dev/install-iq9075.sh",
                         )
 
     def test_fleet_runtime_assembler_fails_closed_on_runtime_or_cleanup_drift(
@@ -3259,10 +3454,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         config_stream_evidence_path=inputs[
                             "config_stream_evidence"
                         ],
-                        commit_cleanup_evidence_path=inputs[
-                            "commit_cleanup_evidence"
-                        ],
-                        artifact_path=inputs["artifact"],
+                       commit_cleanup_evidence_path=inputs[
+                           "commit_cleanup_evidence"
+                       ],
+                        bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                       artifact_path=inputs["artifact"],
+                        deb_path=inputs["deb"],
                         bom_path=inputs["bom"],
                         candidate_fleet_runner=ROOT
                         / "packaging/dev/run-iq9075-fleet-e2e.py",
@@ -3270,6 +3467,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         / "packaging/dev/run-iq9075-config-stream-e2e.py",
                         candidate_board_tool=ROOT
                         / "packaging/dev/iq9075-board-e2e.py",
+                        candidate_installer=ROOT
+                        / "packaging/dev/install-iq9075.sh",
                         security_policy_path=ROOT
                         / "packaging/release/release-security-policy.json",
                         output_directory=output,
@@ -3315,13 +3514,16 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 commit_cleanup_evidence_path=inputs[
                     "commit_cleanup_evidence"
                 ],
+                bootstrap_evidence_path=inputs["bootstrap_evidence"],
                 artifact_path=inputs["artifact"],
+                deb_path=inputs["deb"],
                 bom_path=inputs["bom"],
                 candidate_fleet_runner=ROOT
                 / "packaging/dev/run-iq9075-fleet-e2e.py",
                 candidate_config_stream_runner=ROOT
                 / "packaging/dev/run-iq9075-config-stream-e2e.py",
                 candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
                 security_policy_path=ROOT
                 / "packaging/release/release-security-policy.json",
                 output_directory=output,
@@ -3381,6 +3583,8 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     / "packaging/dev/run-iq9075-config-stream-e2e.py",
                     candidate_board_tool=ROOT
                     / "packaging/dev/iq9075-board-e2e.py",
+                    candidate_installer=ROOT
+                    / "packaging/dev/install-iq9075.sh",
                 )
             self.assertEqual(
                 verified["runtime_artifact_sha256"], assembled["artifactSha256"]
@@ -4515,7 +4719,25 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             'iq9075-board-e2e.py"',
             runbook,
         )
-        self.assertIn("nine-file", runbook)
+        self.assertIn('--bootstrap-evidence "$bootstrap_evidence"', runbook)
+        self.assertIn('--deb "$candidate_deb"', runbook)
+        self.assertIn(
+            '--candidate-installer "$component_root/packaging/dev/'
+            'install-iq9075.sh"',
+            runbook,
+        )
+        self.assertIn("ten-file", runbook)
+        bootstrap_call = runbook.index(
+            '--run-id "$bootstrap_run_id" --output-dir "$bootstrap_run_dir" '
+            "bootstrap-updater"
+        )
+        bootstrap_complete = runbook.index(
+            'bootstrap_evidence="$bootstrap_run_dir/bootstrap-evidence.json"',
+            bootstrap_call,
+        )
+        rollback_command_issued = runbook.index(
+            "issue the fresh rollback BE command now", bootstrap_complete
+        )
         rollback_call = runbook.index("--scenario oak-fault-rollback")
         rollback_cleanup_call = runbook.index(
             '--run-id "$rollback_run_id" --output-dir "$rollback_run_dir" cleanup',
@@ -4539,6 +4761,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             '--run-id "$media_run_id" --output-dir "$media_run_dir" cleanup',
             soak_call,
         )
+        self.assertLess(bootstrap_call, bootstrap_complete)
+        self.assertLess(bootstrap_complete, rollback_command_issued)
+        self.assertLess(rollback_command_issued, rollback_call)
         self.assertLess(rollback_call, rollback_cleanup_call)
         self.assertLess(rollback_cleanup_call, commit_call)
         self.assertLess(commit_call, config_stream_call)
@@ -4730,6 +4955,67 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "IQ9075_RELEASE_PUBLIC_KEYRING_JSON",
             policy["forbiddenRepositorySecrets"],
         )
+
+    def test_fleet_evidence_uses_exact_committed_command_and_health_roots(
+        self,
+    ) -> None:
+        policy_path = ROOT / "packaging/release/release-security-policy.json"
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        roots = policy["iq9075"]["fleetTrustRoots"]
+        self.assertEqual(roots, READINESS.IQ9075_FLEET_TRUST_ROOTS)
+        for role, descriptor in roots.items():
+            with self.subTest(role=role):
+                path = policy_path.parent / descriptor["file"]
+                raw = path.read_bytes()
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(), descriptor["sha256"]
+                )
+                keyring = json.loads(raw)
+                self.assertEqual(keyring["trustDomain"], "iq9075-dev")
+                self.assertEqual(set(keyring["keys"]), {descriptor["keyId"]})
+                self.assertEqual(
+                    len(
+                        base64.b64decode(
+                            keyring["keys"][descriptor["keyId"]],
+                            validate=True,
+                        )
+                    ),
+                    32,
+                )
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            keyring_root = root / "trusted-fleet-keyrings"
+            keyring_root.mkdir()
+            for descriptor in roots.values():
+                source = policy_path.parent / descriptor["file"]
+                (root / descriptor["file"]).write_bytes(source.read_bytes())
+            READINESS._validate_fleet_trust_roots(
+                policy_directory=root,
+                iq_policy=policy["iq9075"],
+            )
+            command_path = root / roots["command"]["file"]
+            command_path.write_bytes(command_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "bytes differ from policy"
+            ):
+                READINESS._validate_fleet_trust_roots(
+                    policy_directory=root,
+                    iq_policy=policy["iq9075"],
+                )
+            command_path.write_bytes(
+                (policy_path.parent / roots["command"]["file"]).read_bytes()
+            )
+            changed_policy = copy.deepcopy(policy["iq9075"])
+            changed_policy["fleetTrustRoots"]["health"]["keyId"] = (
+                "attacker-controlled-key"
+            )
+            with self.assertRaisesRegex(
+                READINESS.ReadinessError, "differs from the reviewed pin"
+            ):
+                READINESS._validate_fleet_trust_roots(
+                    policy_directory=root,
+                    iq_policy=changed_policy,
+                )
 
     def test_all_external_actions_are_full_sha_pinned(self) -> None:
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):

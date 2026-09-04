@@ -50,6 +50,8 @@ HOST_RE = re.compile(
 USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 DEVICE_ID_RE = re.compile(r"^sp-([1-9][0-9]*)-nuvion-[a-z0-9][a-z0-9-]{0,100}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_SLOT_RE = re.compile(r"^releases/[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -166,6 +168,7 @@ CLEANUP_IDENTITY_FIELDS = (
 )
 
 BOOTSTRAP_REMOTE_PROGRAM = r"""
+import ast
 import hashlib
 import json
 import os
@@ -174,9 +177,10 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-run_id, installer_source, deb_source, installer_sha, deb_sha, version, board_user = sys.argv[1:]
+run_id, installer_source, deb_source, installer_sha, deb_sha, version, component_sha, expected_current_slot, board_user = sys.argv[1:]
 uuid4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 sha256 = re.compile(r"[0-9a-f]{64}\Z")
 semver = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z")
@@ -185,8 +189,10 @@ expected_installer = f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap-installer.sh"
 expected_deb = f"/tmp/nuvion-fleet-e2e-{run_id}-bootstrap.deb"
 if not uuid4.fullmatch(run_id) or not sha256.fullmatch(installer_sha) or not sha256.fullmatch(deb_sha):
     raise SystemExit("invalid bootstrap identity")
-if not semver.fullmatch(version) or not user_re.fullmatch(board_user):
+if not semver.fullmatch(version) or re.fullmatch(r"[0-9a-f]{40}", component_sha) is None or not user_re.fullmatch(board_user):
     raise SystemExit("invalid bootstrap package identity")
+if re.fullmatch(r"releases/[0-9a-f]{64}", expected_current_slot) is None:
+    raise SystemExit("invalid bootstrap baseline slot")
 if installer_source != expected_installer or deb_source != expected_deb:
     raise SystemExit("bootstrap paths are not fixed")
 
@@ -273,6 +279,49 @@ def control(field):
         raise SystemExit("cannot inspect bootstrap package")
     return result.stdout.strip()
 
+def current_slot():
+    current = Path("/opt/nuv-agent/current")
+    metadata = current.lstat()
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit("bootstrap current slot is not a symlink")
+    value = os.readlink(current)
+    if value != expected_current_slot:
+        raise SystemExit("bootstrap changed the signed active slot")
+    return value
+
+def installed_build_identity():
+    path = Path("/usr/lib/nuvion-updater/nuvion_app/build_info.py")
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_size > 4096 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit("installed build identity metadata is unsafe")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (metadata.st_dev, metadata.st_ino, metadata.st_size):
+            raise SystemExit("installed build identity changed while opening")
+        raw = os.read(descriptor, 4097)
+        if len(raw) != opened.st_size or len(raw) > 4096:
+            raise SystemExit("installed build identity changed while reading")
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino, after.st_size) != (opened.st_dev, opened.st_ino, opened.st_size):
+            raise SystemExit("installed build identity changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        syntax = ast.parse(raw.decode("utf-8"))
+    except (UnicodeError, SyntaxError):
+        raise SystemExit("installed build identity is invalid")
+    values = {}
+    for node in syntax.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name) or node.targets[0].id not in {"AGENT_VERSION", "COMPONENT_SHA"} or not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str) or node.targets[0].id in values:
+            raise SystemExit("installed build identity has executable content")
+        values[node.targets[0].id] = node.value.value
+    if values != {"AGENT_VERSION": version, "COMPONENT_SHA": component_sha}:
+        raise SystemExit("installed build identity differs from component A")
+    return values
+
 RUNTIME_UNITS = (
     "nuv-agent.service",
     "nuv-agent-updater.socket",
@@ -333,6 +382,7 @@ try:
     safe_rmtree(private)
     private.mkdir(mode=0o700)
     previous_version = query_package_version()
+    current_slot_before = current_slot()
     copy_verified(installer_source, private_installer, installer_sha, 2 * 1024 * 1024)
     copy_verified(deb_source, private_deb, deb_sha, 4 * 1024 * 1024 * 1024)
     if control("Package") != "nuv-agent" or control("Architecture") != "arm64" or control("Version") != version:
@@ -358,6 +408,7 @@ try:
     installed_version = query_package_version()
     if installed_version != version:
         raise SystemExit("installed package version mismatch")
+    build_identity = installed_build_identity()
     sys.path.insert(0, "/usr/lib/nuvion-updater")
     from nuvion_updater.version import UPDATER_VERSION
     if UPDATER_VERSION != "0.2.0":
@@ -367,13 +418,7 @@ try:
     if not stat.S_ISREG(tool_metadata.st_mode) or stat.S_ISLNK(tool_metadata.st_mode) or tool_metadata.st_uid != 0 or stat.S_IMODE(tool_metadata.st_mode) != 0o755:
         raise SystemExit("packaged board tool identity is unsafe")
     tool_sha = hashlib.sha256(tool.read_bytes()).hexdigest()
-    current = Path("/opt/nuv-agent/current")
-    current_metadata = current.lstat()
-    if not stat.S_ISLNK(current_metadata.st_mode):
-        raise SystemExit("bootstrap current slot is not a symlink")
-    current_slot = os.readlink(current)
-    if re.fullmatch(r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})", current_slot) is None:
-        raise SystemExit("bootstrap current slot is invalid")
+    current_slot_after = current_slot()
     evidence = {
         "schemaVersion": 1,
         "protocolVersion": "iq9075-fleet-e2e-v2",
@@ -382,11 +427,13 @@ try:
         "otaEvidence": False,
         "previousPackageVersion": previous_version,
         "installedPackageVersion": installed_version,
+        "componentSha": build_identity["COMPONENT_SHA"],
         "packageSha256": deb_sha,
         "installerSha256": installer_sha,
         "updaterCodeVersion": UPDATER_VERSION,
         "boardToolSha256": tool_sha,
-        "currentSlot": current_slot,
+        "currentSlotBefore": current_slot_before,
+        "currentSlot": current_slot_after,
     }
 except BaseException as exc:
     primary_failure = stable_failure(exc)
@@ -407,6 +454,7 @@ if primary_failure is not None or cleanup_failures:
 if not isinstance(evidence, dict):
     raise SystemExit("out-of-band updater bootstrap produced no evidence")
 evidence["servicesInactive"] = True
+evidence["completedAt"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
 """.strip()
 
@@ -1296,6 +1344,8 @@ class OpenSshTransport:
         installer_sha256: str,
         package_sha256: str,
         expected_version: str,
+        expected_component_sha: str,
+        expected_current_slot: str,
     ) -> dict[str, Any]:
         canonical_run_id(run_id)
         if installer_path != REMOTE_BOOTSTRAP_INSTALLER.format(
@@ -1308,6 +1358,10 @@ class OpenSshTransport:
             raise RunnerError("bootstrap digest is invalid")
         if not SEMVER_RE.fullmatch(expected_version):
             raise RunnerError("bootstrap version is invalid")
+        if not FULL_GIT_SHA_RE.fullmatch(expected_component_sha) or not RELEASE_SLOT_RE.fullmatch(
+            expected_current_slot
+        ):
+            raise RunnerError("bootstrap component or baseline slot is invalid")
         return self._invoke_root_python(
             BOOTSTRAP_REMOTE_PROGRAM,
             [
@@ -1317,6 +1371,8 @@ class OpenSshTransport:
                 installer_sha256,
                 package_sha256,
                 expected_version,
+                expected_component_sha,
+                expected_current_slot,
                 self.user,
             ],
             operation="out-of-band-updater-bootstrap",
@@ -3285,9 +3341,13 @@ class FleetRunner:
         local_tool: Path,
         expected_version: str,
         expected_package_sha256: str,
+        expected_component_sha: str,
+        expected_current_slot: str,
     ) -> dict[str, object]:
         if not SEMVER_RE.fullmatch(expected_version) or not SHA256_RE.fullmatch(
             expected_package_sha256
+        ) or not FULL_GIT_SHA_RE.fullmatch(expected_component_sha) or not RELEASE_SLOT_RE.fullmatch(
+            expected_current_slot
         ):
             raise RunnerError("bootstrap version or package digest is invalid")
         installer_sha = sha256_regular(installer, MAX_BOOTSTRAP_INSTALLER_BYTES)
@@ -3312,6 +3372,8 @@ class FleetRunner:
                 installer_sha256=installer_sha,
                 package_sha256=package_sha,
                 expected_version=expected_version,
+                expected_component_sha=expected_component_sha,
+                expected_current_slot=expected_current_slot,
             )
             self.journal.mark("out-of-band-bootstrap", "COMPLETE")
         except BaseException:
@@ -3345,12 +3407,15 @@ class FleetRunner:
             "otaEvidence",
             "previousPackageVersion",
             "installedPackageVersion",
+            "componentSha",
             "packageSha256",
             "installerSha256",
             "updaterCodeVersion",
             "boardToolSha256",
             "currentSlot",
+            "currentSlotBefore",
             "servicesInactive",
+            "completedAt",
         }
         if set(remote) != expected_fields or any(
             (
@@ -3361,16 +3426,15 @@ class FleetRunner:
                 remote.get("outOfBandBootstrap") is not True,
                 remote.get("otaEvidence") is not False,
                 remote.get("installedPackageVersion") != expected_version,
+                remote.get("componentSha") != expected_component_sha,
                 remote.get("packageSha256") != package_sha,
                 remote.get("installerSha256") != installer_sha,
                 remote.get("updaterCodeVersion") != REQUIRED_UPDATER_VERSION,
                 remote.get("boardToolSha256") != local_tool_sha,
                 remote.get("servicesInactive") is not True,
-                re.fullmatch(
-                    r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})",
-                    str(remote.get("currentSlot") or ""),
-                )
-                is None,
+                remote.get("currentSlotBefore") != expected_current_slot,
+                remote.get("currentSlot") != expected_current_slot,
+                not isinstance(remote.get("completedAt"), str),
             )
         ):
             raise RunnerError("out-of-band bootstrap evidence is invalid")
@@ -3381,6 +3445,7 @@ class FleetRunner:
             or len(previous_version) > 128
         ):
             raise RunnerError("previous bootstrap package version is invalid")
+        canonical_utc(remote.get("completedAt"), label="bootstrap completion")
         identity = self._call("bootstrap-tool-identity", "identity")
         if any(
             (
@@ -3420,17 +3485,16 @@ class FleetRunner:
                 persisted.get("outOfBandBootstrap") is not True,
                 persisted.get("otaEvidence") is not False,
                 persisted.get("installedPackageVersion") != expected_version,
+                persisted.get("componentSha") != expected_component_sha,
                 persisted.get("packageSha256") != package_sha,
                 persisted.get("installerSha256") != installer_sha,
                 persisted.get("updaterCodeVersion") != REQUIRED_UPDATER_VERSION,
                 persisted.get("boardToolSha256") != local_tool_sha,
                 persisted.get("boardToolIdentityVerified") is not True,
                 persisted.get("servicesInactive") is not True,
-                re.fullmatch(
-                    r"(?:bootstrap/[0-9A-Za-z.+-]{1,64}|releases/[0-9a-f]{64})",
-                    str(persisted.get("currentSlot") or ""),
-                )
-                is None,
+                persisted.get("currentSlotBefore") != expected_current_slot,
+                persisted.get("currentSlot") != expected_current_slot,
+                not isinstance(persisted.get("completedAt"), str),
             )
         ):
             raise RunnerError("persisted bootstrap evidence is invalid")
@@ -3441,6 +3505,9 @@ class FleetRunner:
             or len(persisted_previous) > 128
         ):
             raise RunnerError("persisted previous package version is invalid")
+        canonical_utc(
+            persisted.get("completedAt"), label="persisted bootstrap completion"
+        )
         assert_no_secret_material(persisted)
         return {
             "schemaVersion": 1,
@@ -4176,6 +4243,8 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--package", required=True)
     bootstrap.add_argument("--expected-version", required=True)
     bootstrap.add_argument("--expected-sha256", required=True)
+    bootstrap.add_argument("--expected-component-sha", required=True)
+    bootstrap.add_argument("--expected-current-slot", required=True)
     subcommands.add_parser("cleanup")
     subcommands.add_parser("resume-boot-gate")
     return parser
@@ -4251,6 +4320,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 package=inputs[2],
                 expected_version=arguments.expected_version,
                 expected_package_sha256=arguments.expected_sha256,
+                expected_component_sha=arguments.expected_component_sha,
+                expected_current_slot=arguments.expected_current_slot,
             )
         elif arguments.command == "candidate-soak":
             inputs = [

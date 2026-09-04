@@ -28,6 +28,15 @@ on:
       bundle_size:
         required: true
         type: string
+      deb_name:
+        required: true
+        type: string
+      deb_sha256:
+        required: true
+        type: string
+      deb_size:
+        required: true
+        type: string
       built_at:
         required: true
         type: string
@@ -230,6 +239,9 @@ jobs:
           BUNDLE_NAME: ${{ inputs.bundle_name }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
           BUNDLE_SIZE: ${{ inputs.bundle_size }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
           BUILT_AT: ${{ inputs.built_at }}
           CONFIG_SCHEMA: ${{ inputs.config_schema }}
           MIN_UPDATER_VERSION: ${{ inputs.min_updater_version }}
@@ -249,6 +261,11 @@ jobs:
           [ -f "$bundle_path" ] && [ ! -L "$bundle_path" ]
           [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
           [ "$(stat -c %s "$bundle_path")" = "$BUNDLE_SIZE" ]
+          [ "$DEB_NAME" = "nuv-agent_${REQUESTED_VERSION}_arm64.deb" ]
+          deb_path="dist/$DEB_NAME"
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           trusted_config_schema="$(PYTHONPATH=publisher python3 -c 'from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)')"
           trusted_updater_version="$(PYTHONPATH=publisher python3 -c 'from nuvion_updater.version import UPDATER_VERSION; print(UPDATER_VERSION)')"
           [ "$CONFIG_SCHEMA" = "$trusted_config_schema" ]
@@ -256,7 +273,8 @@ jobs:
           python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
             "$REQUESTED_SEQUENCE" "$BUILT_AT" \
             "$BUNDLE_NAME" "$BUNDLE_SHA256" "$BUNDLE_SIZE" \
-            "$CONFIG_SCHEMA" "$MIN_UPDATER_VERSION" <<'PY'
+            "$CONFIG_SCHEMA" "$MIN_UPDATER_VERSION" \
+            "$DEB_NAME" "$DEB_SHA256" "$DEB_SIZE" <<'PY'
           import json
           import pathlib
           import sys
@@ -275,6 +293,11 @@ jobs:
                   "sha256": sys.argv[6],
                   "sizeBytes": int(sys.argv[7]),
               },
+              "bootstrapDeb": {
+                  "name": sys.argv[10],
+                  "sha256": sys.argv[11],
+                  "sizeBytes": int(sys.argv[12]),
+              },
           }
           path = pathlib.Path("dist/candidate-build-manifest.json")
           raw = path.read_bytes()
@@ -288,8 +311,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           COMPONENT_SHA: ${{ inputs.component_sha }}
+          VERSION: ${{ inputs.version }}
           BUNDLE_NAME: ${{ inputs.bundle_name }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
           TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
         shell: bash
         run: |
@@ -302,6 +329,11 @@ jobs:
             || { echo "protected main advanced before candidate signing" >&2; exit 1; }
           bundle_path="dist/$BUNDLE_NAME"
           [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          deb_path="dist/$DEB_NAME"
+          [ "$DEB_NAME" = "nuv-agent_${VERSION}_arm64.deb" ]
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           signing_key_id="$(jq -er .iq9075.publisherKeyId publisher/packaging/release/release-security-policy.json)"
           echo "signing_key_id=$signing_key_id" >> "$GITHUB_OUTPUT"
 
@@ -388,6 +420,9 @@ jobs:
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
           BUNDLE_NAME: ${{ inputs.bundle_name }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
         shell: bash
         run: |
           set -euo pipefail
@@ -398,7 +433,7 @@ jobs:
             "$bom_name" "$(sha256sum "dist/$bom_name" | awk '{print $1}')" \
             "$(sha256sum "dist/$bom_name.sig" | awk '{print $1}')" \
             "$(sha256sum publisher/packaging/release/trusted-release-keyrings/iq9075-dev.json | awk '{print $1}')" \
-            "$bom_digest" \
+            "$bom_digest" "$DEB_NAME" "$DEB_SHA256" "$DEB_SIZE" \
             > dist/candidate-evidence-manifest.json <<'PY'
           import json
           import sys
@@ -412,6 +447,11 @@ jobs:
               "agentVersion": sys.argv[4],
               "releaseSequence": int(sys.argv[5]),
               "artifact": {"name": sys.argv[6], "sha256": sys.argv[7]},
+              "bootstrapDeb": {
+                  "name": sys.argv[13],
+                  "sha256": sys.argv[14],
+                  "sizeBytes": int(sys.argv[15]),
+              },
               "bom": {"name": sys.argv[8], "sha256": sys.argv[9]},
               "signature": {"name": sys.argv[8] + ".sig", "sha256": sys.argv[10]},
               "releaseKeyringSha256": sys.argv[11],
@@ -426,6 +466,7 @@ jobs:
           name: iq9075-signed-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/${{ inputs.bundle_name }}
+            dist/${{ inputs.deb_name }}
             dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json
             dist/nuv-agent_${{ inputs.version }}_iq9075-aarch64.release-bom.json.sig
             dist/candidate-evidence-manifest.json
@@ -620,6 +661,9 @@ jobs:
           REQUESTED_SEQUENCE: ${{ inputs.release_sequence }}
           BUNDLE_NAME: ${{ inputs.bundle_name }}
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+          DEB_NAME: ${{ inputs.deb_name }}
+          DEB_SHA256: ${{ inputs.deb_sha256 }}
+          DEB_SIZE: ${{ inputs.deb_size }}
           TRUSTED_WORKFLOW_SHA: ${{ steps.trusted-identity.outputs.workflow_sha }}
         shell: bash
         run: |
@@ -638,6 +682,11 @@ jobs:
           [ -f "$bom_path" ] && [ ! -L "$bom_path" ]
           [ -f "$signature_path" ] && [ ! -L "$signature_path" ]
           [ "$(sha256sum "$bundle_path" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
+          deb_path="dist/$DEB_NAME"
+          [ "$DEB_NAME" = "nuv-agent_${REQUESTED_VERSION}_arm64.deb" ]
+          [ -f "$deb_path" ] && [ ! -L "$deb_path" ]
+          [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
+          [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
             "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
           from pathlib import Path

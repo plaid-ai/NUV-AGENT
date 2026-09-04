@@ -56,6 +56,9 @@ jobs:
       gate_workflow_sha256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
       physical_artifact_sha256: ${{ steps.readiness.outputs.physical_artifact_sha256 }}
       physical_bom_sha256: ${{ steps.readiness.outputs.physical_bom_sha256 }}
+      tested_deb_name: ${{ steps.readiness.outputs.tested_deb_name }}
+      tested_deb_sha256: ${{ steps.readiness.outputs.tested_deb_sha256 }}
+      tested_deb_size: ${{ steps.readiness.outputs.tested_deb_size }}
       requested_sequence: ${{ steps.request.outputs.requested_sequence }}
     steps:
       - name: Resolve request without credentials
@@ -236,6 +239,7 @@ jobs:
             --candidate-fleet-runner release-source/packaging/dev/run-iq9075-fleet-e2e.py \
             --candidate-config-stream-runner release-source/packaging/dev/run-iq9075-config-stream-e2e.py \
             --candidate-board-tool release-source/packaging/dev/iq9075-board-e2e.py \
+            --candidate-installer release-source/packaging/dev/install-iq9075.sh \
             --github-output "$GITHUB_OUTPUT"
 
   release-build:
@@ -427,6 +431,9 @@ jobs:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
           PHYSICAL_ARTIFACT_SHA256: ${{ needs.release-preflight.outputs.physical_artifact_sha256 }}
+          TESTED_DEB_NAME: ${{ needs.release-preflight.outputs.tested_deb_name }}
+          TESTED_DEB_SHA256: ${{ needs.release-preflight.outputs.tested_deb_sha256 }}
+          TESTED_DEB_SIZE: ${{ needs.release-preflight.outputs.tested_deb_size }}
         run: |
           set -euo pipefail
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$COMPONENT_SHA")
@@ -440,6 +447,12 @@ jobs:
           DEB_PATH="dist/$DEB_NAME"
           BOOTSTRAP_BUNDLE_PATH="$BUNDLE_PATH" OUTPUT_DEB="$DEB_PATH" \
             packaging/deb/build-deb.sh
+          [ "$DEB_NAME" = "$TESTED_DEB_NAME" ] \
+            || { echo "release DEB name differs from signed IQ9075 bootstrap evidence" >&2; exit 1; }
+          [ "$(sha256sum "$DEB_PATH" | awk '{print $1}')" = "$TESTED_DEB_SHA256" ] \
+            || { echo "release DEB differs from signed IQ9075 bootstrap evidence" >&2; exit 1; }
+          [ "$(stat -c %s "$DEB_PATH")" = "$TESTED_DEB_SIZE" ] \
+            || { echo "release DEB size differs from signed IQ9075 bootstrap evidence" >&2; exit 1; }
           CONFIG_SCHEMA=$(python3 -c \
             "from nuvion_app.runtime.telemetry import DEFAULT_CONFIG_SCHEMA; print(DEFAULT_CONFIG_SCHEMA)")
           MIN_UPDATER_VERSION=$(python3 -c \

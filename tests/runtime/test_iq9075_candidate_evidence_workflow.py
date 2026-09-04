@@ -91,6 +91,10 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
     def test_secretless_native_arm_build_is_separate_from_signing(self) -> None:
         self.assertIn("runs-on: ubuntu-24.04-arm", self.build)
         self.assertIn("build-agent-bundle.sh", self.build)
+        self.assertIn("packaging/deb/build-deb.sh", self.build)
+        self.assertIn('BOOTSTRAP_BUNDLE_PATH="$bundle_path"', self.build)
+        self.assertIn('deb_name="nuv-agent_${VERSION}_arm64.deb"', self.build)
+        self.assertIn('"bootstrapDeb": {', self.build)
         self.assertIn("stamp-build-info.py", self.build)
         self.assertIn("SOURCE_DATE_EPOCH", self.build)
         self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", self.build)
@@ -137,6 +141,9 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("load_signed_release_bom", self.sign)
         self.assertIn("verify_release_artifact", self.sign)
         self.assertIn("candidate-build-manifest.json", self.sign)
+        self.assertIn("DEB_SHA256: ${{ inputs.deb_sha256 }}", self.sign)
+        self.assertIn('"bootstrapDeb": {', self.sign)
+        self.assertIn("dist/${{ inputs.deb_name }}", self.sign)
         self.assertIn("sha256sum", self.sign)
 
     def test_privileged_jobs_verify_signed_called_workflow_before_checkout(self) -> None:
@@ -335,6 +342,10 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("iq9075-candidate-gcs-cab.json", self.stage)
         self.assertNotIn("packaging/apt/publish-gcs.sh", self.stage)
         self.assertNotIn("gcloud storage", self.stage)
+        publish_step = self.stage.split(
+            "Publish exact candidate objects with downscoped token", maxsplit=1
+        )[1]
+        self.assertNotIn("--deb", publish_step)
         self.assertIn("ifGenerationMatch=0", (ROOT / "packaging/release/publish-iq9075-candidate-gcs.py").read_text(encoding="utf-8"))
         self.assertIn("releases/by-bom-sha256/", self.sign)
         self.assertIn("retention-days: 2", self.trusted_workflow)

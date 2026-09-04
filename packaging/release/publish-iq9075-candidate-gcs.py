@@ -187,6 +187,7 @@ def _read_manifest(source: VerifiedInput) -> dict[str, object]:
         "agentVersion",
         "releaseSequence",
         "artifact",
+        "bootstrapDeb",
         "bom",
         "signature",
         "releaseKeyringSha256",
@@ -231,6 +232,22 @@ def _read_manifest(source: VerifiedInput) -> dict[str, object]:
             or SHA256_PATTERN.fullmatch(digest) is None
         ):
             raise PublishError("candidate object descriptor is invalid")
+
+    bootstrap_deb = payload.get("bootstrapDeb")
+    if not isinstance(bootstrap_deb, dict) or set(bootstrap_deb) != {
+        "name",
+        "sha256",
+        "sizeBytes",
+    }:
+        raise PublishError("candidate bootstrap DEB descriptor is invalid")
+    if (
+        bootstrap_deb.get("name") != f"nuv-agent_{version}_arm64.deb"
+        or not isinstance(bootstrap_deb.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(bootstrap_deb["sha256"]) is None
+        or type(bootstrap_deb.get("sizeBytes")) is not int
+        or not 0 < bootstrap_deb["sizeBytes"] <= MAX_ARTIFACT_BYTES
+    ):
+        raise PublishError("candidate bootstrap DEB descriptor is invalid")
 
     content_path = payload.get("contentAddressedPath")
     if not isinstance(content_path, str) or re.fullmatch(

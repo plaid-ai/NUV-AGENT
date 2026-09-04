@@ -4648,12 +4648,15 @@ class FakeBootstrapTransport:
             "otaEvidence": False,
             "previousPackageVersion": "0.1.115",
             "installedPackageVersion": arguments["expected_version"],
+            "componentSha": arguments["expected_component_sha"],
             "packageSha256": arguments["package_sha256"],
             "installerSha256": arguments["installer_sha256"],
             "updaterCodeVersion": "0.2.0",
             "boardToolSha256": self.local_tool_sha,
+            "currentSlotBefore": arguments["expected_current_slot"],
             "currentSlot": self.current_slot,
             "servicesInactive": True,
+            "completedAt": "2026-09-03T09:59:00.000Z",
         }
 
     def discard_bootstrap_staging(self, *, run_id: str) -> dict[str, object]:
@@ -6231,7 +6234,7 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             tool_sha = hashlib.sha256(tool.read_bytes()).hexdigest()
             transport = FakeBootstrapTransport(
                 local_tool_sha=tool_sha,
-                current_slot="bootstrap/0.1.121",
+                current_slot="releases/" + "b" * 64,
             )
             journal = HOST.HostJournal(
                 output / "journal.json",
@@ -6251,6 +6254,8 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
                 local_tool=tool,
                 expected_version="0.1.121",
                 expected_package_sha256=package_sha,
+                expected_component_sha="a" * 40,
+                expected_current_slot="releases/" + "b" * 64,
             )
             self.assertTrue(result["bootstrapComplete"])
             self.assertFalse(result["otaEvidence"])
@@ -6261,6 +6266,9 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             self.assertTrue(evidence["outOfBandBootstrap"])
             self.assertFalse(evidence["otaEvidence"])
             self.assertEqual(evidence["updaterCodeVersion"], "0.2.0")
+            self.assertEqual(evidence["componentSha"], "a" * 40)
+            self.assertEqual(evidence["currentSlotBefore"], "releases/" + "b" * 64)
+            self.assertEqual(evidence["currentSlot"], "releases/" + "b" * 64)
             self.assertTrue(evidence["boardToolIdentityVerified"])
             self.assertNotIn("foundationVerified", evidence)
 
@@ -6282,7 +6290,7 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             package.chmod(0o600)
             transport = FailingBootstrapTransport(
                 local_tool_sha=hashlib.sha256(tool.read_bytes()).hexdigest(),
-                current_slot="bootstrap/0.1.121",
+                current_slot="releases/" + "b" * 64,
             )
             runner = HOST.FleetRunner(
                 transport=transport,
@@ -6304,6 +6312,8 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
                     expected_package_sha256=hashlib.sha256(
                         package.read_bytes()
                     ).hexdigest(),
+                    expected_component_sha="a" * 40,
+                    expected_current_slot="releases/" + "b" * 64,
                 )
             self.assertEqual(transport.cleanup_calls, 1)
             self.assertFalse((output / "bootstrap-evidence.json").exists())
@@ -6317,6 +6327,8 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
             'control("Package")',
             'control("Architecture")',
             'UPDATER_VERSION != "0.2.0"',
+            'values != {"AGENT_VERSION": version, "COMPONENT_SHA": component_sha}',
+            'current_slot_before = current_slot()',
             '"otaEvidence": False',
             'evidence["servicesInactive"] = True',
         ):
