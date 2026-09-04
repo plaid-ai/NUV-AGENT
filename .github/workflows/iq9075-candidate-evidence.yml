@@ -213,3 +213,9 @@ jobs:
       built_at: ${{ needs.build.outputs.built_at }}
       config_schema: ${{ needs.build.outputs.config_schema }}
       min_updater_version: ${{ needs.build.outputs.min_updater_version }}
+    # Materialize the declared bindings; each fixed called-job Environment
+    # overrides this already-available read-only token or fails closed.
+    secrets:
+      IQ9075_RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.GITHUB_TOKEN }}
+      GCP_PROJECT_ID: ${{ secrets.GITHUB_TOKEN }}
+      GCP_SA_KEY: ${{ secrets.GITHUB_TOKEN }}
