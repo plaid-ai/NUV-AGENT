@@ -159,6 +159,24 @@ class ReconcilerRegistry:
     ) -> tuple[ObservedStateUpdate, ...]:
         return self._observe("observe_stream_metrics", sample)
 
+    def observe_stream_health(self) -> tuple[ObservedStateUpdate, ...]:
+        """Poll reconcilers whose reported state depends on live media proof."""
+
+        updates: list[ObservedStateUpdate] = []
+        with self._lock:
+            reconcilers = tuple(self._reconcilers.values())
+        for reconciler in reconcilers:
+            observer = getattr(reconciler, "observe_runtime_health", None)
+            if not callable(observer):
+                continue
+            update = observer()
+            if update is None:
+                continue
+            if not isinstance(update, ObservedStateUpdate):
+                raise TypeError("runtime health observer returned an invalid update")
+            updates.append(update)
+        return tuple(updates)
+
     def observation_committed(self, update: ObservedStateUpdate) -> None:
         self._notify_observation("observation_committed", update)
 
@@ -420,6 +438,16 @@ class FleetEffectCoordinator:
             restore = getattr(reconciler, "restore_applied", None)
             if not callable(restore):
                 continue
+            readiness = getattr(reconciler, "ready", True)
+            try:
+                ready = bool(readiness() if callable(readiness) else readiness)
+            except Exception:  # noqa: BLE001 - restore waits for proven readiness.
+                ready = False
+            if not ready:
+                # A media-backed reconciler may be registered before its first
+                # frame.  Do not turn that normal startup interval into a
+                # 250ms exception/log loop; the next coordinator pass retries.
+                continue
             applied = self.store.applied_state(command_type)
             if applied is None or applied.command_id in self._restored_command_ids:
                 continue
@@ -465,6 +493,12 @@ class FleetEffectCoordinator:
         with self._observation_lock:
             return self._persist_observations(
                 self.registry.observe_stream_metrics(sample)
+            )
+
+    def observe_stream_health(self) -> int:
+        with self._observation_lock:
+            return self._persist_observations(
+                self.registry.observe_stream_health()
             )
 
     def _persist_observations(

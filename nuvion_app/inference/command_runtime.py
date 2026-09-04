@@ -337,6 +337,15 @@ class FleetCommandRuntime:
             sample,
         )
 
+    async def observe_stream_health(self) -> int:
+        """Persist media-health transitions even when WebRTC emits no sample."""
+
+        if self.effect_coordinator is None:
+            return 0
+        return await asyncio.to_thread(
+            self.effect_coordinator.observe_stream_health,
+        )
+
     def replay_observations(self, *, limit: int = 100) -> int:
         if self.observation_outbox is None:
             return 0
@@ -608,12 +617,22 @@ def build_fleet_command_runtime(
     def effective_capabilities() -> frozenset[str]:
         return frozenset(base_capabilities | set(registry.capabilities))
 
+    def admit_safe_unready_command(command: VerifiedFleetCommand) -> bool:
+        """Ask only the registered reconciler for an explicit safe exception."""
+
+        reconciler = registry.get(command.command_type)
+        admission = getattr(reconciler, "admit_when_unready", None)
+        if not callable(admission):
+            return False
+        return bool(admission(command))
+
     verifier = FleetCommandVerifier(
         keyring=keyring,
         expected_device_id=device_id,
         expected_space_id=space_id,
         capabilities=effective_capabilities(),
         capability_provider=effective_capabilities,
+        unready_command_admission=admit_safe_unready_command,
     )
     observation_outbox = DurableCommandObservationOutbox(inbox)
     reconcile_store = DurableReconcileStore(

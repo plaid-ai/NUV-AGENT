@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -14,6 +15,7 @@ from nuvion_app.inference.stream_policy import (
     GlibMainContextDispatcher,
     StreamPolicy,
     StreamPolicyReconciler,
+    StreamRuntimeEvidence,
     X264EncoderAdapter,
 )
 
@@ -88,6 +90,13 @@ class _FakeElement:
         self.bitrate = int(value)
 
 
+def _healthy_runtime_evidence() -> StreamRuntimeEvidence:
+    return StreamRuntimeEvidence(
+        pipeline_running=True,
+        last_frame_monotonic=time.monotonic(),
+    )
+
+
 class AdaptiveBitrateControllerTest(unittest.TestCase):
     def test_aimd_uses_hysteresis_cooldown_and_clamps(self) -> None:
         controller = AdaptiveBitrateController(
@@ -95,34 +104,64 @@ class AdaptiveBitrateControllerTest(unittest.TestCase):
         )
 
         first = controller.observe(
-            {"quality": "POOR", "packetLossPct": 10.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 10.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=0,
         )
         second = controller.observe(
-            {"quality": "POOR", "packetLossPct": 10.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 10.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=1,
         )
         cooling = controller.observe(
-            {"quality": "GOOD", "packetLossPct": 0.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=500,
         )
         decaying = controller.observe(
-            {"quality": "GOOD", "packetLossPct": 0.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=1500,
         )
         stable = controller.observe(
-            {"quality": "GOOD", "packetLossPct": 0.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=2500,
         )
         recovered = controller.observe(
-            {"quality": "GOOD", "packetLossPct": 0.0, "rttMs": 40},
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 40,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
             now_ms=3500,
         )
 
         self.assertFalse(first.changed)
         self.assertEqual(
             first.reason,
-            "awaiting_hysteresis:connectivity_poor,packet_loss_high",
+            "awaiting_hysteresis:packet_loss_high",
         )
         self.assertTrue(second.changed)
         self.assertEqual(second.bitrate_kbps, 500)
@@ -132,6 +171,7 @@ class AdaptiveBitrateControllerTest(unittest.TestCase):
         self.assertFalse(stable.changed)
         self.assertTrue(recovered.changed)
         self.assertEqual(recovered.bitrate_kbps, 450)
+        self.assertEqual(recovered.reason, "healthy_recovery")
 
     def test_link_bitrate_is_auxiliary_congestion_signal(self) -> None:
         controller = AdaptiveBitrateController(
@@ -260,6 +300,84 @@ class AdaptiveBitrateControllerTest(unittest.TestCase):
         self.assertTrue(second_stale.changed)
         self.assertEqual(second_stale.bitrate_kbps, 500)
 
+    def test_idle_primary_stats_cannot_accumulate_recovery_samples(self) -> None:
+        controller = AdaptiveBitrateController(
+            StreamPolicy.from_payload(
+                _adaptive_payload(
+                    congestionSamples=1,
+                    recoverySamples=2,
+                    cooldownSeconds=1,
+                )
+            )
+        )
+        degraded = controller.observe({"quality": "POOR"}, now_ms=0)
+
+        first_idle = controller.observe(
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 30,
+                "outboundPacketsDelta": 0,
+                "outboundBytesDelta": 0,
+            },
+            now_ms=2000,
+        )
+        second_idle = controller.observe(
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 30,
+                "outboundPacketsDelta": 0,
+                "outboundBytesDelta": 0,
+            },
+            now_ms=3000,
+        )
+        first_progress = controller.observe(
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 30,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
+            now_ms=4000,
+        )
+        recovered = controller.observe(
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 30,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            },
+            now_ms=5000,
+        )
+
+        self.assertTrue(degraded.changed)
+        self.assertEqual(degraded.bitrate_kbps, 500)
+        self.assertEqual(first_idle.reason, "outbound_progress_idle")
+        self.assertEqual(second_idle.reason, "outbound_progress_idle")
+        self.assertFalse(first_progress.changed)
+        self.assertTrue(recovered.changed)
+        self.assertEqual(recovered.bitrate_kbps, 700)
+
+    def test_auxiliary_good_without_outbound_proof_cannot_raise_bitrate(self) -> None:
+        controller = AdaptiveBitrateController(
+            StreamPolicy.from_payload(
+                _adaptive_payload(
+                    congestionSamples=1,
+                    recoverySamples=2,
+                    cooldownSeconds=1,
+                )
+            )
+        )
+
+        degraded = controller.observe({"quality": "POOR"}, now_ms=0)
+        first_good = controller.observe({"quality": "GOOD"}, now_ms=2000)
+        second_good = controller.observe({"quality": "GOOD"}, now_ms=3000)
+
+        self.assertTrue(degraded.changed)
+        self.assertEqual(degraded.bitrate_kbps, 500)
+        self.assertEqual(first_good.reason, "outbound_progress_unproven")
+        self.assertEqual(second_good.reason, "outbound_progress_unproven")
+        self.assertEqual(second_good.bitrate_kbps, 500)
+
 
 class EncoderAdapterTest(unittest.TestCase):
     def test_named_x264_adapter_mutates_and_reads_back_on_dispatcher(self) -> None:
@@ -354,7 +472,10 @@ class StreamPolicyReconcilerTest(unittest.TestCase):
         )
         payload = fixture["validPayloads"][2]
         encoder = _FakeEncoder()
-        outcome = StreamPolicyReconciler(encoder).reconcile(_command(payload))
+        outcome = StreamPolicyReconciler(
+            encoder,
+            runtime_evidence=_healthy_runtime_evidence,
+        ).reconcile(_command(payload))
 
         self.assertEqual(
             set(outcome.reported_state),
@@ -383,9 +504,10 @@ class StreamPolicyReconcilerTest(unittest.TestCase):
 
         for payload, expected_keys in cases:
             with self.subTest(mode=payload["mode"]):
-                outcome = StreamPolicyReconciler(_FakeEncoder()).reconcile(
-                    _command(payload)
-                )
+                outcome = StreamPolicyReconciler(
+                    _FakeEncoder(),
+                    runtime_evidence=_healthy_runtime_evidence,
+                ).reconcile(_command(payload))
                 self.assertEqual(outcome.status, "SUCCEEDED")
                 self.assertEqual(set(outcome.reported_state), set(expected_keys))
                 for key, expected in payload.items():
@@ -400,7 +522,10 @@ class StreamPolicyReconcilerTest(unittest.TestCase):
 
     def test_fixed_policy_reports_encoder_readback(self) -> None:
         encoder = _FakeEncoder()
-        reconciler = StreamPolicyReconciler(encoder)
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            runtime_evidence=_healthy_runtime_evidence,
+        )
         command = _command(
             {
                 "policyVersion": 3,
@@ -423,6 +548,7 @@ class StreamPolicyReconcilerTest(unittest.TestCase):
         reconciler = StreamPolicyReconciler(
             encoder,
             clock_ms=lambda: next(ticks),
+            runtime_evidence=_healthy_runtime_evidence,
         )
         command = _command(_adaptive_payload(congestionSamples=1))
         reconciler.reconcile(command)
@@ -438,6 +564,226 @@ class StreamPolicyReconcilerTest(unittest.TestCase):
         )
         self.assertEqual(update.reported_state["appliedBitrateKbps"], 500)
         self.assertEqual(encoder.set_calls, [1000, 500])
+
+    def test_adaptive_recovery_reason_reaches_reported_observation(self) -> None:
+        ticks = iter([0.0, 2000.0])
+        encoder = _FakeEncoder()
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            clock_ms=lambda: next(ticks),
+            runtime_evidence=_healthy_runtime_evidence,
+        )
+        command = _command(
+            _adaptive_payload(
+                congestionSamples=1,
+                recoverySamples=1,
+                cooldownSeconds=1,
+            )
+        )
+        reconciler.reconcile(command)
+
+        poor = reconciler.observe_connectivity({"quality": "POOR"})
+        reconciler.observation_committed(poor)
+        recovered = reconciler.observe_stream_metrics(
+            {
+                "outboundPacketLossPct": 0.0,
+                "outboundRttMs": 30,
+                "outboundPacketsDelta": 10,
+                "outboundBytesDelta": 1000,
+            }
+        )
+
+        self.assertEqual(poor.reported_state["appliedBitrateKbps"], 500)
+        self.assertEqual(recovered.reported_state["appliedBitrateKbps"], 700)
+        self.assertEqual(
+            recovered.reported_state["lastAdjustmentReason"],
+            "healthy_recovery",
+        )
+        self.assertEqual(encoder.set_calls, [1000, 500, 700])
+
+    def test_hold_reason_change_is_reported_without_bitrate_mutation(self) -> None:
+        encoder = _FakeEncoder()
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            clock_ms=lambda: 0.0,
+            runtime_evidence=_healthy_runtime_evidence,
+        )
+        command = _command(_adaptive_payload())
+        reconciler.reconcile(command)
+
+        update = reconciler.observe_connectivity({})
+
+        self.assertIsNotNone(update)
+        self.assertEqual(update.command_id, command.command_id)
+        self.assertEqual(update.reported_state["appliedBitrateKbps"], 1000)
+        self.assertEqual(
+            update.reported_state["lastAdjustmentReason"],
+            "insufficient_signal",
+        )
+        self.assertEqual(encoder.set_calls, [1000])
+
+    def test_missing_runtime_evidence_fails_before_encoder_mutation(self) -> None:
+        encoder = _FakeEncoder()
+
+        outcome = StreamPolicyReconciler(encoder).reconcile(
+            _command(_adaptive_payload())
+        )
+
+        self.assertEqual(outcome.status, "FAILED")
+        self.assertEqual(outcome.code, "STREAM_HEALTH_EVIDENCE_UNAVAILABLE")
+        self.assertEqual(outcome.reported_state, {"health": "NOT_APPLIED"})
+        self.assertEqual(encoder.set_calls, [])
+
+    def test_pipeline_and_recent_frame_prove_health_without_webrtc(self) -> None:
+        evidence = {"last_frame": 99.0}
+        reconciler = StreamPolicyReconciler(
+            _FakeEncoder(),
+            runtime_evidence=lambda: StreamRuntimeEvidence(
+                pipeline_running=True,
+                last_frame_monotonic=evidence["last_frame"],
+            ),
+            health_clock=lambda: 100.0,
+            max_frame_age_seconds=5.0,
+        )
+
+        outcome = reconciler.reconcile(_command(_adaptive_payload()))
+
+        self.assertEqual(outcome.status, "SUCCEEDED")
+        self.assertEqual(outcome.reported_state["health"], "STREAM_CONTINUOUS")
+        self.assertTrue(reconciler.ready())
+
+    def test_stale_frame_fails_closed_and_resets_recovery_hysteresis(self) -> None:
+        evidence = {"last_frame": 99.0}
+        now = {"value": 100.0}
+        encoder = _FakeEncoder()
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            clock_ms=lambda: now["value"] * 1000.0,
+            runtime_evidence=lambda: StreamRuntimeEvidence(
+                pipeline_running=True,
+                last_frame_monotonic=evidence["last_frame"],
+            ),
+            health_clock=lambda: now["value"],
+            max_frame_age_seconds=5.0,
+        )
+        reconciler.reconcile(
+            _command(
+                _adaptive_payload(
+                    recoverySamples=2,
+                    congestionSamples=1,
+                    cooldownSeconds=1,
+                )
+            )
+        )
+        poor = reconciler.observe_connectivity({"quality": "POOR"})
+        reconciler.observation_committed(poor)
+        now["value"] = 102.0
+        first = reconciler.observe_stream_metrics(
+            {
+                "outboundRttMs": 20,
+                "outboundPacketsDelta": 5,
+                "outboundBytesDelta": 500,
+            }
+        )
+        reconciler.observation_committed(first)
+
+        now["value"] = 110.0
+        stale = reconciler.observe_stream_metrics(
+            {
+                "outboundRttMs": 20,
+                "outboundPacketsDelta": 5,
+                "outboundBytesDelta": 500,
+            }
+        )
+        self.assertIsNotNone(stale)
+        self.assertEqual(stale.reported_state["health"], "STREAM_FRAME_STALE")
+        self.assertEqual(
+            stale.reported_state["lastAdjustmentReason"], "STREAM_FRAME_STALE"
+        )
+        reconciler.observation_committed(stale)
+        self.assertFalse(reconciler.ready())
+        evidence["last_frame"] = 110.0
+        resumed = reconciler.observe_stream_metrics(
+            {
+                "outboundRttMs": 20,
+                "outboundPacketsDelta": 5,
+                "outboundBytesDelta": 500,
+            }
+        )
+
+        self.assertIsNotNone(resumed)
+        self.assertEqual(resumed.reported_state["health"], "STREAM_CONTINUOUS")
+        self.assertEqual(
+            resumed.reported_state["lastAdjustmentReason"],
+            "stream_health_recovered",
+        )
+        reported = reconciler.reported_state()
+        self.assertEqual(reported["appliedBitrateKbps"], 500)
+        self.assertNotEqual(
+            reported["lastAdjustmentReason"],
+            "healthy_recovery",
+        )
+        self.assertEqual(encoder.set_calls, [1000, 500])
+
+    def test_disabled_policy_is_acknowledged_without_live_frame_evidence(self) -> None:
+        encoder = _FakeEncoder(1300)
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            runtime_evidence=lambda: StreamRuntimeEvidence(
+                pipeline_running=True,
+                last_frame_monotonic=0.0,
+            ),
+            health_clock=lambda: 10.0,
+        )
+        disabled = _command({"policyVersion": 8, "mode": "DISABLED"})
+
+        self.assertFalse(reconciler.ready())
+        self.assertTrue(reconciler.admit_when_unready(disabled))
+        outcome = reconciler.reconcile(disabled)
+
+        self.assertEqual(outcome.status, "SUCCEEDED")
+        self.assertEqual(outcome.reported_state["mode"], "DISABLED")
+        self.assertEqual(outcome.reported_state["health"], "STREAM_FRAME_STALE")
+        self.assertEqual(
+            outcome.reported_state["lastAdjustmentReason"], "STREAM_FRAME_STALE"
+        )
+        self.assertEqual(encoder.set_calls, [])
+
+    def test_runtime_probe_failures_publish_health_reason_without_encoder_mutation(
+        self,
+    ) -> None:
+        state: dict[str, object] = {
+            "evidence": StreamRuntimeEvidence(True, 100.0),
+        }
+
+        def runtime_evidence() -> StreamRuntimeEvidence:
+            evidence = state["evidence"]
+            if isinstance(evidence, BaseException):
+                raise evidence
+            return evidence  # type: ignore[return-value]
+
+        encoder = _FakeEncoder()
+        reconciler = StreamPolicyReconciler(
+            encoder,
+            runtime_evidence=runtime_evidence,
+            health_clock=lambda: 100.0,
+        )
+        reconciler.reconcile(_command(_adaptive_payload()))
+        expected = (
+            (StreamRuntimeEvidence(False, 100.0), "STREAM_PIPELINE_NOT_RUNNING"),
+            (RuntimeError("probe unavailable"), "STREAM_HEALTH_PROBE_FAILED"),
+        )
+
+        for evidence, reason in expected:
+            with self.subTest(reason=reason):
+                state["evidence"] = evidence
+                update = reconciler.observe_runtime_health()
+                self.assertIsNotNone(update)
+                self.assertEqual(update.reported_state["health"], reason)
+                self.assertEqual(update.reported_state["lastAdjustmentReason"], reason)
+                reconciler.observation_committed(update)
+
+        self.assertEqual(encoder.set_calls, [1000])
 
 
 if __name__ == "__main__":

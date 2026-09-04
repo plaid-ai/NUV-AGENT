@@ -27,7 +27,18 @@ from nuvion_app.inference.reconcile_store import (
     DurableReconcileStore,
     EffectFenceStale,
 )
-from nuvion_app.inference.stream_policy import StreamPolicyReconciler
+from nuvion_app.inference.stream_policy import (
+    StreamPolicyReconciler,
+    StreamRuntimeEvidence,
+)
+
+
+def _stream_reconciler(encoder: object) -> StreamPolicyReconciler:
+    return StreamPolicyReconciler(
+        encoder,
+        runtime_evidence=lambda: StreamRuntimeEvidence(True, 0.0),
+        health_clock=lambda: 0.0,
+    )
 
 
 def _stream_command(sequence: int, target: int = 1000) -> VerifiedFleetCommand:
@@ -94,6 +105,15 @@ class _WritingReconciler:
         self.restore_calls.append(command.command_id)
         outcome = self.reconcile(command)
         return dict(outcome.reported_state or {})
+
+
+class _ReadinessGatedWritingReconciler(_WritingReconciler):
+    def __init__(self, inbox: DurableCommandInbox) -> None:
+        super().__init__(inbox)
+        self.is_ready = False
+
+    def ready(self) -> bool:
+        return self.is_ready
 
 
 class _RetryingReconciler:
@@ -302,7 +322,7 @@ class DurableReconcileStoreTest(unittest.TestCase):
             lease_seconds=2,
         )
         encoder = _Encoder()
-        reconciler = StreamPolicyReconciler(encoder)
+        reconciler = _stream_reconciler(encoder)
         reconciler.set_effect_fence(fence.assert_current)
 
         ticks["now"] = 13.0
@@ -323,7 +343,7 @@ class DurableReconcileStoreTest(unittest.TestCase):
         )
         self._stage(second)
         encoder = _Encoder()
-        reconciler = StreamPolicyReconciler(encoder)
+        reconciler = _stream_reconciler(encoder)
         reconciler.set_effect_fence(fence.assert_current)
 
         with self.assertRaises(EffectFenceStale):
@@ -335,7 +355,7 @@ class DurableReconcileStoreTest(unittest.TestCase):
         command = _stream_command(1, 1600)
         self._stage(command)
         registry = ReconcilerRegistry()
-        registry.register(StreamPolicyReconciler(_Encoder()))
+        registry.register(_stream_reconciler(_Encoder()))
 
         result = FleetEffectCoordinator(
             inbox=self.inbox,
@@ -381,10 +401,39 @@ class DurableReconcileStoreTest(unittest.TestCase):
         self.assertEqual(restarted.calls, [command.command_id])
         self.assertEqual(self.inbox.get(command.command_id).status, "SUCCEEDED")
 
+    def test_restart_defers_restore_until_reconciler_is_ready(self) -> None:
+        command = _stream_command(1, 1700)
+        self._stage(command)
+        initial = _WritingReconciler(self.inbox)
+        initial_registry = ReconcilerRegistry()
+        initial_registry.register(initial)
+        FleetEffectCoordinator(
+            inbox=self.inbox,
+            store=self.store,
+            registry=initial_registry,
+            owner="worker-before-restart",
+        ).run_once()
+
+        restarted = _ReadinessGatedWritingReconciler(self.inbox)
+        restarted_registry = ReconcilerRegistry()
+        restarted_registry.register(restarted)
+        coordinator = FleetEffectCoordinator(
+            inbox=self.inbox,
+            store=self.store,
+            registry=restarted_registry,
+            owner="worker-after-restart",
+        )
+
+        self.assertEqual(coordinator.run_once().processed, 0)
+        self.assertEqual(restarted.restore_calls, [])
+        restarted.is_ready = True
+        self.assertEqual(coordinator.run_once().processed, 0)
+        self.assertEqual(restarted.restore_calls, [command.command_id])
+
     def test_failed_replacement_restores_previous_applied_policy_next_run(self) -> None:
         encoder = _Encoder()
         registry = ReconcilerRegistry()
-        registry.register(StreamPolicyReconciler(encoder))
+        registry.register(_stream_reconciler(encoder))
         coordinator = FleetEffectCoordinator(
             inbox=self.inbox,
             store=self.store,

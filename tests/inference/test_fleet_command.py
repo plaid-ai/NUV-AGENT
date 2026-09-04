@@ -50,12 +50,14 @@ class FleetCommandVerifierTest(unittest.TestCase):
         device_id: str = DEVICE_ID,
         space_id: int = SPACE_ID,
         capabilities: frozenset[str] = frozenset({"command.config.apply"}),
+        unready_command_admission=None,
     ) -> FleetCommandVerifier:
         return FleetCommandVerifier(
             keyring=keyring,
             expected_device_id=device_id,
             expected_space_id=space_id,
             capabilities=capabilities,
+            unready_command_admission=unready_command_admission,
             clock=lambda: NOW,
             allowed_clock_skew=timedelta(seconds=30),
         )
@@ -519,6 +521,29 @@ class FleetCommandVerifierTest(unittest.TestCase):
         )
         with self.assertRaises(CommandValidationError) as raised:
             no_capability_verifier.verify(self._sign())
+        self.assertEqual(raised.exception.code, "MISSING_CAPABILITY")
+
+    def test_safe_unready_admission_only_bypasses_its_exact_command(self) -> None:
+        verifier = self._verifier(
+            Ed25519Keyring({KID: self.raw_public_key}),
+            capabilities=frozenset(),
+            unready_command_admission=lambda command: (
+                command.command_type == "STREAM_POLICY"
+                and command.payload.get("mode") == "DISABLED"
+            ),
+        )
+        disabled = self._claims_with_payload(
+            {"policyVersion": 1, "mode": "DISABLED"},
+            type="STREAM_POLICY",
+        )
+        fixed = self._claims_with_payload(
+            {"policyVersion": 1, "mode": "FIXED", "targetBitrateKbps": 1000},
+            type="STREAM_POLICY",
+        )
+
+        self.assertEqual(verifier.verify(self._sign(disabled)).payload["mode"], "DISABLED")
+        with self.assertRaises(CommandValidationError) as raised:
+            verifier.verify(self._sign(fixed))
         self.assertEqual(raised.exception.code, "MISSING_CAPABILITY")
 
     def test_rejects_noncanonical_base64_and_non_object_payload(self) -> None:
