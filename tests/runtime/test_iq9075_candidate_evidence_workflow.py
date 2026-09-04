@@ -24,7 +24,7 @@ TRUSTED_WORKFLOW = (
     ROOT / ".github/workflows/iq9075-candidate-trusted-publish.yml"
 )
 RUNBOOK = ROOT / "packaging/release/v0.1.121-release-runbook.md"
-TRUSTED_PUBLISHER_SHA = "7732095f206c11eb4e4b15eb0a8c7391c4cc7534"
+TRUSTED_PUBLISHER_SHA = "59a073eaecbdbfdc79b8be728ac1dc778947410d"
 
 
 class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
