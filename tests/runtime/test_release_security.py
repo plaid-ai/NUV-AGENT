@@ -1889,6 +1889,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 )
                 self.assertIn("path: publisher", section)
                 self.assertIn("path: settings-evidence", section)
+                self.assertRegex(
+                    section,
+                    r"path: settings-evidence\n\s+fetch-depth: 0",
+                )
                 self.assertEqual(
                     section.count("verify-release-settings-attestation.py"),
                     verifier_count[name],
@@ -5668,7 +5672,7 @@ esac
 
 
 class SettingsPolicyTest(unittest.TestCase):
-    def test_general_writers_require_hardened_review_with_single_admin_bypass(self) -> None:
+    def test_general_writers_require_hardened_review_with_pinned_admin_roster(self) -> None:
         policy = json.loads(
             (ROOT / "packaging/release/release-security-policy.json").read_text(
                 encoding="utf-8"
@@ -5690,6 +5694,23 @@ class SettingsPolicyTest(unittest.TestCase):
             },
         )
         self.assertEqual(
+            policy["releaseAdminUsers"],
+            [
+                {
+                    "id": 57535980,
+                    "login": "swiftsjh02",
+                    "role": "maintainer",
+                    "repositoryPermission": "admin",
+                },
+                {
+                    "id": 89565530,
+                    "login": "taewan2002",
+                    "role": "maintainer",
+                    "repositoryPermission": "admin",
+                },
+            ],
+        )
+        self.assertEqual(
             set(policy["requiredEnvironments"]),
             {
                 "homebrew-release",
@@ -5700,17 +5721,25 @@ class SettingsPolicyTest(unittest.TestCase):
                 "face-artifacts-release",
             },
         )
-        for environment in policy["requiredEnvironments"].values():
+        for name, environment in policy["requiredEnvironments"].items():
             self.assertFalse(environment["requireReviewers"])
             self.assertFalse(environment["preventSelfReview"])
             self.assertIsNone(environment["reviewerTeamId"])
+            self.assertFalse(environment["canAdminsBypass"])
             self.assertEqual(
                 environment["deploymentBranchPolicy"],
                 {"protectedBranches": False, "customBranchPolicies": True},
             )
             self.assertEqual(
                 environment["deploymentBranchPolicies"],
-                [{"name": "main", "type": "branch"}],
+                (
+                    [{"name": "candidate-publisher-v1", "type": "tag"}]
+                    if name in {
+                        "iq9075-candidate-sign",
+                        "iq9075-candidate-stage",
+                    }
+                    else [{"name": "main", "type": "branch"}]
+                ),
             )
             self.assertEqual(environment["protectionRuleTypes"], ["branch_policy"])
         codeowners = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
@@ -5804,6 +5833,28 @@ class SettingsPolicyTest(unittest.TestCase):
             ],
             "rules": [
                 {"type": "creation"},
+                {"type": "update"},
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+            ],
+        }
+        candidate_tag_ruleset = {
+            "id": 3,
+            "name": "protected-candidate-publisher",
+            "source": "plaid-ai/NUV-AGENT",
+            "source_type": "Repository",
+            "target": "tag",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {
+                    "include": ["refs/tags/candidate-publisher-v1"],
+                    "exclude": [],
+                }
+            },
+            "bypass_actors": [],
+            "rules": [
+                {"type": "creation"},
+                {"type": "update"},
                 {"type": "deletion"},
                 {"type": "non_fast_forward"},
             ],
@@ -5815,14 +5866,84 @@ class SettingsPolicyTest(unittest.TestCase):
                 "private": False,
                 "owner": {"login": "plaid-ai", "type": "Organization"},
             },
+            "/repos/plaid-ai/NUV-AGENT/git/ref/heads/main": {
+                "ref": "refs/heads/main",
+                "object": {"type": "commit", "sha": "b" * 40},
+            },
+            "/repos/plaid-ai/NUV-AGENT/teams?per_page=100&page=1": [
+                {
+                    "id": 16128529,
+                    "slug": "platform-admin",
+                    "name": "Platform-Admin",
+                    "permission": "push",
+                }
+            ],
+            "/orgs/plaid-ai/teams/platform-admin": {
+                "id": 16128529,
+                "slug": "platform-admin",
+                "name": "Platform-Admin",
+            },
+            "/orgs/plaid-ai/teams/platform-admin/members?role=all&per_page=100&page=1": [
+                {
+                    "id": 57535980,
+                    "login": "swiftsjh02",
+                    "type": "User",
+                    "site_admin": False,
+                },
+                {
+                    "id": 89565530,
+                    "login": "taewan2002",
+                    "type": "User",
+                    "site_admin": False,
+                },
+            ],
+            "/orgs/plaid-ai/teams/platform-admin/memberships/swiftsjh02": {
+                "state": "active",
+                "role": "maintainer",
+            },
+            "/orgs/plaid-ai/teams/platform-admin/memberships/taewan2002": {
+                "state": "active",
+                "role": "maintainer",
+            },
+            "/repos/plaid-ai/NUV-AGENT/collaborators/swiftsjh02/permission": {
+                "permission": "admin",
+                "user": {"id": 57535980, "login": "swiftsjh02"},
+            },
+            "/repos/plaid-ai/NUV-AGENT/collaborators/taewan2002/permission": {
+                "permission": "admin",
+                "user": {"id": 89565530, "login": "taewan2002"},
+            },
             "/repos/plaid-ai/NUV-AGENT/immutable-releases": {"enabled": True},
             "/repos/plaid-ai/NUV-AGENT/branches/main": {"protected": True},
             "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true&per_page=100&page=1": [
                 {"id": 1},
                 {"id": 2},
+                {"id": 3},
             ],
             "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
+            "/repos/plaid-ai/NUV-AGENT/rulesets/3": candidate_tag_ruleset,
+            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v1": {
+                "ref": "refs/tags/candidate-publisher-v1",
+                "object": {"type": "tag", "sha": "c" * 40},
+            },
+            "/repos/plaid-ai/NUV-AGENT/git/tags/" + "c" * 40: {
+                "sha": "c" * 40,
+                "tag": "candidate-publisher-v1",
+                "message": "NUVION IQ9075 candidate publisher v1\n",
+                "object": {"type": "commit", "sha": "9" * 40},
+                "verification": {
+                    "verified": True,
+                    "reason": "valid",
+                    "signature": "-----BEGIN PGP SIGNATURE-----\ntest",
+                    "payload": "object " + "9" * 40,
+                },
+            },
+            "/repos/plaid-ai/NUV-AGENT/contents/.github/workflows/iq9075-candidate-trusted-publish.yml?ref=main": {
+                "type": "file",
+                "path": ".github/workflows/iq9075-candidate-trusted-publish.yml",
+                "sha": "f" * 40,
+            },
             "/repos/plaid-ai/NUV-AGENT/actions/permissions/workflow": {
                 "default_workflow_permissions": "read",
                 "can_approve_pull_request_reviews": False,
@@ -5836,8 +5957,14 @@ class SettingsPolicyTest(unittest.TestCase):
             "iq9075-candidate-stage",
             "face-artifacts-release",
         ):
+            expected_deployment_policy = (
+                {"id": 1, "name": "candidate-publisher-v1", "type": "tag"}
+                if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
+                else {"id": 1, "name": "main", "type": "branch"}
+            )
             responses[f"/repos/plaid-ai/NUV-AGENT/environments/{name}"] = {
                 "name": name,
+                "can_admins_bypass": False,
                 "deployment_branch_policy": {
                     "protected_branches": False,
                     "custom_branch_policies": True,
@@ -5848,7 +5975,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 f"/repos/plaid-ai/NUV-AGENT/environments/{name}/deployment-branch-policies?per_page=100&page=1"
             ] = {
                 "total_count": 1,
-                "branch_policies": [{"id": 1, "name": "main", "type": "branch"}],
+                "branch_policies": [expected_deployment_policy],
             }
 
         policy = json.loads(
@@ -5868,6 +5995,18 @@ class SettingsPolicyTest(unittest.TestCase):
         responses[
             "/orgs/plaid-ai/actions/secrets?per_page=100&page=1"
         ] = {"total_count": 0, "secrets": []}
+        environment_inventory = [
+            {"id": index, "name": name}
+            for index, name in enumerate(
+                policy["requiredEnvironments"], start=1
+            )
+        ]
+        responses[
+            "/repos/plaid-ai/NUV-AGENT/environments?per_page=100&page=1"
+        ] = {
+            "total_count": len(environment_inventory),
+            "environments": environment_inventory,
+        }
         for name, requirements in policy["requiredEnvironments"].items():
             responses[
                 f"/repos/plaid-ai/NUV-AGENT/environments/{name}/secrets?per_page=100&page=1"
@@ -5881,23 +6020,153 @@ class SettingsPolicyTest(unittest.TestCase):
         fake_api = mock.Mock()
         fake_api.get.side_effect = lambda path: responses[path]
         fake_api.get_optional.return_value = SETTINGS.API_NOT_FOUND
-        with mock.patch.object(SETTINGS, "GitHubApi", return_value=fake_api):
+        with mock.patch.object(
+            SETTINGS, "GitHubApi", return_value=fake_api
+        ), mock.patch.object(
+            SETTINGS,
+            "_verify_local_candidate_publisher",
+            return_value={
+                "candidate_publisher_tag": "candidate-publisher-v1",
+                "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                "candidate_publisher_tag_object_sha": "c" * 40,
+                "candidate_publisher_sha": "9" * 40,
+                "component_sha": "b" * 40,
+                "tag_signer_fingerprint": "9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+            },
+        ):
             result = SETTINGS.verify_settings(
                 repository="plaid-ai/NUV-AGENT",
                 token="metadata-only",
                 policy_path=ROOT / "packaging/release/release-security-policy.json",
+                publisher_root=ROOT,
+                candidate_publisher_root=ROOT,
                 trusted_publisher_sha="a" * 40,
                 include_secret_scopes=False,
             )
             self.assertEqual(result["governance"]["pullRequestApprovals"], 1)
+            self.assertEqual(result["auditedMainSha"], "b" * 40)
+            self.assertEqual(
+                result["candidatePublisher"]["audited_main_sha"], "b" * 40
+            )
             result = SETTINGS.verify_settings(
                 repository="plaid-ai/NUV-AGENT",
                 token="admin-metadata-only",
                 policy_path=ROOT / "packaging/release/release-security-policy.json",
+                publisher_root=ROOT,
+                candidate_publisher_root=ROOT,
                 trusted_publisher_sha="a" * 40,
                 include_secret_scopes=True,
             )
             self.assertTrue(result["secretScopesChecked"])
+            environment_inventory_path = (
+                "/repos/plaid-ai/NUV-AGENT/environments?per_page=100&page=1"
+            )
+            ungoverned_secret_path = (
+                "/repos/plaid-ai/NUV-AGENT/environments/legacy-release/"
+                "secrets?per_page=100&page=1"
+            )
+            responses[environment_inventory_path]["total_count"] += 1
+            responses[environment_inventory_path]["environments"].append(
+                {"id": 999, "name": "legacy-release"}
+            )
+            responses[ungoverned_secret_path] = {
+                "total_count": 1,
+                "secrets": [{"name": "GCP_SA_KEY"}],
+            }
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="admin-metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=True,
+                )
+            responses[environment_inventory_path]["total_count"] -= 1
+            responses[environment_inventory_path]["environments"].pop()
+            responses.pop(ungoverned_secret_path)
+            candidate_environment_path = (
+                "/repos/plaid-ai/NUV-AGENT/environments/iq9075-candidate-sign"
+            )
+            responses[candidate_environment_path]["can_admins_bypass"] = True
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[candidate_environment_path]["can_admins_bypass"] = False
+            team_path = "/repos/plaid-ai/NUV-AGENT/teams?per_page=100&page=1"
+            responses[team_path][0]["permission"] = "pull"
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[team_path][0]["permission"] = "push"
+            roster_path = (
+                "/orgs/plaid-ai/teams/platform-admin/members?role=all&per_page=100&page=1"
+            )
+            responses[roster_path].append(
+                {
+                    "id": 999,
+                    "login": "unexpected-admin",
+                    "type": "User",
+                    "site_admin": False,
+                }
+            )
+            responses[
+                "/orgs/plaid-ai/teams/platform-admin/memberships/unexpected-admin"
+            ] = {"state": "active", "role": "member"}
+            responses[
+                "/repos/plaid-ai/NUV-AGENT/collaborators/unexpected-admin/permission"
+            ] = {
+                "permission": "admin",
+                "user": {"id": 999, "login": "unexpected-admin"},
+            }
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[roster_path].pop()
+            responses.pop(
+                "/orgs/plaid-ai/teams/platform-admin/memberships/unexpected-admin"
+            )
+            responses.pop(
+                "/repos/plaid-ai/NUV-AGENT/collaborators/unexpected-admin/permission",
+                None,
+            )
+            swifts_permission_path = (
+                "/repos/plaid-ai/NUV-AGENT/collaborators/swiftsjh02/permission"
+            )
+            responses[swifts_permission_path]["permission"] = "push"
+            with self.assertRaises(SETTINGS.SettingsError):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[swifts_permission_path]["permission"] = "admin"
             responses[
                 "/repos/plaid-ai/NUV-AGENT/environments/homebrew-release"
             ]["protection_rules"].append({"type": "required_reviewers"})
@@ -5906,6 +6175,8 @@ class SettingsPolicyTest(unittest.TestCase):
                     repository="plaid-ai/NUV-AGENT",
                     token="metadata-only",
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
                     trusted_publisher_sha="a" * 40,
                     include_secret_scopes=False,
                 )
@@ -5921,6 +6192,8 @@ class SettingsPolicyTest(unittest.TestCase):
                     repository="plaid-ai/NUV-AGENT",
                     token="metadata-only",
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
                     trusted_publisher_sha="a" * 40,
                     include_secret_scopes=False,
                 )
@@ -5938,23 +6211,27 @@ class SettingsPolicyTest(unittest.TestCase):
                     repository="plaid-ai/NUV-AGENT",
                     token="metadata-only",
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
                     trusted_publisher_sha="a" * 40,
                     include_secret_scopes=False,
                 )
             responses[branch_policy_path]["total_count"] = 1
             responses[branch_policy_path]["branch_policies"].pop()
             extra = json.loads(json.dumps(branch_ruleset))
-            extra["id"] = 3
+            extra["id"] = 4
             extra["rules"][2]["parameters"]["required_approving_review_count"] = 2
             responses[
                 "/repos/plaid-ai/NUV-AGENT/rulesets?includes_parents=true&per_page=100&page=1"
-            ].append({"id": 3})
-            responses["/repos/plaid-ai/NUV-AGENT/rulesets/3"] = extra
+            ].append({"id": 4})
+            responses["/repos/plaid-ai/NUV-AGENT/rulesets/4"] = extra
             with self.assertRaises(SETTINGS.SettingsError):
                 SETTINGS.verify_settings(
                     repository="plaid-ai/NUV-AGENT",
                     token="metadata-only",
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
                     trusted_publisher_sha="a" * 40,
                     include_secret_scopes=False,
                 )
@@ -6166,6 +6443,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 },
                 "rules": [
                     {"type": "creation"},
+                    {"type": "update"},
                     {"type": "deletion"},
                     {"type": "non_fast_forward"},
                 ],
@@ -6176,7 +6454,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 rulesets,
                 target="tag",
                 include="refs/tags/v*",
-                required_rules={"creation", "deletion", "non_fast_forward"},
+                required_rules={"creation", "update", "deletion", "non_fast_forward"},
             )
         )
         rulesets[0]["enforcement"] = "evaluate"
@@ -6185,7 +6463,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 rulesets,
                 target="tag",
                 include="refs/tags/v*",
-                required_rules={"creation", "deletion", "non_fast_forward"},
+                required_rules={"creation", "update", "deletion", "non_fast_forward"},
             )
         )
 
@@ -6282,6 +6560,96 @@ class SettingsPolicyTest(unittest.TestCase):
         extra_rule[0]["rules"].append({"type": "required_signatures"})
         self.assertFalse(SETTINGS._ruleset_covers(extra_rule, **arguments))
 
+    def test_settings_audit_lineage_allows_refresh_after_pinned_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            repository = Path(raw_root)
+            workflow = repository / ".github/workflows/release-publish.yml"
+            workflow.parent.mkdir(parents=True)
+            subprocess.run(
+                ["git", "init", "--initial-branch=main"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Settings Test"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "settings@example.invalid"],
+                cwd=repository,
+                check=True,
+            )
+            workflow.write_text("name: release\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "publisher"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            publisher_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+            (repository / "component.txt").write_text("component\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "audited main"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            audited_main_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+            (repository / "evidence.txt").write_text("signed evidence\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "refresh evidence"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            evidence_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+            ).strip()
+            self.assertEqual(
+                SETTINGS_ATTESTATION._verify_audited_main_lineage(
+                    executing_workflow=workflow,
+                    trusted_publisher_sha=publisher_sha,
+                    audited_main_sha=audited_main_sha,
+                ),
+                evidence_sha,
+            )
+            tree = subprocess.check_output(
+                ["git", "rev-parse", f"{publisher_sha}^{{tree}}"],
+                cwd=repository,
+                text=True,
+            ).strip()
+            unrelated_sha = subprocess.check_output(
+                ["git", "commit-tree", tree],
+                cwd=repository,
+                input="unrelated audit\n",
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Settings Test",
+                    "GIT_AUTHOR_EMAIL": "settings@example.invalid",
+                    "GIT_COMMITTER_NAME": "Settings Test",
+                    "GIT_COMMITTER_EMAIL": "settings@example.invalid",
+                },
+            ).strip()
+            with self.assertRaisesRegex(
+                SETTINGS_ATTESTATION.AttestationError,
+                "outside the trusted protected-main lineage",
+            ):
+                SETTINGS_ATTESTATION._verify_audited_main_lineage(
+                    executing_workflow=workflow,
+                    trusted_publisher_sha=publisher_sha,
+                    audited_main_sha=unrelated_sha,
+                )
+
     def test_short_lived_settings_attestation_binds_policy_and_expiry(self) -> None:
         settings_verifier = (
             ROOT / "packaging/release/verify-github-release-settings.py"
@@ -6299,12 +6667,21 @@ class SettingsPolicyTest(unittest.TestCase):
                 "kind": "nuvion-release-settings-attestation",
                 "repository": "plaid-ai/NUV-AGENT",
                 "trustedPublisherSha": "a" * 40,
+                "auditedMainSha": "e" * 40,
                 "publisherTreeSha256": "b" * 64,
                 "workflowSha256": "c" * 64,
                 "policySha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
                 "verifiedAt": "2026-09-02T00:00:00Z",
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
+                    "candidatePublisher": {
+                        "candidate_publisher_tag": "candidate-publisher-v1",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                        "candidate_publisher_tag_object_sha": "d" * 40,
+                        "candidate_publisher_sha": "9" * 40,
+                        "audited_main_sha": "e" * 40,
+                        "tag_signer_fingerprint": "9A07D327F3ADF6F452A4BF0055E5CAF706571888",
+                    },
                     "defaultBranch": "main",
                     "governance": json.loads(policy.read_text(encoding="utf-8"))[
                         "governance"
@@ -6333,6 +6710,10 @@ class SettingsPolicyTest(unittest.TestCase):
                 },
             ), mock.patch.object(
                 SETTINGS_ATTESTATION, "verify_executing_workflow"
+            ), mock.patch.object(
+                SETTINGS_ATTESTATION,
+                "_verify_audited_main_lineage",
+                return_value="f" * 40,
             ):
                 result = SETTINGS_ATTESTATION.verify_attestation(
                     attestation_path=path,
@@ -6347,6 +6728,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 )
                 self.assertEqual(result["status"], "VERIFIED")
                 self.assertEqual(result["trustedPublisherSha"], "a" * 40)
+                self.assertEqual(result["auditedMainSha"], "e" * 40)
+                self.assertEqual(result["evidenceSha"], "f" * 40)
                 with self.assertRaises(SETTINGS_ATTESTATION.AttestationError):
                     SETTINGS_ATTESTATION.verify_attestation(
                         attestation_path=path,
@@ -6463,12 +6846,21 @@ class SettingsPolicyTest(unittest.TestCase):
                 "kind": "nuvion-release-settings-attestation",
                 "repository": "plaid-ai/NUV-AGENT",
                 "trustedPublisherSha": "a" * 40,
+                "auditedMainSha": "e" * 40,
                 "publisherTreeSha256": "b" * 64,
                 "workflowSha256": "c" * 64,
                 "policySha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
                 "verifiedAt": "2026-09-02T00:00:00Z",
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
+                    "candidatePublisher": {
+                        "candidate_publisher_tag": "candidate-publisher-v1",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                        "candidate_publisher_tag_object_sha": "d" * 40,
+                        "candidate_publisher_sha": "9" * 40,
+                        "audited_main_sha": "e" * 40,
+                        "tag_signer_fingerprint": fingerprint,
+                    },
                     "defaultBranch": "main",
                     "governance": policy_payload["governance"],
                     "secretScopesChecked": True,
@@ -6515,6 +6907,10 @@ class SettingsPolicyTest(unittest.TestCase):
                 },
             ), mock.patch.object(
                 SETTINGS_ATTESTATION, "verify_executing_workflow"
+            ), mock.patch.object(
+                SETTINGS_ATTESTATION,
+                "_verify_audited_main_lineage",
+                return_value="f" * 40,
             ):
                 result = SETTINGS_ATTESTATION.verify_attestation(
                     attestation_path=attestation,
@@ -6539,6 +6935,7 @@ class SettingsPolicyTest(unittest.TestCase):
                 },
                 "rules": [
                     {"type": "creation"},
+                    {"type": "update"},
                     {"type": "deletion"},
                     {"type": "non_fast_forward"},
                 ],
@@ -6554,7 +6951,7 @@ class SettingsPolicyTest(unittest.TestCase):
         arguments = {
             "target": "tag",
             "include": "refs/tags/v*",
-            "required_rules": {"creation", "deletion", "non_fast_forward"},
+            "required_rules": {"creation", "update", "deletion", "non_fast_forward"},
             "required_bypass_team_id": 16128529,
             "required_bypass_mode": "always",
         }

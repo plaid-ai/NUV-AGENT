@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -207,6 +209,66 @@ def _organization_secret_applies(
     return repository_id in identifiers
 
 
+def _verify_local_candidate_publisher(
+    *,
+    candidate_publisher_root: Path,
+    publisher_sha: str,
+    component_sha: str,
+    policy_path: Path,
+) -> dict[str, str]:
+    script = (
+        candidate_publisher_root
+        / "packaging/release/verify-candidate-publisher-tag.py"
+    )
+    signer_directory = (
+        candidate_publisher_root / "packaging/release/trusted-tag-signers"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--repository",
+                str(candidate_publisher_root),
+                "--publisher-sha",
+                publisher_sha,
+                "--component-sha",
+                component_sha,
+                "--main-ref",
+                "refs/remotes/origin/main",
+                "--policy",
+                str(policy_path),
+                "--signer-directory",
+                str(signer_directory),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SettingsError("local candidate publisher verification failed") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "candidate publisher verifier failed"
+        raise SettingsError(detail[:500])
+    result = _strict_json(
+        completed.stdout.encode("utf-8"), label="candidate publisher verification"
+    )
+    expected_keys = {
+        "candidate_publisher_tag",
+        "candidate_publisher_tag_ref",
+        "candidate_publisher_tag_object_sha",
+        "candidate_publisher_sha",
+        "component_sha",
+        "tag_signer_fingerprint",
+    }
+    if not isinstance(result, dict) or set(result) != expected_keys:
+        raise SettingsError("candidate publisher verification output is invalid")
+    return result
+
+
 def _ruleset_covers(
     rulesets: list[Any],
     *,
@@ -227,6 +289,7 @@ def _ruleset_covers(
         if isinstance(value, dict)
         and value.get("target") == target
         and value.get("enforcement") == "active"
+        and (required_name is None or value.get("name") == required_name)
     ]
     if len(candidates) != 1:
         return False
@@ -326,6 +389,8 @@ def verify_settings(
     repository: str,
     token: str,
     policy_path: Path,
+    publisher_root: Path,
+    candidate_publisher_root: Path,
     trusted_publisher_sha: str,
     include_secret_scopes: bool,
 ) -> dict[str, Any]:
@@ -341,10 +406,12 @@ def verify_settings(
             "defaultBranch",
             "requiredStatusContext",
             "releaseAdminTeamId",
+            "releaseAdminUsers",
             "immutableReleases",
             "trustedTagSignerFingerprints",
             "legacyUnsignedReruns",
             "governance",
+            "candidatePublisher",
             "requiredEnvironments",
             "forbiddenRepositorySecrets",
             "apt",
@@ -356,7 +423,9 @@ def verify_settings(
     required_status_context = policy.get("requiredStatusContext")
     environments = policy.get("requiredEnvironments")
     release_admin_team_id = policy.get("releaseAdminTeamId")
+    release_admin_users = policy.get("releaseAdminUsers")
     governance = policy.get("governance")
+    candidate_publisher = policy.get("candidatePublisher")
     expected_governance = {
         "pullRequestApprovals": 1,
         "dismissStaleReviewsOnPush": True,
@@ -386,13 +455,39 @@ def verify_settings(
         "iq9075-candidate-stage": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
+    expected_candidate_publisher = {
+        "tag": "candidate-publisher-v1",
+        "tagRef": "refs/tags/candidate-publisher-v1",
+        "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
+        "agentVersion": "0.1.121",
+        "releaseSequence": 2,
+        "configSchema": "12",
+        "minUpdaterVersion": "0.2.0",
+        "rulesetName": "protected-candidate-publisher",
+    }
+    expected_release_admin_users = [
+        {
+            "id": 57535980,
+            "login": "swiftsjh02",
+            "role": "maintainer",
+            "repositoryPermission": "admin",
+        },
+        {
+            "id": 89565530,
+            "login": "taewan2002",
+            "role": "maintainer",
+            "repositoryPermission": "admin",
+        },
+    ]
     if (
         default_branch != "main"
         or required_status_context != "agent-release-gate"
         or not isinstance(environments, dict)
         or release_admin_team_id != 16128529
+        or release_admin_users != expected_release_admin_users
         or policy.get("immutableReleases") is not True
         or governance != expected_governance
+        or candidate_publisher != expected_candidate_publisher
         or set(environments) != set(expected_environment_secrets)
     ):
         raise SettingsError("release security policy settings are invalid")
@@ -400,6 +495,110 @@ def verify_settings(
     repo = api.get(f"/repos/{repository}")
     if not isinstance(repo, dict) or repo.get("default_branch") != default_branch:
         raise SettingsError("repository default branch does not match release policy")
+    repository_teams = _paginated_list(
+        api,
+        f"/repos/{repository}/teams",
+        label="repository team permissions",
+    )
+    release_admin_teams = [
+        team
+        for team in repository_teams
+        if isinstance(team, dict) and team.get("id") == release_admin_team_id
+    ]
+    if (
+        len(release_admin_teams) != 1
+        or release_admin_teams[0].get("slug") != "platform-admin"
+        or release_admin_teams[0].get("name") != "Platform-Admin"
+        or release_admin_teams[0].get("permission")
+        not in {"push", "maintain", "admin"}
+    ):
+        raise SettingsError("release administrator team repository access is invalid")
+    release_admin_team = api.get("/orgs/plaid-ai/teams/platform-admin")
+    if (
+        not isinstance(release_admin_team, dict)
+        or release_admin_team.get("id") != release_admin_team_id
+        or release_admin_team.get("slug") != "platform-admin"
+        or release_admin_team.get("name") != "Platform-Admin"
+    ):
+        raise SettingsError("release administrator team identity is invalid")
+    release_admin_members = _paginated_list(
+        api,
+        "/orgs/plaid-ai/teams/platform-admin/members?role=all",
+        label="release administrator team members",
+    )
+    normalized_release_admin_members: list[dict[str, Any]] = []
+    seen_release_admin_ids: set[int] = set()
+    seen_release_admin_logins: set[str] = set()
+    for member in release_admin_members:
+        identifier = member.get("id") if isinstance(member, dict) else None
+        login = member.get("login") if isinstance(member, dict) else None
+        if (
+            isinstance(identifier, bool)
+            or not isinstance(identifier, int)
+            or identifier < 1
+            or identifier in seen_release_admin_ids
+            or not isinstance(login, str)
+            or not login
+            or login in seen_release_admin_logins
+            or member.get("type") != "User"
+            or member.get("site_admin") is not False
+        ):
+            raise SettingsError("release administrator team member metadata is invalid")
+        seen_release_admin_ids.add(identifier)
+        seen_release_admin_logins.add(login)
+        membership = api.get(
+            "/orgs/plaid-ai/teams/platform-admin/memberships/"
+            f"{urllib.parse.quote(login, safe='')}"
+        )
+        role = membership.get("role") if isinstance(membership, dict) else None
+        if (
+            not isinstance(membership, dict)
+            or membership.get("state") != "active"
+            or role not in {"member", "maintainer"}
+        ):
+            raise SettingsError("release administrator team membership is invalid")
+        repository_permission = api.get(
+            f"/repos/{repository}/collaborators/{urllib.parse.quote(login, safe='')}/permission"
+        )
+        permission_user = (
+            repository_permission.get("user")
+            if isinstance(repository_permission, dict)
+            else None
+        )
+        if (
+            not isinstance(repository_permission, dict)
+            or repository_permission.get("permission") != "admin"
+            or not isinstance(permission_user, dict)
+            or permission_user.get("id") != identifier
+            or permission_user.get("login") != login
+        ):
+            raise SettingsError(
+                "release administrator effective repository permission is invalid"
+            )
+        normalized_release_admin_members.append(
+            {
+                "id": identifier,
+                "login": login,
+                "role": role,
+                "repositoryPermission": repository_permission["permission"],
+            }
+        )
+    if sorted(normalized_release_admin_members, key=lambda value: value["id"]) != (
+        expected_release_admin_users
+    ):
+        raise SettingsError("release administrator roster differs from signed policy")
+    main_ref = api.get(f"/repos/{repository}/git/ref/heads/{default_branch}")
+    main_object = main_ref.get("object") if isinstance(main_ref, dict) else None
+    component_sha = main_object.get("sha") if isinstance(main_object, dict) else None
+    if (
+        not isinstance(main_ref, dict)
+        or main_ref.get("ref") != f"refs/heads/{default_branch}"
+        or not isinstance(main_object, dict)
+        or main_object.get("type") != "commit"
+        or not isinstance(component_sha, str)
+        or not COMMIT_SHA.fullmatch(component_sha)
+    ):
+        raise SettingsError("protected main Git ref identity is invalid")
     immutable_releases = api.get(f"/repos/{repository}/immutable-releases")
     if (
         not isinstance(immutable_releases, dict)
@@ -437,9 +636,11 @@ def verify_settings(
     ]
     active_targets = [value.get("target") for value in active_rulesets]
     if (
-        len(active_rulesets) != 2
+        len(active_rulesets) != 3
         or not all(isinstance(value, str) for value in active_targets)
-        or sorted(active_targets) != ["branch", "tag"]
+        or sorted(active_targets) != ["branch", "tag", "tag"]
+        or {value.get("name") for value in active_rulesets}
+        != {"protected-main", "protected-release-tags", "protected-candidate-publisher"}
     ):
         raise SettingsError("effective release governance has unexpected active rulesets")
     if not _ruleset_covers(
@@ -460,13 +661,113 @@ def verify_settings(
         active_rulesets,
         target="tag",
         include="refs/tags/v*",
-        required_rules={"creation", "deletion", "non_fast_forward"},
+        required_rules={"creation", "update", "deletion", "non_fast_forward"},
         required_name="protected-release-tags",
         required_source=repository,
         required_bypass_team_id=release_admin_team_id,
         required_bypass_mode="always",
     ):
         raise SettingsError("active v* tag ruleset is incomplete")
+    if not _ruleset_covers(
+        active_rulesets,
+        target="tag",
+        include="refs/tags/candidate-publisher-v1",
+        required_rules={"creation", "update", "deletion", "non_fast_forward"},
+        required_name="protected-candidate-publisher",
+        required_source=repository,
+    ):
+        raise SettingsError("active candidate publisher tag ruleset is incomplete")
+    candidate_tag = candidate_publisher["tag"]
+    candidate_ref = api.get(
+        f"/repos/{repository}/git/ref/tags/{urllib.parse.quote(candidate_tag, safe='')}"
+    )
+    ref_object = candidate_ref.get("object") if isinstance(candidate_ref, dict) else None
+    tag_object_sha = ref_object.get("sha") if isinstance(ref_object, dict) else None
+    if (
+        not isinstance(candidate_ref, dict)
+        or candidate_ref.get("ref") != candidate_publisher["tagRef"]
+        or not isinstance(ref_object, dict)
+        or ref_object.get("type") != "tag"
+        or not isinstance(tag_object_sha, str)
+        or not COMMIT_SHA.fullmatch(tag_object_sha)
+    ):
+        raise SettingsError("candidate publisher ref is not an annotated tag")
+    tag_object = api.get(f"/repos/{repository}/git/tags/{tag_object_sha}")
+    tag_target = tag_object.get("object") if isinstance(tag_object, dict) else None
+    verification = tag_object.get("verification") if isinstance(tag_object, dict) else None
+    if (
+        not isinstance(tag_object, dict)
+        or tag_object.get("sha") != tag_object_sha
+        or tag_object.get("tag") != candidate_tag
+        or tag_object.get("message", "").strip()
+        != "NUVION IQ9075 candidate publisher v1"
+        or not isinstance(tag_target, dict)
+        or tag_target.get("type") != "commit"
+        or not isinstance(tag_target.get("sha"), str)
+        or not COMMIT_SHA.fullmatch(tag_target["sha"])
+        or not isinstance(verification, dict)
+        or not isinstance(verification.get("signature"), str)
+        or not verification["signature"].startswith("-----BEGIN PGP SIGNATURE-----")
+        or not isinstance(verification.get("payload"), str)
+        or not verification["payload"]
+    ):
+        raise SettingsError("candidate publisher annotated tag identity is invalid")
+    candidate_publisher_sha = tag_target["sha"]
+    candidate_policy_path = (
+        candidate_publisher_root.resolve()
+        / "packaging/release/release-security-policy.json"
+    )
+    if candidate_policy_path.read_bytes() != policy_path.resolve().read_bytes():
+        raise SettingsError("candidate and final publisher policies differ")
+    local_candidate_verification = _verify_local_candidate_publisher(
+        candidate_publisher_root=candidate_publisher_root.resolve(),
+        publisher_sha=candidate_publisher_sha,
+        component_sha=component_sha,
+        policy_path=candidate_policy_path,
+    )
+    if (
+        local_candidate_verification.get("candidate_publisher_tag") != candidate_tag
+        or local_candidate_verification.get("candidate_publisher_tag_ref")
+        != candidate_publisher["tagRef"]
+        or local_candidate_verification.get("candidate_publisher_tag_object_sha")
+        != tag_object_sha
+        or local_candidate_verification.get("candidate_publisher_sha")
+        != candidate_publisher_sha
+        or local_candidate_verification.get("component_sha") != component_sha
+        or local_candidate_verification.get("tag_signer_fingerprint")
+        not in policy["trustedTagSignerFingerprints"]
+    ):
+        raise SettingsError("local and GitHub candidate publisher identities differ")
+    local_candidate = {
+        "candidate_publisher_tag": local_candidate_verification[
+            "candidate_publisher_tag"
+        ],
+        "candidate_publisher_tag_ref": local_candidate_verification[
+            "candidate_publisher_tag_ref"
+        ],
+        "candidate_publisher_tag_object_sha": local_candidate_verification[
+            "candidate_publisher_tag_object_sha"
+        ],
+        "candidate_publisher_sha": local_candidate_verification[
+            "candidate_publisher_sha"
+        ],
+        "audited_main_sha": local_candidate_verification["component_sha"],
+        "tag_signer_fingerprint": local_candidate_verification[
+            "tag_signer_fingerprint"
+        ],
+    }
+    workflow_path = candidate_publisher["workflow"]
+    workflow_metadata = api.get(
+        f"/repos/{repository}/contents/{workflow_path}?ref={urllib.parse.quote(default_branch, safe='')}"
+    )
+    if (
+        not isinstance(workflow_metadata, dict)
+        or workflow_metadata.get("type") != "file"
+        or workflow_metadata.get("path") != workflow_path
+        or not isinstance(workflow_metadata.get("sha"), str)
+        or not COMMIT_SHA.fullmatch(workflow_metadata["sha"])
+    ):
+        raise SettingsError("candidate publisher workflow is absent from the default branch")
     classic_protection = api.get_optional(
         f"/repos/{repository}/branches/{urllib.parse.quote(default_branch)}/protection"
     )
@@ -489,13 +790,18 @@ def verify_settings(
             "protectedBranches": False,
             "customBranchPolicies": True,
         }
-        expected_deployment_policies = [{"name": default_branch, "type": "branch"}]
+        expected_deployment_policies = (
+            [{"name": "candidate-publisher-v1", "type": "tag"}]
+            if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
+            else [{"name": default_branch, "type": "branch"}]
+        )
         if (
             set(requirements)
             != {
                 "requireReviewers",
                 "preventSelfReview",
                 "reviewerTeamId",
+                "canAdminsBypass",
                 "deploymentBranchPolicy",
                 "deploymentBranchPolicies",
                 "protectionRuleTypes",
@@ -504,6 +810,7 @@ def verify_settings(
             or requirements.get("requireReviewers") is not False
             or requirements.get("preventSelfReview") is not False
             or requirements.get("reviewerTeamId") is not None
+            or requirements.get("canAdminsBypass") is not False
             or requirements.get("deploymentBranchPolicy") != expected_branch_policy
             or requirements.get("deploymentBranchPolicies")
             != expected_deployment_policies
@@ -520,7 +827,11 @@ def verify_settings(
         environment = api.get(
             f"/repos/{repository}/environments/{urllib.parse.quote(name, safe='')}"
         )
-        if not isinstance(environment, dict) or environment.get("name") != name:
+        if (
+            not isinstance(environment, dict)
+            or environment.get("name") != name
+            or environment.get("can_admins_bypass") is not False
+        ):
             raise SettingsError(f"required environment is unavailable: {name}")
         branch_policy = environment.get("deployment_branch_policy")
         if branch_policy != {
@@ -549,11 +860,12 @@ def verify_settings(
             for value in deployment_policies
             if isinstance(value, dict)
         ]
-        if len(normalized_policies) != len(deployment_policies) or normalized_policies != [
-            {"name": default_branch, "type": "branch"}
-        ]:
+        if (
+            len(normalized_policies) != len(deployment_policies)
+            or normalized_policies != expected_deployment_policies
+        ):
             raise SettingsError(
-                f"environment {name} must allow exactly the main branch"
+                f"environment {name} deployment ref policy differs from release policy"
             )
 
     if include_secret_scopes:
@@ -635,7 +947,35 @@ def verify_settings(
                     raise SettingsError(
                         "high-impact release secret is shared from the organization"
                     )
-        for name, requirements in environments.items():
+        environment_inventory = _paginated_collection(
+            api,
+            f"/repos/{repository}/environments",
+            member="environments",
+            label="repository environment inventory",
+        )
+        environment_names: set[str] = set()
+        environment_ids: set[int] = set()
+        for metadata in environment_inventory:
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            identifier = metadata.get("id") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name) > 255
+                or "\n" in name
+                or "\r" in name
+                or name in environment_names
+                or isinstance(identifier, bool)
+                or not isinstance(identifier, int)
+                or identifier < 1
+                or identifier in environment_ids
+            ):
+                raise SettingsError("repository environment inventory is invalid")
+            environment_names.add(name)
+            environment_ids.add(identifier)
+        if not set(environments).issubset(environment_names):
+            raise SettingsError("required environment is absent from repository inventory")
+        for name in sorted(environment_names):
             secret_metadata = _paginated_collection(
                 api,
                 f"/repos/{repository}/environments/{urllib.parse.quote(name, safe='')}/secrets",
@@ -645,6 +985,13 @@ def verify_settings(
             available = _secret_names(
                 secret_metadata, label=f"environment {name} secret metadata"
             )
+            requirements = environments.get(name)
+            if requirements is None:
+                if available & forbidden_names:
+                    raise SettingsError(
+                        "high-impact release secret exists in an ungoverned environment"
+                    )
+                continue
             required = requirements.get("requiredSecrets")
             if not isinstance(required, list) or set(required) != available:
                 raise SettingsError(
@@ -655,6 +1002,8 @@ def verify_settings(
         "repository": repository,
         "defaultBranch": default_branch,
         "trustedPublisherSha": trusted_publisher_sha,
+        "auditedMainSha": component_sha,
+        "candidatePublisher": local_candidate,
         "secretScopesChecked": include_secret_scopes,
         "governance": governance,
         "status": "VERIFIED",
@@ -667,7 +1016,8 @@ def main() -> int:
     parser.add_argument("--token-env", default="GITHUB_TOKEN")
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--trusted-publisher-sha", required=True)
-    parser.add_argument("--publisher-root", type=Path)
+    parser.add_argument("--publisher-root", type=Path, required=True)
+    parser.add_argument("--candidate-publisher-root", type=Path, required=True)
     parser.add_argument("--include-secret-scopes", action="store_true")
     parser.add_argument("--attestation-output", type=Path)
     parser.add_argument("--valid-hours", type=int, default=24)
@@ -678,6 +1028,8 @@ def main() -> int:
             repository=arguments.repository,
             token=token,
             policy_path=arguments.policy.resolve(),
+            publisher_root=arguments.publisher_root.resolve(),
+            candidate_publisher_root=arguments.candidate_publisher_root.resolve(),
             trusted_publisher_sha=arguments.trusted_publisher_sha,
             include_secret_scopes=arguments.include_secret_scopes,
         )
@@ -688,8 +1040,6 @@ def main() -> int:
                 )
             if arguments.valid_hours < 1 or arguments.valid_hours > 24:
                 raise SettingsError("settings attestation validity must be 1..24 hours")
-            if arguments.publisher_root is None:
-                raise SettingsError("settings attestation requires --publisher-root")
             surface = publisher_surface(
                 arguments.publisher_root,
                 expected_sha=arguments.trusted_publisher_sha,
@@ -701,11 +1051,13 @@ def main() -> int:
                 "schemaVersion": 1,
                 "kind": "nuvion-release-settings-attestation",
                 "repository": arguments.repository,
+                "auditedMainSha": result["auditedMainSha"],
                 "publisherTreeSha256": surface["publisherTreeSha256"],
                 "policySha256": hashlib.sha256(policy_bytes).hexdigest(),
                 "verifiedAt": now.isoformat().replace("+00:00", "Z"),
                 "expiresAt": expires.isoformat().replace("+00:00", "Z"),
                 "settings": {
+                    "candidatePublisher": result["candidatePublisher"],
                     "defaultBranch": result["defaultBranch"],
                     "governance": result["governance"],
                     "secretScopesChecked": result["secretScopesChecked"],

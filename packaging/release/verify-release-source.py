@@ -204,10 +204,12 @@ def verify_release_source(
         "defaultBranch",
         "requiredStatusContext",
         "releaseAdminTeamId",
+        "releaseAdminUsers",
         "immutableReleases",
         "trustedTagSignerFingerprints",
         "legacyUnsignedReruns",
         "governance",
+        "candidatePublisher",
         "requiredEnvironments",
         "forbiddenRepositorySecrets",
         "apt",
@@ -218,7 +220,9 @@ def verify_release_source(
     default_branch = policy.get("defaultBranch")
     required_context = policy.get("requiredStatusContext")
     release_admin_team_id = policy.get("releaseAdminTeamId")
+    release_admin_users = policy.get("releaseAdminUsers")
     governance = policy.get("governance")
+    candidate_publisher = policy.get("candidatePublisher")
     if (
         default_branch != "main"
         or required_context != "agent-release-gate"
@@ -226,6 +230,21 @@ def verify_release_source(
         or isinstance(release_admin_team_id, bool)
         or not isinstance(release_admin_team_id, int)
         or release_admin_team_id < 1
+        or release_admin_users
+        != [
+            {
+                "id": 57535980,
+                "login": "swiftsjh02",
+                "role": "maintainer",
+                "repositoryPermission": "admin",
+            },
+            {
+                "id": 89565530,
+                "login": "taewan2002",
+                "role": "maintainer",
+                "repositoryPermission": "admin",
+            },
+        ]
         or governance
         != {
             "pullRequestApprovals": 1,
@@ -238,6 +257,17 @@ def verify_release_source(
             "environmentReviewers": 0,
             "requiredStatusContext": "agent-release-gate",
             "requiredStatusIntegrationId": 15368,
+        }
+        or candidate_publisher
+        != {
+            "tag": "candidate-publisher-v1",
+            "tagRef": "refs/tags/candidate-publisher-v1",
+            "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
+            "agentVersion": "0.1.121",
+            "releaseSequence": 2,
+            "configSchema": "12",
+            "minUpdaterVersion": "0.2.0",
+            "rulesetName": "protected-candidate-publisher",
         }
         or origin_main_ref
         not in {f"refs/remotes/origin/{default_branch}", f"refs/heads/{default_branch}"}

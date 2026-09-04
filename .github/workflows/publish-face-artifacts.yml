@@ -51,6 +51,7 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           path: settings-evidence
+          fetch-depth: 0
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
