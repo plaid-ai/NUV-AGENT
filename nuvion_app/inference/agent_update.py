@@ -298,10 +298,19 @@ class AgentUpdateReconciler:
         command: VerifiedFleetCommand,
         update: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        evidence = dict(command.payload)
+        # Bind every reported-state observation to the authenticated command,
+        # rather than trusting the helper response to repeat that identity.
+        # The control plane uses both fields as strong rollout commit/rollback
+        # evidence, so omitting either makes a truthful terminal ACK impossible
+        # to reconcile with its rollout target.
+        evidence = {
+            **command.payload,
+            "commandId": command.command_id,
+        }
         if update is None:
             evidence.update(
                 {
+                    "phase": "UNKNOWN",
                     "updatePhase": "UNKNOWN",
                     "functionalHealth": "FUNCTIONAL_UNHEALTHY",
                 }
@@ -328,6 +337,7 @@ class AgentUpdateReconciler:
             if key in update:
                 evidence[key] = update[key]
         phase = str(update.get("phase") or update.get("updatePhase") or "UNKNOWN")
+        evidence["phase"] = phase
         evidence["updatePhase"] = phase
         if phase == "ROLLED_BACK" and isinstance(update.get("previousVersion"), str):
             evidence["agentVersion"] = update["previousVersion"]

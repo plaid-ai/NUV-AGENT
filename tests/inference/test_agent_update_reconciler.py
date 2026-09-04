@@ -67,6 +67,30 @@ def _committed(command: VerifiedFleetCommand) -> dict[str, object]:
     }
 
 
+def _rolled_back(command: VerifiedFleetCommand) -> dict[str, object]:
+    previous_slot = "releases/" + "d" * 64
+    return {
+        "commandId": command.command_id,
+        "phase": "ROLLED_BACK",
+        "targetVersion": command.payload["targetVersion"],
+        "bomDigest": command.payload["bomDigest"],
+        "artifactDigest": "sha256:" + "b" * 64,
+        "componentSha": "c" * 40,
+        "configSchema": "12",
+        "releaseSequence": 42,
+        "bomVerificationStatus": "VERIFIED",
+        "health": "LKG_RESTORED",
+        "functionalHealth": "FUNCTIONAL_UNHEALTHY",
+        "slot": previous_slot,
+        "previousSlot": previous_slot,
+        "previousVersion": "0.1.115",
+        "rollbackSlot": previous_slot,
+        "rollbackVersion": "0.1.115",
+        "publisherKeyId": "release-iq9075-dev-2026-09-01",
+        "errorCode": "ROLLED_BACK",
+    }
+
+
 def _health_attestation(*_args: object) -> dict[str, str]:
     return {"compactJws": "a.b.c"}
 
@@ -187,6 +211,8 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         ).reconcile(command)
 
         self.assertEqual(outcome.status, "SUCCEEDED")
+        self.assertEqual(outcome.reported_state["commandId"], command.command_id)
+        self.assertEqual(outcome.reported_state["phase"], "COMMITTED")
         self.assertEqual(outcome.reported_state["updatePhase"], "COMMITTED")
         self.assertEqual(outcome.reported_state["targetVersion"], "0.1.116")
         self.assertEqual(outcome.reported_state["agentVersion"], "0.1.116")
@@ -196,6 +222,34 @@ class AgentUpdateReconcilerTest(unittest.TestCase):
         )
         self.assertEqual(client.calls[:3], ["STATUS", "BEGIN_COMMIT_GATE", "COMMIT"])
         self.assertEqual(client.calls[4], "ATTESTATION:a.b.c")
+
+    def test_rolled_back_evidence_matches_backend_strong_contract(self) -> None:
+        command = _command()
+        outcome = AgentUpdateReconciler(
+            _Client(initial=_rolled_back(command))  # type: ignore[arg-type]
+        ).reconcile(command)
+
+        self.assertEqual(outcome.status, "ROLLED_BACK")
+        self.assertEqual(outcome.code, "ROLLED_BACK")
+        evidence = outcome.reported_state
+        self.assertEqual(evidence["commandId"], command.command_id)
+        self.assertEqual(evidence["phase"], "ROLLED_BACK")
+        self.assertEqual(evidence["updatePhase"], "ROLLED_BACK")
+        self.assertEqual(evidence["targetVersion"], command.payload["targetVersion"])
+        self.assertEqual(evidence["bomDigest"], command.payload["bomDigest"])
+        self.assertEqual(evidence["artifactDigest"], "sha256:" + "b" * 64)
+        self.assertEqual(evidence["componentSha"], "c" * 40)
+        self.assertEqual(evidence["configSchema"], "12")
+        self.assertEqual(evidence["releaseSequence"], 42)
+        self.assertEqual(evidence["bomVerificationStatus"], "VERIFIED")
+        self.assertEqual(evidence["errorCode"], "ROLLED_BACK")
+        self.assertEqual(evidence["health"], "LKG_RESTORED")
+        self.assertEqual(evidence["functionalHealth"], "FUNCTIONAL_UNHEALTHY")
+        self.assertEqual(evidence["previousVersion"], "0.1.115")
+        self.assertEqual(evidence["rollbackVersion"], "0.1.115")
+        self.assertEqual(evidence["previousSlot"], "releases/" + "d" * 64)
+        self.assertEqual(evidence["rollbackSlot"], "releases/" + "d" * 64)
+        self.assertEqual(evidence["slot"], "releases/" + "d" * 64)
 
     def test_attestation_is_required_after_live_readiness_and_before_commit(self) -> None:
         command = _command()
