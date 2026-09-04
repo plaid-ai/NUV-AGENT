@@ -24,6 +24,7 @@ from publisher_trust import (
 
 FINGERPRINT = re.compile(r"^[0-9A-F]{40}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_DOCUMENT_BYTES = 256 * 1024
 
@@ -174,6 +175,115 @@ def _verify_signature(
     return next(iter(accepted))
 
 
+def _git_scalar(repository: Path, *arguments: str) -> str:
+    environment = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LC_ALL": "C",
+    }
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                *arguments,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AttestationError("settings evidence Git verification failed") from exc
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value or "\n" in value or "\r" in value:
+        raise AttestationError("settings evidence Git verification failed")
+    return value
+
+
+def _verify_audited_main_lineage(
+    *,
+    executing_workflow: Path,
+    trusted_publisher_sha: str,
+    audited_main_sha: str,
+) -> str:
+    if (
+        COMMIT_SHA.fullmatch(trusted_publisher_sha) is None
+        or COMMIT_SHA.fullmatch(audited_main_sha) is None
+    ):
+        raise AttestationError("settings evidence commit identity is invalid")
+    workflow_path = executing_workflow.absolute()
+    if len(workflow_path.parents) < 3:
+        raise AttestationError("executing workflow repository path is invalid")
+    evidence_root = workflow_path.parents[2].resolve()
+    expected_workflow = evidence_root / ".github/workflows/release-publish.yml"
+    if workflow_path.resolve() != expected_workflow.resolve():
+        raise AttestationError("executing workflow is outside the settings evidence root")
+    top_level = Path(
+        _git_scalar(evidence_root, "rev-parse", "--show-toplevel")
+    ).resolve()
+    if top_level != evidence_root:
+        raise AttestationError("settings evidence repository root is invalid")
+    evidence_sha = _git_scalar(evidence_root, "rev-parse", "HEAD^{commit}")
+    if COMMIT_SHA.fullmatch(evidence_sha) is None:
+        raise AttestationError("settings evidence HEAD is invalid")
+    for candidate in (trusted_publisher_sha, audited_main_sha, evidence_sha):
+        if _git_scalar(evidence_root, "cat-file", "-t", candidate) != "commit":
+            raise AttestationError("settings evidence lineage contains a non-commit")
+    environment = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LC_ALL": "C",
+    }
+    for ancestor, descendant in (
+        (trusted_publisher_sha, audited_main_sha),
+        (audited_main_sha, evidence_sha),
+    ):
+        try:
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(evidence_root),
+                    "-c",
+                    "core.fsmonitor=false",
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor,
+                    descendant,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AttestationError("settings evidence lineage check failed") from exc
+        if completed.returncode != 0:
+            raise AttestationError(
+                "audited main is outside the trusted protected-main lineage"
+            )
+    if _git_scalar(evidence_root, "rev-parse", "HEAD^{commit}") != evidence_sha:
+        raise AttestationError("settings evidence HEAD changed during verification")
+    return evidence_sha
+
+
 def verify_attestation(
     *,
     attestation_path: Path,
@@ -221,6 +331,7 @@ def verify_attestation(
         "kind",
         "repository",
         "trustedPublisherSha",
+        "auditedMainSha",
         "publisherTreeSha256",
         "workflowSha256",
         "policySha256",
@@ -230,11 +341,25 @@ def verify_attestation(
     }:
         raise AttestationError("settings attestation fields do not match schema v1")
     settings = attestation.get("settings")
+    candidate_settings = (
+        settings.get("candidatePublisher") if isinstance(settings, dict) else None
+    )
+    candidate_policy = policy.get("candidatePublisher")
+    candidate_fields = {
+        "candidate_publisher_tag",
+        "candidate_publisher_tag_ref",
+        "candidate_publisher_tag_object_sha",
+        "candidate_publisher_sha",
+        "audited_main_sha",
+        "tag_signer_fingerprint",
+    }
     if (
         attestation.get("schemaVersion") != 1
         or attestation.get("kind") != "nuvion-release-settings-attestation"
         or attestation.get("repository") != repository
         or attestation.get("trustedPublisherSha") != trusted_publisher_sha
+        or not isinstance(attestation.get("auditedMainSha"), str)
+        or COMMIT_SHA.fullmatch(attestation["auditedMainSha"]) is None
         or not isinstance(attestation.get("publisherTreeSha256"), str)
         or not SHA256.fullmatch(attestation["publisherTreeSha256"])
         or not isinstance(attestation.get("workflowSha256"), str)
@@ -242,13 +367,46 @@ def verify_attestation(
         or not isinstance(attestation.get("policySha256"), str)
         or not SHA256.fullmatch(attestation["policySha256"])
         or attestation["policySha256"] != hashlib.sha256(policy_raw).hexdigest()
-        or settings
+        or not isinstance(settings, dict)
+        or set(settings)
+        != {
+            "candidatePublisher",
+            "defaultBranch",
+            "governance",
+            "secretScopesChecked",
+            "status",
+        }
+        or {key: value for key, value in settings.items() if key != "candidatePublisher"}
         != {
             "defaultBranch": policy.get("defaultBranch"),
             "governance": policy.get("governance"),
             "secretScopesChecked": True,
             "status": "VERIFIED",
         }
+        or not isinstance(candidate_policy, dict)
+        or not isinstance(candidate_settings, dict)
+        or set(candidate_settings) != candidate_fields
+        or candidate_settings.get("candidate_publisher_tag")
+        != candidate_policy.get("tag")
+        or candidate_settings.get("candidate_publisher_tag_ref")
+        != candidate_policy.get("tagRef")
+        or not isinstance(candidate_settings.get("candidate_publisher_sha"), str)
+        or re.fullmatch(
+            r"[0-9a-f]{40}", candidate_settings["candidate_publisher_sha"]
+        )
+        is None
+        or not isinstance(candidate_settings.get("audited_main_sha"), str)
+        or COMMIT_SHA.fullmatch(candidate_settings["audited_main_sha"]) is None
+        or candidate_settings["audited_main_sha"] != attestation["auditedMainSha"]
+        or not isinstance(
+            candidate_settings.get("candidate_publisher_tag_object_sha"), str
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{40}",
+            candidate_settings["candidate_publisher_tag_object_sha"],
+        )
+        is None
+        or candidate_settings.get("tag_signer_fingerprint") not in fingerprints
     ):
         raise AttestationError("settings attestation identity does not match policy")
     verified_at = _timestamp(attestation.get("verifiedAt"), label="verifiedAt")
@@ -265,6 +423,11 @@ def verify_attestation(
         signature_path=signature_path,
         signer_directory=signer_directory,
         allowed_fingerprints=set(fingerprints),
+    )
+    evidence_sha = _verify_audited_main_lineage(
+        executing_workflow=executing_workflow,
+        trusted_publisher_sha=trusted_publisher_sha,
+        audited_main_sha=attestation["auditedMainSha"],
     )
     surface = publisher_surface(
         publisher_root,
@@ -303,6 +466,8 @@ def verify_attestation(
         "schemaVersion": 1,
         "repository": repository,
         "trustedPublisherSha": trusted_publisher_sha,
+        "auditedMainSha": attestation["auditedMainSha"],
+        "evidenceSha": evidence_sha,
         "publisherTreeSha256": attestation["publisherTreeSha256"],
         "workflowSha256": attestation["workflowSha256"],
         "policySha256": attestation["policySha256"],

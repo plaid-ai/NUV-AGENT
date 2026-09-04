@@ -3,6 +3,10 @@
   "defaultBranch": "main",
   "requiredStatusContext": "agent-release-gate",
   "releaseAdminTeamId": 16128529,
+  "releaseAdminUsers": [
+    {"id": 57535980, "login": "swiftsjh02", "role": "maintainer", "repositoryPermission": "admin"},
+    {"id": 89565530, "login": "taewan2002", "role": "maintainer", "repositoryPermission": "admin"}
+  ],
   "immutableReleases": true,
   "trustedTagSignerFingerprints": [
     "9A07D327F3ADF6F452A4BF0055E5CAF706571888"
@@ -20,11 +24,22 @@
     "requiredStatusContext": "agent-release-gate",
     "requiredStatusIntegrationId": 15368
   },
+  "candidatePublisher": {
+    "tag": "candidate-publisher-v1",
+    "tagRef": "refs/tags/candidate-publisher-v1",
+    "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
+    "agentVersion": "0.1.121",
+    "releaseSequence": 2,
+    "configSchema": "12",
+    "minUpdaterVersion": "0.2.0",
+    "rulesetName": "protected-candidate-publisher"
+  },
   "requiredEnvironments": {
     "homebrew-release": {
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
@@ -37,6 +52,7 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
@@ -54,6 +70,7 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
@@ -70,14 +87,15 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
       },
       "deploymentBranchPolicies": [
         {
-          "name": "main",
-          "type": "branch"
+          "name": "candidate-publisher-v1",
+          "type": "tag"
         }
       ],
       "protectionRuleTypes": [
@@ -91,14 +109,15 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
       },
       "deploymentBranchPolicies": [
         {
-          "name": "main",
-          "type": "branch"
+          "name": "candidate-publisher-v1",
+          "type": "tag"
         }
       ],
       "protectionRuleTypes": [
@@ -113,6 +132,7 @@
       "requireReviewers": false,
       "preventSelfReview": false,
       "reviewerTeamId": null,
+      "canAdminsBypass": false,
       "deploymentBranchPolicy": {
         "protectedBranches": false,
         "customBranchPolicies": true
