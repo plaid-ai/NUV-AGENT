@@ -54,6 +54,36 @@ systemd의 여러 `SupplementaryGroups=` 항목은 누적된다.
 이 경로에서는 DepthAI 등 기존 배포 dependency만 읽는다. `gi`는
 `/usr/lib/python3/dist-packages`를 사용한다. 개발 source를 baseline source로 대체하지 않는다.
 
+### 동일 기능을 새 prefix에 staging
+
+launcher는 다음 operator 설정만으로 별도 staging 경로를 선택할 수 있다.
+기존 installer는 원래 prefix 전용이므로 새 prefix 설치에 그대로 재실행하지 않는다.
+
+| 변수 | 미지정 시 기존 기본값 | 허용 범위 |
+| --- | --- | --- |
+| `NUVION_VISUALAD_DEPLOYMENT_ROOT` | `/opt/nuvion-demo/20260910-visualad-htp` | `/opt/nuvion-demo/` 하위 |
+| `NUVION_VISUALAD_DEPLOYMENT_HTP_STATE_DIR` | `/var/lib/nuv-agent/visualad-htp` | `/var/lib/nuv-agent/` 하위 |
+| `NUVION_VISUALAD_DEPLOYMENT_SETTINGS_DIR` | `/var/lib/nuv-agent/visualad-htp-settings` | `/var/lib/nuv-agent/` 하위 |
+
+세 경로는 이미 존재하는 canonical absolute directory여야 한다. 빈 값, 범위 root
+자체, 상대 경로, 상위 탈출, symlink component, 중복 separator 및 trailing slash는
+거부한다. 디렉터리 이름은 영문·숫자·`._-`로 제한한다. state 두 경로는 운영자가
+미리 nuvion:nuvion `0700`으로 생성한다. 원 unit에서 상속된
+`NUVION_SETTINGS_STATE_DIR`는 새 override로 취급하지 않으므로 원 Fleet state로
+묵시적으로 전환되지 않는다. 향후 명시적으로 `/var/lib/nuv-agent/settings`를
+선택할 수 있지만 Fleet 자체는 계속 비활성이다.
+
+새 root에 정확한 git source, 검증된 HTP package tree의 독립 복사본, 동일 manifest와
+graph를 배치하고 source/wheel/model inventory를 다시 검증한다. 기존 prefix 및 signed
+slot은 수정하지 않는다. 새 `deployment.env`에 위 세 변수와 기존 manifest SHA pin을
+기록한 뒤, 새 launcher `--import-check`에도 동일한 변수들을 명시적으로 전달한다.
+실행 시 source/model/SDK 경로는 새 root를 따르고, DepthAI baseline/system GI 경로는
+그대로다. HTP-only, sample 0, Fleet=false, threshold 및 experimental 표시는 변경하지 않는다.
+
+활성화가 별도로 승인되면 기존 90/91을 보존하고 새 전용 override에서 새 launcher와
+EnvironmentFile을 선택한다. 그 override만 회수하면 이전 exp3 경로로 복귀할 수 있다.
+경로 일반화 이후의 source commit/SHA를 새로 기록하며 이전 source SHA로 표시하지 않는다.
+
 ## 3. 정식 수치 승인 기준과 실험 staging — 서비스 재시작 전
 
 아래 1–4의 수치 합격은 **정식 모델 수치 승인 경로**다. 이번 사용자 승인 실험은

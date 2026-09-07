@@ -4,13 +4,36 @@
 # Requires an external deployment pin. No CPU inference fallback.
 set -euo pipefail
 
-readonly demo_root=/opt/nuvion-demo/20260910-visualad-htp
+scoped_directory() {
+  local requested="$1" allowed_root="$2" label="$3" canonical
+  if [[ ! "$requested" =~ ^/[A-Za-z0-9._/-]+$ || "$requested" != "$allowed_root"/* ]]; then
+    printf '%s must be an absolute directory inside its deployment scope.\n' "$label" >&2
+    return 1
+  fi
+  if [[ ! -d "$requested" || -L "$requested" ]]; then
+    printf '%s must be an existing non-symlink directory.\n' "$label" >&2
+    return 1
+  fi
+  canonical=$(cd -- "$requested" && pwd -P) || return 1
+  if [[ "$canonical" != "$requested" ]]; then
+    printf '%s must be canonical, without symlink components or traversal.\n' "$label" >&2
+    return 1
+  fi
+  printf '%s\n' "$canonical"
+}
+
+[ "$(hostname)" = iq9075 ]
+# Explicit empty overrides are errors. Deployment-specific state variables avoid
+# accidentally inheriting the base unit's unrelated Fleet settings directory.
+demo_root=$(scoped_directory "${NUVION_VISUALAD_DEPLOYMENT_ROOT-/opt/nuvion-demo/20260910-visualad-htp}" /opt/nuvion-demo deployment)
+htp_state_dir=$(scoped_directory "${NUVION_VISUALAD_DEPLOYMENT_HTP_STATE_DIR-/var/lib/nuv-agent/visualad-htp}" /var/lib/nuv-agent HTP-state)
+settings_state_dir=$(scoped_directory "${NUVION_VISUALAD_DEPLOYMENT_SETTINGS_DIR-/var/lib/nuv-agent/visualad-htp-settings}" /var/lib/nuv-agent settings)
+readonly demo_root htp_state_dir settings_state_dir
 readonly baseline=/opt/nuv-agent/releases/26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1
 readonly demo_site="$demo_root/python/lib/python3.12/site-packages"
 readonly baseline_site="$baseline/venv/lib/python3.12/site-packages"
 readonly qnn_bundle="$demo_site/onnxruntime_qnn"
 
-[ "$(hostname)" = iq9075 ]
 [ -f "$demo_root/src/nuvion_app/runtime/visualad_htp.py" ]
 [ -f "$demo_root/model/manifest.json" ]
 [ -f "$qnn_bundle/libQnnHtp.so" ]
@@ -27,7 +50,7 @@ export LD_LIBRARY_PATH="$qnn_bundle" ADSP_LIBRARY_PATH="$qnn_bundle"
 export HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 export NUVION_ZSAD_BACKEND=visualad_htp NUVION_ZERO_SHOT_ENABLED=true
 export NUVION_VISUALAD_HTP_MANIFEST="$demo_root/model/manifest.json"
-export NUVION_VISUALAD_HTP_STATE_DIR=/var/lib/nuv-agent/visualad-htp
+export NUVION_VISUALAD_HTP_STATE_DIR="$htp_state_dir"
 export NUVION_VISUALAD_THRESHOLD="${NUVION_VISUALAD_THRESHOLD:-0.0}"
 export NUVION_VISUALAD_EXPERIMENTAL=true
 export NUVION_VISUALAD_VALIDATION_STATUS=PARITY_FAILED
@@ -37,15 +60,15 @@ export NUVION_ZERO_SHOT_SAMPLE_SEC=0
 export NUVION_DEMO_MODE=false NUVION_VIDEO_SOURCE=oak
 export NUVION_FACE_TRACKING_ENABLED=false
 export NUVION_FLEET_COMMAND_ENABLED=false
-export NUVION_SETTINGS_STATE_DIR=/var/lib/nuv-agent/visualad-htp-settings
+export NUVION_SETTINGS_STATE_DIR="$settings_state_dir"
 export NUVION_MODEL_POINTER=visualad/iq9075-htp-demo
 export NUVION_MODEL_VERSION=visualad-visa-97eb5f88a44f-htp
 export NUVION_MODEL_LOCAL_DIR="$demo_root/model"
 export NUVION_AGENT_VERSION=0.1.121+iq9075.visualad.htp.exp3
 export NUVION_COMPONENT_SHA=unknown
-export NUVION_RELEASE_BOM_PATH= NUVION_EXPECTED_BOM_DIGEST=
+export NUVION_RELEASE_BOM_PATH="" NUVION_EXPECTED_BOM_DIGEST=""
 export NUVION_BOM_ID=development-visualad-htp-not-a-release
-export NUVION_BOM_DIGEST= NUVION_ARTIFACT_DIGEST= NUVION_ACTIVE_SLOT=
+export NUVION_BOM_DIGEST="" NUVION_ARTIFACT_DIGEST="" NUVION_ACTIVE_SLOT=""
 
 exec /usr/bin/python3 -s -c '
 import os, runpy, sys
