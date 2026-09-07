@@ -25,8 +25,9 @@
     "requiredStatusIntegrationId": 15368
   },
   "candidatePublisher": {
-    "tag": "candidate-publisher-v1",
-    "tagRef": "refs/tags/candidate-publisher-v1",
+    "tag": "candidate-publisher-v2",
+    "tagRef": "refs/tags/candidate-publisher-v2",
+    "retiredTagRefs": ["refs/tags/candidate-publisher-v1"],
     "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
     "agentVersion": "0.1.121",
     "releaseSequence": 2,
@@ -94,7 +95,7 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v1",
+          "name": "candidate-publisher-v2",
           "type": "tag"
         }
       ],
@@ -116,7 +117,7 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v1",
+          "name": "candidate-publisher-v2",
           "type": "tag"
         }
       ],

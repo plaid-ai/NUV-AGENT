@@ -28,6 +28,15 @@ class CandidatePublisherTagTest(unittest.TestCase):
         cls.gpg_home = cls.support / "gpg"
         cls.gpg_home.mkdir(mode=0o700)
         cls.gpg_environment = {**os.environ, "GNUPGHOME": str(cls.gpg_home)}
+        cls.fingerprint, cls.public_key = cls._generate_signer(
+            "Candidate Publisher New <candidate-new@example.invalid>"
+        )
+        cls.retired_fingerprint, cls.retired_public_key = cls._generate_signer(
+            "Candidate Publisher Retired <candidate-retired@example.invalid>"
+        )
+
+    @classmethod
+    def _generate_signer(cls, identity: str) -> tuple[str, bytes]:
         subprocess.run(
             [
                 "gpg",
@@ -35,7 +44,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
                 "--passphrase",
                 "",
                 "--quick-generate-key",
-                "Candidate Publisher Test <candidate@example.invalid>",
+                identity,
                 "ed25519",
                 "cert",
                 "1d",
@@ -45,11 +54,11 @@ class CandidatePublisherTagTest(unittest.TestCase):
             env=cls.gpg_environment,
         )
         listing = subprocess.check_output(
-            ["gpg", "--batch", "--with-colons", "--list-keys"],
+            ["gpg", "--batch", "--with-colons", "--list-keys", identity],
             text=True,
             env=cls.gpg_environment,
         )
-        cls.fingerprint = next(
+        fingerprint = next(
             line.split(":")[9]
             for line in listing.splitlines()
             if line.startswith("fpr:")
@@ -61,7 +70,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
                 "--passphrase",
                 "",
                 "--quick-add-key",
-                cls.fingerprint,
+                fingerprint,
                 "ed25519",
                 "sign",
                 "1d",
@@ -70,10 +79,11 @@ class CandidatePublisherTagTest(unittest.TestCase):
             capture_output=True,
             env=cls.gpg_environment,
         )
-        cls.public_key = subprocess.check_output(
-            ["gpg", "--batch", "--armor", "--export", cls.fingerprint],
+        public_key = subprocess.check_output(
+            ["gpg", "--batch", "--armor", "--export", fingerprint],
             env=cls.gpg_environment,
         )
+        return fingerprint, public_key
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -102,7 +112,10 @@ class CandidatePublisherTagTest(unittest.TestCase):
         )
 
     def _fixture(
-        self, *, policy_fingerprint: str | None = None
+        self,
+        *,
+        policy_fingerprint: str | None = None,
+        policy_public_key: bytes | None = None,
     ) -> tuple[Path, str, str, Path, Path]:
         repository = self.root / "repository"
         repository.mkdir()
@@ -121,7 +134,9 @@ class CandidatePublisherTagTest(unittest.TestCase):
         self._write_policy(policy, policy_payload)
         signers = repository / VERIFIER.SIGNER_RELATIVE_PATH
         signers.mkdir()
-        (signers / "candidate-publisher.asc").write_bytes(self.public_key)
+        (signers / "candidate-publisher.asc").write_bytes(
+            self.public_key if policy_public_key is None else policy_public_key
+        )
         self._run_git(repository, "add", ".")
         self._run_git(repository, "commit", "-m", "publisher")
         publisher_sha = self._git(repository, "rev-parse", "HEAD")
@@ -151,8 +166,9 @@ class CandidatePublisherTagTest(unittest.TestCase):
             "defaultBranch": "main",
             "trustedTagSignerFingerprints": [self.fingerprint],
             "candidatePublisher": {
-                "tag": "candidate-publisher-v1",
-                "tagRef": "refs/tags/candidate-publisher-v1",
+                "tag": "candidate-publisher-v2",
+                "tagRef": "refs/tags/candidate-publisher-v2",
+                "retiredTagRefs": ["refs/tags/candidate-publisher-v1"],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
                 "agentVersion": "0.1.121",
                 "releaseSequence": 2,
@@ -187,12 +203,15 @@ class CandidatePublisherTagTest(unittest.TestCase):
             signer_directory=signers,
         )
 
-    def test_accepts_exact_signed_direct_tag_for_clean_ancestor(self) -> None:
+    def test_accepts_v2_signed_with_new_key_frozen_in_publisher(self) -> None:
         repository, publisher_sha, component_sha, policy, signers = self._fixture()
         result = self._verify(
             repository, publisher_sha, component_sha, policy, signers
         )
-        self.assertEqual(result["candidate_publisher_tag"], VERIFIER.EXPECTED_TAG)
+        self.assertEqual(result["candidate_publisher_tag"], "candidate-publisher-v2")
+        self.assertEqual(
+            result["candidate_publisher_tag_ref"], "refs/tags/candidate-publisher-v2"
+        )
         self.assertEqual(result["candidate_publisher_sha"], publisher_sha)
         self.assertEqual(result["component_sha"], component_sha)
         self.assertEqual(result["tag_signer_fingerprint"], self.fingerprint)
@@ -277,8 +296,12 @@ class CandidatePublisherTagTest(unittest.TestCase):
             VERIFIER._candidate_policy(policy)
 
         for field, value in (
-            ("tag", "candidate-publisher-v2"),
-            ("tagRef", "refs/tags/candidate-publisher-v2"),
+            ("tag", "candidate-publisher-v1"),
+            ("tagRef", "refs/tags/candidate-publisher-v1"),
+            ("retiredTagRefs", []),
+            ("retiredTagRefs", ["refs/tags/candidate-publisher-v2"]),
+            ("retiredTagRefs", ["refs/tags/candidate-publisher-*"]),
+            ("retiredTagRefs", ["refs/tags/candidate-publisher-v1"] * 2),
         ):
             with self.subTest(field=field):
                 payload = self._policy_payload()
@@ -325,6 +348,20 @@ class CandidatePublisherTagTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             VERIFIER.CandidatePublisherVerificationError, "exactly match"
+        ):
+            self._verify(repository, publisher_sha, component_sha, policy, signers)
+
+    def test_rejects_new_signature_when_frozen_publisher_trusts_only_old_key(self) -> None:
+        # Both frozen trust inputs agree with each other, as in the failed v1
+        # publisher, but the tag was signed after the actual signing key changed.
+        repository, publisher_sha, component_sha, policy, signers = self._fixture(
+            policy_fingerprint=self.retired_fingerprint,
+            policy_public_key=self.retired_public_key,
+        )
+        self.assertNotEqual(self.retired_fingerprint, self.fingerprint)
+        with self.assertRaisesRegex(
+            VERIFIER.CandidatePublisherVerificationError,
+            "^candidate publisher tag signature verification failed$",
         ):
             self._verify(repository, publisher_sha, component_sha, policy, signers)
 
