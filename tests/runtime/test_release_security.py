@@ -341,6 +341,41 @@ def production_restoration_evidence(
     return value
 
 
+class ApiTimestampTest(unittest.TestCase):
+    def test_api_timestamp_accepts_server_fractional_precision(self) -> None:
+        for digits in range(10):
+            fraction = "123456789"[:digits]
+            with self.subTest(fraction=fraction):
+                value = (
+                    "2026-09-04T01:02:03"
+                    + (f".{fraction}" if fraction else "")
+                    + "Z"
+                )
+                expected = dt.datetime(
+                    2026, 9, 4, 1, 2, 3,
+                    int(fraction[:6].ljust(6, "0")),
+                    tzinfo=dt.timezone.utc,
+                )
+                self.assertEqual(
+                    READINESS._api_timestamp(value, label="issuedAt"), expected
+                )
+
+    def test_api_timestamp_rejects_invalid_or_noncanonical_values(self) -> None:
+        for value in (
+            None,
+            "2026-02-30T01:02:03Z",
+            "2026-09-04T01:02:03.Z",
+            "2026-09-04T01:02:03.1234567890Z",
+            "2026-09-04T01:02:03.1+00:00",
+            "2026-09-04T01:02:03Z\n",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    READINESS.ReadinessError, "issuedAt is not canonical API UTC"
+                ):
+                    READINESS._api_timestamp(value, label="issuedAt")
+
+
 class ReleaseSecurityWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         self.publish = (ROOT / ".github/workflows/release-publish.yml").read_text(
@@ -5168,15 +5203,19 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         self.assertIn(
             'git merge-base --is-ancestor "$component_sha" "$publisher_sha"', runbook
         )
-        expected_changes_match = re.search(
+        expected_changes_matches = re.findall(
             r"expected_b_changes=\"\$\(LC_ALL=C sort <<'EOF'\n(.*?)\nEOF\n\)\"",
             runbook,
             re.DOTALL,
         )
-        self.assertIsNotNone(expected_changes_match)
-        assert expected_changes_match is not None
+        self.assertEqual(len(expected_changes_matches), 2)
         self.assertEqual(
-            set(expected_changes_match.group(1).splitlines()),
+            set(expected_changes_matches[0].splitlines()),
+            set(expected_changes_matches[1].splitlines()),
+            "staging and final publisher must accept the same evidence-only delta",
+        )
+        self.assertEqual(
+            set(expected_changes_matches[0].splitlines()),
             {
                 "A\tpackaging/release/iq9075-v0.1.121-bootstrap-evidence.json",
                 "A\tpackaging/release/iq9075-v0.1.121-commit-cleanup-evidence.json",

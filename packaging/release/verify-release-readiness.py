@@ -1409,8 +1409,12 @@ def _api_timestamp(value: object, *, label: str) -> dt.datetime:
         is None
     ):
         raise ReadinessError(f"{label} is not canonical API UTC")
+    seconds, separator, fraction = value[:-1].partition(".")
+    # Python 3.10 accepts only millisecond/microsecond fractions. Match newer
+    # runtimes by truncating API nanoseconds to datetime's microsecond precision.
+    normalized = seconds + ("." + fraction[:6].ljust(6, "0") if separator else "")
     try:
-        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = dt.datetime.fromisoformat(normalized + "+00:00")
     except ValueError as exc:
         raise ReadinessError(f"{label} is not canonical API UTC") from exc
     return parsed
