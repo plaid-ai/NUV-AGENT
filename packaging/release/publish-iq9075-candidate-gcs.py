@@ -38,10 +38,117 @@ BROAD_CREDENTIAL_ENVIRONMENT = (
     "GOOGLE_CREDENTIALS",
     "GCP_SA_KEY",
 )
+SAFE_HTTP_STATUSES = frozenset({200, 201, 400, 401, 403, 404, 408, 409, 412, 413, 429, 500, 502, 503, 504})
+SAFE_STAGES = frozenset({
+    "environment", "token", "manifest", "inputs", "validation", "client",
+    "insert", "metadata", "readback", "verification", "cleanup", "interrupted", "unknown",
+})
+SAFE_OBJECT_FIELDS = frozenset({"bom", "signature", "artifact"})
+SAFE_DENIED_PERMISSIONS = frozenset({
+    "storage.objects.create", "storage.objects.get", "storage.objects.delete", "storage.objects.getIamPolicy",
+})
+SAFE_ERROR_CODES = {
+    "broad Google credential environment is forbidden": "BROAD_CREDENTIAL_ENVIRONMENT",
+    "verified candidate input is closed": "INPUT_CLOSED",
+    "verified candidate input is unavailable": "INPUT_UNAVAILABLE",
+    "verified candidate input could not be read": "INPUT_READ_FAILED",
+    "candidate input changed after validation": "INPUT_CHANGED",
+    "candidate input changed during validation": "INPUT_CHANGED",
+    "candidate input changed during upload": "INPUT_CHANGED",
+    "candidate input exceeds its read boundary": "INPUT_BOUNDARY_EXCEEDED",
+    "candidate input path must be absolute": "INPUT_PATH_INVALID",
+    "candidate input is unavailable": "INPUT_UNAVAILABLE",
+    "candidate input must be a regular non-symlink file": "INPUT_TYPE_INVALID",
+    "candidate input has the wrong owner": "INPUT_OWNER_INVALID",
+    "candidate input has an invalid size": "INPUT_SIZE_INVALID",
+    "candidate input could not be read": "INPUT_READ_FAILED",
+    "downscoped token must have mode 0600": "TOKEN_MODE_INVALID",
+    "downscoped token filename is invalid": "TOKEN_FILENAME_INVALID",
+    "downscoped token is invalid": "TOKEN_INVALID",
+    "downscoped token could not be removed": "TOKEN_REMOVAL_FAILED",
+    "downscoped token removal could not be verified": "TOKEN_REMOVAL_UNVERIFIED",
+    "candidate evidence manifest is invalid": "MANIFEST_INVALID",
+    "candidate evidence manifest is not canonical": "MANIFEST_NOT_CANONICAL",
+    "candidate evidence manifest fields are invalid": "MANIFEST_FIELDS_INVALID",
+    "candidate evidence manifest identity is invalid": "MANIFEST_IDENTITY_INVALID",
+    "candidate evidence manifest integer is invalid": "MANIFEST_INTEGER_INVALID",
+    "candidate component SHA is invalid": "COMPONENT_SHA_INVALID",
+    "candidate version is invalid": "VERSION_INVALID",
+    "candidate keyring digest is invalid": "KEYRING_DIGEST_INVALID",
+    "candidate object descriptor is invalid": "OBJECT_DESCRIPTOR_INVALID",
+    "candidate bootstrap DEB descriptor is invalid": "BOOTSTRAP_DESCRIPTOR_INVALID",
+    "candidate content-addressed path is invalid": "CONTENT_ADDRESS_INVALID",
+    "candidate input filename differs from its manifest": "INPUT_FILENAME_MISMATCH",
+    "candidate input digest differs from its manifest": "INPUT_DIGEST_MISMATCH",
+    "candidate release BOM is invalid": "BOM_INVALID",
+    "candidate release BOM digest is invalid": "BOM_DIGEST_INVALID",
+    "candidate release BOM prefix differs from its manifest": "BOM_PREFIX_MISMATCH",
+    "candidate inputs must be distinct files": "INPUTS_NOT_DISTINCT",
+    "candidate object set escaped its exact prefix": "OBJECT_PREFIX_MISMATCH",
+    "Cloud Storage response exceeded its boundary": "GCS_RESPONSE_TOO_LARGE",
+    "Cloud Storage insert failed": "GCS_INSERT_FAILED",
+    "Cloud Storage insert metadata is invalid": "GCS_INSERT_METADATA_INVALID",
+    "Cloud Storage insert returned an unexpected status": "GCS_INSERT_STATUS_INVALID",
+    "Cloud Storage metadata lookup failed": "GCS_METADATA_FAILED",
+    "Cloud Storage metadata is invalid": "GCS_METADATA_INVALID",
+    "Cloud Storage generation-pinned read failed": "GCS_READBACK_FAILED",
+    "Cloud Storage object exceeded expected size": "GCS_READBACK_TOO_LARGE",
+    "Cloud Storage object identity differs": "GCS_OBJECT_IDENTITY_MISMATCH",
+    "Cloud Storage generation is invalid": "GCS_GENERATION_INVALID",
+    "Cloud Storage object size differs": "GCS_OBJECT_SIZE_MISMATCH",
+    "remote bytes differ from the exact candidate input": "GCS_BYTES_MISMATCH",
+    "publication interrupted": "PUBLICATION_INTERRUPTED",
+    "unexpected internal failure": "INTERNAL_FAILURE",
+}
 
 
 class PublishError(RuntimeError):
     """A fail-closed candidate publication or verification error."""
+
+    def __init__(
+        self, message: str, *, stage: str = "unknown", http_status: int | None = None,
+        object_field: str | None = None, denied_permission: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.http_status = http_status
+        self.object_field = object_field
+        self.denied_permission = denied_permission
+
+
+@dataclass
+class _PublicationProgress:
+    stage: str = "environment"
+    object_field: str | None = None
+
+
+def _safe_failure(error: PublishError) -> dict[str, object]:
+    """Emit only local enums; never exception text, requests, responses or tokens."""
+    message = error.args[0] if error.args and type(error.args[0]) is str else ""
+    return {
+        "kind": "nuvion-iq9075-candidate-gcs-stage-failure",
+        "code": SAFE_ERROR_CODES.get(message, "PUBLICATION_BOUNDARY_FAILED"),
+        "stage": error.stage if type(error.stage) is str and error.stage in SAFE_STAGES else "unknown",
+        "httpStatus": error.http_status if type(error.http_status) is int and error.http_status in SAFE_HTTP_STATUSES else None,
+        "object": error.object_field if type(error.object_field) is str and error.object_field in SAFE_OBJECT_FIELDS else None,
+        "deniedPermission": error.denied_permission if type(error.denied_permission) is str and error.denied_permission in SAFE_DENIED_PERMISSIONS else None,
+    }
+
+
+def _safe_denied_permission(body: bytes) -> str | None:
+    if type(body) is not bytes or len(body) > MAX_METADATA_BYTES:
+        return None
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    error = value.get("error") if isinstance(value, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str):
+        return None
+    matches = [permission for permission in SAFE_DENIED_PERMISSIONS
+               if re.search(r"(?<![\w.])" + re.escape(permission) + r"(?![\w.])", message)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _canonical_json(value: object) -> bytes:
@@ -337,6 +444,7 @@ class GoogleStorageJsonClient:
             + "&ifGenerationMatch=0"
         )
         connection = self._connection()
+        response_status = None
         try:
             connection.putrequest("POST", target, skip_accept_encoding=True)
             for key, value in self._headers().items():
@@ -353,11 +461,14 @@ class GoogleStorageJsonClient:
             if sent_size != source.size or sent_digest.hexdigest() != source.sha256:
                 raise PublishError("candidate input changed during upload")
             response = connection.getresponse()
+            response_status = response.status
             body = _bounded_response(response)
             if response.status == 412:
                 return 412, {}
             if response.status not in (200, 201):
-                raise PublishError("Cloud Storage insert failed")
+                raise PublishError("Cloud Storage insert failed", denied_permission=(
+                    _safe_denied_permission(body) if response.status == 403 else None
+                ))
             try:
                 metadata = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -365,10 +476,12 @@ class GoogleStorageJsonClient:
             if not isinstance(metadata, dict):
                 raise PublishError("Cloud Storage insert metadata is invalid")
             return response.status, metadata
-        except PublishError:
+        except PublishError as exc:
+            exc.stage = "insert"
+            exc.http_status = response_status
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError):
-            raise PublishError("Cloud Storage insert failed") from None
+            raise PublishError("Cloud Storage insert failed", stage="insert", http_status=response_status) from None
         finally:
             connection.close()
 
@@ -377,12 +490,16 @@ class GoogleStorageJsonClient:
             "/storage/v1/b/apt.plaidai.io/o/" + self._object_segment(object_name)
         )
         connection = self._connection()
+        response_status = None
         try:
             connection.request("GET", target, headers=self._headers())
             response = connection.getresponse()
+            response_status = response.status
             body = _bounded_response(response)
             if response.status != 200:
-                raise PublishError("Cloud Storage metadata lookup failed")
+                raise PublishError("Cloud Storage metadata lookup failed", denied_permission=(
+                    _safe_denied_permission(body) if response.status == 403 else None
+                ))
             try:
                 metadata = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -390,10 +507,12 @@ class GoogleStorageJsonClient:
             if not isinstance(metadata, dict):
                 raise PublishError("Cloud Storage metadata is invalid")
             return metadata
-        except PublishError:
+        except PublishError as exc:
+            exc.stage = "metadata"
+            exc.http_status = response_status
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError):
-            raise PublishError("Cloud Storage metadata lookup failed") from None
+            raise PublishError("Cloud Storage metadata lookup failed", stage="metadata", http_status=response_status) from None
         finally:
             connection.close()
 
@@ -412,12 +531,16 @@ class GoogleStorageJsonClient:
         connection = self._connection()
         digest = hashlib.sha256()
         total = 0
+        response_status = None
         try:
             connection.request("GET", target, headers=self._headers())
             response = connection.getresponse()
+            response_status = response.status
             if response.status != 200:
-                _bounded_response(response)
-                raise PublishError("Cloud Storage generation-pinned read failed")
+                body = _bounded_response(response)
+                raise PublishError("Cloud Storage generation-pinned read failed", denied_permission=(
+                    _safe_denied_permission(body) if response.status == 403 else None
+                ))
             while True:
                 chunk = response.read(min(CHUNK_BYTES, maximum_bytes - total + 1))
                 if not chunk:
@@ -427,10 +550,12 @@ class GoogleStorageJsonClient:
                     raise PublishError("Cloud Storage object exceeded expected size")
                 digest.update(chunk)
             return digest.hexdigest(), total
-        except PublishError:
+        except PublishError as exc:
+            exc.stage = "readback"
+            exc.http_status = response_status
             raise
         except (OSError, http.client.HTTPException, ssl.SSLError):
-            raise PublishError("Cloud Storage generation-pinned read failed") from None
+            raise PublishError("Cloud Storage generation-pinned read failed", stage="readback", http_status=response_status) from None
         finally:
             connection.close()
 
@@ -488,12 +613,16 @@ def _publish_with_token(
     bom_path: Path,
     signature_path: Path,
     client_factory: Callable[[str], object],
+    progress: _PublicationProgress | None = None,
 ) -> dict[str, object]:
+    progress = progress if progress is not None else _PublicationProgress()
     for variable in BROAD_CREDENTIAL_ENVIRONMENT:
         if os.environ.get(variable):
             raise PublishError("broad Google credential environment is forbidden")
+    progress.stage = "token"
     token = _load_token(token_path)
     _destroy_token(token_path)
+    progress.stage = "manifest"
     manifest_source = _open_verified_input(
         manifest_path, maximum_bytes=MAX_MANIFEST_BYTES
     )
@@ -505,22 +634,28 @@ def _publish_with_token(
     local: dict[str, VerifiedInput] = {}
     client: object | None = None
     try:
+        progress.stage = "inputs"
         for field, path in (
             ("artifact", artifact_path),
             ("bom", bom_path),
             ("signature", signature_path),
         ):
+            progress.object_field = field
             local[field] = _open_verified_input(
                 path, maximum_bytes=MAX_ARTIFACT_BYTES
             )
+        progress.stage = "validation"
+        progress.object_field = None
         inode_ids = {(item.details.st_dev, item.details.st_ino) for item in local.values()}
         if len(inode_ids) != len(local):
             raise PublishError("candidate inputs must be distinct files")
-        identities = {
-            field: _validate_local_descriptor(manifest, field, source)
-            for field, source in local.items()
-        }
+        identities = {}
+        for field, source in local.items():
+            progress.object_field = field
+            identities[field] = _validate_local_descriptor(manifest, field, source)
+        progress.object_field = "bom"
         prefix = _validate_bom_prefix(local["bom"], manifest)
+        progress.object_field = None
         remote = {
             "artifact": prefix + local["artifact"].path.name,
             "bom": prefix + "release-bom.json",
@@ -532,19 +667,24 @@ def _publish_with_token(
         ):
             raise PublishError("candidate object set escaped its exact prefix")
 
+        progress.stage = "client"
         client = client_factory(token)
         token = ""
         published: list[dict[str, object]] = []
         for field in ("bom", "signature", "artifact"):
+            progress.stage = "insert"
+            progress.object_field = field
             object_name = remote[field]
             expected_digest, expected_size = identities[field]
             status, metadata = client.insert(object_name, local[field])
             created = status in (200, 201)
             if status == 412:
+                progress.stage = "metadata"
                 metadata = client.metadata(object_name)
             elif not created:
                 raise PublishError("Cloud Storage insert returned an unexpected status")
             try:
+                progress.stage = "verification"
                 generation = _validated_metadata(
                     metadata, object_name=object_name, expected_size=expected_size
                 )
@@ -554,9 +694,11 @@ def _publish_with_token(
                         "remote bytes differ from the exact candidate input"
                     ) from None
                 raise
+            progress.stage = "readback"
             remote_digest, remote_size = client.digest(
                 object_name, generation, maximum_bytes=expected_size
             )
+            progress.stage = "verification"
             if remote_size != expected_size or remote_digest != expected_digest:
                 raise PublishError("remote bytes differ from the exact candidate input")
             published.append(
@@ -597,6 +739,7 @@ def publish(
     client_factory: Callable[[str], object] = GoogleStorageJsonClient,
 ) -> dict[str, object]:
     token_path = Path(token_path)
+    progress = _PublicationProgress()
     try:
         return _publish_with_token(
             token_path=token_path,
@@ -605,9 +748,23 @@ def publish(
             bom_path=Path(bom_path),
             signature_path=Path(signature_path),
             client_factory=client_factory,
+            progress=progress,
         )
+    except PublishError as exc:
+        if exc.stage == "unknown":
+            exc.stage = progress.stage
+        if exc.object_field is None:
+            exc.object_field = progress.object_field
+        raise
+    except Exception:
+        raise PublishError("unexpected internal failure", stage=progress.stage,
+                           object_field=progress.object_field) from None
     finally:
-        _destroy_token(token_path)
+        try:
+            _destroy_token(token_path)
+        except PublishError as exc:
+            exc.stage = "cleanup"
+            raise
 
 
 def _install_cleanup_signal_handlers() -> None:
@@ -635,8 +792,12 @@ def main(argv: list[str] | None = None) -> int:
             bom_path=arguments.bom,
             signature_path=arguments.signature,
         )
-    except (PublishError, KeyboardInterrupt):
+    except (PublishError, KeyboardInterrupt) as exc:
+        error = exc if isinstance(exc, PublishError) else PublishError(
+            "publication interrupted", stage="interrupted"
+        )
         print("candidate Cloud Storage publication failed closed", file=sys.stderr)
+        print(json.dumps(_safe_failure(error), sort_keys=True, separators=(",", ":")), file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0

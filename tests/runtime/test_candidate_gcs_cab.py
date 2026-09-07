@@ -661,6 +661,104 @@ class CandidateGcsCabTest(unittest.TestCase):
         self.assertIn("http.client.HTTPSConnection", source)
         self.assertNotIn("ProxyHandler", source)
 
+    def test_publisher_diagnostics_only_emit_fixed_enums(self) -> None:
+        sentinel = "SECRET-token-response-exception-path"
+        for status in (sentinel, True, 999, [], {}):
+            error = self.publish.PublishError(
+                sentinel, stage=sentinel, http_status=status, object_field=sentinel,
+                denied_permission=sentinel,
+            )
+            result = self.publish._safe_failure(error)
+            self.assertEqual(result, {
+                "kind": "nuvion-iq9075-candidate-gcs-stage-failure",
+                "code": "PUBLICATION_BOUNDARY_FAILED", "stage": "unknown",
+                "httpStatus": None, "object": None, "deniedPermission": None,
+            })
+            self.assertNotIn(sentinel, json.dumps(result))
+        error = self.publish.PublishError(
+            "Cloud Storage insert failed", stage="insert", http_status=403,
+            object_field="bom",
+        )
+        self.assertEqual(self.publish._safe_failure(error)["code"], "GCS_INSERT_FAILED")
+        self.assertEqual(self.publish._safe_failure(error)["httpStatus"], 403)
+        self.assertEqual(self.publish._safe_failure(error)["object"], "bom")
+
+    def test_publisher_main_diagnostics_never_print_exception_text(self) -> None:
+        sentinel = "SECRET-raw-exception-body"
+        for failure in (
+            self.publish.PublishError(sentinel, stage="readback", http_status=403,
+                                      object_field="signature"),
+            KeyboardInterrupt(sentinel),
+        ):
+            with self.subTest(kind=type(failure).__name__):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(self.publish, "publish", side_effect=failure), \
+                     mock.patch.object(self.publish, "_install_cleanup_signal_handlers"), \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    status = self.publish.main([
+                        "--token-file", "/unused/cab-token", "--manifest", "/unused/manifest",
+                        "--artifact", "/unused/artifact", "--bom", "/unused/bom",
+                        "--signature", "/unused/signature",
+                    ])
+                self.assertEqual(status, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertNotIn(sentinel, errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
+                diagnostic = json.loads(errors.getvalue().splitlines()[-1])
+                self.assertEqual(set(diagnostic), {"kind", "code", "stage", "httpStatus", "object", "deniedPermission"})
+
+    def test_publisher_permission_diagnostic_never_echoes_message(self) -> None:
+        for permission in self.publish.SAFE_DENIED_PERMISSIONS:
+            body = json.dumps({"error": {"message": "SECRET-identity does not have " + permission + " access"}}).encode()
+            self.assertEqual(self.publish._safe_denied_permission(body), permission)
+        for body in (
+            b"SECRET-response", b"[]", b'{"error":{"message":[]}}',
+            b'{"error":{"message":"storage.objects.getIamPolicyExtra"}}',
+            b'{"error":{"message":"prefix.storage.objects.get"}}',
+            b'{"error":{"message":"storage.objects.get storage.objects.create"}}',
+            b"X" * (self.publish.MAX_METADATA_BYTES + 1),
+        ):
+            self.assertIsNone(self.publish._safe_denied_permission(body))
+
+    def test_publisher_progress_identifies_failed_object_and_never_exposes_raw_error(self) -> None:
+        sentinel = "SECRET-transport-error-response"
+        publisher = self.publish
+        for boundary in ("insert", "metadata", "readback", "unexpected"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as raw_root:
+                inputs = self._candidate_fixture(Path(raw_root))
+
+                class FailingClient(FakeGcsClient):
+                    def insert(self, object_name, source):
+                        if object_name.endswith("release-bom.json.sig"):
+                            if boundary == "insert":
+                                raise publisher.PublishError("Cloud Storage insert failed", http_status=403)
+                            if boundary == "metadata":
+                                return 412, {}
+                            if boundary == "unexpected":
+                                raise RuntimeError(sentinel)
+                        return super().insert(object_name, source)
+
+                    def metadata(self, object_name):
+                        raise publisher.PublishError("Cloud Storage metadata lookup failed", http_status=403)
+
+                    def digest(self, object_name, generation, *, maximum_bytes):
+                        if boundary == "readback" and object_name.endswith("release-bom.json.sig"):
+                            raise publisher.PublishError("Cloud Storage generation-pinned read failed", http_status=403)
+                        return super().digest(object_name, generation, maximum_bytes=maximum_bytes)
+
+                with self.assertRaises(publisher.PublishError) as raised:
+                    publisher.publish(
+                        token_path=inputs["token"], manifest_path=inputs["manifest"],
+                        artifact_path=inputs["artifact"], bom_path=inputs["bom"],
+                        signature_path=inputs["signature"], client_factory=lambda _token: FailingClient(),
+                    )
+                result = publisher._safe_failure(raised.exception)
+                self.assertEqual(result["object"], "signature")
+                self.assertEqual(result["stage"], "insert" if boundary == "unexpected" else boundary)
+                self.assertEqual(result["httpStatus"], None if boundary == "unexpected" else 403)
+                self.assertNotIn(sentinel, json.dumps(result))
+                self.assertFalse(inputs["token"].exists())
+
     def test_publisher_binds_validation_and_upload_to_one_open_descriptor(self) -> None:
         source = PUBLISH_PATH.read_text(encoding="utf-8")
         self.assertIn("class VerifiedInput", source)
