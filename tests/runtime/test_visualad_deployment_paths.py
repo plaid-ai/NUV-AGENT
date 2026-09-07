@@ -62,11 +62,14 @@ class VisualADDeploymentPathTests(unittest.TestCase):
             "NUVION_VISUALAD_HTP_MANIFEST",
             "NUVION_VISUALAD_HTP_MANIFEST_SHA256",
             "NUVION_VISUALAD_THRESHOLD",
+            "NUVION_MODEL_POINTER",
+            "NUVION_MODEL_DIGEST",
         )
         output = "\n".join(f'printf "%s\\n" "${name}"' for name in output_names)
         environment = {
             "PATH": os.environ.get("PATH", os.defpath),
             "NUVION_VISUALAD_HTP_MANIFEST_SHA256": "a" * 64,
+            "NUVION_MODEL_DIGEST": "",
             # The real unit injects this; existing demo isolation must survive.
             "NUVION_SETTINGS_STATE_DIR": "/outside/original-fleet-settings",
             **(overrides or {}),
@@ -163,6 +166,52 @@ class VisualADDeploymentPathTests(unittest.TestCase):
                     result, values = self._run({variable: value})
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(values)
+
+    def test_fleet_opt_in_preserves_bootstrap_model_and_requires_explicit_dependencies(
+        self,
+    ):
+        opted_in = {
+            "NUVION_VISUALAD_HTP_FLEET_ENABLED": "true",
+            "NUVION_VISUALAD_HTP_FLEET_STORE": str(self.root / "models"),
+            "NUVION_MODEL_POINTER": "visualad/iq9075-htp-demo",
+            "NUVION_MODEL_DIGEST": "sha256:" + "b" * 64,
+            "NUVION_COMMAND_INBOX_PATH": str(self.root / "inbox.sqlite3"),
+        }
+        result, values = self._run(opted_in)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values["NUVION_FLEET_COMMAND_ENABLED"], "true")
+        self.assertEqual(values["NUVION_MODEL_DIGEST"], opted_in["NUVION_MODEL_DIGEST"])
+        self.assertEqual(
+            values["NUVION_MODEL_POINTER"], opted_in["NUVION_MODEL_POINTER"]
+        )
+        self.assertEqual(values["NUVION_ZERO_SHOT_SAMPLE_SEC"], "0")
+        for key in (
+            "NUVION_VISUALAD_HTP_FLEET_STORE",
+            "NUVION_MODEL_POINTER",
+            "NUVION_MODEL_DIGEST",
+            "NUVION_COMMAND_INBOX_PATH",
+        ):
+            with self.subTest(key=key):
+                result, _ = self._run({**opted_in, key: ""})
+                self.assertNotEqual(result.returncode, 0)
+        for flag in ("", "TRUE", "typo", "1"):
+            with self.subTest(flag=flag):
+                result, _ = self._run(
+                    {**opted_in, "NUVION_VISUALAD_HTP_FLEET_ENABLED": flag}
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_real_fleet_startup_guard_precedes_pipeline_import_but_not_import_check(
+        self,
+    ):
+        source = LAUNCHER.read_text()
+        guard = source.index("prepare_fleet_startup()")
+        self.assertLess(
+            guard, source.index("from nuvion_app.inference import pipeline")
+        )
+        self.assertIn(
+            'if sys.argv[5] == "true" and sys.argv[4] != "--import-check":', source
+        )
 
 
 if __name__ == "__main__":

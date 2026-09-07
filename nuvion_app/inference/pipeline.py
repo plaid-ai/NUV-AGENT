@@ -175,6 +175,13 @@ from nuvion_app.runtime.platform_identity import (
 from nuvion_app.runtime.fleet_capabilities import (
     RUNTIME_ONLY_FLEET_CAPABILITIES,
     SIGLIP_MODEL_CONFIG_CAPABILITY,
+    VISUALAD_HTP_MODEL_CONFIG_CAPABILITY,
+)
+from nuvion_app.runtime.visualad_fleet import (
+    FleetVisualADHTPAnomalyDetector,
+    STORE_ENV as VISUALAD_FLEET_STORE_ENV,
+    build_visualad_fleet_detector,
+    select_visualad_fleet_model,
 )
 from nuvion_app.runtime.telemetry import (
     build_runtime_telemetry,
@@ -1773,7 +1780,12 @@ def build_model_config_capabilities() -> frozenset[str]:
             and callable(getattr(adapter, "can_verify_model", None))
             and adapter.can_verify_model()
         ):
-            return frozenset({SIGLIP_MODEL_CONFIG_CAPABILITY})
+            capability = (
+                VISUALAD_HTP_MODEL_CONFIG_CAPABILITY
+                if adapter.app.user_data.backend == "visualad_htp"
+                else SIGLIP_MODEL_CONFIG_CAPABILITY
+            )
+            return frozenset({capability})
     except Exception:  # noqa: BLE001 - unavailable runtime must not grant capability.
         return frozenset()
     return frozenset()
@@ -1824,6 +1836,17 @@ def build_dynamic_runtime_telemetry(
     user_data = getattr(g_app, "user_data", None)
     if getattr(user_data, "backend", None) in {"visualad", "visualad_htp"}:
         detector = getattr(user_data, "zero_shot", None)
+        if isinstance(detector, FleetVisualADHTPAnomalyDetector):
+            proof = detector.loaded_model_proof()
+            if getattr(user_data, "inference_failed", False) or not getattr(user_data, "running", False):
+                proof = None
+            # Loaded, fresh wrapper bytes are authoritative; startup env and
+            # the unrelated generic resolver snapshot are never actual proof.
+            merged["modelObservedPointer"] = proof["pointer"] if proof else "unknown"
+            merged["modelDigest"] = proof["digest"] if proof else "unknown"
+            merged["modelAggregateDigest"] = "unknown"
+            if proof is None:
+                merged["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
         sampled_at = getattr(user_data, "last_inference_at", None)
         sample_age = max(0.0, time.monotonic() - sampled_at) if sampled_at is not None else None
         ready = bool(getattr(detector, "ready", False))
@@ -2457,7 +2480,7 @@ async def webrtc_stats_sender(runtime: FleetCommandRuntime) -> None:
 
 
 async def signaling_client_main():
-    global websocket, signaling_loop, outbound_queue
+    global signaling_loop, outbound_queue
 
     if signaling_loop is None:
         signaling_loop = asyncio.get_running_loop()
@@ -2466,18 +2489,28 @@ async def signaling_client_main():
     initialize_durable_event_outbox()
     await refresh_updater_runtime_telemetry()
     updater_refresh_task = asyncio.create_task(updater_telemetry_refresh_sender())
-    command_runtime = initialize_fleet_command_runtime()
-    if command_runtime is not None:
-        try:
-            # Boot verification/rollback is local and must not wait for login or
-            # WebSocket availability. Lifecycle ACK/observations remain durable.
-            await command_runtime.reconcile_effects()
-        except Exception as exc:  # noqa: BLE001 - durable lease retries on connect.
-            log.error(
-                "[FLEET-EFFECT] startup reconciliation failed type=%s detail=%s",
-                type(exc).__name__,
-                str(exc)[:500],
+    fleet_effect_task = None
+    try:
+        command_runtime = initialize_fleet_command_runtime()
+        if command_runtime is not None:
+            # This worker belongs to the process, not a WebSocket connection.
+            # Startup retries, health verification and LKG rollback must keep
+            # running while login/transport is unavailable. ACKs remain durable.
+            fleet_effect_task = asyncio.create_task(
+                fleet_effect_reconcile_sender(command_runtime)
             )
+        await _signaling_transport_main(command_runtime)
+    finally:
+        local_tasks = [updater_refresh_task]
+        if fleet_effect_task is not None:
+            local_tasks.append(fleet_effect_task)
+        for task in local_tasks:
+            task.cancel()
+        await asyncio.gather(*local_tasks, return_exceptions=True)
+
+
+async def _signaling_transport_main(command_runtime):
+    global websocket
 
     while True:
         token = await login()
@@ -2536,7 +2569,6 @@ async def signaling_client_main():
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
                 connectivity_task = None
                 fleet_command_poll_task = None
-                fleet_effect_task = None
                 webrtc_stats_task = None
                 fleet_observation_task = None
                 if CONNECTIVITY_ENABLED:
@@ -2573,9 +2605,6 @@ async def signaling_client_main():
                         _set_update_commit_signaling_ready(True)
                     fleet_command_poll_task = asyncio.create_task(
                         fleet_command_poll_sender(command_runtime)
-                    )
-                    fleet_effect_task = asyncio.create_task(
-                        fleet_effect_reconcile_sender(command_runtime)
                     )
                     webrtc_stats_task = asyncio.create_task(
                         webrtc_stats_sender(command_runtime)
@@ -2627,8 +2656,6 @@ async def signaling_client_main():
                 connectivity_task.cancel()
             if "fleet_command_poll_task" in locals() and fleet_command_poll_task is not None:
                 fleet_command_poll_task.cancel()
-            if "fleet_effect_task" in locals() and fleet_effect_task is not None:
-                fleet_effect_task.cancel()
             if "webrtc_stats_task" in locals() and webrtc_stats_task is not None:
                 webrtc_stats_task.cancel()
             if "fleet_observation_task" in locals() and fleet_observation_task is not None:
@@ -2702,13 +2729,18 @@ class NuvionEventState:
         self.last_inference_model_sha256: str | None = None
 
         if self.backend == "visualad_htp":
-            self.zero_shot = VisualADHTPAnomalyDetector(
-                enabled=ZERO_SHOT_ENABLED,
-                manifest_path=os.getenv("NUVION_VISUALAD_HTP_MANIFEST", ""),
-                manifest_sha256=os.getenv("NUVION_VISUALAD_HTP_MANIFEST_SHA256", ""),
-                state_dir=os.getenv("NUVION_VISUALAD_HTP_STATE_DIR", "/var/lib/nuv-agent/visualad-htp"),
-                threshold=float(os.getenv("NUVION_VISUALAD_THRESHOLD", "0.0")),
-            )
+            if os.getenv(VISUALAD_FLEET_STORE_ENV):
+                if not ZERO_SHOT_ENABLED:
+                    raise ValueError("VisualAD Fleet requires enabled HTP inference")
+                self.zero_shot = build_visualad_fleet_detector(os.environ)
+            else:
+                self.zero_shot = VisualADHTPAnomalyDetector(
+                    enabled=ZERO_SHOT_ENABLED,
+                    manifest_path=os.getenv("NUVION_VISUALAD_HTP_MANIFEST", ""),
+                    manifest_sha256=os.getenv("NUVION_VISUALAD_HTP_MANIFEST_SHA256", ""),
+                    state_dir=os.getenv("NUVION_VISUALAD_HTP_STATE_DIR", "/var/lib/nuv-agent/visualad-htp"),
+                    threshold=float(os.getenv("NUVION_VISUALAD_THRESHOLD", "0.0")),
+                )
             if not self.zero_shot.enabled:
                 self.backend = "none"
         elif self.backend == "visualad":
@@ -3547,7 +3579,11 @@ class PipelineSettingsRuntimeAdapter:
                 return False
             if current_state != Gst.State.PLAYING:
                 return False
-            return 100 <= self.encoder.read_bitrate_kbps() <= 20_000
+            if not 100 <= self.encoder.read_bitrate_kbps() <= 20_000:
+                return False
+            if isinstance(getattr(self.app.user_data, "zero_shot", None), FleetVisualADHTPAnomalyDetector):
+                return self.can_verify_model()
+            return True
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return False
 
@@ -3584,12 +3620,53 @@ class PipelineSettingsRuntimeAdapter:
         if self.app.pipeline is None or not self.app.user_data.running:
             return False
         try:
+            if self.app.user_data.backend == "visualad_htp":
+                detector = self._fleet_visualad_detector()
+                return (
+                    detector.loaded_model_proof() is not None
+                    and not getattr(self.app.user_data, "inference_failed", False)
+                )
             self._loaded_siglip_model_source()
         except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
             return False
         return True
 
+    def _fleet_visualad_detector(self) -> FleetVisualADHTPAnomalyDetector:
+        detector = getattr(self.app.user_data, "zero_shot", None)
+        if self.app.user_data.backend != "visualad_htp" or not isinstance(detector, FleetVisualADHTPAnomalyDetector):
+            raise UnsupportedSettingsEffect("active backend has no VisualAD Fleet model adapter")
+        if (
+            Path(self.model_dir).resolve(strict=True) != detector.selection.directory
+            or self.model_pointer != detector.selection.pointer
+        ):
+            raise RuntimeError("active VisualAD Fleet source/pointer differs from settings runtime")
+        return detector
+
+    def startup_pending(self) -> bool:
+        detector = getattr(self.app.user_data, "zero_shot", None)
+        return (
+            self.app.user_data.backend == "visualad_htp"
+            and self.app.user_data.running
+            and isinstance(detector, FleetVisualADHTPAnomalyDetector)
+            and detector.startup_pending()
+        )
+
+    def preflight_model(self, desired) -> None:
+        if self.app.user_data.backend == "siglip":
+            return
+        detector = self._fleet_visualad_detector()
+        select_visualad_fleet_model(
+            detector.selection.store,
+            str(desired.get("pointer") or ""),
+            str(desired.get("digest") or ""),
+            verify_artifacts=True,
+        )
+
     def verify_model(self, desired) -> dict[str, str]:
+        if self.app.user_data.backend == "visualad_htp":
+            if not self.can_verify_model():
+                raise RuntimeError("VisualAD Fleet inference is not freshly healthy")
+            return self._fleet_visualad_detector().verify_model(desired)
         actual_source = self._loaded_siglip_model_source()
         if str(desired.get("pointer") or "") != self.model_pointer:
             raise RuntimeError("active configured model pointer mismatch")
@@ -3892,7 +3969,11 @@ class GStreamerInferenceApp:
                     app=self,
                     encoder=self.encoder_adapter,
                     model_pointer=MODEL_POINTER,
-                    model_dir=resolve_model_dir(resolve_effective_profile()),
+                    model_dir=(
+                        self.user_data.zero_shot.selection.directory
+                        if isinstance(self.user_data.zero_shot, FleetVisualADHTPAnomalyDetector)
+                        else resolve_model_dir(resolve_effective_profile())
+                    ),
                 )
                 fleet_effect_registry.register(
                     SettingsReconciler(

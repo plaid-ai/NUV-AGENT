@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from nuvion_app.inference.command_inbox import DurableCommandInbox
 from nuvion_app.inference.command_observation import DurableCommandObservationOutbox
@@ -430,7 +431,9 @@ class SettingsReconcilerTest(unittest.TestCase):
             500,
         )
         self.assertTrue(reopened_inbox.accept(stale).duplicate)
-        self.assertEqual(reopened_inbox.get(stale.command_id).code, "STALE_CONFIG_VERSION")
+        self.assertEqual(
+            reopened_inbox.get(stale.command_id).code, "STALE_CONFIG_VERSION"
+        )
 
     def test_restart_requires_new_process_and_actual_model_digest(self) -> None:
         requested_model = {
@@ -453,6 +456,80 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(succeeded.status, "SUCCEEDED")
         self.assertEqual(succeeded.reported_state["model"], requested_model)
         self.assertEqual(succeeded.reported_state["health"], "FUNCTIONAL_HEALTHY")
+
+    def test_model_startup_defers_without_restart_then_exact_proof_commits(
+        self,
+    ) -> None:
+        desired = {
+            "pointer": "visualad/iq9075-htp-demo",
+            "digest": "sha256:" + "b" * 64,
+        }
+        command = _command(30, activation="RESTART", sections={"model": desired})
+        self._reconciler(_Runtime(), "before").reconcile(command)
+        runtime = _Runtime()
+        runtime.startup_pending = mock.Mock(return_value=True)
+        runtime.verify_model = mock.Mock(return_value=desired)
+        now = [0.0]
+        restarted = SettingsReconciler(
+            store=AtomicSettingsStore(self.config_path, self.root / "state"),
+            runtime=runtime,
+            process_instance_id="after",
+            startup_clock=lambda: now[0],
+            event_outbox_health_provider=_healthy_event_outbox,
+            command_outbox_health_provider=_healthy_command_outbox,
+        )
+        for clock in (0.0, 599.0):
+            now[0] = clock
+            outcome = restarted.reconcile(command)
+            self.assertEqual(outcome.reported_state["health"], "MODEL_STARTUP_PENDING")
+            self.assertEqual(outcome.checkpoint["nextAction"], "RETRY_EFFECT")
+            self.assertFalse(outcome.checkpoint["restartRequired"])
+        runtime.verify_model.assert_not_called()
+        self.assertEqual(restarted.store.marker()["phase"], "ACTIVATED")
+        runtime.startup_pending.return_value = False
+        self.assertEqual(restarted.reconcile(command).status, "SUCCEEDED")
+        self.assertEqual(restarted.store.marker()["phase"], "COMMITTED")
+
+    def test_model_startup_timeout_cannot_extend_pending_or_claim_healthy(self) -> None:
+        desired = {
+            "pointer": "visualad/iq9075-htp-demo",
+            "digest": "sha256:" + "c" * 64,
+        }
+        command = _command(31, activation="RESTART", sections={"model": desired})
+        self._reconciler(_Runtime(), "before").reconcile(command)
+        runtime = _Runtime()
+        runtime.startup_pending = lambda: True
+        now = [0.0]
+        restarted = SettingsReconciler(
+            store=AtomicSettingsStore(self.config_path, self.root / "state"),
+            runtime=runtime,
+            process_instance_id="after",
+            startup_clock=lambda: now[0],
+            event_outbox_health_provider=_healthy_event_outbox,
+            command_outbox_health_provider=_healthy_command_outbox,
+        )
+        now[0] = 600.0
+        outcome = restarted.reconcile(command)
+        self.assertEqual(outcome.reported_state["health"], "ROLLBACK_RESTART_REQUIRED")
+        self.assertEqual(restarted.store.marker()["phase"], "ROLLBACK_STAGED")
+
+    def test_model_preflight_failure_preserves_active_overlay_and_marker(self) -> None:
+        runtime = _Runtime()
+        runtime.preflight_model = mock.Mock(
+            side_effect=ValueError("target not provisioned")
+        )
+        desired = {
+            "pointer": "visualad/iq9075-htp-demo",
+            "digest": "sha256:" + "d" * 64,
+        }
+        command = _command(32, activation="RESTART", sections={"model": desired})
+        reconciler = self._reconciler(runtime, "before")
+        result = reconciler.reconcile(command)
+        self.assertEqual(result.status, "FAILED")
+        self.assertEqual(result.code, "MODEL_PREFLIGHT_FAILED")
+        self.assertIsNone(reconciler.store.marker())
+        self.assertFalse(reconciler.store.active_path.exists())
+        self.assertEqual(self.config_path.read_bytes(), self.original)
 
     def test_restart_wrong_model_digest_stages_lkg_rollback(self) -> None:
         requested_model = {
@@ -481,7 +558,9 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(recovered.status, "ROLLED_BACK")
         self.assertEqual(recovered.reported_state["health"], "LKG_RESTORED")
         self.assertEqual(
-            AtomicSettingsStore(self.config_path, self.root / "state").marker()["phase"],
+            AtomicSettingsStore(self.config_path, self.root / "state").marker()[
+                "phase"
+            ],
             "ROLLED_BACK",
         )
         self.assertEqual(
@@ -528,7 +607,9 @@ class SettingsReconcilerTest(unittest.TestCase):
             restart_requester=lambda: True,
         ).run_once()
         self.assertEqual(first.processed, 1)
-        self.assertEqual(store.get_job(command.command_id).phase, JOB_PHASE_WAITING_RESTART)
+        self.assertEqual(
+            store.get_job(command.command_id).phase, JOB_PHASE_WAITING_RESTART
+        )
         self.assertEqual(inbox.get(command.command_id).status, "IN_PROGRESS")
         self.assertEqual(observations.pending(), [])
 
@@ -578,7 +659,67 @@ class SettingsReconcilerTest(unittest.TestCase):
         )
         self.assertEqual(len(observations.pending()), 1)
 
-    def test_restart_without_supervisor_support_fails_before_settings_mutation(self) -> None:
+    def test_startup_retry_preserves_inbox_sequence_and_does_not_restart_again(self):
+        desired = {
+            "pointer": "visualad/iq9075-htp-demo",
+            "digest": "sha256:" + "e" * 64,
+        }
+        command = _command(33, activation="RESTART", sections={"model": desired})
+        inbox = DurableCommandInbox(self.root / "startup-retry.sqlite3")
+        observations = DurableCommandObservationOutbox(inbox)
+        clock = [100.0]
+        store = DurableReconcileStore(
+            inbox, observation_outbox=observations, monotonic_clock=lambda: clock[0]
+        )
+        inbox.accept(command)
+        inbox.transition(command.command_id, "IN_PROGRESS")
+        inbox.run_transactional_effect(
+            command.command_id,
+            lambda connection: store.stage_verified(command, connection),
+        )
+        registry = ReconcilerRegistry()
+        registry.register(self._reconciler(_Runtime(), "process-a"))
+        restart = mock.Mock(return_value=True)
+        FleetEffectCoordinator(
+            inbox=inbox,
+            store=store,
+            registry=registry,
+            process_instance_id="process-a",
+            restart_requester=restart,
+        ).run_once()
+        restart.assert_called_once()
+        runtime = _Runtime()
+        runtime.state["model"] = desired
+        runtime.startup_pending = mock.Mock(return_value=True)
+        registry = ReconcilerRegistry()
+        registry.register(self._reconciler(runtime, "process-b"))
+        extra_restart = mock.Mock(return_value=True)
+        coordinator = FleetEffectCoordinator(
+            inbox=inbox,
+            store=store,
+            registry=registry,
+            process_instance_id="process-b",
+            restart_requester=extra_restart,
+        )
+        pending = coordinator.run_once()
+        self.assertEqual(pending.terminal_acks, ())
+        self.assertEqual(inbox.get(command.command_id).status, "IN_PROGRESS")
+        self.assertEqual(observations.pending(), [])
+        self.assertEqual(
+            store.get_job(command.command_id).checkpoint["nextAction"], "RETRY_EFFECT"
+        )
+        extra_restart.assert_not_called()
+        runtime.startup_pending.return_value = False
+        clock[0] += 120.0
+        complete = coordinator.run_once()
+        self.assertEqual([ack.status for ack in complete.terminal_acks], ["SUCCEEDED"])
+        self.assertEqual(inbox.get(command.command_id).sequence, command.sequence)
+        self.assertEqual(len(observations.pending()), 1)
+        extra_restart.assert_not_called()
+
+    def test_restart_without_supervisor_support_fails_before_settings_mutation(
+        self,
+    ) -> None:
         command = _command(13, activation="RESTART")
         inbox = DurableCommandInbox(self.root / "unsupported-restart.sqlite3")
         store = DurableReconcileStore(inbox)
@@ -710,7 +851,9 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(encoder.bitrate, 1400)
         self.assertFalse(settings.store.active_path.exists())
 
-    def test_model_identity_hashes_actual_artifact_and_rejects_wrong_digest(self) -> None:
+    def test_model_identity_hashes_actual_artifact_and_rejects_wrong_digest(
+        self,
+    ) -> None:
         model_dir = self.root / "model"
         metadata = model_dir / "metadata"
         metadata.mkdir(parents=True)
@@ -803,9 +946,7 @@ class SettingsReconcilerTest(unittest.TestCase):
                     crashing.stage_and_activate(
                         command=replacement,
                         process_instance_id="crashing-process",
-                        settings_digest=canonical_settings_digest(
-                            replacement.payload
-                        ),
+                        settings_digest=canonical_settings_digest(replacement.payload),
                     )
 
                 recovered = AtomicSettingsStore(self.config_path, state_dir)
