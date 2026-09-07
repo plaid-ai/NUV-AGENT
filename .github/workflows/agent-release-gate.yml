@@ -14,6 +14,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  observe-standalone-oidc-identity:
+    name: Observe non-secret standalone OIDC identity metadata
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      id-token: write
+    steps:
+      - name: Observe only workflow identity fields without credentials or artifacts
+        env:
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EXPECTED_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          endpoint = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+          parsed = urllib.parse.urlsplit(endpoint)
+          if parsed.scheme != 'https' or parsed.username or parsed.password:
+              raise SystemExit('OIDC endpoint must be HTTPS')
+          separator = '&' if parsed.query else '?'
+          audience = 'nuvion-iq9075-identity-observation'
+          request = urllib.request.Request(
+              endpoint + separator + urllib.parse.urlencode({'audience': audience}),
+              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  value = json.load(response)['value']
+              pieces = value.split('.')
+              if len(pieces) != 3:
+                  raise ValueError('JWT shape')
+              claims = json.loads(base64.urlsafe_b64decode(pieces[1] + '=' * (-len(pieces[1]) % 4)))
+          except (KeyError, ValueError, urllib.error.URLError):
+              raise SystemExit('OIDC metadata observation failed; token not logged') from None
+          fields = ('workflow_ref', 'workflow_sha', 'job_workflow_ref', 'job_workflow_sha', 'ref', 'ref_type', 'event_name')
+          observed = {key: claims[key] for key in fields if key in claims}
+          print(json.dumps({'kind': 'non-authorizing-oidc-metadata-observation', 'claims': observed,
+                            'expectedWorkflowRef': os.environ['EXPECTED_WORKFLOW_REF'],
+                            'expectedWorkflowSha': os.environ['EXPECTED_WORKFLOW_SHA']}, sort_keys=True))
+          # This is diagnostic metadata only. It never authorizes a release,
+          # uploads a JWT, enters a protected Environment, or reads a secret.
+          PY
+
   arm64-release-prerequisite:
     name: arm64-release-prerequisite
     runs-on: ubuntu-24.04-arm
