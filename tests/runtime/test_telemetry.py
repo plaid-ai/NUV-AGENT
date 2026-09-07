@@ -4,8 +4,11 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+from nuvion_app.runtime import telemetry as runtime_telemetry
 from nuvion_app.runtime.config_guard import CURRENT_CONFIG_SCHEMA_VERSION
 from nuvion_app.runtime.platform_identity import (
     PlatformProbe,
@@ -25,6 +28,44 @@ from nuvion_app.runtime.telemetry import (
 
 
 class RuntimeTelemetryTest(unittest.TestCase):
+    def test_static_profiles_and_effect_claims_cannot_advertise_runtime_fleet_features(
+        self,
+    ) -> None:
+        runtime_only = {
+            "fleet.auth.platform_admin.v1",
+            "command.config.model.siglip.v1",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = resolve_platform_identity(
+                environ={},
+                identity_path=root / "missing.json",
+                probe=PlatformProbe(
+                    system="Darwin",
+                    os_version="15",
+                    kernel_version="24",
+                    architecture="arm64",
+                    hardware_text="Apple MacBook Pro",
+                    accelerator_runtime="MPS",
+                    gstreamer_version="1.26.0",
+                ),
+            )
+            self.assertTrue(runtime_only.isdisjoint(identity.capabilities))
+            identity = replace(
+                identity, capabilities=identity.capabilities | runtime_only
+            )
+            telemetry = build_runtime_telemetry(
+                environ={},
+                model_dir=root,
+                platform_identity=identity,
+                effect_capabilities=runtime_only | {"command.config.apply"},
+            )
+        self.assertTrue(runtime_only.isdisjoint(telemetry["capabilities"]))
+        self.assertTrue(
+            runtime_only.isdisjoint(telemetry["runtimeTelemetry"]["capabilities"])
+        )
+        self.assertIn("command.config.apply", telemetry["capabilities"])
+
     def test_default_telemetry_schema_matches_runtime_config_guard(self) -> None:
         self.assertEqual(DEFAULT_CONFIG_SCHEMA, CURRENT_CONFIG_SCHEMA_VERSION)
 
@@ -185,8 +226,113 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertTrue(
             all(character in "0123456789abcdef" for character in digest[7:])
         )
+        self.assertEqual(telemetry["modelAggregateDigest"], digest)
 
-    def test_expected_model_digest_cannot_override_observed_artifact_digest(self) -> None:
+    def test_model_aggregate_digest_uses_same_verified_artifact_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            metadata_dir = model_dir / "metadata"
+            metadata_dir.mkdir()
+            entries = []
+            for key, filename, content in (
+                ("manifest", "manifest.json", b"actual-manifest"),
+                ("model", "model.bin", b"actual-model"),
+            ):
+                destination = model_dir / filename
+                destination.write_bytes(content)
+                entries.append(
+                    {
+                        "key": key,
+                        "dst": str(destination),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
+            (metadata_dir / "downloaded_from_server.json").write_text(
+                json.dumps(entries), encoding="utf-8"
+            )
+            (metadata_dir / "server_presign_response.json").write_text(
+                json.dumps(
+                    {"pointer": "siglip/observed", "modelDigest": "sha256:" + "f" * 64}
+                ),
+                encoding="utf-8",
+            )
+            canonical = "".join(
+                f"{entry['key']}:{entry['sha256']}\n" for entry in entries
+            ).encode("utf-8")
+            aggregate = "sha256:" + hashlib.sha256(canonical).hexdigest()
+            with patch.object(
+                runtime_telemetry,
+                "_verified_artifact_digests",
+                wraps=runtime_telemetry._verified_artifact_digests,
+            ) as verify:
+                telemetry = build_runtime_telemetry(
+                    environ={
+                        "NUVION_MODEL_POINTER": "siglip/expected-only",
+                        "NUVION_MODEL_DIGEST": aggregate,
+                    },
+                    model_dir=model_dir,
+                )
+            verify.assert_called_once_with(model_dir.resolve())
+            self.assertEqual(
+                runtime_telemetry.verify_model_artifact_identity(
+                    model_dir,
+                    expected_pointer="siglip/observed",
+                    expected_digest=aggregate,
+                ),
+                {"pointer": "siglip/observed", "digest": aggregate},
+            )
+        self.assertEqual(telemetry["modelDigest"], "sha256:" + entries[0]["sha256"])
+        self.assertEqual(telemetry["modelAggregateDigest"], aggregate)
+        self.assertEqual(telemetry["modelObservedPointer"], "siglip/observed")
+        self.assertEqual(telemetry["modelPointer"], "siglip/expected-only")
+        self.assertNotEqual(
+            telemetry["modelAggregateDigest"], telemetry["modelResolverDigest"]
+        )
+        self.assertEqual(
+            telemetry["runtimeTelemetry"]["modelAggregateDigest"], aggregate
+        )
+
+    def test_unverified_bytes_cannot_publish_aggregate_or_observed_pointer(
+        self,
+    ) -> None:
+        for scenario in ("missing-download-metadata", "tampered-artifact"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                model_dir = Path(tmp)
+                metadata_dir = model_dir / "metadata"
+                metadata_dir.mkdir()
+                declared = "sha256:" + "f" * 64
+                (metadata_dir / "server_presign_response.json").write_text(
+                    json.dumps({"pointer": "siglip/declared", "modelDigest": declared}),
+                    encoding="utf-8",
+                )
+                if scenario == "tampered-artifact":
+                    artifact = model_dir / "model.bin"
+                    artifact.write_bytes(b"tampered")
+                    (metadata_dir / "downloaded_from_server.json").write_text(
+                        json.dumps(
+                            [{"key": "model", "dst": str(artifact), "sha256": "f" * 64}]
+                        ),
+                        encoding="utf-8",
+                    )
+                telemetry = build_runtime_telemetry(
+                    environ={
+                        "NUVION_MODEL_POINTER": "siglip/declared",
+                        "NUVION_MODEL_DIGEST": declared,
+                    },
+                    model_dir=model_dir,
+                )
+                self.assertEqual(telemetry["modelDigest"], "unknown")
+                self.assertEqual(telemetry["modelAggregateDigest"], "unknown")
+                self.assertEqual(telemetry["modelObservedPointer"], "unknown")
+                self.assertEqual(telemetry["modelExpectedDigest"], declared)
+                self.assertEqual(telemetry["modelResolverDigest"], declared)
+                self.assertEqual(
+                    telemetry["runtimeTelemetry"]["modelAggregateDigest"], "unknown"
+                )
+
+    def test_expected_model_digest_cannot_override_observed_artifact_digest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             metadata_dir = model_dir / "metadata"
@@ -286,7 +432,9 @@ class RuntimeTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["bomId"], "unknown")
         self.assertIn("bomVerificationError", telemetry)
 
-    def test_updater_public_state_hook_requires_canonical_rollback_evidence(self) -> None:
+    def test_updater_public_state_hook_requires_canonical_rollback_evidence(
+        self,
+    ) -> None:
         public_state = {
             "functionalHealth": "FUNCTIONAL_HEALTHY",
             "updatePhase": "ROLLED_BACK",
@@ -314,7 +462,9 @@ class RuntimeTelemetryTest(unittest.TestCase):
                 {"functionalHealth": "HEALTHY"},
             )
 
-    def test_command_agent_update_is_not_advertised_without_registered_effect(self) -> None:
+    def test_command_agent_update_is_not_advertised_without_registered_effect(
+        self,
+    ) -> None:
         telemetry = build_runtime_telemetry(
             environ={},
             effect_capabilities=frozenset(),

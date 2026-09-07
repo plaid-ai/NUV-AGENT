@@ -1,0 +1,192 @@
+{
+  "status": "diagnostic_completed_not_deployment_acceptance",
+  "purpose": "HTP native vs explicit LayerNorm numerical diagnostic, not deployment acceptance",
+  "manifest_sha256": "eea3571da8af9f898743da5edb177d472cf4f2044c9749e339dd7fd74c175fbe",
+  "probe_sha256": "4032c115826d76205958c1f5f3a1eace75e6e1d8a18b3034ba62e3bf51b75764",
+  "cases": [
+    {
+      "name": "native",
+      "status": "diagnostic_completed",
+      "ep_options": {
+        "backend_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtp.so",
+        "enable_htp_fp16_precision": "1",
+        "offload_graph_io_quantization": "0",
+        "skip_qnn_version_check": "0",
+        "profiling_level": "detailed",
+        "profiling_file_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/native/qnn-profile.csv",
+        "enable_framework_op_trace": "1",
+        "framework_op_trace_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/native",
+        "dump_json_qnn_graph": "1",
+        "json_qnn_graph_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/native"
+      },
+      "session_create_seconds": 0.3361896850001358,
+      "ort_inference_seconds": 0.009424735002539819,
+      "profile_providers": [
+        "QNNExecutionProvider"
+      ],
+      "output_sha256": "5158fe354c550713bdc9e45d2c9c3f459c2464cdccfbdb6b9740282f82df6405",
+      "mean_abs_error": 0.00022964250820223242,
+      "max_abs_error": 0.015241622924804688,
+      "p99_abs_error": 0.0012917518615722656,
+      "hotspot_token_722_max_abs_error": 0.0022728443145751953
+    },
+    {
+      "name": "explicit",
+      "status": "diagnostic_completed",
+      "ep_options": {
+        "backend_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtp.so",
+        "enable_htp_fp16_precision": "1",
+        "offload_graph_io_quantization": "0",
+        "skip_qnn_version_check": "0",
+        "profiling_level": "detailed",
+        "profiling_file_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/explicit/qnn-profile.csv",
+        "enable_framework_op_trace": "1",
+        "framework_op_trace_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/explicit",
+        "dump_json_qnn_graph": "1",
+        "json_qnn_graph_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/layernorm-htp-micro-001/explicit"
+      },
+      "session_create_seconds": 0.3351888280012645,
+      "ort_inference_seconds": 0.020431223998457426,
+      "profile_providers": [
+        "QNNExecutionProvider"
+      ],
+      "output_sha256": "ffaf05ca3a3ce546b821249cc7e32ac8e83e64550b585b2babd0b1494abc7960",
+      "mean_abs_error": 0.0004515998880378902,
+      "max_abs_error": 0.030305862426757812,
+      "p99_abs_error": 0.0027027130126953125,
+      "hotspot_token_722_max_abs_error": 0.004204750061035156
+    }
+  ],
+  "elapsed_seconds": 0.8755322600009094,
+  "peak_rss_kib": 258920,
+  "manifest": {
+    "schema": "visualad_ln_precision_micro_v1",
+    "purpose": "native_vs_explicit_LN_diagnosis_not_deployment_or_ground_truth",
+    "sourceCommit": "97eb5f88a44f27c644ea7ed4ecac5e35ddef18bb",
+    "checkpointSha256": "fed8ed5e0973e9adb53a2c91e066eb5ba3f9a42fbf80f115a26998629d1f0a5b",
+    "backboneSha256": "fbc415c3d0d7b79faed8f5ccfb740c32b7c4f5ffe7283b851f89c6231c01a8e0",
+    "lnPostPolicy": "official_test_base",
+    "scriptSha256": "318c04ed4bea02bbead2bba98b3f2da6c6157640ceef8e824ed56104e0478f27",
+    "imageSha256": "713d9b20dd1a3c98bd63f5e5930d5eadb5b92c9a9275283957b68900a7502620",
+    "capture": "original_fp32_decomposed_exporter_block14_ln_1_input",
+    "input": {
+      "name": "activation",
+      "shape": [
+        1,
+        1372,
+        1024
+      ],
+      "dtype": "float32",
+      "path": "activation.npy"
+    },
+    "output": {
+      "name": "normalized",
+      "shape": [
+        1,
+        1372,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    "opset": 20,
+    "epsilon": 1e-05,
+    "graphs": [
+      {
+        "name": "native",
+        "path": "native-layernorm.onnx",
+        "reference": "native-cpu-reference.npy",
+        "nativeReferenceMaxAbs": 0.0,
+        "torchReferenceMaxAbs": 2.002716064453125e-05,
+        "exportedOps": [
+          ":Cast",
+          ":LayerNormalization",
+          ":Cast"
+        ],
+        "cpuOptimizedOps": [
+          ":LayerNormalization",
+          ":Cast"
+        ]
+      },
+      {
+        "name": "explicit",
+        "path": "explicit-layernorm.onnx",
+        "reference": "explicit-cpu-reference.npy",
+        "nativeReferenceMaxAbs": 1.9073486328125e-05,
+        "torchReferenceMaxAbs": 3.814697265625e-06,
+        "exportedOps": [
+          ":Cast",
+          ":Constant",
+          ":ReduceMean",
+          ":Sub",
+          ":Mul",
+          ":Constant",
+          ":ReduceMean",
+          ":Constant",
+          ":Add",
+          ":Sqrt",
+          ":Div",
+          ":Mul",
+          ":Add",
+          ":Cast"
+        ],
+        "cpuOptimizedOps": [
+          ":ReduceMean",
+          ":Sub",
+          ":Mul",
+          ":ReduceMean",
+          ":Add",
+          ":Sqrt",
+          ":Div",
+          ":Mul",
+          ":Add",
+          ":Cast"
+        ]
+      }
+    ],
+    "inputStatistics": {
+      "absMax": 215.41433715820312,
+      "varianceMin": 0.017685014754533768,
+      "varianceMax": 54.73973083496094,
+      "meanStdRatioMax": 1.5137046575546265
+    },
+    "fp16InputWeightRoundingFp32MathMaxAbs": 0.016988754272460938,
+    "versions": {
+      "torch": "2.7.0+cu128",
+      "onnx": "1.20.1",
+      "onnxruntime": "1.23.2"
+    },
+    "note": "HTP internal lowering must be inspected; CPU optimizer evidence does not guarantee QAIRT avoids fusion",
+    "artifacts": [
+      {
+        "path": "native-layernorm.onnx",
+        "sha256": "cf9a2d4545b3c100fd11a9c4cc0642e4ba2b2c90350e5484029376b9a276567b",
+        "size": 8606
+      },
+      {
+        "path": "explicit-layernorm.onnx",
+        "sha256": "132c399b309415f10b2f293cbcbfd01235afe4e94222ce006f06878cd43ac7a5",
+        "size": 9285
+      },
+      {
+        "path": "activation.npy",
+        "sha256": "5ce6327e7d8dfb5f1e6dd9a7a3a06f9c8d72e70dab7a985efb2ff27bd5a636dd",
+        "size": 5619840
+      },
+      {
+        "path": "native-cpu-reference.npy",
+        "sha256": "ee451e40f04423c17a1b900c158dc3401e96ceb368b096ec9cebd5b2fe952c30",
+        "size": 5619840
+      },
+      {
+        "path": "explicit-cpu-reference.npy",
+        "sha256": "3ffdbf88309772351e2782c644fc49fcd224856617b9048bc55541ba82ccfb66",
+        "size": 5619840
+      }
+    ]
+  },
+  "native_vs_explicit_htp": {
+    "mean_abs": 0.0003898141148965806,
+    "max_abs": 0.03125
+  },
+  "torch_imported": false
+}

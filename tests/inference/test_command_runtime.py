@@ -26,6 +26,7 @@ from nuvion_app.inference.command_runtime import (
     FleetCommandRuntime,
     FleetCommandRuntimeError,
     build_fleet_command_runtime,
+    build_fleet_command_runtime_from_env,
     desired_state_handler,
     load_fleet_command_keyring,
 )
@@ -189,6 +190,185 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.root = Path(self.temporary_directory.name)
+
+    def _platform_admin_env(self) -> dict[str, str]:
+        key = (
+            Ed25519PrivateKey.generate()
+            .public_key()
+            .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        )
+        path = self.root / "platform-keyring.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "trustDomain": "macos-dev",
+                    "keys": {"test-only": base64.b64encode(key).decode("ascii")},
+                }
+            )
+        )
+        path.chmod(0o600)
+        return {
+            "NUVION_FLEET_COMMAND_ENABLED": "true",
+            "NUVION_DEVICE_ID": "sp-3-nuvion-test",
+            "NUVION_SPACE_ID": "3",
+            "NUVION_FLEET_COMMAND_KEYRING_PATH": str(path),
+            "NUVION_COMMAND_INBOX_PATH": str(self.root / "platform.sqlite3"),
+        }
+
+    def _from_env(self, values):
+        identity = SimpleNamespace(
+            identity_status="DEV",
+            platform_profile="macos_dev",
+            capabilities=frozenset(
+                {"fleet.command.v1", "fleet.auth.platform_admin.v1"}
+            ),
+        )
+        with mock.patch(
+            "nuvion_app.inference.command_runtime.resolve_platform_identity",
+            return_value=identity,
+        ):
+            return build_fleet_command_runtime_from_env(
+                base_url="https://api.example.test",
+                access_token_provider=lambda: "test-token",
+                ack_sender=lambda *_args: True,
+                environ=values,
+            )
+
+    def test_platform_admin_capability_requires_configured_trusted_runtime(
+        self,
+    ) -> None:
+        runtime = self._from_env(self._platform_admin_env())
+        self.assertEqual(
+            runtime.authorization_capabilities, {"fleet.auth.platform_admin.v1"}
+        )
+        self.assertIn(
+            "PLATFORM_ADMIN", runtime.processor.verifier.allowed_authorization_contexts
+        )
+        self.assertIn(
+            "SPACE_ADMIN", runtime.processor.verifier.allowed_authorization_contexts
+        )
+        self.assertNotIn(
+            "fleet.auth.platform_admin.v1", runtime.processor.verifier.capabilities
+        )
+        runtime.processor.verifier.allowed_authorization_contexts = frozenset(
+            {"SPACE_ADMIN"}
+        )
+        self.assertEqual(runtime.authorization_capabilities, frozenset())
+
+    def test_platform_admin_capability_withdraws_if_verifier_or_keyring_changes(
+        self,
+    ) -> None:
+        runtime = self._from_env(self._platform_admin_env())
+        verifier = runtime.processor.verifier
+        verifier.keyring = object()
+        self.assertEqual(runtime.authorization_capabilities, frozenset())
+        runtime.processor.verifier = MappingVerifier([])
+        self.assertEqual(runtime.authorization_capabilities, frozenset())
+
+    def test_unconfigured_runtime_cannot_advertise_platform_admin(self) -> None:
+        inbox = DurableCommandInbox(self.root / "unconfigured.sqlite3")
+        runtime = FleetCommandRuntime(
+            inbox=inbox,
+            processor=DurableCommandProcessor(
+                inbox=inbox, verifier=MappingVerifier([]), handlers={}
+            ),
+            http_client=BatchHttpClient([]),
+            ack_sender=lambda *_args: True,
+        )
+        self.assertEqual(runtime.authorization_capabilities, frozenset())
+
+    def test_platform_admin_opt_out_keeps_space_admin_and_hides_capability(
+        self,
+    ) -> None:
+        values = self._platform_admin_env()
+        values["NUVION_FLEET_PLATFORM_ADMIN_ENABLED"] = "false"
+        runtime = self._from_env(values)
+        self.assertEqual(runtime.authorization_capabilities, frozenset())
+        self.assertEqual(
+            runtime.processor.verifier.allowed_authorization_contexts, {"SPACE_ADMIN"}
+        )
+        self.assertNotIn(
+            "fleet.auth.platform_admin.v1", runtime.processor.verifier.capabilities
+        )
+
+    def test_disabled_runtime_never_loads_keys_or_grants_platform_admin(self) -> None:
+        for values in (
+            {},
+            {
+                "NUVION_FLEET_COMMAND_ENABLED": "false",
+                "NUVION_FLEET_PLATFORM_ADMIN_ENABLED": "true",
+            },
+        ):
+            with (
+                self.subTest(values=values),
+                mock.patch(
+                    "nuvion_app.inference.command_runtime.load_fleet_command_keyring"
+                ) as load,
+            ):
+                self.assertIsNone(self._from_env(values))
+                load.assert_not_called()
+
+    def test_platform_admin_invalid_opt_out_is_fail_closed(self) -> None:
+        for value in ("", "tru", "enabled", "2"):
+            with self.subTest(value=value):
+                values = self._platform_admin_env()
+                values["NUVION_FLEET_PLATFORM_ADMIN_ENABLED"] = value
+                with self.assertRaisesRegex(FleetCommandRuntimeError, "PLATFORM_ADMIN"):
+                    self._from_env(values)
+
+    def test_platform_admin_runtime_rejects_missing_untrusted_or_writable_keyring(
+        self,
+    ) -> None:
+        for failure in ("missing", "wrong-domain", "writable", "empty"):
+            with self.subTest(failure=failure):
+                values = self._platform_admin_env()
+                path = Path(values["NUVION_FLEET_COMMAND_KEYRING_PATH"])
+                if failure == "missing":
+                    values["NUVION_FLEET_COMMAND_KEYRING_PATH"] = str(
+                        self.root / "missing.json"
+                    )
+                elif failure == "writable":
+                    path.chmod(0o660)
+                else:
+                    payload = json.loads(path.read_text())
+                    if failure == "wrong-domain":
+                        payload["trustDomain"] = "production"
+                    else:
+                        payload["keys"] = {}
+                    path.write_text(json.dumps(payload))
+                with self.assertRaises(FleetCommandRuntimeError):
+                    self._from_env(values)
+
+    def test_platform_and_space_admin_share_the_same_monotonic_sequence(self) -> None:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        inbox = DurableCommandInbox(self.root / "shared-sequence.sqlite3")
+        verifier = FleetCommandVerifier(
+            keyring=Ed25519Keyring({"runtime-key": public_key}),
+            expected_device_id="sp-3-nuvion-test",
+            expected_space_id=3,
+            capabilities={"command.config.apply"},
+            clock=lambda: datetime(2026, 9, 1, 2, 5, tzinfo=timezone.utc),
+        )
+        processor = DurableCommandProcessor(
+            inbox=inbox,
+            verifier=verifier,
+            handlers={"CONFIG_APPLY": desired_state_handler},
+        )
+        platform = _signed_delivery(
+            private_key,
+            sequence=1,
+            claims_overrides={"authorizationContext": "PLATFORM_ADMIN"},
+        )
+        processor.process(platform.compact_jws)
+        with self.assertRaises(CommandInboxError) as replay:
+            processor.process(_signed_delivery(private_key, sequence=1).compact_jws)
+        self.assertEqual(replay.exception.code, "SEQUENCE_REPLAY")
+        processor.process(_signed_delivery(private_key, sequence=2).compact_jws)
+        self.assertEqual(inbox.last_sequence(), 2)
 
     def test_keyring_is_strict_domain_bound_and_symlink_safe(self) -> None:
         raw_public_key = (
@@ -838,9 +1018,7 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
             set(runtime.processor.handlers),
             {"STREAM_POLICY", "CONFIG_APPLY", "AGENT_UPDATE"},
         )
-        self.assertIn(
-            "command.stream.policy", runtime.processor.verifier.capabilities
-        )
+        self.assertIn("command.stream.policy", runtime.processor.verifier.capabilities)
         self.assertNotIn(
             "command.config.apply", runtime.processor.verifier.capabilities
         )

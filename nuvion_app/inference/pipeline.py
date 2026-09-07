@@ -41,6 +41,7 @@ from nuvion_app.inference.command_runtime import (
     FleetCommandRuntime,
     FleetCommandRuntimeError,
     build_fleet_command_runtime_from_env,
+    runtime_authorization_capabilities,
 )
 from nuvion_app.inference.agent_update import AgentUpdateReconciler
 from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
@@ -152,6 +153,8 @@ gi.require_version("GLibUnix", "2.0")
 from gi.repository import Gst, GLib, GLibUnix
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
+from nuvion_app.runtime.visualad import VisualADAnomalyDetector
+from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
 from nuvion_app.inference.video_source import resolve_depthai_device_id
@@ -168,6 +171,10 @@ from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
     resolve_platform_identity,
+)
+from nuvion_app.runtime.fleet_capabilities import (
+    RUNTIME_ONLY_FLEET_CAPABILITIES,
+    SIGLIP_MODEL_CONFIG_CAPABILITY,
 )
 from nuvion_app.runtime.telemetry import (
     build_runtime_telemetry,
@@ -1744,6 +1751,34 @@ def build_command_observation_runtime_health() -> dict:
         }
 
 
+def build_model_config_capabilities() -> frozenset[str]:
+    """Advertise verification support, not proof that a target model is applied."""
+
+    runtime = fleet_command_runtime
+    if not isinstance(runtime, FleetCommandRuntime):
+        return frozenset()
+    try:
+        if not runtime.trusted_verifier_ready:
+            return frozenset()
+        if "command.config.apply" not in runtime.effect_capabilities:
+            return frozenset()
+        reconciler = runtime.effect_coordinator.registry.get("CONFIG_APPLY")
+        if not isinstance(reconciler, SettingsReconciler):
+            return frozenset()
+        adapter = reconciler.runtime
+        if (
+            isinstance(adapter, PipelineSettingsRuntimeAdapter)
+            and adapter.app is g_app
+            and callable(getattr(adapter, "verify_model", None))
+            and callable(getattr(adapter, "can_verify_model", None))
+            and adapter.can_verify_model()
+        ):
+            return frozenset({SIGLIP_MODEL_CONFIG_CAPABILITY})
+    except Exception:  # noqa: BLE001 - unavailable runtime must not grant capability.
+        return frozenset()
+    return frozenset()
+
+
 def build_dynamic_runtime_telemetry(
     base_capabilities: set[str] | frozenset[str] = frozenset(),
 ) -> dict:
@@ -1779,8 +1814,52 @@ def build_dynamic_runtime_telemetry(
     merged["agentUpdate"] = updater_telemetry["agentUpdate"]
     merged["updaterVersion"] = updater_telemetry["updaterVersion"]
     merged["capabilities"] = sorted(
-        set(base_capabilities) | set(fleet_effect_registry.capabilities)
+        (
+            (set(base_capabilities) | set(fleet_effect_registry.capabilities))
+            - RUNTIME_ONLY_FLEET_CAPABILITIES
+        )
+        | runtime_authorization_capabilities(fleet_command_runtime)
+        | build_model_config_capabilities()
     )
+    user_data = getattr(g_app, "user_data", None)
+    if getattr(user_data, "backend", None) in {"visualad", "visualad_htp"}:
+        detector = getattr(user_data, "zero_shot", None)
+        sampled_at = getattr(user_data, "last_inference_at", None)
+        sample_age = max(0.0, time.monotonic() - sampled_at) if sampled_at is not None else None
+        ready = bool(getattr(detector, "ready", False))
+        failed = bool(getattr(user_data, "inference_failed", False))
+        frame_arrived_at = getattr(user_data, "last_inference_frame_arrived_at", None)
+        frame_age = max(0.0, time.monotonic() - frame_arrived_at) if frame_arrived_at is not None else None
+        # A running video pipeline alone does not prove working inference.
+        if not ready or failed or sample_age is None or sample_age > 60.0:
+            merged["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
+        merged["inference"] = {
+            "backend": user_data.backend,
+            "ready": ready,
+            "failed": failed,
+            "source": "demo" if getattr(user_data, "demo_mode", False) else VIDEO_SOURCE_ENV,
+            "scoreKind": "raw_top_1_percent_mean",
+            "experimental": os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true",
+            "validationStatus": os.getenv("NUVION_VISUALAD_VALIDATION_STATUS", "UNVERIFIED"),
+            "thresholdStatus": os.getenv("NUVION_VISUALAD_THRESHOLD_STATUS", "UNCALIBRATED"),
+            "threshold": getattr(detector, "threshold", None),
+            "modelSha256": getattr(user_data, "last_inference_model_sha256", None),
+            "backboneSha256": getattr(detector, "backbone_sha256", None),
+            "sourceCommit": getattr(detector, "source_commit", None),
+            "lnPostPolicy": getattr(detector, "ln_post_policy", None),
+            "executionProvider": getattr(detector, "execution_provider", None),
+            "graphSha256": getattr(detector, "graph_sha256", None),
+            "manifestSha256": getattr(detector, "loaded_manifest_sha256", None),
+            "inferenceSeconds": getattr(detector, "last_inference_seconds", None),
+            "inferenceCount": getattr(detector, "inference_count", 0),
+            "processingMode": "continuous_latest" if user_data.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0 else "sampled",
+            "configuredSampleSeconds": ZERO_SHOT_SAMPLE_SEC,
+            "frameArrivalAgeSeconds": round(frame_age, 3) if frame_age is not None else None,
+            "anomalyScore": getattr(user_data, "last_inference_score", None),
+            "sampleAgeSeconds": round(sample_age, 1) if sample_age is not None else None,
+            # Legacy sampleAgeSeconds is completion age, not camera capture age.
+            "lastResultAgeSeconds": round(sample_age, 1) if sample_age is not None else None,
+        }
     return merged
 
 
@@ -2559,6 +2638,14 @@ async def signaling_client_main():
         await asyncio.sleep(10)
 
 
+@dataclass(frozen=True)
+class TimedInferenceFrame:
+    """Own the frame and appsink arrival time together, not sensor exposure time."""
+
+    pixels: np.ndarray
+    arrived_at_monotonic: float
+
+
 class NuvionEventState:
     def __init__(self, overlay_callback=None, demo_source: MvtecDemoSource | None = None):
         self.pipeline_started_at = time.time()
@@ -2608,8 +2695,34 @@ class NuvionEventState:
         self.zero_shot = None
         self.triton_client = None
         self._triton_client_thread_id = None
+        self.inference_failed = False
+        self.last_inference_at: float | None = None
+        self.last_inference_frame_arrived_at: float | None = None
+        self.last_inference_score: float | None = None
+        self.last_inference_model_sha256: str | None = None
 
-        if self.backend == "siglip":
+        if self.backend == "visualad_htp":
+            self.zero_shot = VisualADHTPAnomalyDetector(
+                enabled=ZERO_SHOT_ENABLED,
+                manifest_path=os.getenv("NUVION_VISUALAD_HTP_MANIFEST", ""),
+                manifest_sha256=os.getenv("NUVION_VISUALAD_HTP_MANIFEST_SHA256", ""),
+                state_dir=os.getenv("NUVION_VISUALAD_HTP_STATE_DIR", "/var/lib/nuv-agent/visualad-htp"),
+                threshold=float(os.getenv("NUVION_VISUALAD_THRESHOLD", "0.0")),
+            )
+            if not self.zero_shot.enabled:
+                self.backend = "none"
+        elif self.backend == "visualad":
+            self.zero_shot = VisualADAnomalyDetector(
+                enabled=ZERO_SHOT_ENABLED,
+                repo_path=os.getenv("NUVION_VISUALAD_SOURCE", ""),
+                backbone_path=os.getenv("NUVION_VISUALAD_BACKBONE", ""),
+                checkpoint_path=os.getenv("NUVION_VISUALAD_CHECKPOINT", ""),
+                threshold=float(os.getenv("NUVION_VISUALAD_THRESHOLD", "0.0")),
+                num_threads=int(os.getenv("NUVION_VISUALAD_CPU_THREADS", "2")),
+            )
+            if not self.zero_shot.enabled:
+                self.backend = "none"
+        elif self.backend == "siglip":
             self.zero_shot = ZeroShotAnomalyDetector(
                 enabled=ZERO_SHOT_ENABLED,
                 model_name=ZERO_SHOT_MODEL,
@@ -2804,9 +2917,9 @@ class NuvionEventState:
         self.last_sent_status = status
         self.last_sent_at = now
         if status_changed:
-            log.info("[ZSAD] Sent %s status (change): %s", status, tagged_message)
+            log.info("[ZSAD] Sent %s status (change) eventId=%s: %s", status, event_id, tagged_message)
         else:
-            log.info("[ZSAD] Sent %s status (repeat): %s", status, tagged_message)
+            log.info("[ZSAD] Sent %s status (repeat) eventId=%s: %s", status, event_id, tagged_message)
 
     def _apply_demo_tag(self, message: str) -> str:
         if not self.demo_mode:
@@ -3052,7 +3165,22 @@ class NuvionEventState:
     def maybe_enqueue_frame(self, frame_rgb):
         now = time.time()
         if self.backend != "none":
-            if now - self.zero_shot_last_sample >= ZERO_SHOT_SAMPLE_SEC:
+            if self.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0:
+                # One appsink producer and one inference worker: keep at most
+                # one pending frame, replacing stale work without blocking video.
+                latest = TimedInferenceFrame(frame_rgb, time.monotonic())
+                try:
+                    self.zero_shot_queue.put_nowait(latest)
+                except queue.Full:
+                    try:
+                        self.zero_shot_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.zero_shot_queue.put_nowait(latest)
+                    except queue.Full:
+                        pass
+            elif now - self.zero_shot_last_sample >= ZERO_SHOT_SAMPLE_SEC:
                 self.zero_shot_last_sample = now
                 if not self.zero_shot_queue.full():
                     try:
@@ -3070,6 +3198,16 @@ class NuvionEventState:
                         pass
 
     def _zsad_worker(self):
+        if self.running and self.backend == "visualad_htp" and self.zero_shot and self.zero_shot.enabled:
+            # Initial HTP compilation can take minutes. Discard the one queued
+            # startup frame afterwards and wait for a freshly captured frame.
+            # A compiled graph alone must not mark inference ready/healthy.
+            prepare = getattr(self.zero_shot, "prepare", None)
+            if callable(prepare) and prepare():
+                try:
+                    self.zero_shot_queue.get_nowait()
+                except queue.Empty:
+                    pass
         while self.running:
             if critical_event_safety_gate.is_stopped():
                 time.sleep(0.25)
@@ -3079,32 +3217,94 @@ class NuvionEventState:
             except queue.Empty:
                 continue
 
-            if frame is None:
+            if not self.running:
+                break
+            if frame is None or critical_event_safety_gate.is_stopped():
                 continue
 
-            if self.backend == "siglip" and self.zero_shot and self.zero_shot.enabled:
-                is_anomaly, result = self.zero_shot.is_anomaly(frame)
+            frame_arrived_at = None
+            if isinstance(frame, TimedInferenceFrame):
+                frame_arrived_at = frame.arrived_at_monotonic
+                frame = frame.pixels
+
+            if self.backend in {"siglip", "visualad", "visualad_htp"} and self.zero_shot and self.zero_shot.enabled:
+                processing_started = time.monotonic()
+                try:
+                    is_anomaly, result = self.zero_shot.is_anomaly(frame)
+                except Exception as exc:
+                    log.error("[ZSAD] inference failed backend=%s type=%s", self.backend, type(exc).__name__)
+                    result = None
+                # Loading/HTP execution may finish after shutdown or a safety
+                # stop. Such a result cannot publish a late inspection/clip.
+                if not self.running:
+                    break
+                if critical_event_safety_gate.is_stopped():
+                    continue
+                if result is None:
+                    # Missing/failed inference is not a normal inspection and
+                    # must not kill the worker or create a false recovery event.
+                    self.inference_failed = True
+                    get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
+                    self._set_anomaly_overlay(f"{self.backend.upper()} inference unavailable")
+                    continue
                 if result:
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
+                    if self.inference_failed:
+                        self.inference_failed = False
+                        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
+                    self.last_inference_at = time.monotonic()
+                    self.last_inference_frame_arrived_at = frame_arrived_at
+                    self.last_inference_score = score
+                    self.last_inference_model_sha256 = result.get("model_sha256")
+                    provenance = ""
+                    if self.backend in {"visualad", "visualad_htp"}:
+                        provenance = (
+                            f"VisualAD source={'demo' if self.demo_mode else VIDEO_SOURCE_ENV} "
+                            f"model={result.get('model_sha256', 'unknown')} "
+                            f"rawAnomalyScore={score:.4f} "
+                            f"threshold={self.zero_shot.threshold:.4f} "
+                        )
+                        if self.backend == "visualad_htp":
+                            provenance += (
+                                f"provider=QNN/HTP graph={result.get('graph_sha256', 'unknown')} "
+                                f"inferenceSeconds={result.get('inference_seconds', 0):.3f} "
+                                f"processingSeconds={time.monotonic() - processing_started:.3f} "
+                            )
+                            if frame_arrived_at is not None:
+                                provenance += (
+                                    "mode=continuous_latest "
+                                    f"queueWaitSeconds={max(0.0, processing_started - frame_arrived_at):.3f} "
+                                    f"frameToResultSeconds={max(0.0, self.last_inference_at - frame_arrived_at):.3f} "
+                                )
+                        if os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true":
+                            provenance += (
+                                "experimental=true "
+                                f"validation={os.getenv('NUVION_VISUALAD_VALIDATION_STATUS', 'UNVERIFIED')} "
+                                f"thresholdStatus={os.getenv('NUVION_VISUALAD_THRESHOLD_STATUS', 'UNCALIBRATED')} "
+                            )
+                        log.info("[VISUALAD] %s status=%s", provenance, status)
                     overlay = OverlayPayload(
                         status=status,
                         label=label,
                         score=score,
                         ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
                     )
-                    self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
+                    live_overlay = f"{status} {label} {score:.2f}"
+                    if self.backend in {"visualad", "visualad_htp"} and os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true":
+                        live_overlay = f"EXP / UNCALIBRATED {status} {score:.2f}"
+                    self._set_anomaly_overlay(overlay if self.demo_mode else live_overlay)
                     try:
                         if status == "DEFECT":
-                            self.send_status("DEFECT", label, f"Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
+                            self.send_status("DEFECT", label, f"{provenance}Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
                         else:
-                            self.send_status("NORMAL", label, f"Recovered to normal: {label} ({score:.2f})", "INFO")
+                            self.send_status("NORMAL", label, f"{provenance}Recovered to normal: {label} ({score:.2f})", "INFO")
                     except CriticalEventBackpressureError as exc:
                         log.critical("[SAFETY-STOP] %s", exc)
                         continue
 
-                    if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
+                    if self.backend == "siglip" and PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                         now = time.time()
                         if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
                             try:
@@ -3122,6 +3322,10 @@ class NuvionEventState:
                     log.warning("[TRITON] inference failed: %s", exc)
                     continue
 
+                if not self.running:
+                    break
+                if critical_event_safety_gate.is_stopped():
+                    continue
                 if result is None:
                     continue
 
@@ -3347,7 +3551,7 @@ class PipelineSettingsRuntimeAdapter:
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return False
 
-    def verify_model(self, desired) -> dict[str, str]:
+    def _loaded_siglip_model_source(self) -> Path:
         detector = getattr(self.app.user_data, "zero_shot", None)
         source_provider = getattr(detector, "loaded_model_source", None)
         if (
@@ -3372,6 +3576,21 @@ class PipelineSettingsRuntimeAdapter:
             raise RuntimeError("loaded model source is no longer resolvable") from exc
         if actual_source != expected_source:
             raise RuntimeError("active runtime loaded an old or different model source")
+        return actual_source
+
+    def can_verify_model(self) -> bool:
+        """Cheap live eligibility; full artifact hashing remains an apply check."""
+
+        if self.app.pipeline is None or not self.app.user_data.running:
+            return False
+        try:
+            self._loaded_siglip_model_source()
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return False
+        return True
+
+    def verify_model(self, desired) -> dict[str, str]:
+        actual_source = self._loaded_siglip_model_source()
         if str(desired.get("pointer") or "") != self.model_pointer:
             raise RuntimeError("active configured model pointer mismatch")
         verified = verify_model_artifact_identity(
@@ -3877,6 +4096,10 @@ class GStreamerInferenceApp:
             return f"{prefix}ZSAD TRITON ON | WEBRTC{tracking_suffix}"
         if backend == "siglip":
             return f"{prefix}ZSAD ON | WEBRTC{tracking_suffix}"
+        if backend == "visualad":
+            return f"{prefix}VisualAD preparing | WEBRTC{tracking_suffix}"
+        if backend == "visualad_htp":
+            return f"{prefix}VisualAD HTP preparing | WEBRTC{tracking_suffix}"
         return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
 
     def run(self):

@@ -1,0 +1,42 @@
+{
+  "purpose": "Package imports only; no camera/model/service start",
+  "modules": [
+    {
+      "name": "cv2",
+      "status": "passed",
+      "version": "5.0.0",
+      "path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/cv2/__init__.py"
+    },
+    {
+      "name": "depthai",
+      "status": "passed",
+      "version": "2.32.0.0",
+      "path": "/opt/nuv-agent/releases/26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1/venv/lib/python3.12/site-packages/depthai.cpython-312-aarch64-linux-gnu.so"
+    },
+    {
+      "name": "gi",
+      "status": "passed",
+      "version": "3.48.2",
+      "path": "/usr/lib/python3/dist-packages/gi/__init__.py"
+    },
+    {
+      "name": "onnxruntime",
+      "status": "passed",
+      "version": "1.26.0",
+      "path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime/__init__.py"
+    },
+    {
+      "name": "nuvion_app.inference.pipeline",
+      "status": "passed",
+      "version": null,
+      "path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/import-source.0a2IU5/nuvion_app/inference/pipeline.py"
+    }
+  ],
+  "freeze_sha256": "0e0a275d8893a15573388b3588a1e03f1ccf2d5da0686cb64bd8788e6382c468",
+  "pip_check": "No broken requirements found.",
+  "torch_imported": false,
+  "numpy_version": "2.5.3",
+  "opencv_version": "5.0.0.93",
+  "config_path_only": "/etc/nuv-agent/agent.env",
+  "status": "passed"
+}

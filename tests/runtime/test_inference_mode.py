@@ -11,6 +11,13 @@ class InferenceModeTest(unittest.TestCase):
     def test_normalize_backend_supports_mps_alias(self) -> None:
         self.assertEqual(inference_mode.normalize_backend("mps"), "siglip")
         self.assertEqual(inference_mode.normalize_backend("triton"), "triton")
+        self.assertEqual(inference_mode.normalize_backend("visualad"), "visualad")
+        self.assertEqual(inference_mode.normalize_backend("visualad_htp"), "visualad_htp")
+
+    def test_visualad_does_not_fall_back_to_triton(self) -> None:
+        with mock.patch.dict(os.environ, {"NUVION_ZSAD_BACKEND": "visualad"}):
+            inference_mode.apply_inference_runtime_defaults()
+            self.assertEqual(os.getenv("NUVION_ZSAD_BACKEND"), "visualad")
 
     def test_normalize_backend_fallbacks_to_default(self) -> None:
         self.assertEqual(inference_mode.normalize_backend("unknown", default="triton"), "triton")

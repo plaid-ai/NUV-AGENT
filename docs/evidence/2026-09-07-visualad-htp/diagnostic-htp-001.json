@@ -1,0 +1,367 @@
+{
+  "status": "diagnostic_completed_not_deployment_acceptance",
+  "stage": "complete",
+  "purpose": "precision diagnosis only; never deployment acceptance or ground truth",
+  "manifest_sha256": "ffa2bb5e8d9b29e6041ab8de9c69f22919c5abd135bcc776db7d55dc1b5fec13",
+  "probe_sha256": "955465902f575169cd962c67115efeca19628ff93eb5823919f3bdaae353150e",
+  "cpu_work": "RGB bicubic resize/normalization; saved-reference comparison and non-learned cosine/bilinear/Gaussian/top-1% only",
+  "limits": {
+    "deadline_seconds": 600,
+    "max_rss_kib": 12582912
+  },
+  "elapsed_seconds": 144.11060843900123,
+  "peak_rss_kib": 5345900,
+  "manifest": {
+    "schema": "visualad_precision_diagnostic_v1",
+    "purpose": "precision_diagnosis_not_deployment_or_ground_truth",
+    "graph": "visualad-diagnostic.onnx",
+    "opset": 20,
+    "sourceCommit": "97eb5f88a44f27c644ea7ed4ecac5e35ddef18bb",
+    "checkpointSha256": "fed8ed5e0973e9adb53a2c91e066eb5ba3f9a42fbf80f115a26998629d1f0a5b",
+    "backboneSha256": "fbc415c3d0d7b79faed8f5ccfb740c32b7c4f5ffe7283b851f89c6231c01a8e0",
+    "lnPostPolicy": "official_test_base",
+    "input": {
+      "name": "image",
+      "shape": [
+        1,
+        3,
+        518,
+        518
+      ],
+      "dtype": "float32"
+    },
+    "diagnosticScriptSha256": "5b61c2c2374812a59622d693b1d29bdac80c31803c0d8691a87d2ccfd881ee8e",
+    "referenceGenerationScriptSha256": "eca1dbd0f05bcea6b917c597cceec24f78905efd8c27970f4f3672feec88a626",
+    "exporterSha256": "df09defa384a184853d4fc965d6a0ba0f702366b6edb09abb1e7ab7730e2c858",
+    "imageSha256": "713d9b20dd1a3c98bd63f5e5930d5eadb5b92c9a9275283957b68900a7502620",
+    "outputs": [
+      {
+        "name": "patch_maps",
+        "shape": [
+          1,
+          4,
+          37,
+          37
+        ],
+        "dtype": "float32"
+      },
+      {
+        "name": "vit_features",
+        "shape": [
+          1,
+          4,
+          1369,
+          1024
+        ],
+        "dtype": "float32"
+      },
+      {
+        "name": "saf_features",
+        "shape": [
+          1,
+          4,
+          1369,
+          1024
+        ],
+        "dtype": "float32"
+      },
+      {
+        "name": "adapted_tokens",
+        "shape": [
+          1,
+          4,
+          2,
+          1024
+        ],
+        "dtype": "float32"
+      },
+      {
+        "name": "final_tokens",
+        "shape": [
+          1,
+          2,
+          1024
+        ],
+        "dtype": "float32"
+      }
+    ],
+    "artifacts": [
+      {
+        "path": "visualad-diagnostic.onnx",
+        "size": 1340873237,
+        "sha256": "f502ac0ca854b2b35944a7e506e3baa1e19f7209195a524087674ddcff42678c"
+      },
+      {
+        "path": "cpu-reference.npz",
+        "size": 44923558,
+        "sha256": "c844641d28429d0b2d7f1fa43e743eab1e8a185790b38bf68e40dcc9987c0f7e"
+      }
+    ],
+    "sameOnnxReferenceProvider": "CPUExecutionProvider",
+    "onnxruntimeVersion": "1.23.2",
+    "productionPatchMapParity": {
+      "status": "passed",
+      "rtol": 0.0001,
+      "atol": 0.0001,
+      "maxAbs": 0.0
+    },
+    "cudaAuxiliaryParity": {
+      "status": "failed",
+      "tensor": "vit_features",
+      "maxAbsReported": 0.00630713,
+      "mismatchedElementsReported": 12862,
+      "totalElements": 5607424,
+      "rtol": 0.0001,
+      "atol": 0.0001,
+      "note": "Preserved failed CUDA/CPU intermediate comparison; not a deployment acceptance"
+    }
+  },
+  "runtime_sha256": {
+    "visualad.py": "57d19ffeb6825ad1dc06abf6d72b87b9a77c172ea126f7d8f27ca7bcbdfd84ac",
+    "visualad_htp.py": "3235575ad2338cfbca3ab32a9cdc827a2c7b658401770a603e83547dccc29fdc"
+  },
+  "versions": {
+    "onnxruntime": "1.26.0",
+    "onnxruntime-qnn": "2.5.0",
+    "onnx": "1.22.0",
+    "protobuf": "7.36.1",
+    "numpy": "2.5.3",
+    "Pillow": "12.3.0",
+    "scipy": "1.18.1"
+  },
+  "ep_options": {
+    "backend_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtp.so",
+    "enable_htp_fp16_precision": "1",
+    "offload_graph_io_quantization": "0",
+    "skip_qnn_version_check": "0",
+    "htp_performance_mode": "balanced",
+    "profiling_level": "detailed",
+    "profiling_file_path": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/diagnostic-htp-001/diagnostic-qnn.csv",
+    "enable_framework_op_trace": "1",
+    "framework_op_trace_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/diagnostic-htp-001/framework-op-trace"
+  },
+  "disable_cpu_ep_fallback": "1",
+  "session_create_seconds": 138.20043881700258,
+  "session_providers": [
+    "QNNExecutionProvider",
+    "CPUExecutionProvider"
+  ],
+  "ort_inference_seconds": 2.059451679000631,
+  "profile_providers": [
+    "QNNExecutionProvider"
+  ],
+  "profile_sha256": "ded0e62ee987ad93beb229c68fd61bf6c7105a97d34fe33fa9eb6bb23b43ba42",
+  "actual_sha256": "d28d10fa4c3abadfa5193044b2831d67196dbb8b9bfdfab823fab987018374bb",
+  "tensor_errors": {
+    "patch_maps": {
+      "mean_abs": 0.008179224096238613,
+      "max_abs": 0.4099575877189636,
+      "p99_abs": 0.07934430241584778,
+      "layers": [
+        {
+          "layer": 6,
+          "mean_abs": 0.004444425459951162,
+          "max_abs": 0.05503906309604645,
+          "p99_abs": 0.029744954779744148
+        },
+        {
+          "layer": 12,
+          "mean_abs": 0.006618172395974398,
+          "max_abs": 0.11865150928497314,
+          "p99_abs": 0.04873218014836311
+        },
+        {
+          "layer": 18,
+          "mean_abs": 0.007519063074141741,
+          "max_abs": 0.23940551280975342,
+          "p99_abs": 0.08937616646289825
+        },
+        {
+          "layer": 24,
+          "mean_abs": 0.014135236851871014,
+          "max_abs": 0.4099575877189636,
+          "p99_abs": 0.20754918456077576
+        }
+      ]
+    },
+    "vit_features": {
+      "mean_abs": 0.04231603816151619,
+      "max_abs": 18.88762855529785,
+      "p99_abs": 0.4373430013656616,
+      "layers": [
+        {
+          "layer": 6,
+          "mean_abs": 0.021965621039271355,
+          "max_abs": 0.6421269178390503,
+          "p99_abs": 0.09961625933647156
+        },
+        {
+          "layer": 12,
+          "mean_abs": 0.033377714455127716,
+          "max_abs": 4.025956630706787,
+          "p99_abs": 0.22895988821983337
+        },
+        {
+          "layer": 18,
+          "mean_abs": 0.05326550081372261,
+          "max_abs": 18.88762855529785,
+          "p99_abs": 0.6072036027908325
+        },
+        {
+          "layer": 24,
+          "mean_abs": 0.06065531447529793,
+          "max_abs": 14.689579963684082,
+          "p99_abs": 0.7267720103263855
+        }
+      ],
+      "vector_cosine_mean": 0.9934180378913879,
+      "vector_cosine_min": -0.10639085620641708
+    },
+    "saf_features": {
+      "mean_abs": 0.03232542797923088,
+      "max_abs": 9.263601303100586,
+      "p99_abs": 0.35060998797416687,
+      "layers": [
+        {
+          "layer": 6,
+          "mean_abs": 0.016255144029855728,
+          "max_abs": 0.5774741172790527,
+          "p99_abs": 0.07052035629749298
+        },
+        {
+          "layer": 12,
+          "mean_abs": 0.024050436913967133,
+          "max_abs": 1.5553104877471924,
+          "p99_abs": 0.16568736732006073
+        },
+        {
+          "layer": 18,
+          "mean_abs": 0.041798148304224014,
+          "max_abs": 8.670844078063965,
+          "p99_abs": 0.5271158814430237
+        },
+        {
+          "layer": 24,
+          "mean_abs": 0.04719799384474754,
+          "max_abs": 9.263601303100586,
+          "p99_abs": 0.5988574624061584
+        }
+      ],
+      "vector_cosine_mean": 0.9975156188011169,
+      "vector_cosine_min": 0.6839064955711365
+    },
+    "adapted_tokens": {
+      "mean_abs": 0.01921193115413189,
+      "max_abs": 0.12480711936950684,
+      "p99_abs": 0.08110184967517853,
+      "layers": [
+        {
+          "layer": 6,
+          "mean_abs": 0.01920420303940773,
+          "max_abs": 0.11906599998474121,
+          "p99_abs": 0.07958941906690598
+        },
+        {
+          "layer": 12,
+          "mean_abs": 0.01921425573527813,
+          "max_abs": 0.12480711936950684,
+          "p99_abs": 0.08081845939159393
+        },
+        {
+          "layer": 18,
+          "mean_abs": 0.019243154674768448,
+          "max_abs": 0.11943280696868896,
+          "p99_abs": 0.08149179071187973
+        },
+        {
+          "layer": 24,
+          "mean_abs": 0.01918611489236355,
+          "max_abs": 0.11768586188554764,
+          "p99_abs": 0.08138448745012283
+        }
+      ],
+      "vector_cosine_mean": 0.9996639490127563,
+      "vector_cosine_min": 0.9993119239807129
+    },
+    "final_tokens": {
+      "mean_abs": 0.01914793625473976,
+      "max_abs": 0.11987769603729248,
+      "p99_abs": 0.0797661617398262,
+      "vector_cosine_mean": 0.9996374845504761,
+      "vector_cosine_min": 0.9993621110916138
+    }
+  },
+  "diagnostic_vs_production_htp_patch_map": {
+    "mean_abs": 0.0,
+    "max_abs": 0.0,
+    "p99_abs": 0.0
+  },
+  "cosine_reconstruction": {
+    "all_reference": {
+      "vs_reference_patch_maps": {
+        "mean_abs": 7.442978500193931e-08,
+        "max_abs": 4.76837158203125e-07,
+        "p99_abs": 2.384185791015625e-07
+      },
+      "vs_htp_patch_maps": {
+        "mean_abs": 0.00817923154681921,
+        "max_abs": 0.4099578261375427,
+        "p99_abs": 0.07934439182281494
+      },
+      "score": -0.7252974510192871,
+      "score_abs_error": 0.0
+    },
+    "all_htp": {
+      "vs_reference_patch_maps": {
+        "mean_abs": 0.008092066273093224,
+        "max_abs": 0.4102051258087158,
+        "p99_abs": 0.07883298397064209
+      },
+      "vs_htp_patch_maps": {
+        "mean_abs": 0.00043472519610077143,
+        "max_abs": 0.0020714998245239258,
+        "p99_abs": 0.001416623592376709
+      },
+      "score": -0.7199581265449524,
+      "score_abs_error": 0.005339324474334717
+    },
+    "htp_features_reference_tokens": {
+      "vs_reference_patch_maps": {
+        "mean_abs": 0.007992436178028584,
+        "max_abs": 0.4103540778160095,
+        "p99_abs": 0.07879027724266052
+      },
+      "vs_htp_patch_maps": {
+        "mean_abs": 0.0011597344418987632,
+        "max_abs": 0.004305005073547363,
+        "p99_abs": 0.0034142732620239258
+      },
+      "score": -0.7224245071411133,
+      "score_abs_error": 0.002872943878173828
+    },
+    "reference_features_htp_tokens": {
+      "vs_reference_patch_maps": {
+        "mean_abs": 0.0010767297353595495,
+        "max_abs": 0.003978729248046875,
+        "p99_abs": 0.0031810402870178223
+      },
+      "vs_htp_patch_maps": {
+        "mean_abs": 0.008117076009511948,
+        "max_abs": 0.40717893838882446,
+        "p99_abs": 0.07907891273498535
+      },
+      "score": -0.7228454947471619,
+      "score_abs_error": 0.002451956272125244
+    }
+  },
+  "reference_score": -0.7252974510192871,
+  "htp_score": -0.720341682434082,
+  "torch_imported": false,
+  "loaded_qnn_libraries": [
+    "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtp.so",
+    "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtpPrepare.so",
+    "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnHtpV73Stub.so",
+    "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libQnnSystem.so",
+    "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/venv/lib/python3.12/site-packages/onnxruntime_qnn/libonnxruntime_providers_qnn.so"
+  ]
+}
