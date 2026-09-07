@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-VALID_BACKENDS = {"triton", "siglip", "none"}
+VALID_BACKENDS = {"triton", "siglip", "visualad", "visualad_htp", "none"}
 BACKEND_ALIASES = {"mps": "siglip"}
 VALID_SIGLIP_DEVICES = {"auto", "mps", "cuda", "cpu"}
 VALID_FACE_TRACKING_BACKENDS = {"auto", "triton", "opencv"}

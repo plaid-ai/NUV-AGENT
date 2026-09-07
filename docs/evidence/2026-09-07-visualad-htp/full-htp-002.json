@@ -1,0 +1,108 @@
+{
+  "status": "failed",
+  "stage": "inference_0",
+  "purpose": "Real OAK image functional/conversion parity and performance; not anomaly accuracy ground truth",
+  "cpu_work": "Only RGB bicubic resize/normalization and non-learned bilinear/Gaussian/top-1% postprocessing; no learned CPU inference",
+  "cpu_fallback": "forbidden",
+  "runtime_dir": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/runtime-full002.mwm6sF",
+  "manifest": "/home/plaid/nuvion-demo/20260910-visualad-htp-probe/exports/export-002-bd3872db/manifest.json",
+  "manifest_sha256": "bd3872db91b04fc3c15f95f9d33dfc716f59129252ca8a50d591bf597b377ddf",
+  "image_sha256": "713d9b20dd1a3c98bd63f5e5930d5eadb5b92c9a9275283957b68900a7502620",
+  "reference_sha256": "22a654834ab18824a96e7739f1fe0324935d1c738e04bd4ada25e0cead4057fb",
+  "limits": {
+    "external_timeout_seconds": 600,
+    "max_rss_kib": 12582912
+  },
+  "parity_gates": {
+    "score_abs_error": 0.01,
+    "patch_map_mean_abs_error": 0.01,
+    "patch_map_max_abs_error": 0.1
+  },
+  "calls": [
+    {
+      "index": 0,
+      "wall_seconds": 143.3202554390009,
+      "inference_seconds": 0.646939674999885,
+      "ort_inference_seconds": 0.6464000340019993,
+      "ready": true,
+      "last_error": null,
+      "is_anomaly": false,
+      "result": {
+        "label": "normal",
+        "score": -0.719450056552887,
+        "raw_score": -0.719450056552887,
+        "labels": [
+          "anomaly_score"
+        ],
+        "scores": [
+          -0.719450056552887
+        ],
+        "backend": "visualad_htp",
+        "execution_provider": "QNNExecutionProvider/HTP",
+        "model_sha256": "fed8ed5e0973e9adb53a2c91e066eb5ba3f9a42fbf80f115a26998629d1f0a5b",
+        "backbone_sha256": "fbc415c3d0d7b79faed8f5ccfb740c32b7c4f5ffe7283b851f89c6231c01a8e0",
+        "graph_sha256": "6571970e81b53b6ccffb36e08b75393f15337659f99e6d77aaa05985ef3154b2",
+        "manifest_sha256": "bd3872db91b04fc3c15f95f9d33dfc716f59129252ca8a50d591bf597b377ddf",
+        "source_commit": "97eb5f88a44f27c644ea7ed4ecac5e35ddef18bb",
+        "ln_post_policy": "official_test_base",
+        "image_size": 518,
+        "inference_seconds": 0.646939674999885
+      },
+      "peak_rss_kib": 5257532,
+      "patch_shape": [
+        1,
+        4,
+        37,
+        37
+      ],
+      "patch_finite": true,
+      "patch_map_max_abs_error": 0.4180218577384949,
+      "patch_map_mean_abs_error": 0.008237672038376331,
+      "postprocess_map_shape": [
+        518,
+        518
+      ],
+      "postprocess_map_finite": true,
+      "postprocess_map_max_abs_error": 0.3687920570373535,
+      "score_abs_error": 0.0058473944664001465,
+      "parity_passed": false
+    }
+  ],
+  "elapsed_seconds": 144.80374188800124,
+  "peak_rss_kib": 5257532,
+  "versions": {
+    "onnxruntime": "1.26.0",
+    "onnxruntime-qnn": "2.5.0",
+    "onnx": "1.22.0",
+    "numpy": "2.5.3",
+    "Pillow": "12.3.0",
+    "scipy": "1.18.1"
+  },
+  "runtime_sha256": {
+    "visualad.py": "57d19ffeb6825ad1dc06abf6d72b87b9a77c172ea126f7d8f27ca7bcbdfd84ac",
+    "visualad_htp.py": "b719077e55fc0351f92c974083e804116845b71ea864eee4b6b95174d616b5c1"
+  },
+  "freeze_sha256": "0e0a275d8893a15573388b3588a1e03f1ccf2d5da0686cb64bd8788e6382c468",
+  "pip_check": "No broken requirements found.",
+  "reference_postprocessed_score": -0.7252974510192871,
+  "image_shape": [
+    480,
+    640,
+    3
+  ],
+  "session_create_seconds": 138.8065782800004,
+  "session_providers": [
+    "QNNExecutionProvider",
+    "CPUExecutionProvider"
+  ],
+  "error": "RuntimeError: HTP output did not pass the predeclared conversion parity gates",
+  "ort_profiles": {
+    "visualad-htp-ort_2026-09-07_07-06-52_120.json": {
+      "providers": [
+        "QNNExecutionProvider"
+      ],
+      "sha256": "b94da99afbaa2b900cc93cb65ec793aac0a3d69563add44eea562e7baa8ebb61"
+    }
+  },
+  "torch_imported": false
+}

@@ -28,7 +28,7 @@ from nuvion_app.runtime.config_guard import ensure_runtime_config, guard_config,
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
 
-_BACKEND_CHOICES = ("triton", "siglip", "mps", "none")
+_BACKEND_CHOICES = ("triton", "siglip", "visualad", "visualad_htp", "mps", "none")
 _SIGLIP_DEVICE_CHOICES = ("auto", "mps", "cuda", "cpu")
 
 
@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--backend",
         choices=_BACKEND_CHOICES,
-        help="Override backend for this run: triton|siglip|mps(alias for siglip+mps)|none",
+        help="Override backend: triton|siglip|visualad|visualad_htp|mps(alias for siglip+mps)|none",
     )
     run_parser.add_argument(
         "--demo",
