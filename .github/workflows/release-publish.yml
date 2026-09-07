@@ -241,6 +241,7 @@ jobs:
             --candidate-config-stream-runner release-source/packaging/dev/run-iq9075-config-stream-e2e.py \
             --candidate-board-tool release-source/packaging/dev/iq9075-board-e2e.py \
             --candidate-installer release-source/packaging/dev/install-iq9075.sh \
+            --candidate-rollout-control release-source/packaging/dev/run-iq9075-agent-rollout-control.py \
             --github-output "$GITHUB_OUTPUT"
 
   release-build:

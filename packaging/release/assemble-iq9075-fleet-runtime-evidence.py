@@ -178,13 +178,22 @@ def _assemble_into(
     config_stream_evidence_path: Path,
     commit_cleanup_evidence_path: Path,
     bootstrap_evidence_path: Path,
+    release_registration_path: Path,
+    rollback_rollout_created_path: Path,
+    rollback_rollout_issuance_path: Path,
+    rollback_rollout_terminal_path: Path,
+    commit_rollout_created_path: Path,
+    commit_rollout_issuance_path: Path,
+    commit_rollout_terminal_path: Path,
     artifact_path: Path,
     deb_path: Path,
     bom_path: Path,
+    bom_signature_path: Path,
     candidate_fleet_runner: Path,
     candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
     candidate_installer: Path,
+    candidate_rollout_control: Path,
     security_policy_path: Path,
     output_directory: Path,
     version: str,
@@ -232,8 +241,46 @@ def _assemble_into(
         label="Fleet updater bootstrap evidence",
         require_canonical=True,
     )
-    _bom, bom_raw = _object(
-        bom_path, label="release BOM", require_canonical=True
+    release_registration, release_registration_raw = _object(
+        release_registration_path,
+        label="Fleet release registration evidence",
+        require_canonical=True,
+    )
+    rollback_rollout_created, rollback_rollout_created_raw = _object(
+        rollback_rollout_created_path,
+        label="rollback rollout creation evidence",
+        require_canonical=True,
+    )
+    rollback_rollout_issuance, rollback_rollout_issuance_raw = _object(
+        rollback_rollout_issuance_path,
+        label="rollback rollout issuance evidence",
+        require_canonical=True,
+    )
+    rollback_rollout_terminal, rollback_rollout_terminal_raw = _object(
+        rollback_rollout_terminal_path,
+        label="rollback rollout terminal evidence",
+        require_canonical=True,
+    )
+    commit_rollout_created, commit_rollout_created_raw = _object(
+        commit_rollout_created_path,
+        label="commit rollout creation evidence",
+        require_canonical=True,
+    )
+    commit_rollout_issuance, commit_rollout_issuance_raw = _object(
+        commit_rollout_issuance_path,
+        label="commit rollout issuance evidence",
+        require_canonical=True,
+    )
+    commit_rollout_terminal, commit_rollout_terminal_raw = _object(
+        commit_rollout_terminal_path,
+        label="commit rollout terminal evidence",
+        require_canonical=True,
+    )
+    _bom, bom_raw = _object(bom_path, label="release BOM", require_canonical=True)
+    bom_signature, bom_signature_raw = _object(
+        bom_signature_path,
+        label="release BOM signature",
+        require_canonical=True,
     )
     security, _security_raw = _object(
         security_policy_path, label="release security policy"
@@ -241,9 +288,7 @@ def _assemble_into(
     artifact_sha256, artifact_size = _regular_digest(
         artifact_path, maximum=MAX_ARTIFACT_BYTES
     )
-    deb_sha256, deb_size = _regular_digest(
-        deb_path, maximum=MAX_ARTIFACT_BYTES
-    )
+    deb_sha256, deb_size = _regular_digest(deb_path, maximum=MAX_ARTIFACT_BYTES)
 
     publisher_fleet_runner = (
         Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
@@ -252,11 +297,11 @@ def _assemble_into(
         Path(__file__).resolve().parents[1] / "dev/iq9075-board-e2e.py"
     )
     publisher_config_stream_runner = (
-        Path(__file__).resolve().parents[1]
-        / "dev/run-iq9075-config-stream-e2e.py"
+        Path(__file__).resolve().parents[1] / "dev/run-iq9075-config-stream-e2e.py"
     )
-    publisher_installer = (
-        Path(__file__).resolve().parents[1] / "dev/install-iq9075.sh"
+    publisher_installer = Path(__file__).resolve().parents[1] / "dev/install-iq9075.sh"
+    publisher_rollout_control = (
+        Path(__file__).resolve().parents[1] / "dev/run-iq9075-agent-rollout-control.py"
     )
     fleet_runner_sha256 = _digest(_regular_bytes(publisher_fleet_runner))
     config_stream_runner_sha256 = _digest(
@@ -264,28 +309,29 @@ def _assemble_into(
     )
     board_tool_sha256 = _digest(_regular_bytes(publisher_board_tool))
     installer_sha256 = _digest(_regular_bytes(publisher_installer))
+    rollout_control_sha256 = _digest(_regular_bytes(publisher_rollout_control))
 
     output_directory = _private_output_directory(output_directory)
     names = {
-        "rollback_manifest": (
-            f"iq9075-v{version}-rollback-fleet-manifest.json"
-        ),
-        "rollback_evidence": (
-            f"iq9075-v{version}-rollback-fleet-evidence.json"
-        ),
+        "rollback_manifest": (f"iq9075-v{version}-rollback-fleet-manifest.json"),
+        "rollback_evidence": (f"iq9075-v{version}-rollback-fleet-evidence.json"),
         "rollback_cleanup_evidence": (
             f"iq9075-v{version}-rollback-cleanup-evidence.json"
         ),
         "commit_manifest": f"iq9075-v{version}-commit-fleet-manifest.json",
         "commit_evidence": f"iq9075-v{version}-commit-fleet-evidence.json",
-        "config_stream_evidence": (
-            f"iq9075-v{version}-config-stream-evidence.json"
-        ),
-        "commit_cleanup_evidence": (
-            f"iq9075-v{version}-commit-cleanup-evidence.json"
-        ),
+        "config_stream_evidence": (f"iq9075-v{version}-config-stream-evidence.json"),
+        "commit_cleanup_evidence": (f"iq9075-v{version}-commit-cleanup-evidence.json"),
         "bootstrap_evidence": f"iq9075-v{version}-bootstrap-evidence.json",
+        "release_registration": f"iq9075-v{version}-release-registration.json",
+        "rollback_rollout_created": f"iq9075-v{version}-rollback-rollout-created.json",
+        "rollback_rollout_issuance": f"iq9075-v{version}-rollback-rollout-issuance.json",
+        "rollback_rollout_terminal": f"iq9075-v{version}-rollback-rollout-terminal.json",
+        "commit_rollout_created": f"iq9075-v{version}-commit-rollout-created.json",
+        "commit_rollout_issuance": f"iq9075-v{version}-commit-rollout-issuance.json",
+        "commit_rollout_terminal": f"iq9075-v{version}-commit-rollout-terminal.json",
         "bom": f"nuv-agent_{version}_iq9075-aarch64.release-bom.json",
+        "bom_signature": (f"nuv-agent_{version}_iq9075-aarch64.release-bom.json.sig"),
         "summary": f"iq9075-v{version}-fleet-runtime-evidence.json",
     }
     paths = {key: _safe_output(output_directory, name) for key, name in names.items()}
@@ -314,7 +360,39 @@ def _assemble_into(
             "bootstrap_evidence",
             bootstrap_evidence_raw,
         ),
+        (release_registration_path, "release_registration", release_registration_raw),
+        (
+            rollback_rollout_created_path,
+            "rollback_rollout_created",
+            rollback_rollout_created_raw,
+        ),
+        (
+            rollback_rollout_issuance_path,
+            "rollback_rollout_issuance",
+            rollback_rollout_issuance_raw,
+        ),
+        (
+            rollback_rollout_terminal_path,
+            "rollback_rollout_terminal",
+            rollback_rollout_terminal_raw,
+        ),
+        (
+            commit_rollout_created_path,
+            "commit_rollout_created",
+            commit_rollout_created_raw,
+        ),
+        (
+            commit_rollout_issuance_path,
+            "commit_rollout_issuance",
+            commit_rollout_issuance_raw,
+        ),
+        (
+            commit_rollout_terminal_path,
+            "commit_rollout_terminal",
+            commit_rollout_terminal_raw,
+        ),
         (bom_path, "bom", bom_raw),
+        (bom_signature_path, "bom_signature", bom_signature_raw),
     ):
         _copy_input(source, paths[key], raw)
 
@@ -335,10 +413,42 @@ def _assemble_into(
         )
         if validated_config_stream_runner_sha256 != config_stream_runner_sha256:
             raise AssemblyError("config-stream runner digest changed during assembly")
+        rollout_gate, validated_rollout_control_sha256 = (
+            readiness._validated_rollout_control_gate(
+                release_registration=release_registration,
+                release_registration_raw=release_registration_raw,
+                rollback_created=rollback_rollout_created,
+                rollback_created_raw=rollback_rollout_created_raw,
+                rollback_issuance=rollback_rollout_issuance,
+                rollback_issuance_raw=rollback_rollout_issuance_raw,
+                rollback_terminal=rollback_rollout_terminal,
+                rollback_terminal_raw=rollback_rollout_terminal_raw,
+                commit_created=commit_rollout_created,
+                commit_created_raw=commit_rollout_created_raw,
+                commit_issuance=commit_rollout_issuance,
+                commit_issuance_raw=commit_rollout_issuance_raw,
+                commit_terminal=commit_rollout_terminal,
+                commit_terminal_raw=commit_rollout_terminal_raw,
+                rollback_manifest=rollback_manifest,
+                rollback_evidence=rollback_evidence,
+                rollback_cleanup=rollback_cleanup_evidence,
+                commit_manifest=commit_manifest,
+                commit_evidence=commit_evidence,
+                commit_cleanup=commit_cleanup_evidence,
+                config_stream_gate=config_stream_gate,
+                bootstrap_evidence=bootstrap_evidence,
+                bom=_bom,
+                bom_raw=bom_raw,
+                bom_signature=bom_signature,
+                bom_signature_raw=bom_signature_raw,
+                candidate_rollout_control=candidate_rollout_control,
+                iq_policy=security.get("iq9075", {}),
+            )
+        )
+        if validated_rollout_control_sha256 != rollout_control_sha256:
+            raise AssemblyError("rollout control digest changed during assembly")
         runtime_gate = {
-            "bootstrap": readiness._bootstrap_runtime_gate(
-                bootstrap_evidence
-            ),
+            "bootstrap": readiness._bootstrap_runtime_gate(bootstrap_evidence),
             "rollback": readiness._fleet_runtime_gate(
                 rollback_evidence,
                 rollback_cleanup_evidence,
@@ -350,11 +460,12 @@ def _assemble_into(
                 commit_manifest,
             ),
             "configStream": config_stream_gate,
+            "rolloutControl": rollout_gate,
         }
     except Exception as exc:
         raise AssemblyError("Fleet Runtime result cannot be summarized") from exc
     summary = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "kind": "nuvion-iq9075-fleet-runtime-release-evidence",
         "agentVersion": version,
         "componentSha": component_sha,
@@ -362,6 +473,7 @@ def _assemble_into(
         "configStreamRunnerSha256": config_stream_runner_sha256,
         "boardToolSha256": board_tool_sha256,
         "installerSha256": installer_sha256,
+        "rolloutControlSha256": rollout_control_sha256,
         "rollbackManifest": {
             "file": names["rollback_manifest"],
             "sha256": _digest(rollback_manifest_raw),
@@ -394,12 +506,44 @@ def _assemble_into(
             "file": names["bootstrap_evidence"],
             "sha256": _digest(bootstrap_evidence_raw),
         },
+        "releaseRegistration": {
+            "file": names["release_registration"],
+            "sha256": _digest(release_registration_raw),
+        },
+        "rollbackRolloutCreated": {
+            "file": names["rollback_rollout_created"],
+            "sha256": _digest(rollback_rollout_created_raw),
+        },
+        "rollbackRolloutIssuance": {
+            "file": names["rollback_rollout_issuance"],
+            "sha256": _digest(rollback_rollout_issuance_raw),
+        },
+        "rollbackRolloutTerminal": {
+            "file": names["rollback_rollout_terminal"],
+            "sha256": _digest(rollback_rollout_terminal_raw),
+        },
+        "commitRolloutCreated": {
+            "file": names["commit_rollout_created"],
+            "sha256": _digest(commit_rollout_created_raw),
+        },
+        "commitRolloutIssuance": {
+            "file": names["commit_rollout_issuance"],
+            "sha256": _digest(commit_rollout_issuance_raw),
+        },
+        "commitRolloutTerminal": {
+            "file": names["commit_rollout_terminal"],
+            "sha256": _digest(commit_rollout_terminal_raw),
+        },
         "testedArtifact": {
             "name": artifact_path.name,
             "sha256": artifact_sha256,
             "sizeBytes": artifact_size,
         },
         "testedBom": {"file": names["bom"], "sha256": _digest(bom_raw)},
+        "testedBomSignature": {
+            "file": names["bom_signature"],
+            "sha256": _digest(bom_signature_raw),
+        },
         "testedDeb": {
             "name": deb_path.name,
             "sha256": deb_sha256,
@@ -420,6 +564,7 @@ def _assemble_into(
             candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
             candidate_installer=candidate_installer,
+            candidate_rollout_control=candidate_rollout_control,
         )
     except Exception as exc:
         raise AssemblyError(
@@ -436,8 +581,17 @@ def _assemble_into(
         "configStreamEvidence": str(paths["config_stream_evidence"]),
         "commitCleanupEvidence": str(paths["commit_cleanup_evidence"]),
         "bootstrapEvidence": str(paths["bootstrap_evidence"]),
+        "releaseRegistration": str(paths["release_registration"]),
+        "rollbackRolloutCreated": str(paths["rollback_rollout_created"]),
+        "rollbackRolloutIssuance": str(paths["rollback_rollout_issuance"]),
+        "rollbackRolloutTerminal": str(paths["rollback_rollout_terminal"]),
+        "commitRolloutCreated": str(paths["commit_rollout_created"]),
+        "commitRolloutIssuance": str(paths["commit_rollout_issuance"]),
+        "commitRolloutTerminal": str(paths["commit_rollout_terminal"]),
+        "testedBomSignature": str(paths["bom_signature"]),
         "artifactSha256": artifact_sha256,
         "bomSha256": _digest(bom_raw),
+        "bomSignatureSha256": _digest(bom_signature_raw),
         "debSha256": deb_sha256,
         "debSize": str(deb_size),
     }
@@ -453,13 +607,22 @@ def assemble(
     config_stream_evidence_path: Path,
     commit_cleanup_evidence_path: Path,
     bootstrap_evidence_path: Path,
+    release_registration_path: Path,
+    rollback_rollout_created_path: Path,
+    rollback_rollout_issuance_path: Path,
+    rollback_rollout_terminal_path: Path,
+    commit_rollout_created_path: Path,
+    commit_rollout_issuance_path: Path,
+    commit_rollout_terminal_path: Path,
     artifact_path: Path,
     deb_path: Path,
     bom_path: Path,
+    bom_signature_path: Path,
     candidate_fleet_runner: Path,
     candidate_config_stream_runner: Path,
     candidate_board_tool: Path,
     candidate_installer: Path,
+    candidate_rollout_control: Path,
     security_policy_path: Path,
     output_directory: Path,
     version: str,
@@ -479,20 +642,29 @@ def assemble(
             config_stream_evidence_path=config_stream_evidence_path,
             commit_cleanup_evidence_path=commit_cleanup_evidence_path,
             bootstrap_evidence_path=bootstrap_evidence_path,
+            release_registration_path=release_registration_path,
+            rollback_rollout_created_path=rollback_rollout_created_path,
+            rollback_rollout_issuance_path=rollback_rollout_issuance_path,
+            rollback_rollout_terminal_path=rollback_rollout_terminal_path,
+            commit_rollout_created_path=commit_rollout_created_path,
+            commit_rollout_issuance_path=commit_rollout_issuance_path,
+            commit_rollout_terminal_path=commit_rollout_terminal_path,
             artifact_path=artifact_path,
             deb_path=deb_path,
             bom_path=bom_path,
+            bom_signature_path=bom_signature_path,
             candidate_fleet_runner=candidate_fleet_runner,
             candidate_config_stream_runner=candidate_config_stream_runner,
             candidate_board_tool=candidate_board_tool,
             candidate_installer=candidate_installer,
+            candidate_rollout_control=candidate_rollout_control,
             security_policy_path=security_policy_path,
             output_directory=staging,
             version=version,
             component_sha=component_sha,
         )
         staged_files = sorted(path for path in staging.iterdir() if path.is_file())
-        if len(staged_files) != 10:
+        if len(staged_files) != 18:
             raise AssemblyError("staged Fleet Runtime evidence file set is incomplete")
         final_paths = [_safe_output(final_root, path.name) for path in staged_files]
         published: list[Path] = []
@@ -523,6 +695,14 @@ def assemble(
             "configStreamEvidence",
             "commitCleanupEvidence",
             "bootstrapEvidence",
+            "releaseRegistration",
+            "rollbackRolloutCreated",
+            "rollbackRolloutIssuance",
+            "rollbackRolloutTerminal",
+            "commitRolloutCreated",
+            "commitRolloutIssuance",
+            "commitRolloutTerminal",
+            "testedBomSignature",
         ):
             result[key] = str(final_root / Path(result[key]).name)
         return result
@@ -545,15 +725,22 @@ def main() -> int:
     parser.add_argument("--config-stream-evidence", required=True, type=Path)
     parser.add_argument("--commit-cleanup-evidence", required=True, type=Path)
     parser.add_argument("--bootstrap-evidence", required=True, type=Path)
+    parser.add_argument("--release-registration", required=True, type=Path)
+    parser.add_argument("--rollback-rollout-created", required=True, type=Path)
+    parser.add_argument("--rollback-rollout-issuance", required=True, type=Path)
+    parser.add_argument("--rollback-rollout-terminal", required=True, type=Path)
+    parser.add_argument("--commit-rollout-created", required=True, type=Path)
+    parser.add_argument("--commit-rollout-issuance", required=True, type=Path)
+    parser.add_argument("--commit-rollout-terminal", required=True, type=Path)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--deb", required=True, type=Path)
     parser.add_argument("--bom", required=True, type=Path)
+    parser.add_argument("--bom-signature", required=True, type=Path)
     parser.add_argument("--candidate-fleet-runner", required=True, type=Path)
-    parser.add_argument(
-        "--candidate-config-stream-runner", required=True, type=Path
-    )
+    parser.add_argument("--candidate-config-stream-runner", required=True, type=Path)
     parser.add_argument("--candidate-board-tool", required=True, type=Path)
     parser.add_argument("--candidate-installer", required=True, type=Path)
+    parser.add_argument("--candidate-rollout-control", required=True, type=Path)
     parser.add_argument("--security-policy", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--version", required=True)
@@ -563,25 +750,28 @@ def main() -> int:
         result = assemble(
             rollback_manifest_path=arguments.rollback_manifest,
             rollback_evidence_path=arguments.rollback_evidence,
-            rollback_cleanup_evidence_path=(
-                arguments.rollback_cleanup_evidence
-            ),
+            rollback_cleanup_evidence_path=(arguments.rollback_cleanup_evidence),
             commit_manifest_path=arguments.commit_manifest,
             commit_evidence_path=arguments.commit_evidence,
             config_stream_evidence_path=arguments.config_stream_evidence,
-            commit_cleanup_evidence_path=(
-                arguments.commit_cleanup_evidence
-            ),
+            commit_cleanup_evidence_path=(arguments.commit_cleanup_evidence),
             bootstrap_evidence_path=arguments.bootstrap_evidence,
+            release_registration_path=arguments.release_registration,
+            rollback_rollout_created_path=arguments.rollback_rollout_created,
+            rollback_rollout_issuance_path=arguments.rollback_rollout_issuance,
+            rollback_rollout_terminal_path=arguments.rollback_rollout_terminal,
+            commit_rollout_created_path=arguments.commit_rollout_created,
+            commit_rollout_issuance_path=arguments.commit_rollout_issuance,
+            commit_rollout_terminal_path=arguments.commit_rollout_terminal,
             artifact_path=arguments.artifact,
             deb_path=arguments.deb,
             bom_path=arguments.bom,
+            bom_signature_path=arguments.bom_signature,
             candidate_fleet_runner=arguments.candidate_fleet_runner,
-            candidate_config_stream_runner=(
-                arguments.candidate_config_stream_runner
-            ),
+            candidate_config_stream_runner=(arguments.candidate_config_stream_runner),
             candidate_board_tool=arguments.candidate_board_tool,
             candidate_installer=arguments.candidate_installer,
+            candidate_rollout_control=arguments.candidate_rollout_control,
             security_policy_path=arguments.security_policy,
             output_directory=arguments.output_directory,
             version=arguments.version,

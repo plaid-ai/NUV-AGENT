@@ -99,9 +99,7 @@ class UpdaterSecurityTest(unittest.TestCase):
             request.write_text('{"schemaVersion":1}', encoding="utf-8")
             request.chmod(0o600)
             self.assertEqual(
-                read_ingested_request(
-                    root, "request.json", require_root_owner=False
-                ),
+                read_ingested_request(root, "request.json", require_root_owner=False),
                 b'{"schemaVersion":1}',
             )
             with self.assertRaises(UpdaterSecurityError):
@@ -167,9 +165,13 @@ class UpdaterSecurityTest(unittest.TestCase):
             allowed_uids={12345},
         )
         server_side, client_side = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        with server_side, client_side, mock.patch(
-            "nuvion_updater.protocol.get_peer_credentials",
-            return_value=PeerCredentials(pid=99, uid=54321, gid=54321),
+        with (
+            server_side,
+            client_side,
+            mock.patch(
+                "nuvion_updater.protocol.get_peer_credentials",
+                return_value=PeerCredentials(pid=99, uid=54321, gid=54321),
+            ),
         ):
             client_side.sendall(b'{"schemaVersion":1,"operation":"STATUS"}\n')
             client_side.shutdown(socket.SHUT_WR)
@@ -187,9 +189,13 @@ class UpdaterSecurityTest(unittest.TestCase):
             allowed_uids={501},
         )
         server_side, client_side = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        with server_side, client_side, mock.patch(
-            "nuvion_updater.protocol.get_peer_credentials",
-            return_value=PeerCredentials(pid=99, uid=501, gid=501),
+        with (
+            server_side,
+            client_side,
+            mock.patch(
+                "nuvion_updater.protocol.get_peer_credentials",
+                return_value=PeerCredentials(pid=99, uid=501, gid=501),
+            ),
         ):
             client_side.sendall(
                 b'{"commandId":"00000000-0000-4000-8000-000000000001",'
@@ -207,9 +213,9 @@ class UpdaterSecurityTest(unittest.TestCase):
         with left, right:
             UpdaterClient(expected_peer_uid=os.getuid())._validate_connected_peer(left)
             with self.assertRaises(UpdaterClientError) as raised:
-                UpdaterClient(expected_peer_uid=os.getuid() + 1)._validate_connected_peer(
-                    left
-                )
+                UpdaterClient(
+                    expected_peer_uid=os.getuid() + 1
+                )._validate_connected_peer(left)
         self.assertEqual(raised.exception.code, "UNSAFE_UPDATER_PEER")
 
     def test_response_disconnect_does_not_crash_privileged_server(self) -> None:
@@ -277,9 +283,7 @@ class UpdaterSecurityTest(unittest.TestCase):
         with mock.patch.object(
             unavailable_client,
             "status",
-            side_effect=UpdaterClientError(
-                "UNSAFE_UPDATER_PEER", "peer is not root"
-            ),
+            side_effect=UpdaterClientError("UNSAFE_UPDATER_PEER", "peer is not root"),
         ):
             unavailable = build_updater_capability_telemetry(unavailable_client)
         self.assertEqual(unavailable["updaterVersion"], "unknown")
@@ -298,9 +302,7 @@ class UpdaterSecurityTest(unittest.TestCase):
             malformed = build_updater_capability_telemetry(malformed_client)
         self.assertEqual(malformed["updaterVersion"], "unknown")
         self.assertFalse(malformed["agentUpdate"]["capabilityAvailable"])
-        self.assertEqual(
-            malformed["agentUpdate"]["reason"], "INVALID_UPDATER_VERSION"
-        )
+        self.assertEqual(malformed["agentUpdate"]["reason"], "INVALID_UPDATER_VERSION")
 
     def test_root_update_phase_is_mapped_with_persistent_evidence(self) -> None:
         client = UpdaterClient(require_root_owner=False)
@@ -327,6 +329,46 @@ class UpdaterSecurityTest(unittest.TestCase):
         self.assertEqual(telemetry["updatePhase"], "ROLLED_BACK")
         self.assertEqual(telemetry["updateEvidence"], update)
         self.assertNotIn("update", telemetry["agentUpdate"])
+
+    def test_authenticated_slot_identity_is_forwarded_and_invalid_slot_fails_closed(
+        self,
+    ) -> None:
+        client = UpdaterClient(require_root_owner=False)
+        active_slot = "releases/" + "a" * 64
+        previous_slot = "bootstrap/0.1.120"
+        with mock.patch.object(
+            client,
+            "status",
+            return_value={
+                "capabilityAvailable": True,
+                "capabilityReason": "READY",
+                "updaterVersion": "0.2.0",
+                "activeSlot": active_slot,
+                "previousSlot": previous_slot,
+                "update": None,
+            },
+        ):
+            telemetry = build_updater_capability_telemetry(client)
+        self.assertEqual(telemetry["agentUpdate"]["activeSlot"], active_slot)
+        self.assertEqual(telemetry["agentUpdate"]["previousSlot"], previous_slot)
+        self.assertTrue(telemetry["agentUpdate"]["capabilityAvailable"])
+
+        with mock.patch.object(
+            client,
+            "status",
+            return_value={
+                "capabilityAvailable": True,
+                "capabilityReason": "READY",
+                "updaterVersion": "0.2.0",
+                "activeSlot": "../../unsafe",
+                "previousSlot": None,
+                "update": None,
+            },
+        ):
+            invalid = build_updater_capability_telemetry(client)
+        self.assertFalse(invalid["agentUpdate"]["capabilityAvailable"])
+        self.assertEqual(invalid["agentUpdate"]["reason"], "INVALID_SLOT_STATUS")
+        self.assertIsNone(invalid["agentUpdate"]["activeSlot"])
 
     def test_server_monotonic_watchdog_runs_without_connections(self) -> None:
         listener = mock.Mock(spec=socket.socket)
