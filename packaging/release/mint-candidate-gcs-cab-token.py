@@ -34,6 +34,37 @@ MAX_STS_RESPONSE_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 16 * 1024
 MAX_TOKEN_LIFETIME_SECONDS = 3600
 REQUEST_TIMEOUT_SECONDS = 30.0
+SAFE_STS_HTTP_STATUSES = frozenset({
+    200, 400, 401, 403, 404, 408, 409, 412, 413, 429, 500, 502, 503, 504
+})
+SAFE_OAUTH_ERRORS = frozenset({
+    "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+    "unsupported_grant_type", "invalid_scope", "invalid_target", "access_denied",
+    "server_error", "temporarily_unavailable",
+})
+SAFE_STAGES = frozenset({
+    "credential_input", "policy_input", "source_access_token", "sts_exchange",
+    "sts_response", "token_output", "interrupted", "unknown",
+})
+SAFE_ERROR_CODES = {
+    "source access token mint failed": "SOURCE_ACCESS_TOKEN_FAILED",
+    "source token is invalid": "SOURCE_TOKEN_INVALID",
+    "candidate access-boundary policy is invalid": "CAB_POLICY_INVALID",
+    "candidate access-boundary policy differs from the pinned policy": "CAB_POLICY_MISMATCH",
+    "STS exchange failed": "STS_EXCHANGE_FAILED",
+    "STS exchange returned an invalid response": "STS_RESPONSE_INVALID",
+    "STS exchange returned an unexpected token type": "STS_TOKEN_TYPE_INVALID",
+    "STS exchange returned an unexpected bearer type": "STS_BEARER_TYPE_INVALID",
+    "STS exchange returned an invalid lifetime": "STS_LIFETIME_INVALID",
+    "downscoped token is invalid": "DOWNSCOPED_TOKEN_INVALID",
+    "source credential changed before controlled removal": "SOURCE_REMOVAL_CHANGED",
+    "source credential could not be removed": "SOURCE_REMOVAL_FAILED",
+    "source credential removal could not be verified": "SOURCE_REMOVAL_UNVERIFIED",
+    "downscoped token output already exists": "TOKEN_OUTPUT_EXISTS",
+    "downscoped token could not be written": "TOKEN_OUTPUT_FAILED",
+    "mint interrupted": "MINT_INTERRUPTED",
+    "unexpected internal failure": "INTERNAL_FAILURE",
+}
 
 EXPECTED_POLICY = {
     "accessBoundary": {
@@ -41,11 +72,9 @@ EXPECTED_POLICY = {
             {
                 "availabilityCondition": {
                     "expression": (
-                        "resource.type == 'storage.googleapis.com/Object' && "
                         "resource.name.startsWith('projects/_/buckets/"
                         "apt.plaidai.io/objects/releases/by-bom-sha256/')"
                     ),
-                    "title": "iq9075-candidate-content-addressed-v1",
                 },
                 "availablePermissions": [
                     "inRole:roles/storage.objectCreator",
@@ -62,6 +91,38 @@ EXPECTED_POLICY = {
 
 class CabError(RuntimeError):
     """A fail-closed candidate credential boundary violation."""
+
+    def __init__(
+        self, message: str, *, http_status: int | None = None,
+        oauth_error: str | None = None, stage: str = "unknown",
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.http_status = http_status
+        self.oauth_error = oauth_error
+
+
+def _safe_failure(error: CabError) -> dict[str, object]:
+    """Never serialize exception text or remote/body-derived free text."""
+    message = error.args[0] if error.args and type(error.args[0]) is str else ""
+    return {
+        "kind": "nuvion-iq9075-candidate-cab-token-mint-failure",
+        "code": SAFE_ERROR_CODES.get(message, "CAB_BOUNDARY_FAILED"),
+        "stage": error.stage if type(error.stage) is str and error.stage in SAFE_STAGES else "unknown",
+        "httpStatus": error.http_status if type(error.http_status) is int and error.http_status in SAFE_STS_HTTP_STATUSES else None,
+        "oauthError": error.oauth_error if type(error.oauth_error) is str and error.oauth_error in SAFE_OAUTH_ERRORS else None,
+    }
+
+
+def _safe_sts_error(raw_response: bytes) -> str | None:
+    if not isinstance(raw_response, bytes) or len(raw_response) > MAX_STS_RESPONSE_BYTES:
+        return None
+    try:
+        payload = json.loads(raw_response)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    value = payload.get("error") if isinstance(payload, dict) else None
+    return value if type(value) is str and value in SAFE_OAUTH_ERRORS else None
 
 
 def _canonical_json(value: object) -> bytes:
@@ -342,6 +403,7 @@ def mint(
     credential_bytes = bytearray()
     source_token = ""
     downscoped_token = ""
+    stage = "credential_input"
     try:
         try:
             credential_details = _validate_source_credential_target(credential_path)
@@ -356,10 +418,12 @@ def mint(
             _remove_required(credential_path, expected=credential_details)
             credential_removed = True
 
+            stage = "policy_input"
             policy, policy_raw = _read_exact_policy(policy_path)
             if output_path.exists() or output_path.is_symlink():
                 raise CabError("downscoped token output already exists")
 
+            stage = "source_access_token"
             with tempfile.TemporaryDirectory(
                 prefix="nuvion-candidate-gcloud-"
             ) as raw_config:
@@ -407,13 +471,16 @@ def mint(
                 _remove_required(credential_path, expected=credential_details)
                 credential_removed = True
 
+        stage = "sts_exchange"
         request_body = urllib.parse.urlencode(
             {
                 "grant_type": TOKEN_EXCHANGE_GRANT,
                 "requested_token_type": ACCESS_TOKEN_TYPE,
-                "subject_token_type": ACCESS_TOKEN_TYPE,
                 "subject_token": source_token,
-                "options": json.dumps(policy, sort_keys=True, separators=(",", ":")),
+                "subject_token_type": ACCESS_TOKEN_TYPE,
+                # Match google-auth's exchange_token/_make_request contract:
+                # options JSON is percent-encoded before form-urlencoded data.
+                "options": urllib.parse.quote(json.dumps(policy)),
             }
         ).encode("ascii")
         try:
@@ -431,7 +498,11 @@ def mint(
             or not isinstance(raw_response, bytes)
             or len(raw_response) > MAX_STS_RESPONSE_BYTES
         ):
-            raise CabError("STS exchange failed")
+            raise CabError(
+                "STS exchange failed", http_status=status_code,
+                oauth_error=_safe_sts_error(raw_response),
+            )
+        stage = "sts_response"
         try:
             payload = json.loads(raw_response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -455,6 +526,7 @@ def mint(
             )
         except (UnicodeEncodeError, AttributeError):
             raise CabError("downscoped token is invalid") from None
+        stage = "token_output"
         _write_exclusive_secret(output_path, downscoped_token)
         downscoped_token = ""
         return {
@@ -464,6 +536,11 @@ def mint(
             "policySha256": hashlib.sha256(policy_raw).hexdigest(),
             "credentialRemoved": True,
         }
+    except CabError as exc:
+        exc.stage = stage
+        raise
+    except Exception:
+        raise CabError("unexpected internal failure", stage=stage) from None
     finally:
         source_token = ""
         downscoped_token = ""
@@ -490,8 +567,16 @@ def main(argv: list[str] | None = None) -> int:
             policy_path=arguments.policy,
             output_path=arguments.output_token,
         )
-    except (CabError, KeyboardInterrupt):
-        print("candidate CAB token mint failed closed", file=sys.stderr)
+    except CabError as exc:
+        print(json.dumps(_safe_failure(exc), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        error = CabError("mint interrupted", stage="interrupted")
+        print(json.dumps(_safe_failure(error), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except Exception:
+        error = CabError("unexpected internal failure")
+        print(json.dumps(_safe_failure(error), sort_keys=True, separators=(",", ":")), file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
