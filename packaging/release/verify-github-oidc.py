@@ -17,7 +17,7 @@ from typing import Any
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID = re.compile(r"^[1-9][0-9]*$")
-TAG = "candidate-publisher-v2"
+TAG = "candidate-publisher-v3"
 TAG_REF = f"refs/tags/{TAG}"
 WORKFLOW_REF = (
     "plaid-ai/NUV-AGENT/.github/workflows/"
@@ -210,7 +210,13 @@ def verify(
         if claims.get(name) != expected_value:
             raise OidcVerificationError(f"GitHub OIDC claim {name} is not protected")
     if "job_workflow_ref" in claims or "job_workflow_sha" in claims:
-        raise OidcVerificationError("reusable-workflow identity appeared in standalone token")
+        # GitHub may include these fields for a standalone job too. They may
+        # only repeat this exact protected workflow, never name a callee.
+        if (
+            claims.get("job_workflow_ref") != WORKFLOW_REF
+            or claims.get("job_workflow_sha") != publisher_sha
+        ):
+            raise OidcVerificationError("GitHub OIDC job workflow identity is not the standalone publisher")
     now = int(time.time())
     for name in ("nbf", "iat", "exp"):
         if isinstance(claims.get(name), bool) or not isinstance(claims.get(name), int):
