@@ -269,6 +269,56 @@ def _verify_local_candidate_publisher(
     return result
 
 
+def _candidate_tag_publisher_sha(
+    tag_object: Any, *, tag_object_sha: str, candidate_tag: str
+) -> str:
+    tag_target = tag_object.get("object") if isinstance(tag_object, dict) else None
+    verification = tag_object.get("verification") if isinstance(tag_object, dict) else None
+    if (
+        not isinstance(tag_object, dict)
+        or tag_object.get("sha") != tag_object_sha
+        or not COMMIT_SHA.fullmatch(tag_object_sha)
+        or tag_object.get("tag") != candidate_tag
+        or not isinstance(tag_target, dict)
+        or tag_target.get("type") != "commit"
+        or not isinstance(tag_target.get("sha"), str)
+        or not COMMIT_SHA.fullmatch(tag_target["sha"])
+        or not isinstance(verification, dict)
+        or not isinstance(verification.get("signature"), str)
+        or not verification["signature"].startswith("-----BEGIN PGP SIGNATURE-----\n")
+        or not verification["signature"].endswith("-----END PGP SIGNATURE-----\n")
+        or not isinstance(verification.get("payload"), str)
+    ):
+        raise SettingsError("candidate publisher annotated tag identity is invalid")
+    signature = verification["signature"]
+    payload = verification["payload"]
+    expected_message = "NUVION IQ9075 candidate publisher v2\n"
+    header, separator, unsigned_message = payload.partition("\n\n")
+    header_lines = header.split("\n")
+    if (
+        tag_object.get("message") != expected_message + signature
+        or not separator
+        or unsigned_message != expected_message
+        or len(header_lines) != 4
+        or header_lines[:3]
+        != [f"object {tag_target['sha']}", "type commit", f"tag {candidate_tag}"]
+        or not header_lines[3].startswith("tagger ")
+        or len(header_lines[3]) <= len("tagger ")
+        or "\r" in header
+        or "\0" in header
+    ):
+        raise SettingsError("candidate publisher signed tag payload is inconsistent")
+    try:
+        raw_tag = (payload + signature).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SettingsError("candidate publisher signed tag encoding is invalid") from exc
+    # Bind API fields to the same Git object verified cryptographically below.
+    object_header = f"tag {len(raw_tag)}\0".encode("ascii")
+    if hashlib.sha1(object_header + raw_tag).hexdigest() != tag_object_sha:
+        raise SettingsError("candidate publisher signed tag object hash is inconsistent")
+    return tag_target["sha"]
+
+
 def _ruleset_covers(
     rulesets: list[Any],
     *,
@@ -694,26 +744,9 @@ def verify_settings(
     ):
         raise SettingsError("candidate publisher ref is not an annotated tag")
     tag_object = api.get(f"/repos/{repository}/git/tags/{tag_object_sha}")
-    tag_target = tag_object.get("object") if isinstance(tag_object, dict) else None
-    verification = tag_object.get("verification") if isinstance(tag_object, dict) else None
-    if (
-        not isinstance(tag_object, dict)
-        or tag_object.get("sha") != tag_object_sha
-        or tag_object.get("tag") != candidate_tag
-        or tag_object.get("message", "").strip()
-        != "NUVION IQ9075 candidate publisher v2"
-        or not isinstance(tag_target, dict)
-        or tag_target.get("type") != "commit"
-        or not isinstance(tag_target.get("sha"), str)
-        or not COMMIT_SHA.fullmatch(tag_target["sha"])
-        or not isinstance(verification, dict)
-        or not isinstance(verification.get("signature"), str)
-        or not verification["signature"].startswith("-----BEGIN PGP SIGNATURE-----")
-        or not isinstance(verification.get("payload"), str)
-        or not verification["payload"]
-    ):
-        raise SettingsError("candidate publisher annotated tag identity is invalid")
-    candidate_publisher_sha = tag_target["sha"]
+    candidate_publisher_sha = _candidate_tag_publisher_sha(
+        tag_object, tag_object_sha=tag_object_sha, candidate_tag=candidate_tag
+    )
     candidate_policy_path = (
         candidate_publisher_root.resolve()
         / "packaging/release/release-security-policy.json"
