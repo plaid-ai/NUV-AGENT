@@ -62,6 +62,16 @@ jobs:
           # This is diagnostic metadata only. It never authorizes a release,
           # uploads a JWT, enters a protected Environment, or reads a secret.
           PY
+      - name: Check publisher Ed25519 runtime without release material
+        run: |
+          command -v python3
+          python3 - <<'PY'
+          import cryptography
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          key = Ed25519PrivateKey.generate()
+          key.public_key().verify(key.sign(b'publisher-runtime-probe'), b'publisher-runtime-probe')
+          print('Ed25519 round-trip PASS; cryptography=' + cryptography.__version__)
+          PY
 
   arm64-release-prerequisite:
     name: arm64-release-prerequisite
