@@ -6167,9 +6167,9 @@ esac
                     )
 
 
-def candidate_publisher_tag_response() -> dict[str, object]:
-    # Actual GitHub response for the immutable v2 tag. Account attribution is
-    # unavailable, while the signature is independently verified by the publisher.
+def candidate_publisher_tag_response(version: int = 3) -> dict[str, object]:
+    # Preserve the real v2 API shape and use an adapted v3 payload for metadata
+    # tests. This reused signature is opaque here; local crypto is tested separately.
     signature = (
         "-----BEGIN PGP SIGNATURE-----\n\n"
         "iJEEABYKADkWIQQT5ZX+/pM7vd1PBN6jQOLrST0C6AUCap4SchsUgAAAAAAEAA5t\n"
@@ -6178,7 +6178,13 @@ def candidate_publisher_tag_response() -> dict[str, object]:
         "IAAF\n=HLUM\n-----END PGP SIGNATURE-----\n"
     )
     publisher_sha = "f8211ffaf2c127d66a540c00e6516c407b6beec8"
-    tag_object_sha = "c8d6f2284fa588edf5193a10d28d69c0c3fa43d3"
+    payload = (
+        f"object {publisher_sha}\ntype commit\ntag candidate-publisher-v{version}\n"
+        "tagger Plaid Platform Admin <platform-admins@plaid.ai.kr> "
+        f"1788744306 +0900\n\nNUVION IQ9075 candidate publisher v{version}\n"
+    )
+    raw_tag = (payload + signature).encode("utf-8")
+    tag_object_sha = hashlib.sha1(f"tag {len(raw_tag)}\0".encode() + raw_tag).hexdigest()
     return {
         "sha": tag_object_sha,
         "url": f"https://api.github.com/repos/plaid-ai/NUV-AGENT/git/tags/{tag_object_sha}",
@@ -6192,25 +6198,21 @@ def candidate_publisher_tag_response() -> dict[str, object]:
             "type": "commit",
             "url": f"https://api.github.com/repos/plaid-ai/NUV-AGENT/git/commits/{publisher_sha}",
         },
-        "tag": "candidate-publisher-v2",
-        "message": "NUVION IQ9075 candidate publisher v2\n" + signature,
+        "tag": f"candidate-publisher-v{version}",
+        "message": f"NUVION IQ9075 candidate publisher v{version}\n" + signature,
         "verification": {
             "verified": False,
             "reason": "no_user",
             "signature": signature,
-            "payload": (
-                f"object {publisher_sha}\ntype commit\ntag candidate-publisher-v2\n"
-                "tagger Plaid Platform Admin <platform-admins@plaid.ai.kr> "
-                "1788744306 +0900\n\nNUVION IQ9075 candidate publisher v2\n"
-            ),
+            "payload": payload,
             "verified_at": None,
         },
     }
 
 
 class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
-    TAG = "candidate-publisher-v2"
-    TAG_OBJECT_SHA = "c8d6f2284fa588edf5193a10d28d69c0c3fa43d3"
+    TAG = "candidate-publisher-v3"
+    TAG_OBJECT_SHA = candidate_publisher_tag_response()["sha"]
     PUBLISHER_SHA = "f8211ffaf2c127d66a540c00e6516c407b6beec8"
 
     def _verify(self, tag_object: dict[str, object], *, object_sha: str | None = None) -> str:
@@ -6228,15 +6230,21 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         tag_object["sha"] = digest
         return digest
 
-    def test_accepts_real_signed_api_message_and_object_hash(self) -> None:
+    def test_accepts_signed_api_message_shape_and_object_hash(self) -> None:
         tag_object = candidate_publisher_tag_response()
         self.assertEqual(self._rehashed(tag_object), self.TAG_OBJECT_SHA)
         self.assertEqual(
             tag_object["message"],
-            "NUVION IQ9075 candidate publisher v2\n"
+            "NUVION IQ9075 candidate publisher v3\n"
             + tag_object["verification"]["signature"],
         )
         self.assertEqual(self._verify(tag_object), self.PUBLISHER_SHA)
+
+    def test_retired_v2_preserves_real_api_hash_but_is_not_active(self) -> None:
+        tag_object = candidate_publisher_tag_response(version=2)
+        self.assertEqual(tag_object["sha"], "c8d6f2284fa588edf5193a10d28d69c0c3fa43d3")
+        with self.assertRaises(SETTINGS.SettingsError):
+            self._verify(tag_object, object_sha=tag_object["sha"])
 
     def test_github_account_attribution_does_not_replace_local_crypto(self) -> None:
         for verified, reason in ((False, "no_user"), (False, "bad_email"), (True, "valid")):
@@ -6248,7 +6256,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
     def test_rejects_unsigned_or_different_api_message(self) -> None:
         for message in (
             None,
-            "NUVION IQ9075 candidate publisher v2\n",
+            "NUVION IQ9075 candidate publisher v3\n",
             "NUVION IQ9075 candidate publisher v1\n",
             "",
         ):
@@ -6266,7 +6274,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 tag_object["verification"]["signature"] = malformed
                 object_sha = self.TAG_OBJECT_SHA
                 if isinstance(malformed, str):
-                    tag_object["message"] = "NUVION IQ9075 candidate publisher v2\n" + malformed
+                    tag_object["message"] = "NUVION IQ9075 candidate publisher v3\n" + malformed
                     object_sha = self._rehashed(tag_object)
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object, object_sha=object_sha)
@@ -6286,7 +6294,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 verification[field] = verification[field].replace(before, after)
                 if field == "signature":
                     tag_object["message"] = (
-                        "NUVION IQ9075 candidate publisher v2\n" + verification[field]
+                        "NUVION IQ9075 candidate publisher v3\n" + verification[field]
                     )
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object)
@@ -6295,7 +6303,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         cases = (
             ("object " + self.PUBLISHER_SHA, "object " + "1" * 40),
             ("type commit", "type tag"),
-            ("tag candidate-publisher-v2", "tag candidate-publisher-v1"),
+            ("tag candidate-publisher-v3", "tag candidate-publisher-v1"),
             ("tagger Plaid Platform Admin", "committer Plaid Platform Admin"),
             ("\n\nNUVION", "\nencoding UTF-8\n\nNUVION"),
         )
@@ -6311,11 +6319,11 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         tag_object = candidate_publisher_tag_response()
         verification = tag_object["verification"]
         verification["payload"] = verification["payload"].replace(
-            "NUVION IQ9075 candidate publisher v2\n",
-            "NUVION IQ9075 candidate publisher v2\nextra\n",
+            "NUVION IQ9075 candidate publisher v3\n",
+            "NUVION IQ9075 candidate publisher v3\nextra\n",
         )
         tag_object["message"] = (
-            "NUVION IQ9075 candidate publisher v2\nextra\n"
+            "NUVION IQ9075 candidate publisher v3\nextra\n"
             + verification["signature"]
         )
         with self.assertRaises(SETTINGS.SettingsError):
@@ -6401,7 +6409,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertEqual(
                 environment["deploymentBranchPolicies"],
                 (
-                    [{"name": "candidate-publisher-v2", "type": "tag"}]
+                    [{"name": "candidate-publisher-v3", "type": "tag"}]
                     if name
                     in {
                         "iq9075-candidate-sign",
@@ -6517,6 +6525,7 @@ class SettingsPolicyTest(unittest.TestCase):
                     "include": [
                         "refs/tags/candidate-publisher-v1",
                         "refs/tags/candidate-publisher-v2",
+                        "refs/tags/candidate-publisher-v3",
                     ],
                     "exclude": [],
                 }
@@ -6596,8 +6605,8 @@ class SettingsPolicyTest(unittest.TestCase):
             "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/3": candidate_tag_ruleset,
-            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v2": {
-                "ref": "refs/tags/candidate-publisher-v2",
+            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v3": {
+                "ref": "refs/tags/candidate-publisher-v3",
                 "object": {"type": "tag", "sha": candidate_tag_object_sha},
             },
             "/repos/plaid-ai/NUV-AGENT/git/tags/" + candidate_tag_object_sha: candidate_tag_object,
@@ -6620,7 +6629,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "face-artifacts-release",
         ):
             expected_deployment_policy = (
-                {"id": 1, "name": "candidate-publisher-v2", "type": "tag"}
+                {"id": 1, "name": "candidate-publisher-v3", "type": "tag"}
                 if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
                 else {"id": 1, "name": "main", "type": "branch"}
             )
@@ -6686,8 +6695,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 SETTINGS,
                 "_verify_local_candidate_publisher",
                 return_value={
-                    "candidate_publisher_tag": "candidate-publisher-v2",
-                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
+                    "candidate_publisher_tag": "candidate-publisher-v3",
+                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v3",
                     "candidate_publisher_tag_object_sha": candidate_tag_object_sha,
                     "candidate_publisher_sha": candidate_publisher_sha,
                     "component_sha": "b" * 40,
@@ -6739,8 +6748,11 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertTrue(result["secretScopesChecked"])
             candidate_ruleset_path = "/repos/plaid-ai/NUV-AGENT/rulesets/3"
             for tag_refs in (
-                ["refs/tags/candidate-publisher-v2"],
+                ["refs/tags/candidate-publisher-v3"],
                 ["refs/tags/candidate-publisher-v1"],
+                ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"],
+                ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v3"],
+                ["refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3"],
                 ["refs/tags/candidate-publisher-v*"],
             ):
                 invalid_ruleset = copy.deepcopy(candidate_tag_ruleset)
@@ -7487,8 +7499,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v2",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
+                        "candidate_publisher_tag": "candidate-publisher-v3",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v3",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
@@ -7672,8 +7684,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v2",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
+                        "candidate_publisher_tag": "candidate-publisher-v3",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v3",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,

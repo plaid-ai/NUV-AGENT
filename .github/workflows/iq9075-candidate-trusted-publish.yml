@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       release_sequence:
-        description: "Exact IQ9075 release sequence (publisher v2 allows only 2)"
+        description: "Exact IQ9075 release sequence (publisher v3 allows only 2)"
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: iq9075-candidate-publisher-v2-global
+  group: iq9075-candidate-publisher-v3-global
   cancel-in-progress: false
 
 env:
@@ -44,12 +44,12 @@ jobs:
           set -euo pipefail
           [ "$GITHUB_REPOSITORY" = "plaid-ai/NUV-AGENT" ]
           [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v2" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v3" ]
           [ "$GITHUB_RUN_ATTEMPT" = "1" ] \
             || { echo "candidate publisher attempts are not rerunnable; dispatch a new run" >&2; exit 1; }
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v2" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v3" ]
           [[ "$COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$VERSION" = "0.1.121" ]
           [ "$RELEASE_SEQUENCE" = "2" ]
@@ -60,7 +60,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v2'
+      github.ref == 'refs/tags/candidate-publisher-v3'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -105,9 +105,9 @@ jobs:
           [ "$REQUESTED_VERSION" = "0.1.121" ]
           [ "$REQUESTED_SEQUENCE" = "2" ]
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v2" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v3" ]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v2" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v3" ]
           [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
           [ -z "$(git status --porcelain --untracked-files=all)" ]
           git cat-file -e "${PUBLISHER_SHA}^{commit}"
@@ -229,7 +229,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v2' &&
+      github.ref == 'refs/tags/candidate-publisher-v3' &&
       needs.build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -261,7 +261,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v2" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v3" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -311,6 +311,19 @@ jobs:
           echo "workflow_sha=$EXPECTED_TRUSTED_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
           cleanup_identity
           trap - EXIT INT TERM
+      - name: Verify runner Ed25519 support before secret access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import cryptography
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          private_key = Ed25519PrivateKey.generate()
+          payload = b"nuvion-candidate-publisher-runtime-probe"
+          private_key.public_key().verify(private_key.sign(payload), payload)
+          print(f"Ed25519 runtime verified: cryptography={cryptography.__version__}")
+          PY
       - name: Download exact secretless build
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -336,7 +349,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v2 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v3 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -571,7 +584,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v2' &&
+      github.ref == 'refs/tags/candidate-publisher-v3' &&
       needs.build.result == 'success' &&
       needs.sign.result == 'success'
     runs-on: ubuntu-24.04
@@ -604,7 +617,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v2" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v3" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -654,6 +667,19 @@ jobs:
           echo "workflow_sha=$EXPECTED_TRUSTED_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
           cleanup_identity
           trap - EXIT INT TERM
+      - name: Verify runner Ed25519 support before secret access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import cryptography
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          private_key = Ed25519PrivateKey.generate()
+          payload = b"nuvion-candidate-publisher-runtime-probe"
+          private_key.public_key().verify(private_key.sign(payload), payload)
+          print(f"Ed25519 runtime verified: cryptography={cryptography.__version__}")
+          PY
       - name: Download signed candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -676,7 +702,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v2 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v3 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
