@@ -146,6 +146,80 @@ class FleetCommandVerifierTest(unittest.TestCase):
         self.assertEqual(command.required_capability, "command.config.apply")
         self.assertEqual(command.key_id, KID)
 
+    def test_platform_admin_signed_command_keeps_exact_target_binding(self) -> None:
+        claims = self._claims(
+            authorizationContext="PLATFORM_ADMIN", actor=f"admin::{uuid.uuid4()}"
+        )
+        command = self.verifier.verify(self._sign(claims))
+        self.assertEqual(command.authorization_context, "PLATFORM_ADMIN")
+        self.assertEqual(command.actor, claims["actor"])
+        self.assertEqual((command.device_id, command.space_id), (DEVICE_ID, SPACE_ID))
+        self.assertEqual(command.required_capability, "command.config.apply")
+
+    def test_platform_admin_does_not_relax_existing_validation(self) -> None:
+        for overrides, code in (
+            ({"deviceId": "another-device"}, "DEVICE_MISMATCH"),
+            ({"spaceId": SPACE_ID + 1}, "SPACE_MISMATCH"),
+            ({"sequence": 0}, "INVALID_CLAIMS"),
+            ({"payloadHash": "0" * 64}, "INVALID_PAYLOAD_HASH"),
+            ({"schemaVersion": 99}, "UNSUPPORTED_SCHEMA"),
+            ({"expiresAt": "2026-09-01T02:01:00Z"}, "EXPIRED"),
+            ({"expiresAt": "2026-09-02T02:00:01Z"}, "INVALID_TIME_WINDOW"),
+            (
+                {"authorizationContext": "PLATFORM_OWNER"},
+                "UNSUPPORTED_AUTHORIZATION_CONTEXT",
+            ),
+        ):
+            with self.subTest(code=code):
+                claims = self._claims(authorizationContext="PLATFORM_ADMIN")
+                claims.update(overrides)
+                self._assert_code(code, self._sign(claims))
+        claims = self._claims(authorizationContext="PLATFORM_ADMIN")
+        self._assert_code(
+            "INVALID_SIGNATURE",
+            self._sign(claims, private_key=Ed25519PrivateKey.generate()),
+        )
+        self._assert_code(
+            "UNKNOWN_KEY_ID",
+            self._sign(
+                claims,
+                header={"alg": "EdDSA", "kid": "unknown", "typ": "nuvion-command+jws"},
+            ),
+        )
+        missing_capability = self._verifier(
+            Ed25519Keyring({KID: self.raw_public_key}), capabilities=frozenset()
+        )
+        with self.assertRaises(CommandValidationError) as raised:
+            missing_capability.verify(self._sign(claims))
+        self.assertEqual(raised.exception.code, "MISSING_CAPABILITY")
+
+    def test_tampering_space_admin_context_cannot_elevate_signed_authority(
+        self,
+    ) -> None:
+        claims = self._claims()
+        original = self._sign(claims)
+        protected, _, signature = original.split(".")
+        claims["authorizationContext"] = "PLATFORM_ADMIN"
+        changed = _b64url(_json_bytes(claims))
+        self._assert_code("INVALID_SIGNATURE", f"{protected}.{changed}.{signature}")
+
+    def test_explicit_space_only_verifier_rejects_platform_admin(self) -> None:
+        verifier = FleetCommandVerifier(
+            keyring=Ed25519Keyring({KID: self.raw_public_key}),
+            expected_device_id=DEVICE_ID,
+            expected_space_id=SPACE_ID,
+            capabilities={"command.config.apply"},
+            allowed_authorization_contexts={"SPACE_ADMIN"},
+            clock=lambda: NOW,
+        )
+        self.assertEqual(
+            verifier.verify(self._sign()).authorization_context, "SPACE_ADMIN"
+        )
+        rejection = verifier.verify_for_rejection(
+            self._sign(self._claims(authorizationContext="PLATFORM_ADMIN"))
+        )
+        self.assertEqual(rejection.code, "UNSUPPORTED_AUTHORIZATION_CONTEXT")
+
     def test_accepts_der_subject_public_key_info(self) -> None:
         der = self.private_key.public_key().public_bytes(
             encoding=serialization.Encoding.DER,
@@ -541,7 +615,9 @@ class FleetCommandVerifierTest(unittest.TestCase):
             type="STREAM_POLICY",
         )
 
-        self.assertEqual(verifier.verify(self._sign(disabled)).payload["mode"], "DISABLED")
+        self.assertEqual(
+            verifier.verify(self._sign(disabled)).payload["mode"], "DISABLED"
+        )
         with self.assertRaises(CommandValidationError) as raised:
             verifier.verify(self._sign(fixed))
         self.assertEqual(raised.exception.code, "MISSING_CAPABILITY")
@@ -739,9 +815,7 @@ class FleetCommandVerifierTest(unittest.TestCase):
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
                 with self.assertRaises(CommandValidationError) as raised:
-                    self.verifier.verify(
-                        self._sign(self._claims_with_payload(payload))
-                    )
+                    self.verifier.verify(self._sign(self._claims_with_payload(payload)))
                 self.assertEqual(raised.exception.code, "INVALID_PAYLOAD_SCHEMA")
 
     def test_fleet_effect_v2_stream_policy_cross_contract_fixture(self) -> None:

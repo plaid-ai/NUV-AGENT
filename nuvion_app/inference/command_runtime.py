@@ -44,6 +44,7 @@ from nuvion_app.inference.effect_reconciler import (
 from nuvion_app.inference.fleet_command import (
     AUTHENTICATED_REJECTION_CODES,
     COMMAND_CAPABILITY_BY_TYPE,
+    DEFAULT_AUTHORIZATION_CONTEXTS,
     CommandValidationError,
     Ed25519Keyring,
     FleetCommandEvaluation,
@@ -51,6 +52,12 @@ from nuvion_app.inference.fleet_command import (
     VerifiedFleetCommand,
 )
 from nuvion_app.inference.reconcile_store import DurableReconcileStore
+from nuvion_app.runtime.fleet_capabilities import (
+    PLATFORM_ADMIN_CAPABILITY,
+    PLATFORM_ADMIN_CONTEXT,
+    RUNTIME_AUTHORIZATION_CAPABILITIES,
+    RUNTIME_ONLY_FLEET_CAPABILITIES,
+)
 from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
@@ -283,6 +290,7 @@ class FleetCommandRuntime:
         pull_page_size: int = DEFAULT_COMMAND_PULL_LIMIT,
         max_resume_batches: int = DEFAULT_MAX_PULL_BATCHES,
         resume_page_size: int = DEFAULT_COMMAND_PULL_LIMIT,
+        trusted_keyring: Ed25519Keyring | None = None,
     ) -> None:
         self.inbox = inbox
         self.processor = processor
@@ -303,12 +311,43 @@ class FleetCommandRuntime:
         self._pending_resume_cursor = 0
         self._pending_resume_through: int | None = None
         self._sync_lock = asyncio.Lock()
+        # Only the successful domain/ownership-checked factory supplies this
+        # keyring. A manually constructed/test runtime is not advertisement proof.
+        verifier = getattr(processor, "verifier", None)
+        self._trusted_keyring = trusted_keyring
+        self._trusted_verifier = (
+            verifier
+            if isinstance(trusted_keyring, Ed25519Keyring)
+            and isinstance(verifier, FleetCommandVerifier)
+            and verifier.keyring is trusted_keyring
+            else None
+        )
+
+    @property
+    def trusted_verifier_ready(self) -> bool:
+        verifier = self._trusted_verifier
+        return (
+            verifier is not None
+            and self.processor.verifier is verifier
+            and verifier.keyring is self._trusted_keyring
+        )
+
+    @property
+    def authorization_capabilities(self) -> frozenset[str]:
+        if self.trusted_verifier_ready and PLATFORM_ADMIN_CONTEXT in (
+            self._trusted_verifier.allowed_authorization_contexts
+        ):
+            return frozenset({PLATFORM_ADMIN_CAPABILITY})
+        return frozenset()
 
     @property
     def effect_capabilities(self) -> frozenset[str]:
         if self.effect_coordinator is None:
             return frozenset()
-        return self.effect_coordinator.registry.capabilities
+        return (
+            self.effect_coordinator.registry.capabilities
+            - RUNTIME_ONLY_FLEET_CAPABILITIES
+        )
 
     async def reconcile_effects(self) -> int:
         """Run one bounded external-effect batch and publish terminal ACKs."""
@@ -557,6 +596,19 @@ class FleetCommandRuntime:
             )
 
 
+def runtime_authorization_capabilities(
+    runtime: FleetCommandRuntime | None,
+) -> frozenset[str]:
+    """Advertise only the current configured verifier's authorization support."""
+
+    if not isinstance(runtime, FleetCommandRuntime):
+        return frozenset()
+    try:
+        return runtime.authorization_capabilities & RUNTIME_AUTHORIZATION_CAPABILITIES
+    except Exception:  # noqa: BLE001 - telemetry must fail closed if runtime is unavailable.
+        return frozenset()
+
+
 def build_fleet_command_runtime(
     *,
     base_url: str,
@@ -570,7 +622,10 @@ def build_fleet_command_runtime(
     reconciler_registry: ReconcilerRegistry | None = None,
     process_instance_id: str | None = None,
     restart_requester: Callable[[], bool] | None = None,
+    platform_admin_enabled: bool = True,
 ) -> FleetCommandRuntime:
+    if not isinstance(platform_admin_enabled, bool):
+        raise FleetCommandRuntimeError("platform_admin_enabled must be a boolean")
     if platform_identity.identity_status not in {
         IDENTITY_STATUS_VERIFIED,
         IDENTITY_STATUS_DEV,
@@ -610,12 +665,17 @@ def build_fleet_command_runtime(
             f"Fleet command inbox identity binding failed ({exc.code}): {exc}"
         ) from exc
     registry = reconciler_registry or ReconcilerRegistry()
-    base_capabilities = set(platform_identity.capabilities) - set(
-        COMMAND_CAPABILITY_BY_TYPE.values()
+    base_capabilities = (
+        set(platform_identity.capabilities)
+        - set(COMMAND_CAPABILITY_BY_TYPE.values())
+        - RUNTIME_ONLY_FLEET_CAPABILITIES
     )
 
     def effective_capabilities() -> frozenset[str]:
-        return frozenset(base_capabilities | set(registry.capabilities))
+        return frozenset(
+            (base_capabilities | set(registry.capabilities))
+            - RUNTIME_ONLY_FLEET_CAPABILITIES
+        )
 
     def admit_safe_unready_command(command: VerifiedFleetCommand) -> bool:
         """Ask only the registered reconciler for an explicit safe exception."""
@@ -633,6 +693,11 @@ def build_fleet_command_runtime(
         capabilities=effective_capabilities(),
         capability_provider=effective_capabilities,
         unready_command_admission=admit_safe_unready_command,
+        allowed_authorization_contexts=(
+            DEFAULT_AUTHORIZATION_CONTEXTS
+            if platform_admin_enabled
+            else {"SPACE_ADMIN"}
+        ),
     )
     observation_outbox = DurableCommandObservationOutbox(inbox)
     reconcile_store = DurableReconcileStore(
@@ -665,6 +730,7 @@ def build_fleet_command_runtime(
         reconcile_store=reconcile_store,
         effect_coordinator=effect_coordinator,
         observation_outbox=observation_outbox,
+        trusted_keyring=keyring,
     )
 
 
@@ -682,6 +748,13 @@ def build_fleet_command_runtime_from_env(
     enabled = str(values.get("NUVION_FLEET_COMMAND_ENABLED") or "false").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return None
+    platform_admin = (
+        str(values.get("NUVION_FLEET_PLATFORM_ADMIN_ENABLED", "true")).strip().lower()
+    )
+    if platform_admin not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise FleetCommandRuntimeError(
+            "NUVION_FLEET_PLATFORM_ADMIN_ENABLED must be a boolean"
+        )
     device_id = str(
         values.get("NUVION_DEVICE_ID") or values.get("NUVION_DEVICE_USERNAME") or ""
     ).strip()
@@ -713,4 +786,5 @@ def build_fleet_command_runtime_from_env(
         reconciler_registry=reconciler_registry,
         process_instance_id=process_instance_id,
         restart_requester=restart_requester,
+        platform_admin_enabled=platform_admin in {"1", "true", "yes", "on"},
     )

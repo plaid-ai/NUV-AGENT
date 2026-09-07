@@ -41,6 +41,7 @@ from nuvion_app.inference.command_runtime import (
     FleetCommandRuntime,
     FleetCommandRuntimeError,
     build_fleet_command_runtime_from_env,
+    runtime_authorization_capabilities,
 )
 from nuvion_app.inference.agent_update import AgentUpdateReconciler
 from nuvion_app.inference.effect_reconciler import ReconcilerRegistry
@@ -168,6 +169,10 @@ from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
     resolve_platform_identity,
+)
+from nuvion_app.runtime.fleet_capabilities import (
+    RUNTIME_ONLY_FLEET_CAPABILITIES,
+    SIGLIP_MODEL_CONFIG_CAPABILITY,
 )
 from nuvion_app.runtime.telemetry import (
     build_runtime_telemetry,
@@ -1744,6 +1749,34 @@ def build_command_observation_runtime_health() -> dict:
         }
 
 
+def build_model_config_capabilities() -> frozenset[str]:
+    """Advertise verification support, not proof that a target model is applied."""
+
+    runtime = fleet_command_runtime
+    if not isinstance(runtime, FleetCommandRuntime):
+        return frozenset()
+    try:
+        if not runtime.trusted_verifier_ready:
+            return frozenset()
+        if "command.config.apply" not in runtime.effect_capabilities:
+            return frozenset()
+        reconciler = runtime.effect_coordinator.registry.get("CONFIG_APPLY")
+        if not isinstance(reconciler, SettingsReconciler):
+            return frozenset()
+        adapter = reconciler.runtime
+        if (
+            isinstance(adapter, PipelineSettingsRuntimeAdapter)
+            and adapter.app is g_app
+            and callable(getattr(adapter, "verify_model", None))
+            and callable(getattr(adapter, "can_verify_model", None))
+            and adapter.can_verify_model()
+        ):
+            return frozenset({SIGLIP_MODEL_CONFIG_CAPABILITY})
+    except Exception:  # noqa: BLE001 - unavailable runtime must not grant capability.
+        return frozenset()
+    return frozenset()
+
+
 def build_dynamic_runtime_telemetry(
     base_capabilities: set[str] | frozenset[str] = frozenset(),
 ) -> dict:
@@ -1779,7 +1812,12 @@ def build_dynamic_runtime_telemetry(
     merged["agentUpdate"] = updater_telemetry["agentUpdate"]
     merged["updaterVersion"] = updater_telemetry["updaterVersion"]
     merged["capabilities"] = sorted(
-        set(base_capabilities) | set(fleet_effect_registry.capabilities)
+        (
+            (set(base_capabilities) | set(fleet_effect_registry.capabilities))
+            - RUNTIME_ONLY_FLEET_CAPABILITIES
+        )
+        | runtime_authorization_capabilities(fleet_command_runtime)
+        | build_model_config_capabilities()
     )
     return merged
 
@@ -3347,7 +3385,7 @@ class PipelineSettingsRuntimeAdapter:
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return False
 
-    def verify_model(self, desired) -> dict[str, str]:
+    def _loaded_siglip_model_source(self) -> Path:
         detector = getattr(self.app.user_data, "zero_shot", None)
         source_provider = getattr(detector, "loaded_model_source", None)
         if (
@@ -3372,6 +3410,21 @@ class PipelineSettingsRuntimeAdapter:
             raise RuntimeError("loaded model source is no longer resolvable") from exc
         if actual_source != expected_source:
             raise RuntimeError("active runtime loaded an old or different model source")
+        return actual_source
+
+    def can_verify_model(self) -> bool:
+        """Cheap live eligibility; full artifact hashing remains an apply check."""
+
+        if self.app.pipeline is None or not self.app.user_data.running:
+            return False
+        try:
+            self._loaded_siglip_model_source()
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return False
+        return True
+
+    def verify_model(self, desired) -> dict[str, str]:
+        actual_source = self._loaded_siglip_model_source()
         if str(desired.get("pointer") or "") != self.model_pointer:
             raise RuntimeError("active configured model pointer mismatch")
         verified = verify_model_artifact_identity(

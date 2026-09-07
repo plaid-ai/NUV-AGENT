@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from nuvion_app import build_info
+from nuvion_app.runtime.fleet_capabilities import RUNTIME_ONLY_FLEET_CAPABILITIES
 from nuvion_app.runtime.platform_identity import (
     PlatformIdentity,
     resolve_platform_identity,
@@ -24,9 +25,7 @@ from nuvion_app.runtime.release_bom import (
 DEFAULT_CONFIG_SCHEMA = "12"
 DEFAULT_MODEL_POINTER = "anomalyclip/prod"
 DEFAULT_MODEL_PROFILE = "runtime"
-FUNCTIONAL_HEALTH_VALUES = frozenset(
-    {"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"}
-)
+FUNCTIONAL_HEALTH_VALUES = frozenset({"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"})
 UPDATE_PHASE_VALUES = frozenset(
     {
         "IDLE",
@@ -83,7 +82,9 @@ def merge_runtime_public_state(
     evidence = state.get("updateEvidence")
     if evidence is not None and not isinstance(evidence, Mapping):
         raise ValueError("updateEvidence must be an object")
-    if update_phase == "ROLLED_BACK" and (not isinstance(evidence, Mapping) or not evidence):
+    if update_phase == "ROLLED_BACK" and (
+        not isinstance(evidence, Mapping) or not evidence
+    ):
         raise ValueError("ROLLED_BACK requires persistent updateEvidence")
     merged.update(state)
     return merged
@@ -272,14 +273,15 @@ def build_runtime_telemetry(
         if model_dir
         else _default_model_dir(values, pointer)
     )
-    metadata_model_pointer, metadata_model_version, metadata_model_digest = _read_server_model_identity(
-        resolved_model_dir
+    metadata_model_pointer, metadata_model_version, metadata_model_digest = (
+        _read_server_model_identity(resolved_model_dir)
     )
     model_version = str(values.get("NUVION_MODEL_VERSION") or "").strip()
     if not model_version:
         model_version = metadata_model_version or "unknown"
     expected_model_digest = str(values.get("NUVION_MODEL_DIGEST") or "").strip()
-    observed_artifact_digest = _artifact_manifest_digest(resolved_model_dir)
+    manifest_digest, aggregate_digest = _verified_artifact_digests(resolved_model_dir)
+    observed_artifact_digest = manifest_digest or aggregate_digest
     # Expected config is not actual evidence.  Only byte-verified artifact
     # metadata is published as modelDigest.  The resolver-declared value remains
     # useful context but cannot override the observed digest.
@@ -319,13 +321,14 @@ def build_runtime_telemetry(
             bom_status = "PLATFORM_MISMATCH"
 
     bom_telemetry = release_bom.to_telemetry() if release_bom is not None else {}
-    raw_functional_health = str(
-        values.get("NUVION_FUNCTIONAL_HEALTH") or "FUNCTIONAL_UNHEALTHY"
-    ).strip().upper()
+    raw_functional_health = (
+        str(values.get("NUVION_FUNCTIONAL_HEALTH") or "FUNCTIONAL_UNHEALTHY")
+        .strip()
+        .upper()
+    )
     functional_health = (
         raw_functional_health
-        if raw_functional_health
-        in {"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"}
+        if raw_functional_health in {"FUNCTIONAL_HEALTHY", "FUNCTIONAL_UNHEALTHY"}
         else "FUNCTIONAL_UNHEALTHY"
     )
     result: dict[str, Any] = {
@@ -340,6 +343,7 @@ def build_runtime_telemetry(
         ),
         "modelVersion": model_version,
         "modelDigest": model_digest,
+        "modelAggregateDigest": aggregate_digest or "unknown",
         # An environment value, build constant, or BOM requirement proves
         # neither that the privileged updater is installed nor that it is
         # alive. Fresh peer-authenticated STATUS telemetry is merged by the
@@ -380,7 +384,8 @@ def build_runtime_telemetry(
         result["bomVerificationError"] = bom_error
     result.update(identity.to_telemetry())
     result["capabilities"] = sorted(
-        set(identity.capabilities) | {str(value) for value in effect_capabilities}
+        (set(identity.capabilities) | {str(value) for value in effect_capabilities})
+        - RUNTIME_ONLY_FLEET_CAPABILITIES
     )
     result = merge_runtime_public_state(result, public_state)
     # Keep the established flat fields during rollout while giving BE/FE one

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import sys
@@ -10,6 +11,9 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 def _install_gi_stub_when_native_bindings_are_unavailable() -> None:
@@ -41,6 +45,7 @@ def _install_gi_stub_when_native_bindings_are_unavailable() -> None:
 _install_gi_stub_when_native_bindings_are_unavailable()
 
 from nuvion_app.inference import pipeline
+from nuvion_app.inference.command_runtime import build_fleet_command_runtime
 from nuvion_app.inference.critical_event_safety import (
     CriticalEventBackpressureError,
     CriticalEventSafetyGate,
@@ -65,6 +70,220 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def _trusted_runtime(self, root: Path, registry=None):
+        public_key = (
+            Ed25519PrivateKey.generate()
+            .public_key()
+            .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        )
+        keyring = root / "test-keyring.json"
+        keyring.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "trustDomain": "macos-dev",
+                    "keys": {"test-only": base64.b64encode(public_key).decode("ascii")},
+                }
+            )
+        )
+        keyring.chmod(0o600)
+        return build_fleet_command_runtime(
+            base_url="https://api.example.test",
+            access_token_provider=lambda: "test",
+            ack_sender=lambda *_args: True,
+            device_id="test-device",
+            space_id=3,
+            keyring_path=keyring,
+            inbox_path=root / "inbox.sqlite3",
+            platform_identity=types.SimpleNamespace(
+                identity_status="DEV",
+                platform_profile="macos_dev",
+                capabilities=frozenset(),
+            ),
+            reconciler_registry=registry,
+        )
+
+    def test_runtime_authority_capability_updates_flat_and_nested_heartbeats(
+        self,
+    ) -> None:
+        capability = "fleet.auth.platform_admin.v1"
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._trusted_runtime(Path(temporary))
+            coordinator = pipeline.DeviceStateCoordinator(
+                send_message=lambda _payload: True,
+                line_id=None,
+                process_id=None,
+                telemetry={
+                    "capabilities": [capability],
+                    "runtimeTelemetry": {"capabilities": [capability]},
+                },
+                runtime_telemetry_provider=lambda: (
+                    pipeline.build_dynamic_runtime_telemetry({capability})
+                ),
+            )
+            with mock.patch.object(pipeline, "fleet_command_runtime", runtime):
+                payload = coordinator.current_payload()
+                self.assertIn(capability, payload["capabilities"])
+                self.assertIn(capability, payload["runtimeTelemetry"]["capabilities"])
+            with mock.patch.object(pipeline, "fleet_command_runtime", None):
+                payload = coordinator.current_payload()
+                self.assertNotIn(capability, payload["capabilities"])
+                self.assertNotIn(
+                    capability, payload["runtimeTelemetry"]["capabilities"]
+                )
+
+    def test_unready_runtime_and_static_or_effect_claims_cannot_grant_authority(
+        self,
+    ) -> None:
+        capabilities = {
+            "fleet.auth.platform_admin.v1",
+            "command.config.model.siglip.v1",
+        }
+        for attempted in (False, True):
+            for runtime in (
+                None,
+                types.SimpleNamespace(authorization_capabilities=capabilities),
+            ):
+                with (
+                    self.subTest(attempted=attempted, runtime=runtime),
+                    mock.patch.object(pipeline, "fleet_command_runtime", runtime),
+                    mock.patch.object(
+                        pipeline, "fleet_command_runtime_init_attempted", attempted
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "fleet_effect_registry",
+                        types.SimpleNamespace(capabilities=capabilities),
+                    ),
+                    mock.patch.object(
+                        pipeline,
+                        "build_command_observation_runtime_health",
+                        return_value={},
+                    ),
+                ):
+                    telemetry = pipeline.build_dynamic_runtime_telemetry(capabilities)
+                    self.assertTrue(capabilities.isdisjoint(telemetry["capabilities"]))
+
+    def test_failed_authority_runtime_property_withdraws_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._trusted_runtime(Path(temporary))
+            with (
+                mock.patch.object(pipeline, "fleet_command_runtime", runtime),
+                mock.patch.object(
+                    type(runtime),
+                    "authorization_capabilities",
+                    new_callable=mock.PropertyMock,
+                    side_effect=RuntimeError("unavailable"),
+                ),
+            ):
+                telemetry = pipeline.build_dynamic_runtime_telemetry(
+                    {"fleet.auth.platform_admin.v1"}
+                )
+                self.assertNotIn(
+                    "fleet.auth.platform_admin.v1", telemetry["capabilities"]
+                )
+
+    def test_siglip_model_capability_requires_live_matching_runtime_without_hashing(
+        self,
+    ) -> None:
+        capability = "command.config.model.siglip.v1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_dir = root / "model"
+            model_dir.mkdir()
+            detector = types.SimpleNamespace(
+                enabled=True, ready=True, loaded_model_source=lambda: str(model_dir)
+            )
+            app = types.SimpleNamespace(
+                pipeline=object(),
+                user_data=types.SimpleNamespace(
+                    backend="siglip", running=True, zero_shot=detector
+                ),
+            )
+            adapter = pipeline.PipelineSettingsRuntimeAdapter(
+                app=app,
+                encoder=object(),
+                model_pointer="siglip/test",
+                model_dir=model_dir,
+            )
+            registry = pipeline.ReconcilerRegistry()
+            registry.register(
+                pipeline.SettingsReconciler(store=object(), runtime=adapter)
+            )
+            runtime = self._trusted_runtime(root, registry)
+            with (
+                mock.patch.object(pipeline, "fleet_command_runtime", runtime),
+                mock.patch.object(pipeline, "fleet_effect_registry", registry),
+                mock.patch.object(pipeline, "g_app", app),
+                mock.patch.object(
+                    pipeline,
+                    "verify_model_artifact_identity",
+                    side_effect=AssertionError("heartbeat must not hash weights"),
+                ) as verify,
+            ):
+                self.assertIn(
+                    capability,
+                    pipeline.build_dynamic_runtime_telemetry()["capabilities"],
+                )
+                verify.assert_not_called()
+                for backend in ("none", "triton", "visualad", "visualad_htp"):
+                    with (
+                        self.subTest(backend=backend),
+                        mock.patch.object(app.user_data, "backend", backend),
+                    ):
+                        self.assertEqual(
+                            pipeline.build_model_config_capabilities(), frozenset()
+                        )
+                for flag in ("enabled", "ready"):
+                    with (
+                        self.subTest(flag=flag),
+                        mock.patch.object(detector, flag, False),
+                    ):
+                        self.assertEqual(
+                            pipeline.build_model_config_capabilities(), frozenset()
+                        )
+                old_model = root / "old-model"
+                old_model.mkdir()
+                for source in (None, str(old_model), "remote/huggingface-model"):
+                    with (
+                        self.subTest(source=source),
+                        mock.patch.object(
+                            detector,
+                            "loaded_model_source",
+                            lambda source=source: source,
+                        ),
+                    ):
+                        self.assertEqual(
+                            pipeline.build_model_config_capabilities(), frozenset()
+                        )
+                for field in ("can_verify_model", "verify_model"):
+                    with (
+                        self.subTest(field=field),
+                        mock.patch.object(adapter, field, None),
+                    ):
+                        self.assertEqual(
+                            pipeline.build_model_config_capabilities(), frozenset()
+                        )
+                with mock.patch.object(app.user_data, "running", False):
+                    self.assertEqual(
+                        pipeline.build_model_config_capabilities(), frozenset()
+                    )
+                with mock.patch.object(pipeline, "g_app", object()):
+                    self.assertEqual(
+                        pipeline.build_model_config_capabilities(), frozenset()
+                    )
+                with mock.patch.object(pipeline, "fleet_command_runtime", None):
+                    self.assertNotIn(
+                        capability,
+                        pipeline.build_dynamic_runtime_telemetry({capability})[
+                            "capabilities"
+                        ],
+                    )
+                registry.unregister("CONFIG_APPLY")
+                self.assertEqual(
+                    pipeline.build_model_config_capabilities(), frozenset()
+                )
+
     def test_stream_runtime_evidence_reads_playing_state_and_frame_without_webrtc(
         self,
     ) -> None:
@@ -97,7 +316,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(evidence.last_frame_monotonic, 123.0)
         self.assertEqual(app.pipeline.timeout, 0)
 
-    def test_update_commit_readiness_uses_live_pipeline_stomp_rtp_and_outboxes(self) -> None:
+    def test_update_commit_readiness_uses_live_pipeline_stomp_rtp_and_outboxes(
+        self,
+    ) -> None:
         class _Controller:
             @staticmethod
             def runtime_health_snapshot() -> dict[str, object]:
@@ -203,7 +424,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
                 ),
             )
             with (
-                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(
+                    pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)
+                ),
                 mock.patch.object(pipeline, "outbound_queue", pending),
                 mock.patch.object(pipeline, "last_sent_payloads", {}),
                 mock.patch.object(
@@ -242,7 +465,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_unscoped_webrtc_signaling_cannot_bypass_generation_validation(self) -> None:
+    def test_unscoped_webrtc_signaling_cannot_bypass_generation_validation(
+        self,
+    ) -> None:
         self.assertFalse(
             pipeline.enqueue_stomp_message(
                 pipeline.WEBRTC_UPLINK_OFFER_DEST,
@@ -288,7 +513,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         )
         self.assertEqual(cached, {})
 
-    def test_uncorrelated_or_stale_offer_rejection_waits_for_exact_watchdog(self) -> None:
+    def test_uncorrelated_or_stale_offer_rejection_waits_for_exact_watchdog(
+        self,
+    ) -> None:
         token = pipeline.WebRTCSignalingToken(9, "session-current")
         controller = mock.Mock()
         cached = {
@@ -324,12 +551,14 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         controller.reject_signaling.assert_not_called()
         self.assertIn(pipeline.WEBRTC_UPLINK_OFFER_DEST, cached)
 
-    def test_stale_retryable_webrtc_errors_cannot_exhaust_new_session_budget(self) -> None:
+    def test_stale_retryable_webrtc_errors_cannot_exhaust_new_session_budget(
+        self,
+    ) -> None:
         async def scenario() -> None:
             current = pipeline.WebRTCSignalingToken(10, "session-new")
             controller = mock.Mock()
-            controller.is_signaling_token_current.side_effect = (
-                lambda token: token == current
+            controller.is_signaling_token_current.side_effect = lambda token: (
+                token == current
             )
             cached = {
                 pipeline.WEBRTC_UPLINK_OFFER_DEST: pipeline._CachedPayload(
@@ -403,7 +632,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_uncached_webrtc_auth_rejection_blocks_transport_and_tears_down(self) -> None:
+    def test_uncached_webrtc_auth_rejection_blocks_transport_and_tears_down(
+        self,
+    ) -> None:
         controller = mock.Mock()
         attempts = {
             pipeline._agent_retry_key(
@@ -438,11 +669,15 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             )
 
             self.assertTrue(pipeline.agent_uplink_blocked)
-            self.assertEqual(pipeline.agent_uplink_block_reason, "FORBIDDEN token rejected")
+            self.assertEqual(
+                pipeline.agent_uplink_block_reason, "FORBIDDEN token rejected"
+            )
             self.assertEqual(attempts, {})
             controller.on_signaling_reset.assert_called_once_with()
 
-    def test_exact_uncached_candidate_rejection_disposes_current_generation(self) -> None:
+    def test_exact_uncached_candidate_rejection_disposes_current_generation(
+        self,
+    ) -> None:
         token = pipeline.WebRTCSignalingToken(12, "session-current")
         controller = mock.Mock()
         controller.signaling_token_for_session.return_value = token
@@ -479,7 +714,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             reason="signaling frame rejected: WEBRTC_SIGNALING_CAPACITY status=429",
         )
 
-    def test_stale_uncached_candidate_rejection_cannot_dispose_current_session(self) -> None:
+    def test_stale_uncached_candidate_rejection_cannot_dispose_current_session(
+        self,
+    ) -> None:
         controller = mock.Mock()
         controller.signaling_token_for_session.return_value = None
         with (
@@ -508,7 +745,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
         controller.reject_signaling.assert_not_called()
 
-    def test_outbound_sender_revalidates_token_without_dropping_durable_event(self) -> None:
+    def test_outbound_sender_revalidates_token_without_dropping_durable_event(
+        self,
+    ) -> None:
         async def scenario() -> None:
             stale = pipeline.WebRTCSignalingToken(3, "session-old")
             pending: asyncio.Queue[pipeline._OutboundMessage] = asyncio.Queue()
@@ -560,7 +799,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             )
             websocket = _WebSocket()
             with (
-                mock.patch.object(pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)),
+                mock.patch.object(
+                    pipeline, "g_app", types.SimpleNamespace(webrtc_uplink=controller)
+                ),
                 mock.patch.object(pipeline, "outbound_queue", pending),
                 mock.patch.object(pipeline, "critical_event_delivery", delivery),
             ):
@@ -579,9 +820,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_config_label_array_storage_round_trips_without_csv_loss(self) -> None:
         labels = ["scratch,edge", "한글 label"]
-        encoded = config_env_updates(
-            {"labels": {"inspection": labels}}
-        )["NUVION_ZERO_SHOT_LABELS_B64"]
+        encoded = config_env_updates({"labels": {"inspection": labels}})[
+            "NUVION_ZERO_SHOT_LABELS_B64"
+        ]
 
         self.assertEqual(
             pipeline.parse_label_array(encoded, "legacy,fallback"),
@@ -606,7 +847,10 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertNotIn("webrtcbin", description)
         self.assertEqual(description.count("x264enc"), 2)
         self.assertIn("x264enc name=video_encoder", description)
-        self.assertIn("name=video_encoder tune=zerolatency speed-preset=faster bitrate=1750", description)
+        self.assertIn(
+            "name=video_encoder tune=zerolatency speed-preset=faster bitrate=1750",
+            description,
+        )
         self.assertIn("x264enc name=clip_encoder", description)
         self.assertEqual(description.count("level=(string)3.1"), 2)
         self.assertEqual(description.count("max-size-buffers=2"), 2)
@@ -679,7 +923,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             with self.assertRaises(UnsupportedSettingsEffect):
                 adapter.verify_model(desired)
 
-    def test_dynamic_telemetry_merges_updater_rollback_and_functional_health(self) -> None:
+    def test_dynamic_telemetry_merges_updater_rollback_and_functional_health(
+        self,
+    ) -> None:
         app = types.SimpleNamespace(
             pipeline=object(),
             user_data=types.SimpleNamespace(running=True),
@@ -703,7 +949,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIn("updateEvidence", telemetry)
         self.assertIn("commandObservationOutbox", telemetry)
 
-    def test_stale_updater_cache_hides_capability_but_keeps_terminal_evidence(self) -> None:
+    def test_stale_updater_cache_hides_capability_but_keeps_terminal_evidence(
+        self,
+    ) -> None:
         trusted = {
             "agentUpdate": {
                 "capabilityAvailable": True,
@@ -731,7 +979,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(stale["updatePhase"], "ROLLED_BACK")
         self.assertEqual(stale["updateEvidence"], trusted["updateEvidence"])
 
-    def test_supervisor_restart_is_enabled_only_inside_systemd_linux_service(self) -> None:
+    def test_supervisor_restart_is_enabled_only_inside_systemd_linux_service(
+        self,
+    ) -> None:
         with mock.patch.object(pipeline.sys, "platform", "linux"):
             self.assertTrue(
                 pipeline.systemd_restart_enabled(

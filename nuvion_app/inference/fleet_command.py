@@ -18,6 +18,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from nuvion_app.runtime.fleet_capabilities import PLATFORM_ADMIN_CONTEXT
 from nuvion_app.runtime.settings_overlay import (
     SettingsOverlayError,
     validate_model_pointer,
@@ -28,7 +29,7 @@ JWS_TYPE = "nuvion-command+jws"
 MAX_COMMAND_PAYLOAD_BYTES = 64 * 1024
 MAX_COMPACT_JWS_CHARS = 192 * 1024
 DEFAULT_MAX_COMMAND_TTL = timedelta(hours=24)
-DEFAULT_AUTHORIZATION_CONTEXTS = frozenset({"SPACE_ADMIN"})
+DEFAULT_AUTHORIZATION_CONTEXTS = frozenset({"SPACE_ADMIN", PLATFORM_ADMIN_CONTEXT})
 
 COMMAND_CAPABILITY_BY_TYPE = {
     "CONFIG_APPLY": "command.config.apply",
@@ -421,9 +422,7 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
             _bounded_payload_int(video, "width", minimum=160, maximum=7680)
             _bounded_payload_int(video, "height", minimum=120, maximum=4320)
             _bounded_payload_int(video, "fps", minimum=1, maximum=120)
-            _bounded_payload_int(
-                video, "bitrateKbps", minimum=100, maximum=20_000
-            )
+            _bounded_payload_int(video, "bitrateKbps", minimum=100, maximum=20_000)
         return
 
     if command_type == "STREAM_POLICY":
@@ -479,25 +478,17 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
                 "STREAM_POLICY bitrate bounds must satisfy min <= initial <= max",
             )
         if "increaseStepKbps" in payload:
-            _bounded_payload_int(
-                payload, "increaseStepKbps", minimum=1, maximum=10_000
-            )
+            _bounded_payload_int(payload, "increaseStepKbps", minimum=1, maximum=10_000)
         if "decreaseFactor" in payload:
             _bounded_payload_number(
                 payload, "decreaseFactor", minimum=0.5, maximum=0.95
             )
         if "congestionSamples" in payload:
-            _bounded_payload_int(
-                payload, "congestionSamples", minimum=1, maximum=20
-            )
+            _bounded_payload_int(payload, "congestionSamples", minimum=1, maximum=20)
         if "recoverySamples" in payload:
-            _bounded_payload_int(
-                payload, "recoverySamples", minimum=1, maximum=20
-            )
+            _bounded_payload_int(payload, "recoverySamples", minimum=1, maximum=20)
         if "cooldownSeconds" in payload:
-            _bounded_payload_int(
-                payload, "cooldownSeconds", minimum=1, maximum=300
-            )
+            _bounded_payload_int(payload, "cooldownSeconds", minimum=1, maximum=300)
         return
 
     if command_type == "AGENT_UPDATE":
