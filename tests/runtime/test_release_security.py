@@ -6231,7 +6231,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertEqual(
                 environment["deploymentBranchPolicies"],
                 (
-                    [{"name": "candidate-publisher-v1", "type": "tag"}]
+                    [{"name": "candidate-publisher-v2", "type": "tag"}]
                     if name
                     in {
                         "iq9075-candidate-sign",
@@ -6344,7 +6344,10 @@ class SettingsPolicyTest(unittest.TestCase):
             "enforcement": "active",
             "conditions": {
                 "ref_name": {
-                    "include": ["refs/tags/candidate-publisher-v1"],
+                    "include": [
+                        "refs/tags/candidate-publisher-v1",
+                        "refs/tags/candidate-publisher-v2",
+                    ],
                     "exclude": [],
                 }
             },
@@ -6420,14 +6423,14 @@ class SettingsPolicyTest(unittest.TestCase):
             "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/3": candidate_tag_ruleset,
-            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v1": {
-                "ref": "refs/tags/candidate-publisher-v1",
+            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v2": {
+                "ref": "refs/tags/candidate-publisher-v2",
                 "object": {"type": "tag", "sha": "c" * 40},
             },
             "/repos/plaid-ai/NUV-AGENT/git/tags/" + "c" * 40: {
                 "sha": "c" * 40,
-                "tag": "candidate-publisher-v1",
-                "message": "NUVION IQ9075 candidate publisher v1\n",
+                "tag": "candidate-publisher-v2",
+                "message": "NUVION IQ9075 candidate publisher v2\n",
                 "object": {"type": "commit", "sha": "9" * 40},
                 "verification": {
                     "verified": True,
@@ -6455,7 +6458,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "face-artifacts-release",
         ):
             expected_deployment_policy = (
-                {"id": 1, "name": "candidate-publisher-v1", "type": "tag"}
+                {"id": 1, "name": "candidate-publisher-v2", "type": "tag"}
                 if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
                 else {"id": 1, "name": "main", "type": "branch"}
             )
@@ -6521,8 +6524,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 SETTINGS,
                 "_verify_local_candidate_publisher",
                 return_value={
-                    "candidate_publisher_tag": "candidate-publisher-v1",
-                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                    "candidate_publisher_tag": "candidate-publisher-v2",
+                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
                     "candidate_publisher_tag_object_sha": "c" * 40,
                     "candidate_publisher_sha": "9" * 40,
                     "component_sha": "b" * 40,
@@ -6552,6 +6555,46 @@ class SettingsPolicyTest(unittest.TestCase):
                 include_secret_scopes=True,
             )
             self.assertTrue(result["secretScopesChecked"])
+            candidate_ruleset_path = "/repos/plaid-ai/NUV-AGENT/rulesets/3"
+            for tag_refs in (
+                ["refs/tags/candidate-publisher-v2"],
+                ["refs/tags/candidate-publisher-v1"],
+                ["refs/tags/candidate-publisher-v*"],
+            ):
+                invalid_ruleset = copy.deepcopy(candidate_tag_ruleset)
+                invalid_ruleset["conditions"]["ref_name"]["include"] = tag_refs
+                responses[candidate_ruleset_path] = invalid_ruleset
+                with self.subTest(tag_refs=tag_refs):
+                    with self.assertRaisesRegex(
+                        SETTINGS.SettingsError, "candidate publisher tag ruleset"
+                    ):
+                        SETTINGS.verify_settings(
+                            repository="plaid-ai/NUV-AGENT",
+                            token="metadata-only",
+                            policy_path=ROOT / "packaging/release/release-security-policy.json",
+                            publisher_root=ROOT,
+                            candidate_publisher_root=ROOT,
+                            trusted_publisher_sha="a" * 40,
+                            include_secret_scopes=False,
+                        )
+            invalid_ruleset = copy.deepcopy(candidate_tag_ruleset)
+            invalid_ruleset["bypass_actors"] = [
+                {"actor_id": 16128529, "actor_type": "Team", "bypass_mode": "always"}
+            ]
+            responses[candidate_ruleset_path] = invalid_ruleset
+            with self.assertRaisesRegex(
+                SETTINGS.SettingsError, "candidate publisher tag ruleset"
+            ):
+                SETTINGS.verify_settings(
+                    repository="plaid-ai/NUV-AGENT",
+                    token="metadata-only",
+                    policy_path=ROOT / "packaging/release/release-security-policy.json",
+                    publisher_root=ROOT,
+                    candidate_publisher_root=ROOT,
+                    trusted_publisher_sha="a" * 40,
+                    include_secret_scopes=False,
+                )
+            responses[candidate_ruleset_path] = candidate_tag_ruleset
             environment_inventory_path = (
                 "/repos/plaid-ai/NUV-AGENT/environments?per_page=100&page=1"
             )
@@ -7262,8 +7305,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v1",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                        "candidate_publisher_tag": "candidate-publisher-v2",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
@@ -7447,8 +7490,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v1",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v1",
+                        "candidate_publisher_tag": "candidate-publisher-v2",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v2",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,

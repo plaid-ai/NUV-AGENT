@@ -273,7 +273,7 @@ def _ruleset_covers(
     rulesets: list[Any],
     *,
     target: str,
-    include: str,
+    include: str | list[str],
     required_rules: set[str],
     required_name: str | None = None,
     required_source: str | None = None,
@@ -306,7 +306,7 @@ def _ruleset_covers(
         return False
     ref_name = conditions.get("ref_name")
     if not isinstance(ref_name, dict) or ref_name != {
-        "include": [include],
+        "include": [include] if isinstance(include, str) else include,
         "exclude": [],
     }:
         return False
@@ -456,8 +456,9 @@ def verify_settings(
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     expected_candidate_publisher = {
-        "tag": "candidate-publisher-v1",
-        "tagRef": "refs/tags/candidate-publisher-v1",
+        "tag": "candidate-publisher-v2",
+        "tagRef": "refs/tags/candidate-publisher-v2",
+        "retiredTagRefs": ["refs/tags/candidate-publisher-v1"],
         "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
         "agentVersion": "0.1.121",
         "releaseSequence": 2,
@@ -671,7 +672,7 @@ def verify_settings(
     if not _ruleset_covers(
         active_rulesets,
         target="tag",
-        include="refs/tags/candidate-publisher-v1",
+        include=[*candidate_publisher["retiredTagRefs"], candidate_publisher["tagRef"]],
         required_rules={"creation", "update", "deletion", "non_fast_forward"},
         required_name="protected-candidate-publisher",
         required_source=repository,
@@ -700,7 +701,7 @@ def verify_settings(
         or tag_object.get("sha") != tag_object_sha
         or tag_object.get("tag") != candidate_tag
         or tag_object.get("message", "").strip()
-        != "NUVION IQ9075 candidate publisher v1"
+        != "NUVION IQ9075 candidate publisher v2"
         or not isinstance(tag_target, dict)
         or tag_target.get("type") != "commit"
         or not isinstance(tag_target.get("sha"), str)
@@ -791,7 +792,7 @@ def verify_settings(
             "customBranchPolicies": True,
         }
         expected_deployment_policies = (
-            [{"name": "candidate-publisher-v1", "type": "tag"}]
+            [{"name": "candidate-publisher-v2", "type": "tag"}]
             if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
             else [{"name": default_branch, "type": "branch"}]
         )
