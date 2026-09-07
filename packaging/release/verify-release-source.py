@@ -260,9 +260,9 @@ def verify_release_source(
         }
         or candidate_publisher
         != {
-            "tag": "candidate-publisher-v4",
-            "tagRef": "refs/tags/candidate-publisher-v4",
-            "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3"],
+            "tag": "candidate-publisher-v5",
+            "tagRef": "refs/tags/candidate-publisher-v5",
+            "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4"],
             "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
             "agentVersion": "0.1.121",
             "releaseSequence": 2,
