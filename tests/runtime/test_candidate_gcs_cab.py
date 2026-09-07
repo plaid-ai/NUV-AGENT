@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -9,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -98,10 +101,38 @@ class CandidateGcsCabTest(unittest.TestCase):
         expression = rules[0]["availabilityCondition"]["expression"]
         self.assertEqual(
             expression,
-            "resource.type == 'storage.googleapis.com/Object' && "
             "resource.name.startsWith('projects/_/buckets/apt.plaidai.io/objects/"
             "releases/by-bom-sha256/')",
         )
+
+    def test_object_resource_prefix_keeps_bucket_folder_and_other_names_outside_boundary(self) -> None:
+        policy = json.loads(POLICY_PATH.read_bytes())
+        condition = policy["accessBoundary"]["accessBoundaryRules"][0]["availabilityCondition"]
+        prefix = "projects/_/buckets/apt.plaidai.io/objects/releases/by-bom-sha256/"
+        # The exact resource-name namespace identifies objects already. Bucket
+        # and folder resource names cannot satisfy this unchanged object prefix.
+        self.assertEqual(condition, {"expression": f"resource.name.startsWith('{prefix}')"})
+        accepted = (
+            prefix + "a" * 64 + "/release-bom.json",
+            prefix + "a" * 64 + "/release-bom.json.sig",
+            prefix + "a" * 64 + "/nuv-agent.agent-bundle.tar.gz",
+        )
+        rejected = (
+            "projects/_/buckets/apt.plaidai.io",
+            "projects/_/buckets/apt.plaidai.io/folders/releases/by-bom-sha256/a",
+            "projects/_/buckets/apt.plaidai.io/managedFolders/releases/by-bom-sha256/a",
+            "projects/_/buckets/another-bucket/objects/releases/by-bom-sha256/a",
+            "projects/_/buckets/apt.plaidai.io.evil/objects/releases/by-bom-sha256/a",
+            "projects/_/buckets/apt.plaidai.io/objects/releases/versions/0.1.121",
+            "projects/_/buckets/apt.plaidai.io/objects/releases/by-bom-sha256-other/a",
+            "projects/_/buckets/apt.plaidai.io/objects/releases/by-bom-sha256",
+        )
+        for name in accepted:
+            with self.subTest(accepted=name):
+                self.assertTrue(name.startswith(prefix))
+        for name in rejected:
+            with self.subTest(rejected=name):
+                self.assertFalse(name.startswith(prefix))
 
     @staticmethod
     def _credential(path: Path) -> None:
@@ -137,7 +168,8 @@ class CandidateGcsCabTest(unittest.TestCase):
             form = urllib.parse.parse_qs(request_body.decode(), strict_parsing=True)
             self.assertEqual(form["subject_token"], [source_token])
             self.assertEqual(
-                json.loads(form["options"][0]), json.loads(POLICY_PATH.read_text())
+                json.loads(urllib.parse.unquote(form["options"][0])),
+                json.loads(POLICY_PATH.read_text()),
             )
             return (
                 200,
@@ -188,6 +220,122 @@ class CandidateGcsCabTest(unittest.TestCase):
             )
             self.assertNotIn(source_token, json.dumps(result))
             self.assertNotIn(downscoped_token, json.dumps(result))
+
+    def test_sts_request_matches_official_sdk_golden_bytes(self) -> None:
+        # Captured from google-auth 2.57.1 sts.Client.exchange_token with this
+        # policy and a fake request transport. No live credential or STS call.
+        def exchange(body: bytes, *, timeout: float):
+            self.assertEqual(len(body), 892)
+            self.assertEqual(
+                hashlib.sha256(body).hexdigest(),
+                "27a9c216129f3172a154ef0682a62dd24147b0e51786ff3244d8905e0eefe160",
+            )
+            form = urllib.parse.parse_qs(body.decode("ascii"), strict_parsing=True)
+            self.assertTrue(form["options"][0].startswith("%7B%22accessBoundary%22"))
+            self.assertEqual(
+                json.loads(urllib.parse.unquote(form["options"][0])),
+                json.loads(POLICY_PATH.read_text()),
+            )
+            return 200, json.dumps({
+                "access_token": "fixture-downscoped-token",
+                "issued_token_type": self.mint.ACCESS_TOKEN_TYPE,
+                "token_type": "Bearer", "expires_in": 3600,
+            }).encode()
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            credential = root / "gha-creds.json"
+            self._credential(credential)
+            self.mint.mint(
+                credential_path=credential, policy_path=POLICY_PATH,
+                output_path=root / "cab-token", sts_exchange=exchange,
+                command_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                    [], 0, stdout="sdk-fixture-subject-token\n"
+                ),
+            )
+
+    def test_failure_metadata_is_fixed_and_never_echoes_untrusted_text(self) -> None:
+        sentinel = "private-credential-source-token-response-description"
+        errors = (
+            self.mint.CabError(
+                sentinel, stage=sentinel, http_status=987654,
+                oauth_error=sentinel,
+            ),
+            RuntimeError(sentinel),
+            KeyboardInterrupt(sentinel),
+        )
+        for error in errors:
+            with self.subTest(kind=type(error).__name__):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(self.mint, "mint", side_effect=error), \
+                     mock.patch.object(self.mint, "_install_cleanup_signal_handlers"), \
+                     redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = self.mint.main([
+                        "--credential", "/unused/gha-creds.json",
+                        "--policy", "/unused/policy.json",
+                        "--output-token", "/unused/cab-token",
+                    ])
+                self.assertEqual(status, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(sentinel, stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                diagnostic = json.loads(stderr.getvalue())
+                self.assertEqual(set(diagnostic), {"kind", "code", "stage", "httpStatus", "oauthError"})
+                self.assertIn(diagnostic["stage"], self.mint.SAFE_STAGES)
+                self.assertIsNone(diagnostic["httpStatus"])
+                self.assertIsNone(diagnostic["oauthError"])
+
+    def test_sts_failure_exposes_only_allowlisted_metadata_and_removes_adc(self) -> None:
+        sentinel = "untrusted-secret-body-and-token"
+        cases = (
+            (400, {"error": "invalid_request", "error_description": sentinel}, "invalid_request"),
+            (403, {"error": "access_denied", "access_token": sentinel}, "access_denied"),
+            (401, {"error": sentinel}, None),
+            (500, {"error": {"message": sentinel}}, None),
+        )
+        for status, body, expected_error in cases:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                credential, output = root / "gha-creds.json", root / "cab-token"
+                self._credential(credential)
+                with self.assertRaises(self.mint.CabError) as raised:
+                    self.mint.mint(
+                        credential_path=credential, policy_path=POLICY_PATH,
+                        output_path=output,
+                        command_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                            [], 0, stdout="fixture-source-token\n", stderr=sentinel,
+                        ),
+                        sts_exchange=lambda *_args, **_kwargs: (status, json.dumps(body).encode()),
+                    )
+                diagnostic = self.mint._safe_failure(raised.exception)
+                self.assertEqual(diagnostic["code"], "STS_EXCHANGE_FAILED")
+                self.assertEqual(diagnostic["stage"], "sts_exchange")
+                self.assertEqual(diagnostic["httpStatus"], status)
+                self.assertEqual(diagnostic["oauthError"], expected_error)
+                self.assertNotIn(sentinel, json.dumps(diagnostic))
+                self.assertFalse(credential.exists())
+                self.assertFalse(output.exists())
+
+    def test_source_token_failure_is_classified_without_gcloud_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            credential, output = root / "gha-creds.json", root / "cab-token"
+            self._credential(credential)
+            with self.assertRaises(self.mint.CabError) as raised:
+                self.mint.mint(
+                    credential_path=credential, policy_path=POLICY_PATH,
+                    output_path=output,
+                    command_runner=lambda *_args, **_kwargs: subprocess.CompletedProcess(
+                        [], 1, stdout="sensitive-source-token", stderr="sensitive-gcloud-error",
+                    ),
+                    sts_exchange=lambda *_args, **_kwargs: self.fail("STS must not run"),
+                )
+            diagnostic = self.mint._safe_failure(raised.exception)
+            self.assertEqual(diagnostic["code"], "SOURCE_ACCESS_TOKEN_FAILED")
+            self.assertEqual(diagnostic["stage"], "source_access_token")
+            self.assertNotIn("sensitive", json.dumps(diagnostic))
+            self.assertFalse(credential.exists())
+            self.assertFalse(output.exists())
 
     def test_mint_failures_remove_broad_adc_and_never_write_token(self) -> None:
         failures = {

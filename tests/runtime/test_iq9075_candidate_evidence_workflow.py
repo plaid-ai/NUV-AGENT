@@ -62,11 +62,12 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("permissions: {}", self.header)
         self.assertNotIn("secrets:", self.header)
         self.assertEqual(
-            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v3'"),
+            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v4'"),
             3,
         )
         self.assertNotIn("refs/tags/candidate-publisher-v1", self.publisher)
         self.assertNotIn("refs/tags/candidate-publisher-v2", self.publisher)
+        self.assertNotIn("refs/tags/candidate-publisher-v3", self.publisher)
         self.assertNotIn("refs/heads/main", self.publisher)
         self.assertNotIn(
             "uses: plaid-ai/NUV-AGENT/.github/workflows/", self.publisher
@@ -74,7 +75,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", self.header)
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required")
-    def test_authorization_accepts_only_exact_v3_ref_and_workflow_identity(self) -> None:
+    def test_authorization_accepts_only_exact_v4_ref_and_workflow_identity(self) -> None:
         script = textwrap.dedent(
             self.authorize.split("        run: |\n", maxsplit=1)[1]
         )
@@ -82,13 +83,15 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             "plaid-ai/NUV-AGENT/.github/workflows/"
             "iq9075-candidate-trusted-publish.yml@"
         )
-        active_ref = "refs/tags/candidate-publisher-v3"
+        active_ref = "refs/tags/candidate-publisher-v4"
         cases = [
             (active_ref, active_ref, True),
             (active_ref + "0", active_ref + "0", False),
         ]
         for retired_ref in (
-            "refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"
+            "refs/tags/candidate-publisher-v1",
+            "refs/tags/candidate-publisher-v2",
+            "refs/tags/candidate-publisher-v3",
         ):
             cases.extend(
                 (
@@ -170,11 +173,11 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                 self.assertIn("--main-ref refs/remotes/origin/main", job)
                 self.assertIn("verify-github-oidc.py", job)
                 self.assertIn(
-                    "refs/tags/candidate-publisher-v3", job
+                    "refs/tags/candidate-publisher-v4", job
                 )
                 self.assertEqual(
                     OIDC.WORKFLOW_REF,
-                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v3",
+                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v4",
                 )
                 self.assertNotIn("ref: ${{ inputs.component_sha }}", job)
                 self.assertNotIn("stamp-build-info.py", job)
@@ -246,7 +249,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             self.stage[stage_preflight:stage_secret],
         )
 
-    def test_candidate_v3_prevents_downgrade_or_scope_expansion(self) -> None:
+    def test_candidate_v4_prevents_downgrade_or_scope_expansion(self) -> None:
         self.assertGreaterEqual(self.publisher.count('= "0.1.121" ]'), 3)
         self.assertGreaterEqual(self.publisher.count('= "2" ]'), 3)
         self.assertGreaterEqual(self.publisher.count('= "12" ]'), 2)
@@ -289,11 +292,12 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertEqual(
             policy["candidatePublisher"],
             {
-                "tag": "candidate-publisher-v3",
-                "tagRef": "refs/tags/candidate-publisher-v3",
+                "tag": "candidate-publisher-v4",
+                "tagRef": "refs/tags/candidate-publisher-v4",
                 "retiredTagRefs": [
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
+                    "refs/tags/candidate-publisher-v3",
                 ],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
                 "agentVersion": "0.1.121",
@@ -306,7 +310,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         for name in ("iq9075-candidate-sign", "iq9075-candidate-stage"):
             self.assertEqual(
                 policy["requiredEnvironments"][name]["deploymentBranchPolicies"],
-                [{"name": "candidate-publisher-v3", "type": "tag"}],
+                [{"name": "candidate-publisher-v4", "type": "tag"}],
             )
             self.assertFalse(
                 policy["requiredEnvironments"][name]["canAdminsBypass"]
@@ -315,23 +319,29 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn(
             "gh workflow run iq9075-candidate-trusted-publish.yml", runbook
         )
-        self.assertIn("--ref candidate-publisher-v3", runbook)
+        self.assertIn("--ref candidate-publisher-v4", runbook)
         self.assertNotIn("--ref candidate-publisher-v1", runbook)
         self.assertNotIn("--ref candidate-publisher-v2", runbook)
+        self.assertNotIn("--ref candidate-publisher-v3", runbook)
         self.assertIn("job_workflow_sha", runbook)
         self.assertIn("job_workflow_ref", runbook)
         self.assertGreaterEqual(runbook.count("set -euo pipefail"), 2)
         self.assertIn('"can_admins_bypass": false', runbook)
-        self.assertIn("expected exactly one retired v2 tag policy", runbook)
+        self.assertIn("expected exactly one retired v3 tag policy", runbook)
         self.assertIn("locked_candidate_ruleset", runbook)
         self.assertIn("remote ref is not the exact annotated tag", runbook)
+        for version in (1, 2, 3):
+            self.assertGreaterEqual(
+                runbook.count(f"retired_v{version}_tag_object_sha"), 2
+            )
+        self.assertIn("7059eb508b40b156939dc70ab6db0fd5ae08d579", runbook)
         migration = runbook.split("updated_policy=", maxsplit=1)[1]
         migration = migration.split("~~~", maxsplit=1)[0]
         self.assertIn('"$(gh api --method PUT', migration)
         self.assertIn("deployment-branch-policies/$policy_id", migration)
         self.assertNotIn("--method DELETE", migration)
         self.assertNotIn("--method POST", migration)
-        self.assertIn('.id == $id and .name == "candidate-publisher-v3"', migration)
+        self.assertIn('.id == $id and .name == "candidate-publisher-v4"', migration)
         self.assertIn('.type == "tag"', migration)
 
 
@@ -480,7 +490,7 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             self.assertEqual(
                 result["workflowRef"],
                 "plaid-ai/NUV-AGENT/.github/workflows/"
-                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v3",
+                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v4",
             )
 
     def test_accepts_signed_exact_optional_job_workflow_pair(self) -> None:
@@ -506,7 +516,13 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             {"job_workflow_ref": OIDC.WORKFLOW_REF, "job_workflow_sha": "2" * 40},
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v3", "candidate-publisher-v2"
+                    "candidate-publisher-v4", "candidate-publisher-v2"
+                ),
+                "job_workflow_sha": "1" * 40,
+            },
+            {
+                "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
+                    "candidate-publisher-v4", "candidate-publisher-v3"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
@@ -526,7 +542,11 @@ class StandalonePublisherOidcTest(unittest.TestCase):
 
     def test_rejects_validly_signed_retired_oidc_identity(self) -> None:
         cases = []
-        for tag in ("candidate-publisher-v1", "candidate-publisher-v2"):
+        for tag in (
+            "candidate-publisher-v1",
+            "candidate-publisher-v2",
+            "candidate-publisher-v3",
+        ):
             retired = {
                 "ref": f"refs/tags/{tag}",
                 "workflow_ref": (
