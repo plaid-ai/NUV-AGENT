@@ -24,6 +24,7 @@ from nuvion_app.runtime.release_bom import (
     ReleaseTarget,
     build_release_bom_v2_payload,
     canonical_release_bom_json,
+    canonical_release_bom_signature_json,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1191,7 +1192,9 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "5qt8Jow6hXDVt4iGOzp4Dw=="
             ),
         }
-        bom_signature_path.write_bytes(canonical_bytes(bom_signature))
+        bom_signature_path.write_text(
+            canonical_release_bom_signature_json(bom_signature), encoding="utf-8"
+        )
         baseline_digest = (
             "26a7f1674bdd4a24bfe26fa37c681798244990408fe7d858ca76957a88bdb9f1"
         )
@@ -1492,7 +1495,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "spaceId": identity["spaceId"],
             "bomFileSha256": hashlib.sha256(canonical_bytes(bom)).hexdigest(),
             "signatureFileSha256": hashlib.sha256(
-                canonical_bytes(bom_signature)
+                bom_signature_path.read_bytes()
             ).hexdigest(),
             "release": release_record,
         }
@@ -2865,7 +2868,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         )
                     elif encoding == "indent":
                         path.write_text(
-                            json.dumps(value, indent=2, sort_keys=True) + "\n",
+                            json.dumps(value, indent=4, sort_keys=True) + "\n",
                             encoding="utf-8",
                         )
                     else:
@@ -3214,7 +3217,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         )
                     elif encoding == "indent":
                         path.write_text(
-                            json.dumps(value, indent=2, sort_keys=True) + "\n",
+                            json.dumps(value, indent=4, sort_keys=True) + "\n",
                             encoding="utf-8",
                         )
                     else:

@@ -954,6 +954,21 @@ def canonical_release_bom_signature_json(signature_payload: dict[str, Any]) -> s
     )
 
 
+def validate_release_bom_signature_encoding(
+    signature_payload: dict[str, Any], raw: bytes
+) -> None:
+    """Accept publisher output and legacy compact JSON without rewriting evidence.
+
+    Callers must strictly parse the original bytes before this encoding check and
+    keep those same bytes for evidence hashes. Cryptographic verification remains
+    a separate requirement.
+    """
+    publisher = canonical_release_bom_signature_json(signature_payload).encode("utf-8")
+    legacy = _canonical_json(signature_payload) + b"\n"
+    if raw not in (publisher, legacy):
+        raise ReleaseBomValidationError("release signature is not canonical JSON")
+
+
 def _compare_semver(left: str, right: str) -> int:
     left_major, left_minor, left_patch, left_prerelease = _strict_semver_parts(
         left, "updaterVersion"

@@ -11,6 +11,8 @@ import time
 import unittest
 from pathlib import Path
 
+from nuvion_app.runtime.release_bom import canonical_release_bom_signature_json
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "packaging/dev/run-iq9075-agent-rollout-control.py"
 SPEC = importlib.util.spec_from_file_location("iq9075_agent_rollout_control", SCRIPT)
@@ -326,6 +328,66 @@ class RolloutControlTest(unittest.TestCase):
         )
         self.assertEqual(release_path.read_bytes(), _canonical(result))
         return release_path
+
+    def test_publisher_signature_bytes_are_preserved_on_registration_and_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            bom_path, signature_path, release_path = self._inputs(root)
+            signature_raw = canonical_release_bom_signature_json(_signature()).encode(
+                "utf-8"
+            )
+            signature_path.write_bytes(signature_raw)
+            api = _Api([_release_response(), _release_response()])
+            result = MODULE.register_release(
+                api,
+                space_id=SPACE_ID,
+                bom_path=bom_path,
+                signature_path=signature_path,
+                output=release_path,
+            )
+            retry = MODULE.register_release(
+                api,
+                space_id=SPACE_ID,
+                bom_path=bom_path,
+                signature_path=signature_path,
+                output=release_path,
+            )
+            self.assertEqual(result, retry)
+            self.assertEqual(
+                result["signatureFileSha256"], hashlib.sha256(signature_raw).hexdigest()
+            )
+            self.assertEqual(signature_path.read_bytes(), signature_raw)
+            self.assertEqual([call[0] for call in api.calls], ["POST", "GET"])
+
+    def test_invalid_signature_documents_never_reach_registration_api(self) -> None:
+        publisher = canonical_release_bom_signature_json(_signature()).encode("utf-8")
+        invalid_documents = (
+            publisher + b" ",
+            publisher.replace(b"  ", b"    "),
+            publisher.replace(
+                b'"schemaVersion": 1', b'"schemaVersion": 1, "schemaVersion": 1'
+            ),
+            publisher.replace(b'"schemaVersion": 1', b'"schemaVersion": NaN'),
+            publisher + b"{}",
+        )
+        for raw in invalid_documents:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root).resolve()
+                bom_path, signature_path, release_path = self._inputs(root)
+                signature_path.write_bytes(raw)
+                api = _Api([])
+                with self.assertRaises(MODULE.RolloutControlError):
+                    MODULE.register_release(
+                        api,
+                        space_id=SPACE_ID,
+                        bom_path=bom_path,
+                        signature_path=signature_path,
+                        output=release_path,
+                    )
+                self.assertEqual(api.calls, [])
+                self.assertFalse(release_path.exists())
 
     def _issue_rollback(self, root: Path, release_path: Path) -> tuple[Path, Path]:
         created_path = root / "rollback-created.json"

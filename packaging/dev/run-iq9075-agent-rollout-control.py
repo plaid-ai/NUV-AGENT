@@ -21,6 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from nuvion_app.runtime.release_bom import (
+    ReleaseBomValidationError,
+    validate_release_bom_signature_encoding,
+)
+
 DEFAULT_API_ORIGIN = "https://api.nuvion-dev.plaidlabs.ai"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_COOKIE_BYTES = 64 * 1024
@@ -530,8 +538,11 @@ def register_release(
     signature, signature_raw = _object_file(
         signature_path,
         label="candidate BOM signature",
-        canonical=True,
     )
+    try:
+        validate_release_bom_signature_encoding(signature, signature_raw)
+    except ReleaseBomValidationError as exc:
+        raise RolloutControlError(f"candidate BOM signature is invalid: {exc}") from exc
     _preflight_output(output, allow_existing=True)
     if output.exists():
         persisted, _persisted_raw = _load_release(
