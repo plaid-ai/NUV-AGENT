@@ -18,6 +18,10 @@ from typing import Any
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from nuvion_app.runtime.release_bom import (
+    ReleaseBomValidationError,
+    validate_release_bom_signature_encoding,
+)
 from nuvion_app.runtime.stable_file import (
     StableFileError,
     digest_stable_regular_file,
@@ -280,8 +284,11 @@ def _assemble_into(
     bom_signature, bom_signature_raw = _object(
         bom_signature_path,
         label="release BOM signature",
-        require_canonical=True,
     )
+    try:
+        validate_release_bom_signature_encoding(bom_signature, bom_signature_raw)
+    except ReleaseBomValidationError as exc:
+        raise AssemblyError(f"release BOM signature is invalid: {exc}") from exc
     security, _security_raw = _object(
         security_policy_path, label="release security policy"
     )

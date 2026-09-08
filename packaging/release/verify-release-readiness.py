@@ -25,6 +25,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 from nuvion_app.runtime.release_bom import (
     ReleaseBomValidationError,
     ReleaseKeyring,
+    validate_release_bom_signature_encoding,
     verify_release_bom,
     verify_signed_release_bom,
 )
@@ -2241,10 +2242,16 @@ def _validate_fleet_runtime_documents(
         commit_terminal_raw, label="IQ9075 commit rollout terminal evidence"
     )
     bom = _strict_canonical_object(bom_raw, label="IQ9075 Fleet Runtime tested BOM")
-    bom_signature = _strict_canonical_object(
+    bom_signature = _strict_object(
         bom_signature_raw,
         label="IQ9075 Fleet Runtime tested BOM signature",
     )
+    try:
+        validate_release_bom_signature_encoding(bom_signature, bom_signature_raw)
+    except ReleaseBomValidationError as exc:
+        raise ReadinessError(
+            f"IQ9075 Fleet Runtime tested BOM signature is invalid: {exc}"
+        ) from exc
 
     publisher_fleet_runner = (
         Path(__file__).resolve().parents[1] / "dev/run-iq9075-fleet-e2e.py"
