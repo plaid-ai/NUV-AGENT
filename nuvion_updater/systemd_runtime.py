@@ -37,6 +37,12 @@ MAX_ENVIRON_BYTES = 1024 * 1024
 MAX_MARKER_BYTES = 64 * 1024
 MAX_PROC_STAT_BYTES = 16 * 1024
 MAX_BOOT_ID_BYTES = 128
+STARTUP_WAIT_SECONDS = 10.0
+STARTUP_POLL_SECONDS = 0.1
+
+
+class _LauncherStarting(RuntimeError):
+    """The launcher has not yet exec'd the process with its slot environment."""
 
 _COMMAND_ENV = {
     "LANG": "C",
@@ -75,6 +81,7 @@ class SystemdRuntime:
         if result.returncode != 0:
             self._stop_after_failure()
             raise RuntimeError("SYSTEMD_RESTART_FAILED")
+        self._wait_started_slot(expected_slot)
 
     def safe_stop(self) -> None:
         try:
@@ -212,6 +219,10 @@ class SystemdRuntime:
             )
             if restart_result.returncode != 0:
                 raise RuntimeError("FUNCTIONAL_SERVICE_RESTART_FAILED")
+            expected_slot = self.slots.current_slot()
+            if expected_slot is None:
+                raise RuntimeError("BOOT_CURRENT_SLOT_MISSING")
+            self._wait_started_slot(expected_slot)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return self._failed_check(
                 self._reason(exc, "FUNCTIONAL_IQ9075_PROBE_FAILED")
@@ -219,22 +230,54 @@ class SystemdRuntime:
         return True, "FUNCTIONAL_HEALTHY"
 
     def _reset_agent_start_limit(self) -> None:
-        # reset-failed returns an error for a clean inactive/not-yet-loaded
-        # unit on IQ9075 even though a subsequent start succeeds. Query the
-        # predicate first and reset only an actual failed unit.
-        failed_state = self._run(
-            (SYSTEMCTL, "is-failed", "--quiet", AGENT_SERVICE),
-            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
-        )
-        if failed_state.returncode != 0:
-            return
+        # Successful starts also consume StartLimitBurst. Reset before a
+        # controlled OTA restart even when the unit has not failed yet.
         result = self._run(
             (SYSTEMCTL, "reset-failed", AGENT_SERVICE),
             timeout=SYSTEMCTL_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
+            # A not-yet-loaded unit has no counter to reset. Do not interpret
+            # authorization/transport failures on a loaded unit as this case.
+            load_state = self._run(
+                (SYSTEMCTL, "show", "--property=LoadState", "--value", AGENT_SERVICE),
+                timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+            )
+            if load_state.returncode == 0 and load_state.stdout.strip() == "not-found":
+                return
             self._stop_after_failure()
             raise RuntimeError("SYSTEMD_RESET_FAILED")
+
+    def _wait_started_slot(self, expected_slot: str) -> None:
+        # Type=simple reports start success before the shell launcher execs the
+        # Agent. Wait only for a missing startup identity; a wrong/ambiguous
+        # identity is still rejected immediately and every wait is bounded.
+        deadline = time.monotonic() + STARTUP_WAIT_SECONDS
+        try:
+            while True:
+                if self.slots.current_slot() != expected_slot:
+                    raise RuntimeError("SYSTEMD_RESTART_SLOT_MISMATCH")
+                try:
+                    first_pid = self._main_pid()
+                    active_slot = self._active_slot_from_environ(first_pid)
+                    second_pid = self._main_pid()
+                except (FileNotFoundError, ProcessLookupError, _LauncherStarting):
+                    pass
+                except RuntimeError as exc:
+                    if str(exc) != "BOOT_MAIN_PID_UNAVAILABLE":
+                        raise
+                else:
+                    if active_slot != expected_slot:
+                        raise RuntimeError("BOOT_ACTIVE_SLOT_ENV_MISMATCH")
+                    if first_pid == second_pid:
+                        return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("BOOT_STARTUP_TIMEOUT")
+                time.sleep(min(STARTUP_POLL_SECONDS, remaining))
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            self._stop_after_failure()
+            raise
 
     def _validate_rollback_boot(self, expected_slot: str) -> None:
         if self.slots.current_slot() != expected_slot:
@@ -338,6 +381,8 @@ class SystemdRuntime:
             os.close(descriptor)
         prefix = b"NUVION_ACTIVE_SLOT="
         matches = [entry[len(prefix) :] for entry in b"".join(chunks).split(b"\0") if entry.startswith(prefix)]
+        if not matches:
+            raise _LauncherStarting("BOOT_ACTIVE_SLOT_ENV_MISMATCH")
         if len(matches) != 1:
             raise RuntimeError("BOOT_ACTIVE_SLOT_ENV_MISMATCH")
         try:
