@@ -220,6 +220,24 @@ class SystemdRuntimeTest(unittest.TestCase):
         self.assertEqual(run.call_args_list[-1].args[0],
                          ("/usr/bin/systemctl", "restart", "nuv-agent.service"))
 
+    def test_reset_transport_failure_stops_existing_agent_without_restart(self) -> None:
+        for stage in ("reset", "load-state"):
+            for error in (OSError("unavailable"), subprocess.TimeoutExpired("systemctl", 30)):
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    effects = ([self._completed((), returncode=1)]
+                               if stage == "load-state" else [])
+                    effects.extend([error, self._completed(())])
+                    with mock.patch.object(self.runtime, "_run", side_effect=effects) as run, \
+                         mock.patch.object(self.runtime, "_wait_started_slot") as wait:
+                        with self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESET_FAILED") as raised:
+                            self.runtime.restart_agent(self.slots.current_slot())
+                    self.assertIs(raised.exception.__cause__, error)
+                    self.assertEqual(run.call_args_list[-1].args[0],
+                                     ("/usr/bin/systemctl", "stop", "nuv-agent.service"))
+                    self.assertFalse(any(call.args[0][1] == "restart"
+                                         for call in run.call_args_list))
+                    wait.assert_not_called()
+
     def test_startup_wait_accepts_only_after_launcher_exec_has_exact_slot(self) -> None:
         proc_root = self.root / "proc"
         process = proc_root / "412"

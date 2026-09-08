@@ -232,11 +232,13 @@ class SystemdRuntime:
     def _reset_agent_start_limit(self) -> None:
         # Successful starts also consume StartLimitBurst. Reset before a
         # controlled OTA restart even when the unit has not failed yet.
-        result = self._run(
-            (SYSTEMCTL, "reset-failed", AGENT_SERVICE),
-            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0:
+        try:
+            result = self._run(
+                (SYSTEMCTL, "reset-failed", AGENT_SERVICE),
+                timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                return
             # A not-yet-loaded unit has no counter to reset. Do not interpret
             # authorization/transport failures on a loaded unit as this case.
             load_state = self._run(
@@ -245,8 +247,11 @@ class SystemdRuntime:
             )
             if load_state.returncode == 0 and load_state.stdout.strip() == "not-found":
                 return
+        except (OSError, subprocess.SubprocessError) as exc:
             self._stop_after_failure()
-            raise RuntimeError("SYSTEMD_RESET_FAILED")
+            raise RuntimeError("SYSTEMD_RESET_FAILED") from exc
+        self._stop_after_failure()
+        raise RuntimeError("SYSTEMD_RESET_FAILED")
 
     def _wait_started_slot(self, expected_slot: str) -> None:
         # Type=simple reports start success before the shell launcher execs the
