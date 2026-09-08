@@ -141,19 +141,20 @@ class SystemdRuntimeTest(unittest.TestCase):
         with mock.patch(
             "nuvion_updater.systemd_runtime.subprocess.run",
             side_effect=[
-                self._completed((), returncode=1),
+                self._completed(()),
                 self._completed(()),
                 self._completed(()),
             ],
-        ) as run:
+        ) as run, mock.patch.object(self.runtime, "_wait_started_slot") as wait_started:
             current_slot = self.slots.current_slot()
             assert current_slot is not None
             self.runtime.restart_agent(current_slot)
             self.assertIsNone(self.runtime.safe_stop())
+        wait_started.assert_called_once_with(current_slot)
 
         self.assertEqual(
             run.call_args_list[0].args[0],
-            ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
+            ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
         )
         self.assertEqual(
             run.call_args_list[1].args[0],
@@ -187,12 +188,12 @@ class SystemdRuntimeTest(unittest.TestCase):
         )
 
     def test_start_limit_reset_failure_safe_stops_before_restart(self) -> None:
-        is_failed = self._completed((), returncode=0)
+        loaded = self._completed((), stdout="loaded\n")
         failed = self._completed((), returncode=1)
         stopped = self._completed(())
         with mock.patch(
             "nuvion_updater.systemd_runtime.subprocess.run",
-            side_effect=[is_failed, failed, stopped],
+            side_effect=[failed, loaded, stopped],
         ) as run, self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESET_FAILED"):
             current_slot = self.slots.current_slot()
             assert current_slot is not None
@@ -200,37 +201,112 @@ class SystemdRuntimeTest(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
-                ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
+                ("/usr/bin/systemctl", "show", "--property=LoadState", "--value", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
             ],
         )
 
-    def test_clean_inactive_or_unloaded_unit_skips_reset_and_can_restart(self) -> None:
-        for status in (1, 4):
-            with self.subTest(is_failed_status=status), mock.patch(
-                "nuvion_updater.systemd_runtime.subprocess.run",
-                side_effect=[
-                    self._completed((), returncode=status),
-                    self._completed(()),
-                ],
-            ) as run:
-                current_slot = self.slots.current_slot()
-                assert current_slot is not None
-                self.runtime.restart_agent(current_slot)
+    def test_unloaded_unit_has_no_counter_but_still_requires_startup_identity(self) -> None:
+        with mock.patch(
+            "nuvion_updater.systemd_runtime.subprocess.run",
+            side_effect=[self._completed((), returncode=1),
+                         self._completed((), stdout="not-found\n"),
+                         self._completed(())],
+        ) as run, mock.patch.object(self.runtime, "_wait_started_slot") as wait:
+            slot = self.slots.current_slot()
+            self.runtime.restart_agent(slot)
+        wait.assert_called_once_with(slot)
+        self.assertEqual(run.call_args_list[-1].args[0],
+                         ("/usr/bin/systemctl", "restart", "nuv-agent.service"))
 
-            self.assertEqual(
-                [call.args[0] for call in run.call_args_list],
-                [
-                    (
-                        "/usr/bin/systemctl",
-                        "is-failed",
-                        "--quiet",
-                        "nuv-agent.service",
-                    ),
-                    ("/usr/bin/systemctl", "restart", "nuv-agent.service"),
-                ],
-            )
+    def test_reset_transport_failure_stops_existing_agent_without_restart(self) -> None:
+        for stage in ("reset", "load-state"):
+            for error in (OSError("unavailable"), subprocess.TimeoutExpired("systemctl", 30)):
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    effects = ([self._completed((), returncode=1)]
+                               if stage == "load-state" else [])
+                    effects.extend([error, self._completed(())])
+                    with mock.patch.object(self.runtime, "_run", side_effect=effects) as run, \
+                         mock.patch.object(self.runtime, "_wait_started_slot") as wait:
+                        with self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESET_FAILED") as raised:
+                            self.runtime.restart_agent(self.slots.current_slot())
+                    self.assertIs(raised.exception.__cause__, error)
+                    self.assertEqual(run.call_args_list[-1].args[0],
+                                     ("/usr/bin/systemctl", "stop", "nuv-agent.service"))
+                    self.assertFalse(any(call.args[0][1] == "restart"
+                                         for call in run.call_args_list))
+                    wait.assert_not_called()
+
+    def test_startup_wait_accepts_only_after_launcher_exec_has_exact_slot(self) -> None:
+        proc_root = self.root / "proc"
+        process = proc_root / "412"
+        process.mkdir(parents=True)
+        environ = process / "environ"
+        environ.write_bytes(b"PATH=/usr/bin\0")
+        slot = self.slots.current_slot()
+        def exec_launcher(_seconds):
+            environ.write_bytes(b"NUVION_ACTIVE_SLOT=" + slot.encode() + b"\0")
+        with mock.patch("nuvion_updater.systemd_runtime.PROC_ROOT", proc_root), \
+             mock.patch.object(self.runtime, "_main_pid", return_value=412), \
+             mock.patch("nuvion_updater.systemd_runtime.time.sleep", side_effect=exec_launcher) as sleep, \
+             mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+            self.runtime._wait_started_slot(slot)
+        sleep.assert_called_once()
+        stop.assert_not_called()
+
+    def test_startup_wait_times_out_and_stops_when_identity_never_appears(self) -> None:
+        with mock.patch.object(self.runtime, "_main_pid", side_effect=RuntimeError("BOOT_MAIN_PID_UNAVAILABLE")), \
+             mock.patch("nuvion_updater.systemd_runtime.time.monotonic", side_effect=[0.0, 10.0]), \
+             mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+            with self.assertRaisesRegex(RuntimeError, "BOOT_STARTUP_TIMEOUT"):
+                self.runtime._wait_started_slot(self.slots.current_slot())
+        stop.assert_called_once()
+
+    def test_startup_wait_rechecks_new_pid_instead_of_accepting_mixed_processes(self) -> None:
+        slot = self.slots.current_slot()
+        with mock.patch.object(self.runtime, "_main_pid", side_effect=[412, 413, 413, 413]), \
+             mock.patch.object(self.runtime, "_active_slot_from_environ", return_value=slot), \
+             mock.patch("nuvion_updater.systemd_runtime.time.sleep") as sleep, \
+             mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+            self.runtime._wait_started_slot(slot)
+        sleep.assert_called_once()
+        stop.assert_not_called()
+
+    def test_startup_wait_rejects_slot_change_before_reading_process(self) -> None:
+        with mock.patch.object(self.runtime, "_main_pid") as pid, \
+             mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+            with self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESTART_SLOT_MISMATCH"):
+                self.runtime._wait_started_slot("releases/" + "f" * 64)
+        pid.assert_not_called()
+        stop.assert_called_once()
+
+    def test_failed_reset_and_unreadable_unit_state_cannot_bypass_reset(self) -> None:
+        with mock.patch.object(self.runtime, "_run", side_effect=[
+            self._completed((), returncode=1),
+            self._completed((), returncode=1, stdout="not-found\n"),
+        ]), mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+            with self.assertRaisesRegex(RuntimeError, "SYSTEMD_RESET_FAILED"):
+                self.runtime._reset_agent_start_limit()
+        stop.assert_called_once()
+
+    def test_startup_wait_rejects_wrong_and_duplicate_slot_without_retry(self) -> None:
+        proc_root = self.root / "proc"
+        process = proc_root / "412"
+        process.mkdir(parents=True)
+        slot = self.slots.current_slot()
+        for content in (b"NUVION_ACTIVE_SLOT=releases/wrong\0",
+                        b"NUVION_ACTIVE_SLOT=" + slot.encode() + b"\0NUVION_ACTIVE_SLOT=" + slot.encode() + b"\0"):
+            with self.subTest(content=content):
+                (process / "environ").write_bytes(content)
+                with mock.patch("nuvion_updater.systemd_runtime.PROC_ROOT", proc_root), \
+                     mock.patch.object(self.runtime, "_main_pid", return_value=412), \
+                     mock.patch("nuvion_updater.systemd_runtime.time.sleep") as sleep, \
+                     mock.patch.object(self.runtime, "_stop_after_failure") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "BOOT_ACTIVE_SLOT_ENV_MISMATCH"):
+                        self.runtime._wait_started_slot(slot)
+                sleep.assert_not_called()
+                stop.assert_called_once()
 
     def test_boot_check_matches_marker_current_slot_and_stable_main_pid_env(
         self,
@@ -464,7 +540,7 @@ class SystemdRuntimeTest(unittest.TestCase):
                 "nuvion_updater.systemd_runtime.subprocess.run",
                 side_effect=[
                     self._completed(()),
-                    self._completed((), returncode=1),
+                    self._completed(()),
                     self._completed(()),
                 ],
             ) as run,
@@ -478,6 +554,7 @@ class SystemdRuntimeTest(unittest.TestCase):
                 "boot_health_check",
                 return_value=(True, "BOOT_HEALTHY"),
             ) as boot_check,
+            mock.patch.object(runtime, "_wait_started_slot") as wait_started,
         ):
             self.assertEqual(
                 runtime.functional_health_check(self.state),
@@ -487,7 +564,7 @@ class SystemdRuntimeTest(unittest.TestCase):
             [call.args[0] for call in run.call_args_list],
             [
                 ("/usr/bin/systemctl", "stop", "nuv-agent.service"),
-                ("/usr/bin/systemctl", "is-failed", "--quiet", "nuv-agent.service"),
+                ("/usr/bin/systemctl", "reset-failed", "nuv-agent.service"),
                 ("/usr/bin/systemctl", "restart", "nuv-agent.service"),
             ],
         )
@@ -496,6 +573,7 @@ class SystemdRuntimeTest(unittest.TestCase):
             timeout=300,
         )
         boot_check.assert_called_once_with(self.state)
+        wait_started.assert_called_once_with(self.slots.current_slot())
 
     def test_iq9075_probe_failure_remains_safe_stopped(self) -> None:
         probe_dir = self.root / "usr" / "lib" / "nuvion-updater"
