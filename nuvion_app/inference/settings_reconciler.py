@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -424,6 +425,7 @@ class SettingsReconciler:
         config_schema: str = DEFAULT_CONFIG_SCHEMA,
         event_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
         command_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
+        startup_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store = store
         self.runtime = runtime
@@ -432,6 +434,8 @@ class SettingsReconciler:
         self._event_outbox_health_provider = event_outbox_health_provider
         self._command_outbox_health_provider = command_outbox_health_provider
         self._effect_fence: Callable[[], None] = lambda: None
+        self._startup_clock = startup_clock
+        self._startup_started = startup_clock()
         if not self.config_schema.isdigit() or int(self.config_schema) < 1:
             raise ValueError("config_schema must be a positive integer string")
         if (
@@ -455,6 +459,16 @@ class SettingsReconciler:
 
     def _ensure_fence(self) -> None:
         self._effect_fence()
+
+    def _startup_pending(self) -> bool:
+        # A new process gets one bounded preparation window; retries in that
+        # process cannot reset it. The boot guard bounds crash/restart attempts.
+        elapsed = self._startup_clock() - self._startup_started
+        pending = getattr(self.runtime, "startup_pending", None)
+        try:
+            return 0 <= elapsed < 600.0 and callable(pending) and pending() is True
+        except Exception:  # noqa: BLE001 - unavailable readiness cannot prolong boot.
+            return False
 
     def reconcile(
         self, command: VerifiedFleetCommand
@@ -496,6 +510,14 @@ class SettingsReconciler:
                         health="ROLLBACK_RESTART_REQUIRED",
                         marker=marker,
                     )
+                if self._startup_pending():
+                    return self._deferred(
+                        command,
+                        digest,
+                        health="LKG_MODEL_STARTUP_PENDING",
+                        marker=marker,
+                        retry_without_restart=True,
+                    )
                 if self.store.lkg_is_active() and self._functional_health():
                     self._ensure_fence()
                     self.store.update_marker(
@@ -528,6 +550,14 @@ class SettingsReconciler:
                 command.payload["activation"] == "RESTART"
                 and marker.get("stagedProcessInstanceId") != self.process_instance_id
             ):
+                if self._startup_pending():
+                    return self._deferred(
+                        command,
+                        digest,
+                        health="MODEL_STARTUP_PENDING",
+                        marker=marker,
+                        retry_without_restart=True,
+                    )
                 runtime_matches = False
                 try:
                     readback = self.runtime.snapshot()
@@ -557,6 +587,21 @@ class SettingsReconciler:
                     marker=rollback_marker,
                 )
 
+        if command.payload["activation"] == "RESTART" and "model" in command.payload:
+            preflight = getattr(self.runtime, "preflight_model", None)
+            if callable(preflight):
+                self._ensure_fence()
+                try:
+                    preflight(command.payload["model"])
+                except (OSError, RuntimeError, ValueError) as exc:
+                    return CommandEffectOutcome(
+                        status=COMMAND_STATUS_FAILED,
+                        code="MODEL_PREFLIGHT_FAILED",
+                        message=str(exc)[:1000],
+                        reported_state=self._reported(
+                            command, digest, health="NOT_APPLIED"
+                        ),
+                    )
         runtime_snapshot = self.runtime.snapshot()
         try:
             self._ensure_fence()
@@ -632,6 +677,7 @@ class SettingsReconciler:
         *,
         health: str,
         marker: Mapping[str, Any],
+        retry_without_restart: bool = False,
     ) -> ReconcileDeferred:
         return ReconcileDeferred(
             reported_state=self._reported(command, digest, health=health),
@@ -639,6 +685,11 @@ class SettingsReconciler:
                 "settingsDigest": digest,
                 "restartMarker": str(self.store.marker_path),
                 "markerPhase": marker.get("phase"),
+                **(
+                    {"nextAction": "RETRY_EFFECT", "restartRequired": False}
+                    if retry_without_restart
+                    else {}
+                ),
             },
         )
 

@@ -284,6 +284,84 @@ class PipelineDurableSafetyTest(unittest.TestCase):
                     pipeline.build_model_config_capabilities(), frozenset()
                 )
 
+    def test_visualad_model_capability_and_identity_require_actual_live_adapter(self):
+        capability = "command.config.model.visualad_htp.v1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            model_dir = root / "model"
+            model_dir.mkdir()
+            proof = {
+                "pointer": "visualad/iq9075-htp-demo",
+                "digest": "sha256:" + "c" * 64,
+            }
+            detector = object.__new__(pipeline.FleetVisualADHTPAnomalyDetector)
+            detector.selection = types.SimpleNamespace(
+                directory=model_dir, pointer=proof["pointer"]
+            )
+            detector.loaded_model_proof = mock.Mock(return_value=proof)
+            detector.verify_model = mock.Mock(return_value=proof)
+            detector.ready = True
+            app = types.SimpleNamespace(
+                pipeline=object(),
+                user_data=types.SimpleNamespace(
+                    backend="visualad_htp",
+                    running=True,
+                    zero_shot=detector,
+                    inference_failed=False,
+                    last_inference_at=pipeline.time.monotonic(),
+                ),
+            )
+            adapter = pipeline.PipelineSettingsRuntimeAdapter(
+                app=app,
+                encoder=object(),
+                model_pointer=proof["pointer"],
+                model_dir=model_dir,
+            )
+            registry = pipeline.ReconcilerRegistry()
+            registry.register(
+                pipeline.SettingsReconciler(store=object(), runtime=adapter)
+            )
+            runtime = self._trusted_runtime(root, registry)
+            with (
+                mock.patch.object(pipeline, "fleet_command_runtime", runtime),
+                mock.patch.object(pipeline, "fleet_effect_registry", registry),
+                mock.patch.object(pipeline, "g_app", app),
+            ):
+                telemetry = pipeline.build_dynamic_runtime_telemetry()
+                self.assertIn(capability, telemetry["capabilities"])
+                self.assertNotIn(
+                    "command.config.model.siglip.v1", telemetry["capabilities"]
+                )
+                self.assertEqual(telemetry["modelObservedPointer"], proof["pointer"])
+                self.assertEqual(telemetry["modelDigest"], proof["digest"])
+                self.assertEqual(adapter.verify_model(proof), proof)
+                for field, value in (("inference_failed", True), ("running", False)):
+                    with mock.patch.object(app.user_data, field, value):
+                        telemetry = pipeline.build_dynamic_runtime_telemetry(
+                            {capability}
+                        )
+                        self.assertNotIn(capability, telemetry["capabilities"])
+                        self.assertEqual(telemetry["modelDigest"], "unknown")
+                detector.loaded_model_proof.return_value = None
+                telemetry = pipeline.build_dynamic_runtime_telemetry({capability})
+                self.assertNotIn(capability, telemetry["capabilities"])
+                self.assertEqual(telemetry["modelObservedPointer"], "unknown")
+                self.assertEqual(telemetry["modelDigest"], "unknown")
+                detector.loaded_model_proof.return_value = proof
+                with mock.patch.object(adapter, "model_dir", root):
+                    self.assertNotIn(
+                        capability, pipeline.build_model_config_capabilities()
+                    )
+                with mock.patch.object(pipeline, "fleet_command_runtime", None):
+                    self.assertNotIn(
+                        capability,
+                        pipeline.build_dynamic_runtime_telemetry({capability})[
+                            "capabilities"
+                        ],
+                    )
+                registry.unregister("CONFIG_APPLY")
+                self.assertNotIn(capability, pipeline.build_model_config_capabilities())
+
     def _run_visualad_frame(
         self,
         result=None,
