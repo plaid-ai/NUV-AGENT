@@ -12,6 +12,7 @@ import os
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -376,7 +377,7 @@ class FakeBoardRunner:
         timeout: float,
         input_bytes: bytes | None = None,
     ):
-        del timeout, input_bytes
+        del input_bytes
         call = tuple(argv)
         self.calls.append(call)
         if call[:2] == ("/usr/bin/dpkg", "--print-architecture"):
@@ -384,6 +385,15 @@ class FakeBoardRunner:
         if call and call[0] == "/usr/sbin/runuser":
             return BOARD.CommandResult(0, json.dumps(self.updater) + "\n", "")
         if call and call[0] == "/usr/bin/systemd-run":
+            # A synchronous oneshot start waits for ExecStart to exit. A long
+            # sleep cannot become active within the caller's start deadline.
+            if (
+                "--property=Type=oneshot" in call
+                and "--no-block" not in call
+                and "/usr/bin/sleep" in call
+                and float(call[-1]) > timeout
+            ):
+                raise subprocess.TimeoutExpired(call, timeout)
             unit = next(
                 value.split("=", 1)[1] for value in call if value.startswith("--unit=")
             )

@@ -6912,7 +6912,9 @@ class BoardHarness:
                 "/usr/bin/systemd-run",
                 f"--unit={unit}",
                 "--collect",
-                "--property=Type=oneshot",
+                # The sleep must be active while the fault runs. A oneshot
+                # start waits for all 120 seconds and ignores RuntimeMaxSec.
+                "--property=Type=simple",
                 "--property=LimitCORE=0",
                 "--property=RuntimeMaxSec=180",
                 "--property=TimeoutStopSec=45",
