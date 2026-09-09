@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v17`, Agent `0.1.121`, release sequence
-`14`, schema `12`, minimum updater `0.2.0`. Sequences 2–13 and publishers v1–v16
+Current publisher: `candidate-publisher-v18`, Agent `0.1.121`, release sequence
+`15`, schema `12`, minimum updater `0.2.0`. Sequences 2–14 and publishers v1–v17
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v17 \
-     -f tag_message='NUVION IQ9075 candidate publisher v17'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v18 \
+     -f tag_message='NUVION IQ9075 candidate publisher v18'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v17
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v18
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v16 to v17 and verify them.
+   existing candidate-sign/stage tag policies from v17 to v18 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v17 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=14
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v18 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=15
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -166,3 +166,23 @@ No fault journal, deadman or USB write occurs until the authenticated identity
 and current candidate process are confirmed. Publisher v17/sequence14 requires
 fresh complete physical evidence. Earlier tags, artifacts and results remain
 immutable.
+
+## Candidate v18 committed physical rollback baseline
+
+The device committed sequence 12 after physical automatic rollback and normal
+commit passed (commands 22a7199c-a889-4fea-b021-e6cabb357439 and
+4b9313a4-ee4a-48df-9677-1fc35f0f9a5d). Its anti-rollback floor is now 12.
+The full Fleet Runtime validator previously required the legacy promoted
+sequence-1 baseline even on this device, making a new complete qualification
+impossible without an inappropriate floor reset.
+
+The signed release policy now explicitly allowlists the exact sequence-12 BOM
+as an additional physical rollback baseline. Both run manifests, root markers,
+bootstrap and cleanup must match the same pinned version, sequence and digest;
+the candidate must have a higher sequence. Legacy promotion remains sequence 1
+and publication history is unchanged. Sequence 12 is a known-good physical
+baseline, not a claim of complete release qualification.
+
+Publisher v17 was cancelled before staging or device commands. Its immutable
+tag and sequence14 remain retired. Publisher v18/sequence15 carries the same
+tested timeout fix plus this strict baseline selection for fresh qualification.

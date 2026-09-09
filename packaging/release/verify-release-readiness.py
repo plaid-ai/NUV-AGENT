@@ -2044,6 +2044,41 @@ def _validated_rollout_control_gate(
     )
 
 
+def _physical_rollback_baseline(
+    iq_policy: object, expected_slot: object
+) -> dict[str, Any]:
+    """Select an explicitly pinned physical baseline without changing promotion history."""
+    if not isinstance(iq_policy, dict):
+        raise ReadinessError("IQ9075 physical rollback baseline policy is invalid")
+    additional = iq_policy.get("additionalPhysicalRollbackBaselines", [])
+    if not isinstance(additional, list):
+        raise ReadinessError("IQ9075 physical rollback baseline allowlist is invalid")
+    baselines = [iq_policy.get("legacyPromotedBaseline"), *additional]
+    slots: dict[str, dict[str, Any]] = {}
+    sequences: set[int] = set()
+    for baseline in baselines:
+        if (
+            not isinstance(baseline, dict)
+            or set(baseline) != {"agentVersion", "releaseSequence", "bomDigest"}
+            or not isinstance(baseline.get("agentVersion"), str)
+            or not SEMVER.fullmatch(baseline["agentVersion"])
+            or type(baseline.get("releaseSequence")) is not int
+            or baseline["releaseSequence"] < 1
+            or not isinstance(baseline.get("bomDigest"), str)
+            or not baseline["bomDigest"].startswith("sha256:")
+            or not SHA256.fullmatch(baseline["bomDigest"][7:])
+        ):
+            raise ReadinessError("IQ9075 physical rollback baseline identity is invalid")
+        slot = "releases/" + baseline["bomDigest"][7:]
+        if slot in slots or baseline["releaseSequence"] in sequences:
+            raise ReadinessError("IQ9075 physical rollback baseline identity is duplicated")
+        slots[slot] = baseline
+        sequences.add(baseline["releaseSequence"])
+    if not isinstance(expected_slot, str) or expected_slot not in slots:
+        raise ReadinessError("IQ9075 physical rollback baseline is not policy-pinned")
+    return slots[expected_slot]
+
+
 def _validate_fleet_runtime_documents(
     *,
     policy_path: Path,
@@ -2493,8 +2528,8 @@ def _validate_fleet_runtime_documents(
 
     iq_policy = security.get("iq9075")
     target_policy = iq_policy.get("target") if isinstance(iq_policy, dict) else None
-    baseline_policy = (
-        iq_policy.get("legacyPromotedBaseline") if isinstance(iq_policy, dict) else None
+    baseline_policy = _physical_rollback_baseline(
+        iq_policy, rollback_scenario.get("expectedPreviousSlot")
     )
     if (
         not isinstance(iq_policy, dict)
