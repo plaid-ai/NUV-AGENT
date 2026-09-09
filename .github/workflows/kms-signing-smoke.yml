@@ -1,0 +1,56 @@
+name: Cloud KMS signing verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Company signing environment to verify
+        type: choice
+        options: [dev, prod]
+        required: true
+
+permissions: {}
+
+jobs:
+  verify:
+    if: github.repository == 'plaid-ai/NUV-AGENT' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: nuv-signing-${{ inputs.stage }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Authorize company release administrator
+        env:
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          policy = json.loads(Path('packaging/release/release-security-policy.json').read_text())
+          if int(os.environ['ACTOR_ID']) not in [u['id'] for u in policy['releaseAdminUsers']]:
+              raise SystemExit('Only a release administrator can request signing verification')
+          PY
+      - name: Install pinned signing tools
+        run: python -m pip install --require-hashes -r packaging/release/requirements-cloud-kms.txt
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-${{ inputs.stage }}/providers/github
+          service_account: nuv-agent-sign-${{ inputs.stage }}@plaid-451114.iam.gserviceaccount.com
+      - name: Sign and independently verify BOM, evidence and Git tag
+        env:
+          SIGNING_STAGE: ${{ inputs.stage }}
+        run: python packaging/release/verify-cloud-kms.py --stage "$SIGNING_STAGE" --output "$RUNNER_TEMP/kms-proof"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kms-signing-proof-${{ inputs.stage }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/kms-proof
+          if-no-files-found: error
+          retention-days: 30

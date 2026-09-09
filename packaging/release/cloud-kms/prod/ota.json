@@ -1,0 +1,5 @@
+{
+  "keyVersion": "projects/plaid-451114/locations/asia-northeast3/keyRings/nuv-agent-prod/cryptoKeys/ota/cryptoKeyVersions/1",
+  "publicKeySha256": "52da73272dcc1500759a76dc49f73f474b631287c79b0f1bbcf79aa6769b9a3d",
+  "keyId": "release-iq9075-prod-kms-2026-09-v1"
+}

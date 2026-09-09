@@ -1,0 +1,5 @@
+# Release tooling only; never included in the Agent runtime bundle.
+cryptography==50.0.0
+google-cloud-kms==3.16.0
+google-crc32c==1.8.0
+PGPy==0.6.0

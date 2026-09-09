@@ -95,6 +95,7 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install .
+          python -m pip install --require-hashes -r packaging/release/requirements-cloud-kms.txt
           python -m pip install \
             transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
             tokenizers==0.23.1 safetensors==0.8.0
