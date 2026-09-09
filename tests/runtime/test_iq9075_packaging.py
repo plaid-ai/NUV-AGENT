@@ -8,11 +8,40 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class Iq9075PackagingTest(unittest.TestCase):
+    def test_oak_probe_accepts_native_rgb_without_optional_opencv(self) -> None:
+        probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text()
+        embedded = probe.split("<<'PY'\n", 2)[2].rsplit("\nPY", 1)[0]
+        tree = ast.parse(embedded)
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "validate_rgb_frame"]
+        namespace = {"np": np}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<probe>", "exec"), namespace)
+        validate = namespace["validate_rgb_frame"]
+
+        class Packet:
+            def __init__(self, data):
+                self.data = data
+
+            def getFrame(self):
+                return self.data
+
+            def getCvFrame(self):
+                raise RuntimeError("OpenCV is not installed in the release bundle")
+
+        for shape in ((3, 480, 640), (480, 640, 3)):
+            validate(Packet(np.zeros(shape, dtype=np.uint8)))
+        for shape, dtype in (((480, 640), np.uint8), ((480, 640, 3), np.float32)):
+            with self.assertRaisesRegex(RuntimeError, "640x480 RGB uint8"):
+                validate(Packet(np.zeros(shape, dtype=dtype)))
+        self.assertNotIn("packet.getCvFrame()", embedded)
+        self.assertIn("validate_rgb_frame(packet)", embedded)
+
     def test_rollback_oak_probe_is_version_neutral_and_bounded(self) -> None:
         probe = (ROOT / "packaging/dev/probe-iq9075-oak.sh").read_text(
             encoding="utf-8"

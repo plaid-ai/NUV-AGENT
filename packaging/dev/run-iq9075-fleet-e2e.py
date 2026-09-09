@@ -1529,7 +1529,7 @@ def build_manifest(
     if (
         type(hold_seconds) is not int
         or (scenario_type == "commit" and hold_seconds != 0)
-        or (scenario_type == "oak-fault-rollback" and not 0 <= hold_seconds <= 60)
+        or (scenario_type == "oak-fault-rollback" and not 0 <= hold_seconds <= 75)
     ):
         raise RunnerError("scenario hold is invalid")
     if not DIGEST_RE.fullmatch(expected_bom_digest):

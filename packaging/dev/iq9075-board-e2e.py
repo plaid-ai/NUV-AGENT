@@ -43,7 +43,7 @@ OAK_VENDOR = "03e7"
 OAK_PRODUCT = "f63b"
 OAK_MIN_SPEED_MBPS = 5000.0
 DEADMAN_SECONDS = 120
-MAX_FAULT_HOLD_SECONDS = 60
+MAX_FAULT_HOLD_SECONDS = 75
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TRUST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 2 * 1024 * 1024
@@ -6975,6 +6975,76 @@ class BoardHarness:
         if self.usb_write_hook is not None:
             self.usb_write_hook(action, safe_port)
 
+    def _oak_port_pair(self, port: str) -> tuple[Path, Path]:
+        # USB2 and USB3 logical ports share one physical connector. Holding
+        # only the USB device driver lets OAK firmware re-enumerate on its peer.
+        safe_port = canonical_oak_port(port)
+        suffix = safe_port[1:]
+        paths = []
+        sys_root = (self.paths.root / "sys").resolve(strict=True)
+        for bus in (1, 2):
+            logical = f"{bus}{suffix}"
+            hub, number = logical.rsplit(".", 1)
+            path = self.paths.usb_devices / f"{hub}:1.0" / f"{hub}-port{number}"
+            resolved = path.resolve(strict=True)
+            metadata = resolved.stat()
+            if (
+                not resolved.is_relative_to(sys_root)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != self.root_uid
+                or metadata.st_mode & 0o022
+            ):
+                raise HarnessError("OAK companion port endpoint is unsafe")
+            payload, metadata = read_regular(
+                resolved / "disable", maximum=8, kernel_virtual_size=True
+            )
+            if (
+                metadata.st_uid != self.root_uid
+                or metadata.st_mode & 0o022
+                or payload.strip() not in {b"0", b"1"}
+            ):
+                raise HarnessError("OAK port disable attribute is unsafe")
+            paths.append(resolved)
+        for index, path in enumerate(paths):
+            peer = path / "peer"
+            if not peer.is_symlink() or peer.resolve(strict=True) != paths[1 - index]:
+                raise HarnessError("OAK USB2/USB3 companion pairing is invalid")
+        return paths[0], paths[1]
+
+    def _set_oak_ports_disabled(self, port: str, disabled: bool) -> None:
+        pair = self._oak_port_pair(port)
+        # Enable USB3 before its USB2 peer to prefer SuperSpeed enumeration.
+        for index in ((0, 1) if disabled else (1, 0)):
+            path = pair[index] / "disable"
+            before = path.lstat()
+            descriptor = os.open(path, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    raise HarnessError("OAK port changed while opening")
+                if os.write(descriptor, b"1" if disabled else b"0") != 1:
+                    raise HarnessError("OAK port control write was incomplete")
+            finally:
+                os.close(descriptor)
+            if self.usb_write_hook is not None:
+                self.usb_write_hook(
+                    "disable-port" if disabled else "enable-port",
+                    f"{index + 1}{canonical_oak_port(port)[1:]}",
+                )
+        for path in pair:
+            payload, _ = read_regular(path / "disable", maximum=8, kernel_virtual_size=True)
+            if payload.strip() != (b"1" if disabled else b"0"):
+                raise HarnessError("OAK port control did not converge")
+
+    def _recover_oak_fault(self, fault: Mapping[str, Any]) -> None:
+        port = canonical_oak_port(fault.get("port"))
+        method = fault.get("method", "usb-driver-unbind")
+        if method == "usb-port-disable":
+            self._set_oak_ports_disabled(port, False)
+        elif method != "usb-driver-unbind":
+            raise HarnessError("OAK fault method is invalid")
+        self._recover_oak(port)
+
     def _poll_detached(self, port: str, timeout: float = 15) -> None:
         safe_port = canonical_oak_port(port)
         device = self._usb_device_path(safe_port)
@@ -7002,13 +7072,18 @@ class BoardHarness:
 
     def _recover_oak(self, port: str, timeout: float = 30) -> None:
         safe_port = canonical_oak_port(port)
-        # Never write a journal-provided topology into the root usb bind
-        # endpoint until the still-present unbound device proves exact OAK
-        # identity, speed, USB1 ancestry, and global uniqueness.
-        self.verify_oak(require_bound=False, expected_port=safe_port)
         deadline = self.monotonic() + timeout
         last_error: BaseException | None = None
         while self.monotonic() < deadline:
+            # USB firmware may briefly enumerate its bootloader or disappear.
+            # Wait for the original runtime identity before every bind write;
+            # a different topology or USB2 identity is never recovery proof.
+            try:
+                self.verify_oak(require_bound=False, expected_port=safe_port)
+            except (HarnessError, OSError) as exc:
+                last_error = exc
+                self.sleeper(0.5)
+                continue
             try:
                 self._write_usb("bind", safe_port)
             except OSError as exc:
@@ -7067,7 +7142,11 @@ class BoardHarness:
                 raise HarnessError("candidate Agent PID is unavailable before OAK fault")
             oak = self.verify_oak()
             port = canonical_oak_port(oak["port"])
+            pair = self._oak_port_pair(port)
+            if any((path / "disable").read_text().strip() != "0" for path in pair):
+                raise HarnessError("OAK companion ports must be enabled before fault")
             fault = {
+                "method": "usb-port-disable",
                 "armed": True,
                 "unit": self._deadman_unit(run_id),
                 "port": port,
@@ -7092,11 +7171,15 @@ class BoardHarness:
                 signal.signal(signum, interrupted)
             recovered = False
             try:
-                self._write_usb("unbind", port)
-                self._poll_detached(port)
+                self._set_oak_ports_disabled(port, True)
+                for bus in (1, 2):
+                    logical = f"{bus}{port[1:]}"
+                    device = self.paths.usb_devices / logical
+                    if device.exists() or device.is_symlink():
+                        raise HarnessError("OAK remains enumerated on a disabled port")
                 if hold:
                     self.sleeper(float(hold))
-                self._recover_oak(port)
+                self._recover_oak_fault(fault)
                 latest = self._load_state(run_id)
                 latest_fault = latest.get("oakFault")
                 if not isinstance(latest_fault, dict):
@@ -7918,7 +8001,7 @@ class BoardHarness:
                 "recovered": False,
                 "complete": True,
             }
-        self._recover_oak(port)
+        self._recover_oak_fault(fault)
         latest = self._load_state(run_id)
         latest_fault = latest.get("oakFault")
         if (
@@ -8705,7 +8788,7 @@ class BoardHarness:
                 port = canonical_oak_port(fault.get("port"))
                 if fault.get("unit") != self._deadman_unit(run_id):
                     raise HarnessError("OAK cleanup ownership mismatch")
-                self._recover_oak(port)
+                self._recover_oak_fault(fault)
                 recovered = True
                 fault.update(
                     {"armed": False, "recovered": True, "recoveredAt": self.clock()}

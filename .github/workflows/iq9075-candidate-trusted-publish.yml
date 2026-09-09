@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       release_sequence:
-        description: "Exact IQ9075 release sequence (publisher v6 allows only 3)"
+        description: "Exact IQ9075 release sequence (publisher v7 allows only 4)"
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: iq9075-candidate-publisher-v6-global
+  group: iq9075-candidate-publisher-v7-global
   cancel-in-progress: false
 
 env:
@@ -44,15 +44,15 @@ jobs:
           set -euo pipefail
           [ "$GITHUB_REPOSITORY" = "plaid-ai/NUV-AGENT" ]
           [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v6" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v7" ]
           [ "$GITHUB_RUN_ATTEMPT" = "1" ] \
             || { echo "candidate publisher attempts are not rerunnable; dispatch a new run" >&2; exit 1; }
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v6" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v7" ]
           [[ "$COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$VERSION" = "0.1.121" ]
-          [ "$RELEASE_SEQUENCE" = "3" ]
+          [ "$RELEASE_SEQUENCE" = "4" ]
 
   build:
     name: Build exact secretless arm64 candidate
@@ -60,7 +60,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v6'
+      github.ref == 'refs/tags/candidate-publisher-v7'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -103,11 +103,11 @@ jobs:
           set -euo pipefail
           [[ "$REQUESTED_COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "3" ]
+          [ "$REQUESTED_SEQUENCE" = "4" ]
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v6" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v7" ]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v6" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v7" ]
           [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
           [ -z "$(git status --porcelain --untracked-files=all)" ]
           git cat-file -e "${PUBLISHER_SHA}^{commit}"
@@ -229,7 +229,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v6' &&
+      github.ref == 'refs/tags/candidate-publisher-v7' &&
       needs.build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -261,7 +261,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v6" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v7" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -349,7 +349,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v6 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v7 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -371,7 +371,7 @@ jobs:
           [ "$CONFIG_SCHEMA" = "$trusted_config_schema" ]
           [ "$MIN_UPDATER_VERSION" = "$trusted_updater_version" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "3" ]
+          [ "$REQUESTED_SEQUENCE" = "4" ]
           [ "$CONFIG_SCHEMA" = "12" ]
           [ "$MIN_UPDATER_VERSION" = "0.2.0" ]
           python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
@@ -584,7 +584,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v6' &&
+      github.ref == 'refs/tags/candidate-publisher-v7' &&
       needs.build.result == 'success' &&
       needs.sign.result == 'success'
     runs-on: ubuntu-24.04
@@ -617,7 +617,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v6" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v7" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -702,7 +702,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v6 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v7 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -722,7 +722,7 @@ jobs:
           [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
           [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "3" ]
+          [ "$REQUESTED_SEQUENCE" = "4" ]
           PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
             "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
           from pathlib import Path
