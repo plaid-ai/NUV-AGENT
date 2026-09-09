@@ -1733,6 +1733,47 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_trust_waits_for_camera_after_backup_without_mutating_early(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                payloads = fixture.payloads()
+                fixture.foundation_backup()
+                original = fixture.harness._foundation
+                calls = []
+                def recovering():
+                    calls.append(True)
+                    self.assertNotIn("trustTransaction", fixture.harness._load_state(fixture.run_id))
+                    if len(calls) < 3:
+                        raise BOARD.HarnessError("USB1 downstream must contain exactly one OAK-D Lite")
+                    return original()
+                with mock.patch.object(fixture.harness, "_foundation", side_effect=recovering):
+                    result = fixture.enable(payloads)
+                self.assertEqual(result["phase"], "APPLIED")
+                self.assertEqual(len(calls), 3)
+            finally:
+                fixture.close()
+
+    def test_trust_camera_wait_is_bounded_and_rejects_unsafe_foundation(self) -> None:
+        for message, retry in (
+            ("USB1 downstream must contain exactly one OAK-D Lite", True),
+            ("OAK USB topology endpoint is unsafe", False),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                fixture = HarnessFixture(Path(directory))
+                try:
+                    payloads = fixture.payloads()
+                    fixture.foundation_backup()
+                    start = fixture.clock.value
+                    with mock.patch.object(fixture.harness, "_foundation", side_effect=BOARD.HarnessError(message)) as check:
+                        with self.assertRaises(BOARD.HarnessError):
+                            fixture.enable(payloads)
+                    self.assertNotIn("trustTransaction", fixture.harness._load_state(fixture.run_id))
+                    self.assertEqual(check.call_count > 1, retry)
+                    self.assertLess(fixture.clock.value - start, 32)
+                finally:
+                    fixture.close()
+
     def test_fault_preflight_race_has_no_side_effects_and_can_retry(self) -> None:
         for drift in ("old-process", "inactive", "usb-enumeration", "pid-change"):
             with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
