@@ -299,6 +299,15 @@ def plan_sequence(
 
     policy = _read_policy(policy_path)
     target, bucket, trust_domain, iq_policy = _target_from_policy(policy)
+    retired = iq_policy.get("retiredCandidateSequences", [])
+    if (
+        not isinstance(retired, list)
+        or any(type(value) is not int or value < 1 or value > 2**63 - 1 for value in retired)
+        or len(retired) != len(set(retired))
+    ):
+        raise SequencePlanError("retired candidate sequence policy is invalid")
+    if requested_sequence in retired:
+        raise SequencePlanError("requested sequence belongs to a retired candidate")
     publisher_key_id = _verify_pinned_keyring(
         policy_path=policy_path,
         keyring_path=keyring_path,
@@ -311,7 +320,10 @@ def plan_sequence(
             require_root_owner=False,
         )
         expected_payload = build_release_bom_v2_payload(
-            bom_id=f"nuv-agent-{version}-iq9075-aarch64",
+            bom_id=(
+                f"nuv-agent-{version}-iq9075-aarch64"
+                + (f"-seq{requested_sequence}" if requested_sequence >= 3 else "")
+            ),
             release_sequence=requested_sequence,
             agent_version=version,
             component_sha=component_sha,
@@ -352,6 +364,9 @@ def plan_sequence(
         sequences[bom.release_sequence] = bom
         releases[published_version] = bom
 
+    if set(retired).intersection(sequences):
+        raise SequencePlanError("retired candidate sequence exists in the published catalog")
+
     existing = releases.get(version)
     latest_sequence = max(sequences, default=0)
     latest = sequences.get(latest_sequence)
@@ -381,9 +396,12 @@ def plan_sequence(
             )
         mode = "idempotent-existing"
     else:
-        if requested_sequence != latest_sequence + 1:
+        next_sequence = latest_sequence + 1
+        while next_sequence in retired:
+            next_sequence += 1
+        if requested_sequence != next_sequence:
             raise SequencePlanError(
-                f"requested releaseSequence must be latest+1 ({latest_sequence + 1})"
+                f"requested releaseSequence must be next unretired sequence ({next_sequence})"
             )
         if latest is not None and not _promotion_is_complete(
             bucket=bucket,
