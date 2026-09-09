@@ -6912,9 +6912,9 @@ class BoardHarness:
                 "/usr/bin/systemd-run",
                 f"--unit={unit}",
                 "--collect",
-                # The sleep must be active while the fault runs. A oneshot
-                # start waits for all 120 seconds and ignores RuntimeMaxSec.
-                "--property=Type=simple",
+                # Wait for successful exec, not the 120-second sleep to exit,
+                # before permitting a fault that relies on this recovery unit.
+                "--property=Type=exec",
                 "--property=LimitCORE=0",
                 "--property=RuntimeMaxSec=180",
                 "--property=TimeoutStopSec=45",

@@ -358,6 +358,7 @@ class FakeBoardRunner:
             },
         }
         self.deadmen: dict[str, bool] = {}
+        self.sleep_exec_fails = False
         self.updater: dict[str, object] = {
             "capabilityAvailable": True,
             "authenticatedHelper": True,
@@ -397,6 +398,14 @@ class FakeBoardRunner:
             unit = next(
                 value.split("=", 1)[1] for value in call if value.startswith("--unit=")
             )
+            # simple may report active before exec fails; exec propagates the
+            # failure before a caller can rely on the recovery process.
+            if (
+                self.sleep_exec_fails
+                and "/usr/bin/sleep" in call
+                and "--property=Type=exec" in call
+            ):
+                return BOARD.CommandResult(1, "", "Failed at step EXEC")
             if any(value.startswith("--on-active=") for value in call):
                 self.deadmen[unit] = False
                 self.deadmen[unit.removesuffix(".service") + ".timer"] = True
@@ -1644,6 +1653,30 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 ]
                 self.assertTrue(final["liveVerified"])
                 self.assertIn("appliedPids", final)
+            finally:
+                fixture.close()
+
+    def test_deadman_exec_failure_prevents_usb_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state(
+                    "FUNCTIONAL_HEALTHY"
+                )
+                fixture.runner.sleep_exec_fails = True
+                usb_writes = []
+                fixture.harness.usb_write_hook = lambda action, port: usb_writes.append(
+                    (action, port)
+                )
+                with self.assertRaisesRegex(BOARD.HarnessError, "cannot arm"):
+                    fixture.harness.arm_oak_fault(fixture.run_id)
+                self.assertEqual(usb_writes, [])
+                self.assertNotIn(
+                    fixture.harness._deadman_unit(fixture.run_id),
+                    fixture.runner.deadmen,
+                )
             finally:
                 fixture.close()
 
