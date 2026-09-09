@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -26,6 +28,63 @@ DEVICE_ID = "sp-7-nuvion-iq9075"
 EXPIRED_COMMAND_ID = "00000000-0000-4000-8000-000000000003"
 ROLLBACK_COMMAND_ID = "00000000-0000-4000-8000-000000000004"
 COMMIT_COMMAND_ID = "00000000-0000-4000-8000-000000000005"
+
+
+class NativeSyntheticSourceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            import gi
+
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+        except (ImportError, ValueError):
+            if os.environ.get("NUV_REQUIRE_NATIVE_GST") == "1":
+                raise
+            raise unittest.SkipTest("native GStreamer is unavailable") from None
+        cls.gst = Gst
+        Gst.init(None)
+
+    def _frames(self, source: str, count: int = 3) -> list[tuple]:
+        gst = self.gst
+        pipeline = gst.parse_launch(
+            source + " ! tee name=t "
+            "t. ! queue ! appsink name=frames sync=false "
+            "t. ! queue ! videoconvert ! video/x-raw,format=I420 ! fakesink sync=false"
+        )
+        frames = []
+        try:
+            pipeline.set_state(gst.State.PLAYING)
+            sink = pipeline.get_by_name("frames")
+            for _ in range(count):
+                sample = sink.emit("try-pull-sample", 5 * gst.SECOND)
+                self.assertIsNotNone(sample, "synthetic source did not deliver a frame")
+                caps = sample.get_caps().get_structure(0)
+                buffer = sample.get_buffer()
+                expected = caps.get_value("width") * caps.get_value("height") * 3
+                frames.append((caps.get_value("format"), buffer.get_size(), expected, buffer.pts))
+        finally:
+            pipeline.set_state(gst.State.NULL)
+        return frames
+
+    def test_configured_source_supplies_packed_rgb_frames(self) -> None:
+        updates = next(
+            ast.literal_eval(node.value)
+            for node in ast.parse(MODULE.BOARD_PROGRAM).body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "UPDATES" for target in node.targets)
+        )
+        frames = self._frames(updates["NUVION_GST_SOURCE"])
+        for pixel_format, actual_bytes, expected_bytes, _pts in frames:
+            self.assertEqual(pixel_format, "RGB")
+            self.assertEqual(actual_bytes, expected_bytes)
+        timestamps = [frame[3] for frame in frames]
+        self.assertEqual(timestamps, sorted(set(timestamps)))
+
+    def test_planar_frames_do_not_meet_frame_reader_contract(self) -> None:
+        frames = self._frames("videotestsrc num-buffers=1 ! video/x-raw,format=I420", count=1)
+        self.assertEqual(frames[0][0], "I420")
+        self.assertNotEqual(frames[0][1], frames[0][2])
 
 
 class _Clock:

@@ -362,7 +362,7 @@ FIXED = (
 )
 UPDATES = {
     "NUVION_FLEET_COMMAND_ENABLED": "true",
-    "NUVION_GST_SOURCE": "videotestsrc is-live=true pattern=smpte",
+    "NUVION_GST_SOURCE": "videotestsrc is-live=true pattern=smpte ! video/x-raw,format=RGB",
     "NUVION_FLEET_COMMAND_POLL_INTERVAL_SEC": "1",
     "NUVION_FLEET_EFFECT_RECONCILE_INTERVAL_SEC": "0.25",
     "NUVION_FLEET_OBSERVATION_REPLAY_INTERVAL_SEC": "0.5",
