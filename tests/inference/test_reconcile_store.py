@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from nuvion_app.inference.command_inbox import (
@@ -303,6 +304,76 @@ class DurableReconcileStoreTest(unittest.TestCase):
         self.assertEqual(completed.terminal_acks[0].status, "SUCCEEDED")
         self.assertEqual(reconciler.calls, 2)
         self.assertEqual(restart_calls, [])
+
+    def test_update_health_soak_keeps_sampling_after_many_deferrals(self) -> None:
+        # Startup deferrals share attempts with health sampling. The BE requires
+        # 30 seconds of progress with no sample gap above 15 seconds.
+        for command_type, phase, bounded in (
+            ("AGENT_UPDATE", "FUNCTIONAL_HEALTHY", True),
+            ("AGENT_UPDATE", "BOOT_HEALTHY", False),
+            ("STREAM_POLICY", "FUNCTIONAL_HEALTHY", False),
+        ):
+            with self.subTest(command_type=command_type, phase=phase):
+                ticks = {"now": 10.0}
+                inbox = DurableCommandInbox(
+                    Path(self.tempdir.name) / f"soak-{command_type}-{phase}.sqlite3"
+                )
+                store = DurableReconcileStore(inbox, monotonic_clock=lambda: ticks["now"])
+                capability = (
+                    "command.agent.update" if command_type == "AGENT_UPDATE"
+                    else "command.stream.policy"
+                )
+                command = replace(
+                    _stream_command(1), command_type=command_type,
+                    required_capability=capability,
+                )
+                inbox.accept(command)
+                inbox.transition(command.command_id, "IN_PROGRESS")
+                inbox.run_transactional_effect(
+                    command.command_id,
+                    lambda connection: store.stage_verified(command, connection),
+                )
+
+                class SamplingReconciler:
+                    calls = 0
+                    def reconcile(self, command):
+                        self.calls += 1
+                        return ReconcileDeferred(
+                            reported_state={"health": "VERIFYING"},
+                            checkpoint={"nextAction": "RETRY_EFFECT",
+                                        "restartRequired": False,
+                                        "updaterPhase": phase},
+                        )
+
+                reconciler = SamplingReconciler()
+                reconciler.command_type = command_type
+                reconciler.capability = capability
+                registry = ReconcilerRegistry()
+                registry.register(reconciler)
+                restarts = []
+                coordinator = FleetEffectCoordinator(
+                    inbox=inbox, store=store, registry=registry, owner="soak-worker",
+                    restart_requester=lambda: restarts.append(True) or True,
+                )
+                gaps = []
+                for attempt in range(1, 13):
+                    result = coordinator.run_once()
+                    self.assertEqual(result.processed, 1)
+                    self.assertEqual(result.terminal_acks, ())
+                    job = store.get_job(command.command_id)
+                    gap = job.lease_expires_at - ticks["now"]
+                    gaps.append(gap)
+                    if bounded:
+                        self.assertLessEqual(gap, 5.0)
+                    else:
+                        self.assertAlmostEqual(gap, min(60.0, float(2 ** min(attempt, 6))))
+                    self.assertEqual(coordinator.run_once().processed, 0)
+                    ticks["now"] = job.lease_expires_at + 0.01
+                self.assertEqual(reconciler.calls, 12)
+                self.assertEqual(restarts, [])
+                self.assertEqual(inbox.get(command.command_id).status, "IN_PROGRESS")
+                if bounded:
+                    self.assertGreater(sum(gaps), 30.0)
 
     def test_expired_stale_fence_cannot_mutate_encoder(self) -> None:
         ticks = {"now": 10.0}

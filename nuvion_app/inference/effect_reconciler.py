@@ -371,6 +371,15 @@ class FleetEffectCoordinator:
                     )
                     if next_action == "RETRY_EFFECT" and restart_required is False:
                         retry_delay = min(60.0, float(2 ** min(job.attempts, 6)))
+                        if (
+                            command.command_type == "AGENT_UPDATE"
+                            and checkpoint.get("updaterPhase") == "FUNCTIONAL_HEALTHY"
+                        ):
+                            # Health attestation accumulates fresh BE samples over
+                            # 30..60 seconds, with at most 15 seconds between samples.
+                            # Startup attempts must not back off past that window.
+                            # Keep the durable lease and all commit gates intact.
+                            retry_delay = min(retry_delay, 5.0)
                         self.store.defer_for_retry(
                             command,
                             owner=self.owner,
