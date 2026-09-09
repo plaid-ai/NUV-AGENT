@@ -1,0 +1,63 @@
+name: Sign company release approval tag with Cloud KMS
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact protected-main commit to approve
+        required: true
+        type: string
+      tag_name:
+        description: New vX.Y.Z or candidate-publisher-vN tag
+        required: true
+        type: string
+      tag_message:
+        description: Approval explanation and evidence reference
+        required: true
+        type: string
+
+permissions: {}
+concurrency:
+  group: nuv-kms-release-approval
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    if: github.repository == 'plaid-ai/NUV-AGENT' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: nuv-signing-prod
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Authorize identity and exact immutable tag request
+        env:
+          ACTOR_ID: ${{ github.actor_id }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          TAG_MESSAGE: ${{ inputs.tag_message }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python packaging/release/authorize-kms-tag.py
+      - name: Install pinned signing tools
+        run: python -m pip install --require-hashes -r packaging/release/requirements-cloud-kms.txt
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-prod/providers/github
+          service_account: nuv-agent-sign-prod@plaid-451114.iam.gserviceaccount.com
+      - name: Create, verify and publish only the requested new tag
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          TAG_MESSAGE: ${{ inputs.tag_message }}
+          GH_TOKEN: ${{ github.token }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: python packaging/release/authorize-kms-tag.py --sign-and-push

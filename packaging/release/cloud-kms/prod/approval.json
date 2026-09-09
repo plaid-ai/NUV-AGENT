@@ -1,0 +1,6 @@
+{
+  "keyVersion": "projects/plaid-451114/locations/asia-northeast3/keyRings/nuv-agent-prod/cryptoKeys/approval/cryptoKeyVersions/1",
+  "publicKeySha256": "5dce3e8216f66e1e096e3ba1133258c9ec5e88451b921988b0de746d9c90616b",
+  "publicCertificate": "approval.asc",
+  "fingerprint": "775BFCAAF6E7D56F457A6BCF953DEEF5D40EBD20"
+}

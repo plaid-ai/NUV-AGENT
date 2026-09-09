@@ -248,7 +248,11 @@ def main() -> int:
     signing_source = parser.add_mutually_exclusive_group()
     signing_source.add_argument("--signing-private-key")
     signing_source.add_argument("--signing-private-key-env")
+    signing_source.add_argument("--signing-kms-key-version")
+    parser.add_argument("--signing-kms-public-key-sha256")
     args = parser.parse_args()
+    if bool(args.signing_kms_key_version) != bool(args.signing_kms_public_key_sha256):
+        parser.error("KMS signing requires both key version and trusted public key SHA-256")
 
     built_at = args.built_at or datetime.now(timezone.utc).isoformat(
         timespec="seconds"
@@ -276,6 +280,8 @@ def main() -> int:
                 args.signing_key_id,
                 args.signing_private_key,
                 args.signing_private_key_env,
+                args.signing_kms_key_version,
+                args.signing_kms_public_key_sha256,
             )
         ):
             parser.error("v2 target/signing options are not valid for schema v1")
@@ -303,9 +309,9 @@ def main() -> int:
             parser.error("at least one --target is required for schema v2")
         if not args.signing_key_id:
             parser.error("--signing-key-id is required for schema v2")
-        if not args.signing_private_key and not args.signing_private_key_env:
+        if not any((args.signing_private_key, args.signing_private_key_env, args.signing_kms_key_version)):
             parser.error(
-                "--signing-private-key or --signing-private-key-env is required "
+                "--signing-private-key, --signing-private-key-env or --signing-kms-key-version is required "
                 "for schema v2"
             )
         try:
@@ -322,7 +328,13 @@ def main() -> int:
                 artifact_kind=args.artifact_kind,
                 built_at=built_at,
             )
-            if args.signing_private_key:
+            if args.signing_kms_key_version:
+                from cloud_kms_signer import CloudKmsEd25519Key
+
+                private_key = CloudKmsEd25519Key(
+                    args.signing_kms_key_version, args.signing_kms_public_key_sha256
+                )
+            elif args.signing_private_key:
                 key_material = _read_private_key_file(
                     Path(args.signing_private_key).expanduser()
                 )
