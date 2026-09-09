@@ -161,6 +161,7 @@
   },
   "iq9075": {
     "bucket": "apt.plaidai.io",
+    "retiredCandidateSequences": [2],
     "trustDomain": "iq9075-dev",
     "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
     "publicKeyringSha256": "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",

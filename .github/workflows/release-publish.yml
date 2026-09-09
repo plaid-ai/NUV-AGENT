@@ -1354,11 +1354,15 @@ jobs:
           [ "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
           BOM_PATH="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
           SIGNATURE_PATH="$BOM_PATH.sig"
+          BOM_ID="nuv-agent-${VERSION}-iq9075-aarch64"
+          if [ "$RELEASE_SEQUENCE" -ge 3 ]; then
+            BOM_ID="${BOM_ID}-seq${RELEASE_SEQUENCE}"
+          fi
           NUVION_IQ9075_RELEASE_SIGNING_KEY="$RELEASE_SIGNING_PRIVATE_KEY" \
           PYTHONPATH=publisher python3 \
             publisher/packaging/release/generate-release-bom.py \
               --schema-version 2 \
-              --bom-id "nuv-agent-${VERSION}-iq9075-aarch64" \
+              --bom-id "$BOM_ID" \
               --version "$VERSION" \
               --component-sha "$COMPONENT_SHA" \
               --config-schema "$CONFIG_SCHEMA" \

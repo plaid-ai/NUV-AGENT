@@ -5649,7 +5649,7 @@ class ReleaseSourceVerificationTest(unittest.TestCase):
 
 
 class SequenceAndPromotionTest(unittest.TestCase):
-    def test_new_sequence_must_be_latest_plus_one(self) -> None:
+    def test_sequence_skips_only_explicitly_retired_unpublished_candidates(self) -> None:
         from nuvion_app.runtime.release_bom import ReleaseTarget, VerifiedReleaseBom
 
         target = ReleaseTarget(
@@ -5698,29 +5698,46 @@ class SequenceAndPromotionTest(unittest.TestCase):
                     artifact_path=artifact,
                     version="0.1.121",
                     component_sha="a" * 40,
-                    requested_sequence=2,
+                    requested_sequence=3,
                     config_schema="12",
                     min_updater_version="0.2.0",
                     built_at="2026-09-02T00:00:00+00:00",
                 )
-                self.assertEqual(reservation["releaseSequence"], 2)
+                self.assertEqual(reservation["releaseSequence"], 3)
                 self.assertEqual(output["latest_sequence"], "1")
                 self.assertEqual(
-                    output["reservation_object"], "releases/reservations/iq9075/2.json"
+                    output["reservation_object"], "releases/reservations/iq9075/3.json"
                 )
-                with self.assertRaises(PLAN_OTA.SequencePlanError):
-                    PLAN_OTA.plan_sequence(
-                        policy_path=ROOT
-                        / "packaging/release/release-security-policy.json",
-                        keyring_path=keyring,
-                        artifact_path=artifact,
-                        version="0.1.121",
-                        component_sha="a" * 40,
-                        requested_sequence=3,
-                        config_schema="12",
-                        min_updater_version="0.2.0",
-                        built_at="2026-09-02T00:00:00+00:00",
-                    )
+                for rejected in (1, 2, 4):
+                    with self.assertRaises(PLAN_OTA.SequencePlanError):
+                        PLAN_OTA.plan_sequence(
+                            policy_path=ROOT
+                            / "packaging/release/release-security-policy.json",
+                            keyring_path=keyring,
+                            artifact_path=artifact,
+                            version="0.1.121",
+                            component_sha="a" * 40,
+                            requested_sequence=rejected,
+                            config_schema="12",
+                            min_updater_version="0.2.0",
+                            built_at="2026-09-02T00:00:00+00:00",
+                        )
+                original_policy = PLAN_OTA._read_policy(
+                    ROOT / "packaging/release/release-security-policy.json"
+                )
+                for retired in ([], [True], [0], [2, 2], [1, 2], "2"):
+                    invalid_policy = copy.deepcopy(original_policy)
+                    invalid_policy["iq9075"]["retiredCandidateSequences"] = retired
+                    with self.subTest(retired=retired), mock.patch.object(
+                        PLAN_OTA, "_read_policy", return_value=invalid_policy
+                    ), self.assertRaises(PLAN_OTA.SequencePlanError):
+                        PLAN_OTA.plan_sequence(
+                            policy_path=ROOT / "packaging/release/release-security-policy.json",
+                            keyring_path=keyring, artifact_path=artifact,
+                            version="0.1.121", component_sha="a" * 40,
+                            requested_sequence=3, config_schema="12",
+                            min_updater_version="0.2.0", built_at="2026-09-02T00:00:00+00:00",
+                        )
 
     def test_distribution_promotion_is_deterministic_and_binds_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
