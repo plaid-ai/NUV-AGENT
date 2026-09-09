@@ -325,6 +325,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -881,6 +882,18 @@ def db_counts():
     finally:
         connection.close()
 
+def wait_observation_drain(seconds=30):
+    deadline = time.monotonic() + seconds
+    while True:
+        counts = db_counts()
+        if any(counts[key] for key in ("inboxPendingRows", "observationReservedRows", "observationDlqRows")):
+            raise Failure("pre-existing command work is not drained")
+        if counts["observationPendingRows"] == 0:
+            return counts
+        if time.monotonic() >= deadline:
+            raise Failure("command observations did not drain before preparation deadline")
+        time.sleep(0.2)
+
 def save_snapshots(work):
     before = work / "before"
     before.mkdir(parents=True, exist_ok=False)
@@ -972,10 +985,13 @@ def prepare(rid, manifest_sha):
         state["deadman"]["lifecycle"] = "ARMED"
         state["phase"] = "ARMED"
         atomic(work / "state.json", canonical(state))
+        wait_observation_drain()
         systemctl("stop", "nuv-agent.service")
         counts = db_counts()
-        if any(counts.values()):
+        if any(counts[key] for key in ("inboxPendingRows", "observationReservedRows", "observationDlqRows")):
             raise Failure("pre-existing command work is not drained")
+        # Shutdown can enqueue a final streaming observation after its delivery
+        # worker stops. Preserve it and let the restarted worker acknowledge it.
         active_baseline = baseline()
         config_raw, config_meta = read_regular(CONFIG, 2 * 1024 * 1024)
         test_config = render_updates(config_raw)
@@ -1011,6 +1027,7 @@ def prepare(rid, manifest_sha):
             raise Failure("Agent release identity changed during preparation")
         state["activeRuntimeIdentity"] = active_identity
         atomic(work / "state.json", canonical(state))
+        counts = wait_observation_drain()
     except BaseException:
         if (work / "state.json").exists():
             restore(rid, internal=True)
