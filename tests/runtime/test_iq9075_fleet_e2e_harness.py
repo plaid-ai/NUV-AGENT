@@ -577,6 +577,14 @@ class HarnessFixture:
         self._write("/sys/bus/usb/devices/2-1.1/idProduct", "f63b\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1.1/serial", "oak-iq9075-test\n", 0o444)
         self._write("/sys/bus/usb/devices/2-1.1/speed", "5000\n", 0o444)
+        ports = []
+        for bus in (1, 2):
+            path = self._write(
+                f"/sys/bus/usb/devices/{bus}-1:1.0/{bus}-1-port1/disable", "0", 0o644
+            ).parent
+            ports.append(path)
+        for index, path in enumerate(ports):
+            (path / "peer").symlink_to(ports[1 - index])
         self._write("/sys/bus/usb/drivers/usb/unbind", "", 0o600)
         self._write("/sys/bus/usb/drivers/usb/bind", "", 0o600)
         (self.root / "sys/bus/usb/devices/2-1/driver").symlink_to("../../drivers/usb")
@@ -607,7 +615,17 @@ class HarnessFixture:
         self.paths.lock_root.mkdir(parents=True, exist_ok=True)
 
     def _usb_hook(self, action: str, port: str) -> None:
-        driver = self.paths.usb_devices / port / "driver"
+        device = self.paths.usb_devices / port
+        detached = self.paths.usb_devices / f".{port}.disconnected"
+        if action == "disable-port":
+            if device.exists():
+                device.rename(detached)
+            return
+        if action == "enable-port":
+            if detached.exists():
+                detached.rename(device)
+            return
+        driver = device / "driver"
         if action == "unbind":
             try:
                 driver.unlink()
@@ -1656,6 +1674,146 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_port_fault_holds_both_companions_and_recovers_exact_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                observed = []
+                original_sleep = fixture.harness.sleeper
+
+                def observe_hold(seconds):
+                    if seconds == 10:
+                        pair = fixture.harness._oak_port_pair("2-1.1")
+                        self.assertTrue(all((p / "disable").read_text() == "1" for p in pair))
+                        self.assertFalse((fixture.paths.usb_devices / "2-1.1").exists())
+                        self.assertFalse((fixture.paths.usb_devices / "1-1.1").exists())
+                        observed.append(seconds)
+                    original_sleep(seconds)
+
+                fixture.harness.sleeper = observe_hold
+                result = fixture.harness.arm_oak_fault(fixture.run_id)
+                self.assertEqual(observed, [10])
+                self.assertTrue(result["recovered"])
+                state = fixture.harness._load_state(fixture.run_id)["oakFault"]
+                self.assertEqual(state["method"], "usb-port-disable")
+                self.assertFalse(state["armed"])
+                self.assertEqual(fixture.harness.verify_oak()["speedMbps"], 5000)
+            finally:
+                fixture.close()
+
+    def test_invalid_companion_pair_prevents_any_fault_write(self) -> None:
+        for defect in ("peer", "attribute-symlink", "already-disabled"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
+                fixture = HarnessFixture(Path(directory))
+                try:
+                    fixture.provision("oak-fault-rollback")
+                    fixture.activate_candidate()
+                    fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                    pair = fixture.harness._oak_port_pair("2-1.1")
+                    if defect == "peer":
+                        (pair[0] / "peer").unlink()
+                        (pair[0] / "peer").symlink_to(pair[0])
+                    elif defect == "attribute-symlink":
+                        (pair[0] / "disable").unlink()
+                        (pair[0] / "disable").symlink_to(pair[1] / "disable")
+                    else:
+                        (pair[0] / "disable").write_text("1")
+                    writes = []
+                    fixture.harness.usb_write_hook = lambda *args: writes.append(args)
+                    with self.assertRaises(BOARD.HarnessError):
+                        fixture.harness.arm_oak_fault(fixture.run_id)
+                    self.assertEqual(writes, [])
+                finally:
+                    fixture.close()
+
+    def test_partial_port_disable_is_recoverable_by_same_run_deadman(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+
+                def interrupt_write(action, port):
+                    fixture._usb_hook(action, port)
+                    if action == "disable-port":
+                        raise InterruptedError("injected interruption after first port")
+
+                fixture.harness.usb_write_hook = interrupt_write
+                with self.assertRaises(InterruptedError):
+                    fixture.harness.arm_oak_fault(fixture.run_id)
+                self.assertTrue(fixture.harness._load_state(fixture.run_id)["oakFault"]["armed"])
+                fixture.harness.usb_write_hook = fixture._usb_hook
+                self.assertTrue(fixture.harness.cleanup(fixture.run_id, deadman_only=True)["recovered"])
+                self.assertTrue(all((p / "disable").read_text() == "0" for p in fixture.harness._oak_port_pair("2-1.1")))
+            finally:
+                fixture.close()
+
+    def test_port_recovery_waits_for_agent_after_exclusive_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                statuses = [False, True]
+                observed = []
+                def runtime_status(_unit):
+                    active = statuses.pop(0)
+                    observed.append(active)
+                    return {"active": active}
+                fixture.harness._unit_status = runtime_status
+                fixture.harness._recover_oak("2-1.1", require_runtime_active=True)
+                self.assertEqual(observed, [False, True])
+                self.assertGreaterEqual(fixture.clock.monotonic(), 0.5)
+            finally:
+                fixture.close()
+
+    def test_oak_recovery_waits_for_original_runtime_before_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                product = fixture.paths.usb_devices / "2-1.1/idProduct"
+                product.chmod(0o644)
+                product.write_text("2485\n")
+                product.chmod(0o444)
+                writes = []
+
+                def usb_write(action, port):
+                    self.assertEqual(product.read_text().strip(), "f63b")
+                    writes.append((action, port))
+                    fixture._usb_hook(action, port)
+
+                def settle(seconds):
+                    self.assertEqual(writes, [])
+                    fixture.clock.sleep(seconds)
+                    product.chmod(0o644)
+                    product.write_text("f63b\n")
+                    product.chmod(0o444)
+
+                fixture.harness.usb_write_hook = usb_write
+                fixture.harness.sleeper = settle
+                fixture.harness._recover_oak("2-1.1")
+                self.assertEqual(writes, [("bind", "2-1.1")])
+            finally:
+                fixture.close()
+
+    def test_oak_recovery_never_binds_a_persistent_bootloader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                product = fixture.paths.usb_devices / "2-1.1/idProduct"
+                product.chmod(0o644)
+                product.write_text("2485\n")
+                product.chmod(0o444)
+                writes = []
+                fixture.harness.usb_write_hook = lambda *args: writes.append(args)
+                with self.assertRaisesRegex(BOARD.HarnessError, "did not recover"):
+                    fixture.harness._recover_oak("2-1.1", timeout=2)
+                self.assertEqual(writes, [])
+            finally:
+                fixture.close()
+
     def test_deadman_exec_failure_prevents_usb_fault(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
@@ -1691,9 +1849,8 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 )
 
                 def never_rebind(action: str, port: str) -> None:
-                    driver = fixture.paths.usb_devices / port / "driver"
-                    if action == "unbind" and driver.exists():
-                        driver.unlink()
+                    if action == "disable-port":
+                        fixture._usb_hook(action, port)
 
                 fixture.harness.usb_write_hook = never_rebind
                 with self.assertRaisesRegex(BOARD.HarnessError, "did not recover"):

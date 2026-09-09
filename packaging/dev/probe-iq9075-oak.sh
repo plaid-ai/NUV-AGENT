@@ -79,6 +79,7 @@ import sys
 import time
 
 import depthai
+import numpy as np
 
 
 if version("depthai") != "2.32.0.0":
@@ -159,8 +160,17 @@ def make_pipeline():
     return pipeline
 
 
+def validate_rgb_frame(packet):
+    # The signed bundle includes NumPy and DepthAI, but not optional OpenCV.
+    frame = np.asarray(packet.getFrame())
+    if frame.shape == (3, 480, 640):
+        frame = np.transpose(frame, (1, 2, 0))
+    if frame.shape != (480, 640, 3) or frame.dtype != np.uint8:
+        raise RuntimeError("OAK readiness frame must be 640x480 RGB uint8")
+
+
 # Stopping the production Agent closes XLink and re-enumerates OAK-D Lite from
-# application PID 2485 to bootloader PID f63b (or the reverse). A one-shot open
+# bootloader PID 2485 to runtime PID f63b (or the reverse). A one-shot open
 # during that physical USB transition produced a false rollback on IQ9075.
 # Require two consecutive enumerations and retry the complete Device lifecycle
 # within one strict wall-clock deadline.
@@ -217,12 +227,7 @@ while time.monotonic() < deadline and not ready:
                     time.sleep(0.01)
             if packet is None:
                 raise RuntimeError("OAK readiness frame timeout")
-            frame = packet.getCvFrame()
-            if getattr(frame, "shape", None) != (480, 640, 3):
-                raise RuntimeError(
-                    f"unexpected OAK frame shape: {getattr(frame, 'shape', None)}"
-                )
-            del frame
+            validate_rgb_frame(packet)
             del packet
             del queue
         ready = True
