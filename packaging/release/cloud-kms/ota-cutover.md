@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v18`, Agent `0.1.121`, release sequence
-`15`, schema `12`, minimum updater `0.2.0`. Sequences 2–14 and publishers v1–v17
+Current publisher: `candidate-publisher-v19`, Agent `0.1.121`, release sequence
+`16`, schema `12`, minimum updater `0.2.0`. Sequences 2–15 and publishers v1–v18
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v18 \
-     -f tag_message='NUVION IQ9075 candidate publisher v18'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v19 \
+     -f tag_message='NUVION IQ9075 candidate publisher v19'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v18
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v19
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v17 to v18 and verify them.
+   existing candidate-sign/stage tag policies from v18 to v19 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v18 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=15
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v19 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=16
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -58,9 +58,9 @@ production KMS OTA key is not part of this development keyring.
    rollback. Signing keys are never exported from KMS.
 
 This cutover does not mark `0.1.121` READY. Physical automatic rollback and commit
-acceptance are separate. Main-branch protection was disabled by the repository
-owner; the formal release settings gate still requires its configured protection
-and signed evidence. No successful settings/OTA attestation is implied here.
+acceptance are separate. Main-branch protection has been restored. The formal
+release settings gate still requires a fresh live settings audit and signed
+evidence. No successful settings/OTA attestation is implied here.
 APT signing and GCS publishing credentials are outside this OTA key migration.
 
 ## Candidate v12 physical validation retry
@@ -186,3 +186,22 @@ baseline, not a claim of complete release qualification.
 Publisher v17 was cancelled before staging or device commands. Its immutable
 tag and sequence14 remain retired. Publisher v18/sequence15 carries the same
 tested timeout fix plus this strict baseline selection for fresh qualification.
+
+## Candidate v19 encoder ownership preflight
+
+Sequence 15 passed physical automatic rollback and normal commit. The following
+CONFIG_APPLY bitrate test correctly failed with ENCODER_OWNED_BY_STREAM_POLICY:
+the existing adaptive policy still owned the encoder. That failed chain remains
+non-promotable. The existing collision protection is unchanged.
+
+Before a new bootstrap/R/C chain, issue STREAM_POLICY DISABLED through the real
+Fleet API and require its successful ACK and converged streaming twin. Confirm
+all commands are terminal, all queues drained, and no physical-test lease is
+active. Do not change bitrate through CONFIG_APPLY while ADAPTIVE or FIXED owns
+it. Current camera CONFIG_APPLY change/restore and adaptive/disabled commands
+were separately exercised successfully; they do not replace formal evidence.
+
+Publisher v19 signs sequence 16. The already committed, signed sequence-15 BOM
+is explicitly allowlisted as its physical rollback baseline; the promoted APT
+baseline remains 0.1.120/sequence 1. Preserve all older candidate tags, artifacts,
+failed commands and proofs. A fresh complete chain is required for promotion.
