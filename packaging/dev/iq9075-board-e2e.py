@@ -3453,6 +3453,25 @@ class BoardHarness:
                 pass
             raise
 
+    def _baseline_after_backup(self) -> dict[str, object]:
+        # A consistent backup restarts the Agent. systemd active does not imply
+        # that DepthAI has finished returning from its USB2 bootloader to USB3.
+        # This wait performs only foundation reads, before trust preparation.
+        transient = {
+            "USB1 downstream must contain exactly one OAK-D Lite",
+            "OAK USB topology endpoint is unavailable",
+            "OAK-D Lite must negotiate at 5Gbps",
+            "OAK-D Lite is not bound to the exact USB driver",
+        }
+        deadline = self.monotonic() + 30
+        while True:
+            try:
+                return self._foundation()
+            except HarnessError as exc:
+                if str(exc) not in transient or self.monotonic() >= deadline:
+                    raise
+                self.sleeper(1)
+
     def enable_fleet(
         self,
         run_id: str,
@@ -3508,7 +3527,11 @@ class BoardHarness:
                     or foundation.get("verified") is not True
                 ):
                     raise HarnessError("foundation preflight is incomplete")
-                live_foundation = self._foundation()
+                live_foundation = (
+                    self._baseline_after_backup()
+                    if state.get("trustTransaction") is None
+                    else self._foundation()
+                )
                 if manifest["scenario"]["expectedPreviousSlot"] != foundation.get(
                     "currentSlot"
                 ) or manifest["scenario"]["expectedPreviousVersion"] != foundation.get(

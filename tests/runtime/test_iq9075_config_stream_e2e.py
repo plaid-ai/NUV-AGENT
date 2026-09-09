@@ -685,6 +685,31 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
 
         self.assertEqual(board.restore_calls, 1)
 
+    def test_cancelled_command_does_not_replace_actual_expiry_proof(self) -> None:
+        class CancelledApi(_Api):
+            def commands(self, *, space_id: int, device_id: str) -> list[dict]:
+                commands = super().commands(space_id=space_id, device_id=device_id)
+                commands.append({
+                    "commandId": "00000000-0000-4000-8000-000000000002",
+                    "sequence": 2, "type": "AGENT_UPDATE", "status": "EXPIRED",
+                    "issuedAt": "2026-09-02T23:58:00.000Z",
+                    "expiresAt": "2026-09-04T00:00:00.000Z",
+                })
+                return commands
+        clock = _Clock()
+        board = _Board()
+        orchestrator = MODULE.ConfigStreamOrchestrator(
+            api=CancelledApi(board), board=board, monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+            wall_clock=lambda: datetime(2026, 9, 3, tzinfo=timezone.utc),
+        )
+        evidence = orchestrator.run(
+            run_id=RUN_ID, manifest=_manifest(), manifest_sha256="1" * 64,
+            ota_evidence_sha256="2" * 64, wait_seconds=120,
+        )
+        self.assertEqual([c["commandId"] for c in evidence["expiredPredecessors"]], [EXPIRED_COMMAND_ID])
+        self.assertTrue(all(evidence["gates"].values()))
+
     def test_future_expired_deadline_fails_and_restores(self) -> None:
         class FutureExpiredApi(_Api):
             def commands(self, *, space_id: int, device_id: str) -> list[dict]:
@@ -704,7 +729,7 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             wall_clock=lambda: datetime(2026, 9, 3, tzinfo=timezone.utc),
         )
 
-        with self.assertRaisesRegex(MODULE.ConfigStreamError, "future"):
+        with self.assertRaisesRegex(MODULE.ConfigStreamError, "expired predecessor"):
             orchestrator.run(
                 run_id=RUN_ID,
                 manifest=_manifest(),

@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v14`, Agent `0.1.121`, release sequence
-`11`, schema `12`, minimum updater `0.2.0`. Sequences 2–10 and publishers v1–v13
+Current publisher: `candidate-publisher-v15`, Agent `0.1.121`, release sequence
+`12`, schema `12`, minimum updater `0.2.0`. Sequences 2–11 and publishers v1–v14
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v14 \
-     -f tag_message='NUVION IQ9075 candidate publisher v14'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v15 \
+     -f tag_message='NUVION IQ9075 candidate publisher v15'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v14
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v15
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v13 to v14 and verify them.
+   existing candidate-sign/stage tag policies from v14 to v15 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v14 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=11
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v15 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=12
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -113,3 +113,25 @@ root commit gate, attestation signature and commit deadline remain mandatory.
 Publisher v14 signs sequence 11 with new exact-workflow candidate-v14 and
 release-main-v14 providers. Sequence 10 and all prior failed artifacts remain
 immutable. New complete rollback and commit evidence is required.
+
+## Candidate v15 startup and heartbeat prerequisites
+
+Sequence 11 rollback passed; commit requested attestation every five seconds,
+but the deployed heartbeat interval was still 30 seconds. Its command
+`3a5ec88b-7035-477f-a622-c6bb7622fc28` therefore failed the unchanged 15-second
+sample-gap check and automatically rolled back. IQ9075's supported
+NUVION_DEVICE_STATE_INTERVAL_SEC setting was changed to 5 with a root-owned
+backup; existing Agent reconciliation reported the actual terminal state.
+The runtime default and template now also use 5 seconds. Existing explicit
+30-second device settings must be migrated before attempting commit.
+
+After the consistent backup restarts the Agent, pre-trust foundation checks
+wait at most 30 seconds for transient OAK enumeration/binding recovery.
+Unsafe paths and other foundation failures still abort immediately. No trust,
+USB fault, or runtime mutation is performed by the wait.
+
+BE HALT may label a queued command EXPIRED before its signed TTL. Preserve that
+terminal history but exclude it from elapsed-expiry proof. Config/stream still
+requires at least one predecessor whose actual signed deadline passed, adjacent
+rollback/commit, a drained queue, and exact final restoration. No timestamp,
+command, ACK, or old artifact is rewritten. New v15/sequence12 evidence is required.

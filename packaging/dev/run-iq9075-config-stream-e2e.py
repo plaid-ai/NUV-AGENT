@@ -1965,7 +1965,11 @@ class ConfigStreamOrchestrator:
                 if _utc_timestamp(
                     expires_at, "expired predecessor expiresAt"
                 ) > self.wall_clock():
-                    raise ConfigStreamError("expired predecessor deadline is in the future")
+                    # The BE also marks queued commands EXPIRED when a rollout
+                    # is halted before its TTL. Such terminal history is not
+                    # evidence of elapsed expiry; require another predecessor
+                    # whose signed deadline has actually passed.
+                    continue
                 expired_predecessors.append(
                     {
                         "commandId": item["commandId"],
