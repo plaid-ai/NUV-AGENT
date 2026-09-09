@@ -7036,14 +7036,18 @@ class BoardHarness:
             if payload.strip() != (b"1" if disabled else b"0"):
                 raise HarnessError("OAK port control did not converge")
 
-    def _recover_oak_fault(self, fault: Mapping[str, Any]) -> None:
+    def _recover_oak_fault(
+        self, fault: Mapping[str, Any], *, timeout: float = 30
+    ) -> None:
         port = canonical_oak_port(fault.get("port"))
         method = fault.get("method", "usb-driver-unbind")
         if method == "usb-port-disable":
             self._set_oak_ports_disabled(port, False)
         elif method != "usb-driver-unbind":
             raise HarnessError("OAK fault method is invalid")
-        self._recover_oak(port, require_runtime_active=method == "usb-port-disable")
+        self._recover_oak(
+            port, timeout=timeout, require_runtime_active=method == "usb-port-disable"
+        )
 
     def _poll_detached(self, port: str, timeout: float = 15) -> None:
         safe_port = canonical_oak_port(port)
@@ -7188,7 +7192,10 @@ class BoardHarness:
                         raise HarnessError("OAK remains enumerated on a disabled port")
                 if hold:
                     self.sleeper(float(hold))
-                self._recover_oak_fault(fault)
+                # A startup camera fault can exhaust Agent restart attempts.
+                # Leave room for the 120s boot watchdog and automatic baseline
+                # restart after a 75s hold; the independent deadman stays armed.
+                self._recover_oak_fault(fault, timeout=75)
                 latest = self._load_state(run_id)
                 latest_fault = latest.get("oakFault")
                 if not isinstance(latest_fault, dict):
