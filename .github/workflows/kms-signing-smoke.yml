@@ -35,7 +35,8 @@ jobs:
           import json, os
           from pathlib import Path
           policy = json.loads(Path('packaging/release/release-security-policy.json').read_text())
-          assert int(os.environ['ACTOR_ID']) in [u['id'] for u in policy['releaseAdminUsers']]
+          if int(os.environ['ACTOR_ID']) not in [u['id'] for u in policy['releaseAdminUsers']]:
+              raise SystemExit('Only a release administrator can request signing verification')
           PY
       - name: Install pinned signing tools
         run: python -m pip install --require-hashes -r packaging/release/requirements-cloud-kms.txt
