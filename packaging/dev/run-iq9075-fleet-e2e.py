@@ -3823,7 +3823,8 @@ class FleetRunner:
                     "oak-fault",
                     "arm-oak-fault",
                     ["--run-id", self.run_id],
-                    timeout=int(scenario["holdSeconds"]) + 90,
+                    # 75s normal recovery plus systemd startup/status/retirement.
+                    timeout=int(scenario["holdSeconds"]) + 135,
                 )
         while True:
             evidence = self._call("evidence", "evidence", ["--run-id", self.run_id])

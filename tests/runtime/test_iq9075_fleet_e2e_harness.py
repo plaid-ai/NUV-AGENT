@@ -1730,6 +1730,54 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_maximum_fault_recovery_finishes_before_deadman_start(self) -> None:
+        for recover in (True, False):
+            with self.subTest(recover=recover), tempfile.TemporaryDirectory() as directory:
+                fixture = HarnessFixture(Path(directory))
+                try:
+                    payloads = fixture.payloads("oak-fault-rollback")
+                    manifest = json.loads(payloads["manifest"])
+                    manifest["scenario"]["holdSeconds"] = BOARD.MAX_FAULT_HOLD_SECONDS
+                    payloads["manifest"] = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    fixture.foundation_backup()
+                    fixture.enable(payloads)
+                    fixture.activate_candidate()
+                    fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                    start = fixture.clock.monotonic()
+                    original = fixture.harness._unit_status
+                    calls = 0
+
+                    def delayed_baseline(unit):
+                        nonlocal calls
+                        calls += 1
+                        result = original(unit)
+                        if calls > 1:
+                            result["active"] = recover and fixture.clock.monotonic() - start >= 149
+                        return result
+
+                    fixture.harness._unit_status = delayed_baseline
+                    if recover:
+                        self.assertTrue(fixture.harness.arm_oak_fault(fixture.run_id)["recovered"])
+                    else:
+                        with self.assertRaisesRegex(BOARD.HarnessError, "did not recover"):
+                            fixture.harness.arm_oak_fault(fixture.run_id)
+                    elapsed = fixture.clock.monotonic() - start
+                    self.assertGreaterEqual(elapsed, 149)
+                    self.assertLess(elapsed + 30, BOARD.DEADMAN_SECONDS)
+                    state = fixture.harness._load_state(fixture.run_id)["oakFault"]
+                    self.assertEqual(state["armed"], not recover)
+                    if not recover:
+                        self.assertNotEqual(state.get("recovered"), True)
+                    deadman_call = next(call for call in fixture.runner.calls
+                        if call and call[0] == "/usr/bin/systemd-run"
+                        and any(item.startswith("--unit=nuvion-oak-deadman-") for item in call))
+                    self.assertEqual(deadman_call[-2:], ("/usr/bin/sleep", str(BOARD.DEADMAN_SECONDS)))
+                    self.assertGreater(BOARD.OAK_DEADMAN_RUNTIME_SECONDS,
+                        BOARD.DEADMAN_SECONDS + BOARD.OAK_DEADMAN_STOP_SECONDS)
+                    self.assertGreater(BOARD.OAK_DEADMAN_STOP_SECONDS, 30)
+                finally:
+                    fixture.close()
+
     def test_invalid_companion_pair_prevents_any_fault_write(self) -> None:
         for defect in ("peer", "attribute-symlink", "already-disabled"):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
@@ -1896,7 +1944,7 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                         for item in call
                     )
                 )
-                self.assertIn("--property=RuntimeMaxSec=180", deadman_call)
+                self.assertIn("--property=RuntimeMaxSec=270", deadman_call)
                 self.assertIn("--property=TimeoutStopSec=45", deadman_call)
                 self.assertIn("--property=LimitCORE=0", deadman_call)
                 fixture.harness.usb_write_hook = fixture._usb_hook

@@ -42,8 +42,13 @@ USB_TOPOLOGY_RE = re.compile(
 OAK_VENDOR = "03e7"
 OAK_PRODUCT = "f63b"
 OAK_MIN_SPEED_MBPS = 5000.0
-DEADMAN_SECONDS = 120
 MAX_FAULT_HOLD_SECONDS = 75
+OAK_NORMAL_RECOVERY_SECONDS = 75
+# The normal writer finishes its maximum hold/recovery before the independent
+# deadman starts. Reserve 60s for systemd startup/status and retirement overhead.
+DEADMAN_SECONDS = MAX_FAULT_HOLD_SECONDS + OAK_NORMAL_RECOVERY_SECONDS + 60
+OAK_DEADMAN_STOP_SECONDS = 45
+OAK_DEADMAN_RUNTIME_SECONDS = DEADMAN_SECONDS + OAK_DEADMAN_STOP_SECONDS + 15
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TRUST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 2 * 1024 * 1024
@@ -6912,12 +6917,12 @@ class BoardHarness:
                 "/usr/bin/systemd-run",
                 f"--unit={unit}",
                 "--collect",
-                # Wait for successful exec, not the 120-second sleep to exit,
+                # Wait for successful exec, not the bounded sleep to exit,
                 # before permitting a fault that relies on this recovery unit.
                 "--property=Type=exec",
                 "--property=LimitCORE=0",
-                "--property=RuntimeMaxSec=180",
-                "--property=TimeoutStopSec=45",
+                f"--property=RuntimeMaxSec={OAK_DEADMAN_RUNTIME_SECONDS}",
+                f"--property=TimeoutStopSec={OAK_DEADMAN_STOP_SECONDS}",
                 f"--property=ExecStopPost={command}",
                 "/usr/bin/sleep",
                 str(DEADMAN_SECONDS),
@@ -7195,7 +7200,7 @@ class BoardHarness:
                 # A startup camera fault can exhaust Agent restart attempts.
                 # Leave room for the 120s boot watchdog and automatic baseline
                 # restart after a 75s hold; the independent deadman stays armed.
-                self._recover_oak_fault(fault, timeout=75)
+                self._recover_oak_fault(fault, timeout=OAK_NORMAL_RECOVERY_SECONDS)
                 latest = self._load_state(run_id)
                 latest_fault = latest.get("oakFault")
                 if not isinstance(latest_fault, dict):

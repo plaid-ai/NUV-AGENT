@@ -62,7 +62,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("permissions: {}", self.header)
         self.assertNotIn("secrets:", self.header)
         self.assertEqual(
-            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v8'"),
+            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v9'"),
             3,
         )
         self.assertNotIn("refs/tags/candidate-publisher-v1", self.publisher)
@@ -76,7 +76,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", self.header)
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required")
-    def test_authorization_accepts_only_exact_v8_ref_and_workflow_identity(self) -> None:
+    def test_authorization_accepts_only_exact_v9_ref_and_workflow_identity(self) -> None:
         script = textwrap.dedent(
             self.authorize.split("        run: |\n", maxsplit=1)[1]
         )
@@ -84,14 +84,15 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             "plaid-ai/NUV-AGENT/.github/workflows/"
             "iq9075-candidate-trusted-publish.yml@"
         )
-        active_ref = "refs/tags/candidate-publisher-v8"
+        active_ref = "refs/tags/candidate-publisher-v9"
         cases = [
-            (active_ref, active_ref, "5", True),
+            (active_ref, active_ref, "6", True),
             (active_ref, active_ref, "2", False),
             (active_ref, active_ref, "3", False),
             (active_ref, active_ref, "4", False),
-            (active_ref, active_ref, "6", False),
-            (active_ref + "0", active_ref + "0", "5", False),
+            (active_ref, active_ref, "5", False),
+            (active_ref, active_ref, "7", False),
+            (active_ref + "0", active_ref + "0", "6", False),
         ]
         for retired_ref in (
             "refs/tags/candidate-publisher-v1",
@@ -101,12 +102,13 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             "refs/tags/candidate-publisher-v5",
             "refs/tags/candidate-publisher-v6",
             "refs/tags/candidate-publisher-v7",
+            "refs/tags/candidate-publisher-v8",
         ):
             cases.extend(
                 (
-                    (retired_ref, retired_ref, "5", False),
-                    (retired_ref, active_ref, "5", False),
-                    (active_ref, retired_ref, "5", False),
+                    (retired_ref, retired_ref, "6", False),
+                    (retired_ref, active_ref, "6", False),
+                    (active_ref, retired_ref, "6", False),
                 )
             )
         for ref, workflow_ref, sequence, accepted in cases:
@@ -182,11 +184,11 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                 self.assertIn("--main-ref refs/remotes/origin/main", job)
                 self.assertIn("verify-github-oidc.py", job)
                 self.assertIn(
-                    "refs/tags/candidate-publisher-v8", job
+                    "refs/tags/candidate-publisher-v9", job
                 )
                 self.assertEqual(
                     OIDC.WORKFLOW_REF,
-                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v8",
+                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v9",
                 )
                 self.assertNotIn("ref: ${{ inputs.component_sha }}", job)
                 self.assertNotIn("stamp-build-info.py", job)
@@ -258,9 +260,9 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             self.stage[stage_preflight:stage_secret],
         )
 
-    def test_candidate_v8_prevents_downgrade_or_scope_expansion(self) -> None:
+    def test_candidate_v9_prevents_downgrade_or_scope_expansion(self) -> None:
         self.assertGreaterEqual(self.publisher.count('= "0.1.121" ]'), 3)
-        self.assertGreaterEqual(self.publisher.count('= "5" ]'), 3)
+        self.assertGreaterEqual(self.publisher.count('= "6" ]'), 3)
         self.assertGreaterEqual(self.publisher.count('= "12" ]'), 2)
         self.assertGreaterEqual(self.publisher.count('= "0.2.0" ]'), 2)
         forbidden = (
@@ -305,8 +307,8 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertEqual(
             policy["candidatePublisher"],
             {
-                "tag": "candidate-publisher-v8",
-                "tagRef": "refs/tags/candidate-publisher-v8",
+                "tag": "candidate-publisher-v9",
+                "tagRef": "refs/tags/candidate-publisher-v9",
                 "retiredTagRefs": [
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
@@ -315,10 +317,11 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v5",
                     "refs/tags/candidate-publisher-v6",
                     "refs/tags/candidate-publisher-v7",
+                    "refs/tags/candidate-publisher-v8",
                 ],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
                 "agentVersion": "0.1.121",
-                "releaseSequence": 5,
+                "releaseSequence": 6,
                 "configSchema": "12",
                 "minUpdaterVersion": "0.2.0",
                 "rulesetName": "protected-candidate-publisher",
@@ -327,7 +330,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         for name in ("iq9075-candidate-sign", "iq9075-candidate-stage"):
             self.assertEqual(
                 policy["requiredEnvironments"][name]["deploymentBranchPolicies"],
-                [{"name": "candidate-publisher-v8", "type": "tag"}],
+                [{"name": "candidate-publisher-v9", "type": "tag"}],
             )
             self.assertFalse(
                 policy["requiredEnvironments"][name]["canAdminsBypass"]
@@ -336,7 +339,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn(
             "gh workflow run iq9075-candidate-trusted-publish.yml", runbook
         )
-        self.assertIn("--ref candidate-publisher-v8", runbook)
+        self.assertIn("--ref candidate-publisher-v9", runbook)
         self.assertNotIn("--ref candidate-publisher-v1", runbook)
         self.assertNotIn("--ref candidate-publisher-v2", runbook)
         self.assertNotIn("--ref candidate-publisher-v3", runbook)
@@ -345,10 +348,10 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("job_workflow_ref", runbook)
         self.assertGreaterEqual(runbook.count("set -euo pipefail"), 2)
         self.assertIn('"can_admins_bypass": false', runbook)
-        self.assertIn("expected exactly one retired v7 tag policy", runbook)
+        self.assertIn("expected exactly one retired v8 tag policy", runbook)
         self.assertIn("locked_candidate_ruleset", runbook)
         self.assertIn("remote ref is not the exact annotated tag", runbook)
-        for version in (1, 2, 3, 4, 5, 6, 7):
+        for version in (1, 2, 3, 4, 5, 6, 7, 8):
             self.assertGreaterEqual(
                 runbook.count(f"retired_v{version}_tag_object_sha"), 2
             )
@@ -360,7 +363,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("deployment-branch-policies/$policy_id", migration)
         self.assertNotIn("--method DELETE", migration)
         self.assertNotIn("--method POST", migration)
-        self.assertIn('.id == $id and .name == "candidate-publisher-v8"', migration)
+        self.assertIn('.id == $id and .name == "candidate-publisher-v9"', migration)
         self.assertIn('.type == "tag"', migration)
 
 
@@ -509,7 +512,7 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             self.assertEqual(
                 result["workflowRef"],
                 "plaid-ai/NUV-AGENT/.github/workflows/"
-                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v8",
+                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v9",
             )
 
     def test_accepts_signed_exact_optional_job_workflow_pair(self) -> None:
@@ -535,13 +538,13 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             {"job_workflow_ref": OIDC.WORKFLOW_REF, "job_workflow_sha": "2" * 40},
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v8", "candidate-publisher-v2"
+                    "candidate-publisher-v9", "candidate-publisher-v2"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v8", "candidate-publisher-v3"
+                    "candidate-publisher-v9", "candidate-publisher-v3"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
@@ -551,7 +554,7 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             },
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v8", "candidate-publisher-v4"
+                    "candidate-publisher-v9", "candidate-publisher-v4"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
