@@ -965,6 +965,37 @@ class WebRTCUplinkControllerTest(unittest.TestCase):
         self.assertEqual(reset["connectionState"], "new")
         self.assertEqual(reset["outboundProgressSamples"], 0)
 
+    def test_stats_progress_accepts_gstreamer_enum_types(self) -> None:
+        class StatsType:
+            def __init__(self, nick: str) -> None:
+                self.value_nick = nick
+
+            def __str__(self) -> str:
+                name = self.value_nick.replace("-", "_").upper()
+                return f"<enum GST_WEBRTC_STATS_{name} of type GstWebRTC.WebRTCStatsType>"
+
+        accumulator = self.module.WebRTCStatsAccumulator()
+        samples = []
+        for index in range(3):
+            samples.append(accumulator.observe({
+                "rtp-outbound-stream-stats": {
+                    "type": StatsType("outbound-rtp"),
+                    "timestamp": (index + 1) * 1_000_000,
+                    "packets-sent": (index + 1) * 100,
+                    "bytes-sent": (index + 1) * 100_000,
+                },
+                "rtp-remote-inbound-stream-stats": {
+                    "type": StatsType("remote-inbound-rtp"),
+                    "round-trip-time": 0.05,
+                },
+            }))
+
+        for sample in samples[1:]:
+            self.assertIsNotNone(sample)
+            self.assertEqual(sample["outboundPacketsDelta"], 100.0)
+            self.assertEqual(sample["outboundBytesDelta"], 100_000.0)
+            self.assertEqual(sample["outboundRttMs"], 50.0)
+
     def test_late_stats_callback_from_replaced_session_is_ignored(self) -> None:
         controller, _pipeline = self._controller()
         self._start(controller, "session-1")

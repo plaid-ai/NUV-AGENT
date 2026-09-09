@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v12`, Agent `0.1.121`, release sequence
-`9`, schema `12`, minimum updater `0.2.0`. Sequences 2–8 and publishers v1–v11
+Current publisher: `candidate-publisher-v13`, Agent `0.1.121`, release sequence
+`10`, schema `12`, minimum updater `0.2.0`. Sequences 2–9 and publishers v1–v12
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v12 \
-     -f tag_message='NUVION IQ9075 candidate publisher v12'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v13 \
+     -f tag_message='NUVION IQ9075 candidate publisher v13'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v12
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v13
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v11 to v12 and verify them.
+   existing candidate-sign/stage tag policies from v12 to v13 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v12 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=9
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v13 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=10
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -80,3 +80,19 @@ loss, a recorded fault, identity mismatch and recovery failure still abort.
 Sequence 9 and publisher v12 require fresh bootstrap/R/C evidence. Their WIF
 providers are `candidate-v12` and `release-main-v12`; previous providers and
 immutable artifacts remain unchanged.
+
+## Candidate v13 RTP statistics compatibility
+
+The sequence-9 commit attempt reached FUNCTIONAL_HEALTHY but timed out before
+opening a commit gate. IQ9075 GStreamer returns WebRTCStatsType enums, whose
+string representation contains underscores. Normalize their value_nick so
+actual increasing packet/byte counters are recognized. Keep the connected
+ICE, fresh camera, current-process STOMP, two RTP samples, and health
+attestation requirements unchanged. Publisher v13 signs sequence 10 through
+new exact-workflow candidate-v13 and release-main-v13 WIF providers. Previous
+failed evidence, tags, providers, and artifact bytes remain preserved.
+
+The host rollback poll also waits through PAUSED_HEALTH_UNKNOWN while the
+exact terminal ACK is awaiting its derived projection. Missing or malformed
+final rollback evidence is rejected explicitly. All final evidence predicates
+remain unchanged; a paused rollout alone never constitutes success.
