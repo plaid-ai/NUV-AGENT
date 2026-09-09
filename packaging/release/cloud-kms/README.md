@@ -49,7 +49,7 @@ is added alongside the old company key so existing signed evidence remains valid
 The development approval key is deliberately absent from production tag trust.
 
 This change does **not** mark `0.1.121` READY or resume the paused IQ9075 OTA test.
-`candidate-publisher-v22` signs sequence 19 with the development OTA KMS key.
+`candidate-publisher-v23` signs sequence 20 with the development OTA KMS key.
 The IQ9075 development board must not trust the production OTA key. The active
 IQ9075 keyring contains the new development key and the previous public key so
 existing releases remain verifiable for rollback. Readiness still requires the
