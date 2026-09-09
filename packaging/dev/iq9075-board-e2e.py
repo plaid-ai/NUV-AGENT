@@ -319,7 +319,12 @@ if isinstance(update, dict) and safe["capabilityAvailable"] and safe["authentica
     command_id = update.get("commandId")
     if not isinstance(command_id, str) or not command_id:
         raise RuntimeError("updater probe command identity is unavailable")
-    raw_update = client.status(command_id).get("update")
+    try:
+        raw_update = client.status(command_id).get("update")
+    except OSError:
+        print(json.dumps({"capabilityAvailable": False, "authenticatedHelper": False,
+                          "reason": "UPDATER_UNAVAILABLE"}, sort_keys=True, separators=(",", ":")))
+        raise SystemExit(3)
     if not isinstance(raw_update, dict) or raw_update.get("commandId") != command_id:
         raise RuntimeError("updater probe command identity changed")
     safe["update"] = {
@@ -2048,7 +2053,7 @@ class BoardHarness:
         if failures:
             raise HarnessError("protected writers did not quiesce at the boot gate")
 
-    def _probe_updater(self) -> dict[str, object]:
+    def _probe_updater(self, *, retry_unavailable: bool = False) -> dict[str, object]:
         python = self.paths.install_root / "current/venv/bin/python"
         result = self.runner.run(
             [
@@ -2084,6 +2089,14 @@ class BoardHarness:
         }
         if safe_update is not None:
             safe["update"] = safe_update
+        if (
+            retry_unavailable
+            and safe["reason"] == "UPDATER_UNAVAILABLE"
+            and safe["capabilityAvailable"] is False
+            and safe["authenticatedHelper"] is False
+            and result.returncode == 3
+        ):
+            return safe
         if (
             result.returncode != 0
             or safe["capabilityAvailable"] is not True
@@ -7167,7 +7180,19 @@ class BoardHarness:
             if state.get("oakFault") is not None:
                 raise HarnessError("existing OAK fault must be reconciled, never rearmed")
             hold = int(scenario["holdSeconds"])
-            updater = self._probe_updater()
+            not_ready = {
+                "schemaVersion": 1,
+                "runId": run_id,
+                "fault": "oak-usb-disconnect",
+                "armed": False,
+                "retryable": True,
+                "reason": "CANDIDATE_RUNTIME_TRANSITION",
+            }
+            # The exclusive functional probe can occupy the updater RPC server.
+            # Retry only unavailable reads before any fault journal or USB write.
+            updater = self._probe_updater(retry_unavailable=True)
+            if updater.get("reason") == "UPDATER_UNAVAILABLE":
+                return not_ready
             update = updater.get("update")
             if not isinstance(update, Mapping):
                 raise HarnessError("updater has no candidate update to fault")
@@ -7191,14 +7216,6 @@ class BoardHarness:
             # baseline process; the exclusive functional probe restarts it too.
             # A host observation is therefore only a hint. Retry only this
             # read-only preflight, before creating a fault journal or deadman.
-            not_ready = {
-                "schemaVersion": 1,
-                "runId": run_id,
-                "fault": "oak-usb-disconnect",
-                "armed": False,
-                "retryable": True,
-                "reason": "CANDIDATE_RUNTIME_TRANSITION",
-            }
             try:
                 candidate = self._agent_process_identity(f"releases/{digest}")
                 oak = self.verify_oak()
