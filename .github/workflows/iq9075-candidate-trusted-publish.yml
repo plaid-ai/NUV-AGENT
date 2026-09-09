@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       release_sequence:
-        description: "Exact IQ9075 release sequence (publisher v20 allows only 17)"
+        description: "Exact IQ9075 release sequence (publisher v21 allows only 18)"
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: iq9075-candidate-publisher-v20-global
+  group: iq9075-candidate-publisher-v21-global
   cancel-in-progress: false
 
 env:
@@ -49,15 +49,15 @@ jobs:
           esac
           [ "$GITHUB_REPOSITORY" = "plaid-ai/NUV-AGENT" ]
           [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v20" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v21" ]
           [ "$GITHUB_RUN_ATTEMPT" = "1" ] \
             || { echo "candidate publisher attempts are not rerunnable; dispatch a new run" >&2; exit 1; }
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v20" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v21" ]
           [[ "$COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$VERSION" = "0.1.121" ]
-          [ "$RELEASE_SEQUENCE" = "17" ]
+          [ "$RELEASE_SEQUENCE" = "18" ]
 
   build:
     name: Build exact secretless arm64 candidate
@@ -65,7 +65,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v20'
+      github.ref == 'refs/tags/candidate-publisher-v21'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -108,11 +108,11 @@ jobs:
           set -euo pipefail
           [[ "$REQUESTED_COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "17" ]
+          [ "$REQUESTED_SEQUENCE" = "18" ]
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v20" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v21" ]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v20" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v21" ]
           [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
           [ -z "$(git status --porcelain --untracked-files=all)" ]
           git cat-file -e "${PUBLISHER_SHA}^{commit}"
@@ -234,7 +234,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v20' &&
+      github.ref == 'refs/tags/candidate-publisher-v21' &&
       needs.build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -266,7 +266,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v20" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v21" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -354,7 +354,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v20 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v21 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -376,7 +376,7 @@ jobs:
           [ "$CONFIG_SCHEMA" = "$trusted_config_schema" ]
           [ "$MIN_UPDATER_VERSION" = "$trusted_updater_version" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "17" ]
+          [ "$REQUESTED_SEQUENCE" = "18" ]
           [ "$CONFIG_SCHEMA" = "12" ]
           [ "$MIN_UPDATER_VERSION" = "0.2.0" ]
           python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
@@ -455,7 +455,7 @@ jobs:
       - name: Authenticate exact immutable candidate to Cloud KMS
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
-          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-dev/providers/candidate-v20
+          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-dev/providers/candidate-v21
           service_account: nuv-agent-sign-dev@plaid-451114.iam.gserviceaccount.com
           create_credentials_file: true
 
@@ -600,7 +600,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v20' &&
+      github.ref == 'refs/tags/candidate-publisher-v21' &&
       needs.build.result == 'success' &&
       needs.sign.result == 'success'
     runs-on: ubuntu-24.04
@@ -633,7 +633,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v20" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v21" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -718,7 +718,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v20 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v21 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -738,7 +738,7 @@ jobs:
           [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
           [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "17" ]
+          [ "$REQUESTED_SEQUENCE" = "18" ]
           PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
             "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
           from pathlib import Path

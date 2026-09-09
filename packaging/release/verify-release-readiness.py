@@ -516,6 +516,31 @@ def _validate_fleet_trust_roots(
     return validated
 
 
+def _good_stream_reason(reason: object, bitrate: int, maximum: int, *, startup: bool = False) -> bool:
+    # Telemetry is sampled after the ACK; a later healthy controller tick can
+    # replace the activation/change reason before the observer reads it.
+    if not isinstance(reason, str):
+        return False
+    if reason in {"healthy_recovery", "awaiting_hysteresis:stable", "cooldown:stable"}:
+        return True
+    if reason == "at_maximum":
+        return bitrate == maximum
+    return startup and reason == "policy_activated"
+
+
+def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
+    if not isinstance(reason, str):
+        return False
+    if reason == "at_minimum":
+        return bitrate == minimum
+    for prefix in ("awaiting_hysteresis:", "cooldown:"):
+        if reason.startswith(prefix):
+            reason = reason.removeprefix(prefix)
+            break
+    tokens = reason.split(",")
+    return "connectivity_poor" in tokens and all(token and token == token.strip() for token in tokens)
+
+
 def _validated_config_stream_gate(
     *,
     config_stream_evidence: dict[str, Any],
@@ -1139,7 +1164,9 @@ def _validated_config_stream_gate(
             stream.get("recoveredGood"), "recovered GOOD observation"
         )
         disabled = command(stream.get("disabled"), "STREAM_POLICY")
-        poor_reason_tokens = poor["lastAdjustmentReason"].split(",")
+        expected_initial = max(400, min(2000, int(baseline_settings["video"]["bitrateKbps"])))
+        minimum = max(100, expected_initial // 4)
+        maximum = min(20_000, max(expected_initial + 800, expected_initial * 2))
         if (
             adaptive_id != adaptive.get("commandId")
             or type(adaptive.get("sequence")) is not int
@@ -1153,7 +1180,8 @@ def _validated_config_stream_gate(
             or initial["appliedBitrateKbps"] < 1
             or initial.get("health") != "STREAM_CONTINUOUS"
             or initial.get("encoder") != "x264enc"
-            or initial.get("lastAdjustmentReason") != "policy_activated"
+            or not minimum <= initial["appliedBitrateKbps"] <= maximum
+            or not _good_stream_reason(initial.get("lastAdjustmentReason"), initial["appliedBitrateKbps"], maximum, startup=True)
             or initial.get("commandId") != adaptive.get("commandId")
             or initial.get("sequence") != adaptive.get("sequence")
             or initial.get("projectionShape") != document.get("projectionShape")
@@ -1166,9 +1194,10 @@ def _validated_config_stream_gate(
                 poor["appliedBitrateKbps"] < initial["appliedBitrateKbps"]
                 and recovered["appliedBitrateKbps"] > poor["appliedBitrateKbps"]
             )
-            or any(not token or token != token.strip() for token in poor_reason_tokens)
-            or "connectivity_poor" not in poor_reason_tokens
-            or recovered["lastAdjustmentReason"] != "healthy_recovery"
+            or not minimum <= poor["appliedBitrateKbps"] <= maximum
+            or not minimum <= recovered["appliedBitrateKbps"] <= maximum
+            or not _poor_stream_reason(poor["lastAdjustmentReason"], poor["appliedBitrateKbps"], minimum)
+            or not _good_stream_reason(recovered["lastAdjustmentReason"], recovered["appliedBitrateKbps"], maximum)
             or disabled["reportedState"].get("mode") != "DISABLED"
             or disabled["reportedState"].get("encoder") != "x264enc"
             or disabled["reportedState"].get("lastAdjustmentReason")
