@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v13`, Agent `0.1.121`, release sequence
-`10`, schema `12`, minimum updater `0.2.0`. Sequences 2–9 and publishers v1–v12
+Current publisher: `candidate-publisher-v14`, Agent `0.1.121`, release sequence
+`11`, schema `12`, minimum updater `0.2.0`. Sequences 2–10 and publishers v1–v13
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v13 \
-     -f tag_message='NUVION IQ9075 candidate publisher v13'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v14 \
+     -f tag_message='NUVION IQ9075 candidate publisher v14'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v13
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v14
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v12 to v13 and verify them.
+   existing candidate-sign/stage tag policies from v13 to v14 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v13 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=10
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v14 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=11
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -96,3 +96,20 @@ The host rollback poll also waits through PAUSED_HEALTH_UNKNOWN while the
 exact terminal ACK is awaiting its derived projection. Missing or malformed
 final rollback evidence is rejected explicitly. All final evidence predicates
 remain unchanged; a paused rollout alone never constitutes success.
+
+## Candidate v14 health attestation sampling
+
+Sequence 10 rollback passed including the BE projection and exact cleanup.
+The normal commit command `adbe754a-9411-4235-b27c-9d6365f18c2a` opened its
+root-owned commit gate but the generic effect retry backoff reached 32 seconds.
+BE requires continuous healthy samples with no gap above 15 seconds, so each
+retry reset the soak. The root watchdog automatically restored 0.1.120 after
+COMMIT_TIMEOUT; this chain is failed evidence, not acceptance.
+
+Only AGENT_UPDATE in FUNCTIONAL_HEALTHY now caps its durable retry delay at
+5 seconds. Startup retries and unrelated effects retain their backoff. The
+30..60-second soak, fresh heartbeat/RTP progress, current process identity,
+root commit gate, attestation signature and commit deadline remain mandatory.
+Publisher v14 signs sequence 11 with new exact-workflow candidate-v14 and
+release-main-v14 providers. Sequence 10 and all prior failed artifacts remain
+immutable. New complete rollback and commit evidence is required.
