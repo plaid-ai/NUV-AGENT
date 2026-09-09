@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v23`, Agent `0.1.121`, release sequence
-`20`, schema `12`, minimum updater `0.2.0`. Sequences 2–19 and publishers v1–v22
+Current publisher: `candidate-publisher-v24`, Agent `0.1.121`, release sequence
+`21`, schema `12`, minimum updater `0.2.0`. Sequences 2–20 and publishers v1–v23
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v23 \
-     -f tag_message='NUVION IQ9075 candidate publisher v23'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v24 \
+     -f tag_message='NUVION IQ9075 candidate publisher v24'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v23
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v24
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v22 to v23 and verify them.
+   existing candidate-sign/stage tag policies from v23 to v24 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v23 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=20
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v24 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=21
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -285,3 +285,33 @@ existing board-owned test phases, without injecting application observations:
 Publisher v23 pins fresh sequence 20 and new exact-workflow OIDC providers.
 Agent, updater, configuration runner and independent readiness verifier bytes
 are unchanged from publisher v22.
+
+## Candidate v24 actual RTP congestion qualification
+
+Sequence 20 completed physical automatic rollback and normal commit, but its
+full config/stream qualification failed. The old iw/ping fixture did not alter
+the fresh RTP statistics that own the production adaptive controller. Closing
+a browser consumer also leaves the Agent-to-SFU uplink running; the v23 viewer
+phase workaround above is superseded by this socket-scoped test fixture.
+
+Publisher v24 / sequence 21 requires a fresh complete physical chain. The
+synthetic RGB source remains camera independent. The root runner binds a
+35-percent UDP loss rule to the prepared Agent PID/start time, dedicated UID,
+service cgroup, run marker and existing UDP source ports. TCP/control traffic
+and other sockets are outside that rule. Intent is journaled before applying
+it, and an independent systemd timer removes its owned table after 60 seconds.
+GOOD and normal/failure/reboot restoration reconcile only that owned table and
+stop its timer. Changed rules or an incomplete recovery fail closed.
+
+Config/stream evidence schema 2 requires positive dropped-packet counters,
+actual RTP packet-loss reasons with a lower bitrate, and later healthy bitrate
+recovery after exact rule removal. The independent readiness verifier checks
+socket identity, rule fingerprint, counter continuity and cleanup. Existing
+ACK, revision, twin, queue, release-binding and bitrate-bound gates remain.
+Native nft coverage runs in an isolated network namespace, including an
+unaffected control flow and post-removal recovery. No production adaptive
+controller priority, updater acceptance or release security gate is relaxed.
+
+The committed sequence-20 BOM is an explicitly pinned physical rollback
+baseline only. The published sequence-1 / 0.1.120 promotion baseline, old tags,
+artifacts and failed qualification evidence remain unchanged.

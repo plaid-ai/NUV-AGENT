@@ -77,11 +77,12 @@ jobs:
       - name: Verify native synthetic Fleet frames before physical qualification
         env:
           NUV_REQUIRE_NATIVE_GST: "1"
+          NUV_REQUIRE_NATIVE_NFT: "1"
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base
-          /usr/bin/python3 -B -m unittest tests.runtime.test_iq9075_config_stream_e2e.NativeSyntheticSourceTest
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base nftables iproute2 util-linux
+          /usr/bin/python3 -B -m unittest tests.runtime.test_iq9075_config_stream_e2e.NativeSyntheticSourceTest tests.runtime.test_iq9075_config_stream_e2e.NativeRtpSocketScopeTest
 
       - name: Stamp exact checked-out candidate identity
         run: |

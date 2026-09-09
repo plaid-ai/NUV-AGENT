@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 KIND = "nuvion-iq9075-config-stream-e2e-evidence"
 DEFAULT_API_BASE_URL = "https://api.nuvion-dev.plaidlabs.ai"
 MAX_HTTP_BYTES = 2 * 1024 * 1024
@@ -366,9 +366,6 @@ UPDATES = {
     "NUVION_FLEET_COMMAND_POLL_INTERVAL_SEC": "1",
     "NUVION_FLEET_EFFECT_RECONCILE_INTERVAL_SEC": "0.25",
     "NUVION_FLEET_OBSERVATION_REPLAY_INTERVAL_SEC": "0.5",
-    "NUVION_CONNECTIVITY_INTERVAL_SEC": "1",
-    "NUVION_CONNECTIVITY_MIN_SEND_INTERVAL_SEC": "1",
-    "NUVION_WIFI_INTERFACE": "fleet0",
 }
 
 class Failure(RuntimeError):
@@ -946,6 +943,10 @@ def prepare(rid, manifest_sha):
     if SHA_RE.fullmatch(manifest_sha) is None:
         raise Failure("manifest digest is invalid")
     run_root, work, runtime, dropin = work_paths(rid)
+    for tool in ("/usr/sbin/nft", "/usr/bin/ss", "/usr/bin/systemd-run"):
+        if not os.access(tool, os.X_OK):
+            raise Failure("RTP fault prerequisites are unavailable")
+    packet_absent(rid)
     run_state = load_json(run_root / "run.json")
     transaction = run_state.get("trustTransaction")
     if not isinstance(transaction, dict) or transaction.get("phase") != "APPLIED" or transaction.get("liveVerified") is not True or transaction.get("manifestSha256") != manifest_sha:
@@ -964,7 +965,7 @@ def prepare(rid, manifest_sha):
     work.mkdir(mode=0o700)
     os.chown(work, 0, 0)
     os.chmod(work, 0o700)
-    dropin_payload = ("[Service]\nEnvironment=PATH=" + str(runtime / "bin") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n").encode()
+    dropin_payload = ("[Service]\nEnvironment=NUVION_RTP_QUALIFICATION_RUN_ID=" + rid + "\n").encode()
     state = {
         "schemaVersion": 1,
         "runId": rid,
@@ -1006,14 +1007,7 @@ def prepare(rid, manifest_sha):
         runtime.mkdir(mode=0o755)
         os.chown(runtime, 0, 0)
         os.chmod(runtime, 0o755)
-        (runtime / "bin").mkdir(mode=0o755)
-        os.chown(runtime / "bin", 0, 0)
-        os.chmod(runtime / "bin", 0o755)
         atomic(runtime / "quality", b"GOOD\n", 0o644, 0, 0)
-        iw = ("#!/bin/sh\nset -eu\nmode=$(/bin/cat " + shlex_quote(str(runtime / "quality")) + ")\nif [ \"${1:-}\" = dev ] && [ \"$#\" -eq 1 ]; then /bin/printf 'phy#0\\n\\tInterface fleet0\\n'; exit 0; fi\nif [ \"$mode\" = POOR ]; then signal=-90; rate='0.1 MBit/s'; else signal=-50; rate='100.0 MBit/s'; fi\n/bin/printf 'Connected to 00:11:22:33:44:55 (on fleet0)\\n\\tsignal: %s dBm\\n\\ttx bitrate: %s\\n\\trx bitrate: %s\\n' \"$signal\" \"$rate\" \"$rate\"\n").encode()
-        ping = ("#!/bin/sh\nset -eu\nmode=$(/bin/cat " + shlex_quote(str(runtime / "quality")) + ")\nif [ \"$mode\" = POOR ]; then /bin/printf '3 packets transmitted, 2 received, 20%% packet loss\\nrtt min/avg/max/mdev = 300.000/300.000/300.000/0.000 ms\\n'; else /bin/printf '3 packets transmitted, 3 received, 0%% packet loss\\nrtt min/avg/max/mdev = 20.000/20.000/20.000/0.000 ms\\n'; fi\n").encode()
-        atomic(runtime / "bin/iw", iw, 0o755, 0, 0)
-        atomic(runtime / "bin/ping", ping, 0o755, 0, 0)
         atomic(dropin, dropin_payload, 0o644, 0, 0)
         state["phase"] = "ACTIVE"
         atomic(work / "state.json", canonical(state))
@@ -1032,10 +1026,179 @@ def prepare(rid, manifest_sha):
         if (work / "state.json").exists():
             restore(rid, internal=True)
         raise
-    return {"schemaVersion": 1, "runId": rid, "prepared": True, "syntheticSource": "videotestsrc", "connectivityShim": "scoped-iw-ping", "baseline": active_baseline, "configBeforeSha256": state["configBeforeSha256"], "configTestSha256": state["configTestSha256"], "runtimeIdentity": active_identity, "exclusiveLease": True, "deadmanArmed": True, "queue": counts}
+    return {"schemaVersion": 1, "runId": rid, "prepared": True, "syntheticSource": "videotestsrc", "connectivityShim": "socket-scoped-rtp-drop", "baseline": active_baseline, "configBeforeSha256": state["configBeforeSha256"], "configTestSha256": state["configTestSha256"], "runtimeIdentity": active_identity, "exclusiveLease": True, "deadmanArmed": True, "queue": counts}
 
 def shlex_quote(value):
     return "'" + value.replace("'", "'\\''") + "'"
+
+def packet_names(rid):
+    run_id(rid)
+    return 'nuvion_rtp_' + rid.replace('-', ''), 'nuvion-rtp-' + rid.replace('-', '')
+
+def nft_json(*args, absent=False):
+    result = subprocess.run(['/usr/sbin/nft', '-j', '-n', *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+    if result.returncode:
+        if absent and not any(x['name'] == args[-1] and x['family'] == 'inet' for x in packet_tables()):
+            return None
+        raise Failure('RTP fault nft query failed')
+    if len(result.stdout) > 1024 * 1024:
+        raise Failure('RTP fault nft query exceeds bound')
+    return json.loads(result.stdout)
+
+def packet_tables():
+    result = nft_json('list', 'tables')
+    records = [dict(x['table']) for x in result['nftables'] if 'table' in x]
+    if len(records) > 256 or any(set(x) != {'family', 'name', 'handle'} or type(x['handle']) is not int for x in records):
+        raise Failure('nft table inventory is invalid')
+    return sorted(records, key=lambda x: (x['family'], x['name']))
+
+def packet_rules(table, uid, ports):
+    if re.fullmatch(r'nuvion_rtp_[0-9a-f]{32}', table) is None or type(uid) is not int or uid < 1 or not isinstance(ports, list) or ports != sorted(set(ports)) or not 1 <= len(ports) <= 16 or any(type(p) is not int or not 1024 < p < 65536 for p in ports):
+        raise Failure('RTP fault socket scope is invalid')
+    return ('add table inet ' + table + '\nadd chain inet ' + table + ' output { type filter hook output priority 0; policy accept; }\nadd rule inet ' + table + ' output meta skuid ' + str(uid) + ' udp sport { ' + ', '.join(map(str, ports)) + ' } numgen random mod 100 < 35 counter drop\n')
+
+def packet_shape(table, uid, ports):
+    return [
+        {'table': {'family': 'inet', 'name': table}},
+        {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
+        {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
+            {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': uid}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
+            {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
+        ]}},
+    ]
+
+def packet_counter(fault, *, absent=False):
+    value = nft_json('list', 'table', 'inet', fault['table'], absent=absent)
+    if value is None:
+        return None
+    records = [x for x in value['nftables'] if 'metainfo' not in x]
+    for item in records:
+        for body in item.values():
+            if isinstance(body, dict): body.pop('handle', None)
+    try:
+        counter = dict(records[2]['rule']['expr'][3]['counter'])
+        if set(counter) != {'packets', 'bytes'} or any(type(v) is not int or v < 0 for v in counter.values()):
+            raise Failure('RTP fault counter is invalid')
+        records[2]['rule']['expr'][3]['counter'] = {'packets': 0, 'bytes': 0}
+    except (IndexError, KeyError, TypeError) as exc:
+        raise Failure('RTP fault rule shape is invalid') from exc
+    if records != packet_shape(fault['table'], fault['uid'], fault['udpSourcePorts']) or sha(canonical(records)) != fault['ruleShapeSha256']:
+        raise Failure('RTP fault rule changed outside its socket scope')
+    return counter
+
+def packet_binding(rid):
+    pid = service_pid()
+    proc = Path('/proc') / str(pid)
+    uid = pwd.getpwnam('nuvion').pw_uid
+    status, _ = read_regular(proc / 'status', 64 * 1024)
+    uid_lines = [x.split()[1:] for x in status.decode().splitlines() if x.startswith('Uid:')]
+    cgroup = read_regular(proc / 'cgroup', 65536)[0].decode().strip()
+    env = read_regular(proc / 'environ', 1024 * 1024)[0].split(b'\0')
+    if uid < 1 or uid_lines != [[str(uid)] * 4] or cgroup != '0::/system.slice/nuv-agent.service' or ('NUVION_RTP_QUALIFICATION_RUN_ID=' + rid).encode() not in env:
+        raise Failure('RTP fault process identity is invalid')
+    start_ticks = int((proc / 'stat').read_text().rsplit(') ', 1)[1].split()[19])
+    output = subprocess.run(['/usr/bin/ss', '-H', '-uanpe'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True, text=True).stdout
+    if len(output) > 1024 * 1024:
+        raise Failure('RTP socket inventory exceeds bound')
+    rows = [x for x in output.splitlines() if 'pid=' + str(pid) + ',' in x]
+    ports = []
+    for row in rows:
+        if 'uid:' + str(uid) + ' ' not in row or 'cgroup:/system.slice/nuv-agent.service' not in row:
+            raise Failure('RTP socket owner differs from Agent process')
+        ports.append(int(row.split()[3].rsplit(':', 1)[1]))
+    ports = sorted(set(ports))
+    packet_rules(packet_names(rid)[0], uid, ports)
+    if service_pid() != pid or int((proc / 'stat').read_text().rsplit(') ', 1)[1].split()[19]) != start_ticks:
+        raise Failure('Agent process changed while binding RTP sockets')
+    return {'servicePid': pid, 'processStartTicks': start_ticks, 'uid': uid, 'cgroup': cgroup, 'udpSourcePorts': ports}
+
+def packet_apply(rid, state, work):
+    if state.get('packetFault') is not None:
+        raise Failure('RTP fault already attempted; preserve its recovery journal')
+    table, unit = packet_names(rid)
+    binding = packet_binding(rid)
+    if binding['servicePid'] != state.get('testServicePid'):
+        raise Failure('RTP fault is not bound to the prepared runtime')
+    before = packet_tables()
+    if any(x['family'] == 'inet' and x['name'] == table for x in before):
+        raise Failure('RTP fault table already exists')
+    if any(systemctl('is-active', target, check=False).stdout.strip() in {'active', 'activating', 'deactivating'} for target in (unit + '.timer', unit + '.service')):
+        raise Failure('RTP fault recovery unit already exists')
+    fault = {'kind': 'socket-scoped-rtp-drop', 'runId': rid, 'phase': 'ARMING', 'table': table, 'timerUnit': unit + '.timer', 'automaticRemovalSeconds': 60, 'dropPercent': 35, **binding, 'previousTablesSha256': sha(canonical(before)), 'ruleShapeSha256': sha(canonical(packet_shape(table, binding['uid'], binding['udpSourcePorts'])))}
+    state['packetFault'] = fault
+    atomic(work / 'state.json', canonical(state))
+    rules = packet_rules(table, binding['uid'], binding['udpSourcePorts'])
+    subprocess.run(['/usr/sbin/nft', '-c', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
+    subprocess.run(['/usr/bin/systemd-run', '--quiet', '--collect', '--unit=' + unit, '--on-active=60s', '--timer-property=AccuracySec=1s', '--property=Type=oneshot', '/usr/sbin/nft', 'delete', 'table', 'inet', table], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True)
+    if systemctl('is-active', unit + '.timer', check=False).stdout.strip() != 'active':
+        raise Failure('RTP fault automatic recovery timer is not active')
+    if packet_binding(rid) != binding:
+        raise Failure('RTP socket binding changed before fault application')
+    subprocess.run(['/usr/sbin/nft', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
+    fault.update({'phase': 'ACTIVE', 'appliedAt': utc_now(), 'timerArmed': True, 'counter': packet_counter(fault)})
+    atomic(work / 'state.json', canonical(state))
+    return dict(fault)
+
+def packet_inspect(rid, state):
+    fault = state.get('packetFault')
+    if fault is None:
+        return {'kind': 'socket-scoped-rtp-drop', 'runId': rid, 'phase': 'NOT_APPLIED'}
+    if fault.get('runId') != rid or (fault.get('table'), fault.get('timerUnit')) != (packet_names(rid)[0], packet_names(rid)[1] + '.timer'):
+        raise Failure('RTP fault journal identity is invalid')
+    if fault.get('phase') == 'ACTIVE':
+        if systemctl('is-active', fault['timerUnit'], check=False).stdout.strip() != 'active':
+            raise Failure('RTP fault independent recovery timer is not active')
+        binding = packet_binding(rid)
+        if any(fault.get(k) != v for k, v in binding.items()):
+            raise Failure('RTP fault active process or sockets changed')
+        return {**fault, 'counter': packet_counter(fault), 'observedAt': utc_now()}
+    if fault.get('phase') == 'RELEASED':
+        if not packet_units_inactive(rid) or packet_counter(fault, absent=True) is not None or sha(canonical(packet_tables())) != fault['previousTablesSha256']:
+            raise Failure('RTP fault network restoration is no longer exact')
+        return dict(fault)
+    raise Failure('RTP fault transition is incomplete')
+
+def packet_units_inactive(rid):
+    unit = packet_names(rid)[1]
+    return all(systemctl('is-active', target, check=False).stdout.strip() in {'inactive', 'failed', 'unknown', ''} for target in (unit + '.timer', unit + '.service'))
+
+def packet_absent(rid):
+    table, _ = packet_names(rid)
+    if any(x['family'] == 'inet' and x['name'] == table for x in packet_tables()) or not packet_units_inactive(rid):
+        raise Failure('RTP fault resources exist without a recovery journal')
+    return {'kind': 'socket-scoped-rtp-drop', 'runId': rid, 'phase': 'NOT_APPLIED', 'exactNetworkRestoration': True}
+
+def packet_release(rid, state, work, *, require_active=False):
+    fault = state.get('packetFault')
+    if fault is None:
+        return packet_absent(rid)
+    table, unit = packet_names(rid)
+    if fault.get('runId') != rid or fault.get('table') != table or fault.get('timerUnit') != unit + '.timer':
+        raise Failure('RTP fault recovery identity is invalid')
+    if fault.get('phase') == 'RELEASED':
+        return packet_inspect(rid, state)
+    if require_active and fault.get('phase') != 'ACTIVE':
+        raise Failure('RTP fault was not fully applied')
+    current = packet_counter(fault, absent=True)
+    if require_active and current is None:
+        raise Failure('RTP fault recovery deadline elapsed before observation')
+    if current is not None:
+        fault['counter'] = current
+    fault['phase'] = 'RELEASING'
+    atomic(work / 'state.json', canonical(state))
+    # Keep independent recovery armed until the owned rule is confirmed absent.
+    if packet_counter(fault, absent=True) is not None:
+        subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True)
+    if packet_counter(fault, absent=True) is not None or sha(canonical(packet_tables())) != fault['previousTablesSha256']:
+        raise Failure('RTP fault table restoration is incomplete')
+    systemctl('stop', unit + '.timer', unit + '.service', check=False)
+    if not packet_units_inactive(rid):
+        raise Failure('RTP fault recovery timer remains active')
+    fault.update({'phase': 'RELEASED', 'releasedAt': utc_now(), 'exactNetworkRestoration': True, 'timerDisarmed': True, 'tableAbsent': True})
+    atomic(work / 'state.json', canonical(state))
+    return dict(fault)
 
 def set_link(rid, quality):
     _, work, runtime, _ = work_paths(rid)
@@ -1046,8 +1209,9 @@ def set_link(rid, quality):
     target = runtime / "quality"
     current, meta = read_regular(target, 16)
     del current
+    network = packet_apply(rid, state, work) if quality == "POOR" else packet_release(rid, state, work, require_active=state.get("packetFault") is not None)
     atomic(target, (quality + "\n").encode(), stat.S_IMODE(meta.st_mode), meta.st_uid, meta.st_gid)
-    return {"schemaVersion": 1, "runId": rid, "quality": quality, "changed": True}
+    return {"schemaVersion": 1, "runId": rid, "quality": quality, "changed": True, "networkCondition": network}
 
 def inspect(rid, command_id):
     if COMMAND_ID_RE.fullmatch(command_id) is None or str(uuid.UUID(command_id)) != command_id:
@@ -1071,7 +1235,7 @@ def inspect(rid, command_id):
         else:
             command = {"commandId": str(row["command_id"]), "sequence": int(row["sequence"]), "type": str(row["command_type"]), "status": str(row["status"]), "ackStatuses": transitions, "reportedState": json.loads(row["reported_state_json"]) if row["reported_state_json"] else None}
         observed = None if observation is None else {"revision": int(observation["revision"]), "reportedState": json.loads(observation["reported_state_json"]), "acked": observation["acknowledged_at"] is not None}
-        return {"schemaVersion": 1, "runId": rid, "command": command, "observation": observed, "queue": counts, "settings": current_settings, "settingsSha256": settings_sha, "serviceActive": service_active()}
+        return {"schemaVersion": 1, "runId": rid, "command": command, "observation": observed, "queue": counts, "settings": current_settings, "settingsSha256": settings_sha, "serviceActive": service_active(), "networkCondition": packet_inspect(rid, state)}
     finally:
         connection.close()
 
@@ -1131,6 +1295,7 @@ def complete_deadman_cleanup(rid, state, work, *, deadman):
     atomic(work / "state.json", canonical(state))
 
 def restoration_response(state, rid, work, restored_settings, identity, *, idempotent, no_mutation):
+    network = packet_release(rid, state, work)
     if not isinstance(state.get("restoredCompletedAt"), str):
         state["restoredCompletedAt"] = utc_now()
         atomic(work / "state.json", canonical(state))
@@ -1138,6 +1303,8 @@ def restoration_response(state, rid, work, restored_settings, identity, *, idemp
     if isinstance(cached, dict):
         if cached.get("schemaVersion") != 1 or cached.get("runId") != rid or not isinstance(cached.get("completedAt"), str) or cached.get("completedAt") != state.get("restoredCompletedAt") or cached.get("restored") is not True or cached.get("exactRestoration") is not True or cached.get("noMutation") is not no_mutation or cached.get("exclusiveLeaseReleased") is not True or cached.get("deadmanDisarmed") is not True:
             raise Failure("sealed config-stream restoration response is invalid")
+        if cached.get("networkCondition") != network:
+            raise Failure("sealed RTP restoration evidence is invalid")
         cached_settings = cached.get("settings")
         if isinstance(cached_settings, dict) and sha(canonical(cached_settings)) != cached.get("settingsSha256"):
             raise Failure("sealed config-stream settings evidence is invalid")
@@ -1160,6 +1327,7 @@ def restoration_response(state, rid, work, restored_settings, identity, *, idemp
         "runtimeIdentity": identity,
         "exclusiveLeaseReleased": not CONFIG_LEASE.exists() and not CONFIG_LEASE.is_symlink(),
         "deadmanDisarmed": state.get("deadman", {}).get("armed") is False,
+        "networkCondition": network,
     }
     state["restorationResponse"] = dict(response)
     atomic(work / "state.json", canonical(state))
@@ -1170,9 +1338,10 @@ def restore(rid, internal=False, deadman=False):
     if not work.exists() and not work.is_symlink():
         if CONFIG_LEASE.exists() or CONFIG_LEASE.is_symlink():
             raise Failure("config-stream lease exists without a recovery journal")
+        network = packet_absent(rid)
         if not deadman:
             disarm_deadman(rid)
-        return {"schemaVersion": 1, "runId": rid, "completedAt": utc_now(), "restored": True, "idempotent": True, "noMutation": True, "exactRestoration": True, "runtimeRestarted": False, "configSha256": None, "settings": None, "settingsSha256": None, "encoderStartupBitrateKbps": None, "runtimeIdentity": None, "exclusiveLeaseReleased": True, "deadmanDisarmed": True}
+        return {"schemaVersion": 1, "runId": rid, "completedAt": utc_now(), "restored": True, "idempotent": True, "noMutation": True, "exactRestoration": True, "runtimeRestarted": False, "configSha256": None, "settings": None, "settingsSha256": None, "encoderStartupBitrateKbps": None, "runtimeIdentity": None, "exclusiveLeaseReleased": True, "deadmanDisarmed": True, "networkCondition": network}
     work_meta = work.lstat()
     state_meta = (work / "state.json").lstat()
     if stat.S_ISLNK(work_meta.st_mode) or not stat.S_ISDIR(work_meta.st_mode) or work_meta.st_uid != 0 or stat.S_IMODE(work_meta.st_mode) != 0o700 or stat.S_ISLNK(state_meta.st_mode) or not stat.S_ISREG(state_meta.st_mode) or state_meta.st_uid != 0 or stat.S_IMODE(state_meta.st_mode) != 0o600:
@@ -1180,6 +1349,7 @@ def restore(rid, internal=False, deadman=False):
     state = load_json(work / "state.json")
     if state.get("runId") != rid or state.get("schemaVersion") != 1 or SHA_RE.fullmatch(str(state.get("manifestSha256") or "")) is None:
         raise Failure("config-stream state identity is invalid")
+    packet_release(rid, state, work)
     parents = parent_snapshots(state, runtime, dropin)
     phase = state.get("phase")
     if phase not in {"ARMING", "ARMED", "PREPARED", "ACTIVE", "RESTORING", "RESTORED"}:
@@ -1269,6 +1439,7 @@ def reboot_restore(rid):
     state = load_json(work / "state.json")
     if state.get("runId") != rid or state.get("schemaVersion") != 1 or SHA_RE.fullmatch(str(state.get("manifestSha256") or "")) is None:
         raise Failure("config-stream reboot recovery identity is invalid")
+    packet_release(rid, state, work)
     lease_present = CONFIG_LEASE.exists() or CONFIG_LEASE.is_symlink()
     if lease_present:
         validate_config_lease(rid)
@@ -1643,7 +1814,72 @@ def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
             reason = reason.removeprefix(prefix)
             break
     tokens = reason.split(",")
-    return "connectivity_poor" in tokens and all(token and token == token.strip() for token in tokens)
+    return "packet_loss_high" in tokens and set(tokens) <= {"packet_loss_high", "round_trip_time_high", "connectivity_poor", "nack_increase", "pli_increase", "queue_pressure_high"}
+
+
+def validate_network_condition(value, *, run_id, service_pid, phase):
+    """Require an actual, narrowly scoped RTP fault and its bounded recovery."""
+    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
+    extra = {'observedAt'} if phase == 'ACTIVE' else {'releasedAt', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
+    if not isinstance(value, dict) or set(value) != common | extra or phase not in {'ACTIVE', 'RELEASED'}:
+        raise ConfigStreamError('RTP network condition fields are invalid')
+    table = 'nuvion_rtp_' + run_id.replace('-', '')
+    ports = value.get('udpSourcePorts')
+    if (value['kind'] != 'socket-scoped-rtp-drop' or value['runId'] != run_id or value['phase'] != phase
+        or value['table'] != table or value['timerUnit'] != 'nuvion-rtp-' + run_id.replace('-', '') + '.timer'
+        or type(value['automaticRemovalSeconds']) is not int or value['automaticRemovalSeconds'] != 60
+        or type(value['dropPercent']) is not int or value['dropPercent'] != 35
+        or type(value['servicePid']) is not int or value['servicePid'] != service_pid or service_pid < 1
+        or type(value['processStartTicks']) is not int or value['processStartTicks'] < 1
+        or type(value['uid']) is not int or value['uid'] < 1
+        or value['cgroup'] != '0::/system.slice/nuv-agent.service'
+        or not isinstance(ports, list) or not 1 <= len(ports) <= 16
+        or any(type(p) is not int or not 1024 < p < 65536 for p in ports)
+        or ports != sorted(set(ports)) or value['timerArmed'] is not True):
+        raise ConfigStreamError('RTP fault is not bound to the prepared Agent sockets')
+    counter = value['counter']
+    if not isinstance(counter, dict) or set(counter) != {'packets', 'bytes'} or any(type(v) is not int or v <= 0 for v in counter.values()):
+        raise ConfigStreamError('RTP fault has no actual dropped packet evidence')
+    rules = [
+        {'table': {'family': 'inet', 'name': table}},
+        {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
+        {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
+            {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': value['uid']}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
+            {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
+        ]}},
+    ]
+    encoded = (json.dumps(rules, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
+    if value['ruleShapeSha256'] != hashlib.sha256(encoded).hexdigest() or not isinstance(value['previousTablesSha256'], str) or re.fullmatch(r'[0-9a-f]{64}', value['previousTablesSha256']) is None:
+        raise ConfigStreamError('RTP fault rule or network baseline fingerprint is invalid')
+    applied = _utc_timestamp(value['appliedAt'], 'RTP fault appliedAt')
+    observed = _utc_timestamp(value['observedAt'] if phase == 'ACTIVE' else value['releasedAt'], 'RTP fault observation')
+    if not 0 <= (observed - applied).total_seconds() < 60:
+        raise ConfigStreamError('RTP fault observation exceeded its recovery deadline')
+    if phase == 'RELEASED' and any(value[k] is not True for k in ('exactNetworkRestoration', 'timerDisarmed', 'tableAbsent')):
+        raise ConfigStreamError('RTP fault restoration is incomplete')
+    return dict(value)
+
+
+def validate_network_transition(poor, recovered):
+    varying = {'phase', 'observedAt', 'releasedAt', 'counter', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
+    if ({k: v for k, v in poor.items() if k not in varying} != {k: v for k, v in recovered.items() if k not in varying}
+        or any(recovered['counter'][k] < poor['counter'][k] for k in ('packets', 'bytes'))
+        or _utc_timestamp(recovered['releasedAt'], 'RTP releasedAt') < _utc_timestamp(poor['observedAt'], 'RTP observedAt')):
+        raise ConfigStreamError('RTP fault changed between loss and recovery')
+
+
+def validate_network_restoration(value, *, run_id):
+    if not isinstance(value, dict) or value.get("kind") != "socket-scoped-rtp-drop" or value.get("runId") != run_id or value.get("exactNetworkRestoration") is not True:
+        raise ConfigStreamError("RTP network recovery is incomplete")
+    if value.get("phase") == "NOT_APPLIED":
+        if set(value) != {"kind", "runId", "phase", "exactNetworkRestoration"}:
+            raise ConfigStreamError("RTP pre-mutation recovery fields are invalid")
+    elif (value.get("phase") != "RELEASED" or value.get("table") != "nuvion_rtp_" + run_id.replace("-", "")
+          or value.get("timerUnit") != "nuvion-rtp-" + run_id.replace("-", "") + ".timer"
+          or value.get("timerDisarmed") is not True or value.get("tableAbsent") is not True):
+        raise ConfigStreamError("RTP fault resources are not restored")
 
 
 class ConfigStreamOrchestrator:
@@ -1788,6 +2024,8 @@ class ConfigStreamOrchestrator:
         device_id: str,
         run_id: str,
         after_revision: int,
+        network_pid: int,
+        network_phase: str,
         bitrate_test: Callable[[int], bool],
         deadline: float,
         reason_test: Callable[[Mapping[str, Any]], bool] | None = None,
@@ -1833,6 +2071,7 @@ class ConfigStreamOrchestrator:
                 except ConfigStreamError:
                     pass
                 else:
+                    network = validate_network_condition(board.get("networkCondition"), run_id=run_id, service_pid=network_pid, phase=network_phase)
                     return {
                         "commandId": issued.command_id,
                         "sequence": issued.sequence,
@@ -1845,6 +2084,7 @@ class ConfigStreamOrchestrator:
                         "encoder": str(reported.get("encoder") or ""),
                         "projectionShape": shape,
                         "queue": queue,
+                        "networkCondition": network,
                     }
             self.sleeper(1.0)
         raise ConfigStreamError("timed out waiting for adaptive streaming observation")
@@ -1899,7 +2139,7 @@ class ConfigStreamOrchestrator:
                 or prep.get("runId") != run_id
                 or prep.get("prepared") is not True
                 or prep.get("syntheticSource") != "videotestsrc"
-                or prep.get("connectivityShim") != "scoped-iw-ping"
+                or prep.get("connectivityShim") != "socket-scoped-rtp-drop"
                 or not SHA256_RE.fullmatch(str(prep.get("configBeforeSha256") or ""))
                 or not SHA256_RE.fullmatch(str(prep.get("configTestSha256") or ""))
                 or prep.get("exclusiveLease") is not True
@@ -2181,6 +2421,8 @@ class ConfigStreamOrchestrator:
                 space_id=space_id,
                 device_id=device_id,
                 run_id=run_id,
+                network_pid=runtime_identity["servicePid"],
+                network_phase="ACTIVE",
                 after_revision=max(
                     adaptive["localObservationRevision"],
                     adaptive["reportedRevision"],
@@ -2198,12 +2440,15 @@ class ConfigStreamOrchestrator:
                 device_id=device_id,
                 run_id=run_id,
                 after_revision=poor["policyRevision"],
+                network_pid=runtime_identity["servicePid"],
+                network_phase="RELEASED",
                 bitrate_test=lambda bitrate: poor["appliedBitrateKbps"] < bitrate <= adaptive_payload["maxBitrateKbps"],
                 reason_test=lambda state: _good_stream_reason(
                     state.get("lastAdjustmentReason"), state["appliedBitrateKbps"], adaptive_payload["maxBitrateKbps"],
                 ),
                 deadline=deadline,
             )
+            validate_network_transition(poor["networkCondition"], recovered["networkCondition"])
             disabled_payload = {"policyVersion": version + 3, "mode": "DISABLED"}
             issued_disabled = self.api.issue(
                 space_id=space_id,
@@ -2338,6 +2583,7 @@ class ConfigStreamOrchestrator:
             if cleanup_required:
                 try:
                     restored = self._restore_board(run_id=run_id)
+                    validate_network_restoration(restored.get("networkCondition"), run_id=run_id)
                     no_mutation = restored.get("noMutation") is True
                     valid_restoration = (
                         restored.get("schemaVersion") != 1
@@ -2399,6 +2645,8 @@ class ConfigStreamOrchestrator:
                     if valid_restoration:
                         raise ConfigStreamError("board restoration evidence is invalid")
                     if result is not None:
+                        if restored.get("networkCondition") != result["stream"]["recoveredGood"]["networkCondition"]:
+                            raise ConfigStreamError("RTP network restoration evidence changed during cleanup")
                         result["cleanup"] = dict(restored)
                         result["gates"]["exactBoardRestoration"] = True
                         result["gates"]["encoderStartupBaselineRestored"] = True
@@ -2459,6 +2707,7 @@ def validate_reboot_recovery(value: Any, *, run_id: str) -> dict[str, Any]:
         "runtimeIdentity",
         "exclusiveLeaseReleased",
         "deadmanDisarmed",
+        "networkCondition",
     }
     if (
         set(recovery) != expected
@@ -2474,6 +2723,7 @@ def validate_reboot_recovery(value: Any, *, run_id: str) -> dict[str, Any]:
         or recovery.get("deadmanDisarmed") is not True
     ):
         raise ConfigStreamError("config-stream reboot recovery is incomplete")
+    validate_network_restoration(recovery.get("networkCondition"), run_id=run_id)
     _utc_timestamp(recovery.get("completedAt"), "reboot recovery completedAt")
     if recovery["noMutation"] is True:
         if any(

@@ -538,7 +538,64 @@ def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
             reason = reason.removeprefix(prefix)
             break
     tokens = reason.split(",")
-    return "connectivity_poor" in tokens and all(token and token == token.strip() for token in tokens)
+    return "packet_loss_high" in tokens and set(tokens) <= {"packet_loss_high", "round_trip_time_high", "connectivity_poor", "nack_increase", "pli_increase", "queue_pressure_high"}
+
+
+def _rtp_timestamp(value, label):
+    return _timestamp(value, label=label)
+
+
+def validate_network_condition(value, *, run_id, service_pid, phase):
+    """Require an actual, narrowly scoped RTP fault and its bounded recovery."""
+    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
+    extra = {'observedAt'} if phase == 'ACTIVE' else {'releasedAt', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
+    if not isinstance(value, dict) or set(value) != common | extra or phase not in {'ACTIVE', 'RELEASED'}:
+        raise ReadinessError('RTP network condition fields are invalid')
+    table = 'nuvion_rtp_' + run_id.replace('-', '')
+    ports = value.get('udpSourcePorts')
+    if (value['kind'] != 'socket-scoped-rtp-drop' or value['runId'] != run_id or value['phase'] != phase
+        or value['table'] != table or value['timerUnit'] != 'nuvion-rtp-' + run_id.replace('-', '') + '.timer'
+        or type(value['automaticRemovalSeconds']) is not int or value['automaticRemovalSeconds'] != 60
+        or type(value['dropPercent']) is not int or value['dropPercent'] != 35
+        or type(value['servicePid']) is not int or value['servicePid'] != service_pid or service_pid < 1
+        or type(value['processStartTicks']) is not int or value['processStartTicks'] < 1
+        or type(value['uid']) is not int or value['uid'] < 1
+        or value['cgroup'] != '0::/system.slice/nuv-agent.service'
+        or not isinstance(ports, list) or not 1 <= len(ports) <= 16
+        or any(type(p) is not int or not 1024 < p < 65536 for p in ports)
+        or ports != sorted(set(ports)) or value['timerArmed'] is not True):
+        raise ReadinessError('RTP fault is not bound to the prepared Agent sockets')
+    counter = value['counter']
+    if not isinstance(counter, dict) or set(counter) != {'packets', 'bytes'} or any(type(v) is not int or v <= 0 for v in counter.values()):
+        raise ReadinessError('RTP fault has no actual dropped packet evidence')
+    rules = [
+        {'table': {'family': 'inet', 'name': table}},
+        {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
+        {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
+            {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': value['uid']}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
+            {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
+        ]}},
+    ]
+    encoded = (json.dumps(rules, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
+    if value['ruleShapeSha256'] != hashlib.sha256(encoded).hexdigest() or not isinstance(value['previousTablesSha256'], str) or re.fullmatch(r'[0-9a-f]{64}', value['previousTablesSha256']) is None:
+        raise ReadinessError('RTP fault rule or network baseline fingerprint is invalid')
+    applied = _rtp_timestamp(value['appliedAt'], 'RTP fault appliedAt')
+    observed = _rtp_timestamp(value['observedAt'] if phase == 'ACTIVE' else value['releasedAt'], 'RTP fault observation')
+    if not 0 <= (observed - applied).total_seconds() < 60:
+        raise ReadinessError('RTP fault observation exceeded its recovery deadline')
+    if phase == 'RELEASED' and any(value[k] is not True for k in ('exactNetworkRestoration', 'timerDisarmed', 'tableAbsent')):
+        raise ReadinessError('RTP fault restoration is incomplete')
+    return dict(value)
+
+
+def validate_network_transition(poor, recovered):
+    varying = {'phase', 'observedAt', 'releasedAt', 'counter', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
+    if ({k: v for k, v in poor.items() if k not in varying} != {k: v for k, v in recovered.items() if k not in varying}
+        or any(recovered['counter'][k] < poor['counter'][k] for k in ('packets', 'bytes'))
+        or _rtp_timestamp(recovered['releasedAt'], 'RTP releasedAt') < _rtp_timestamp(poor['observedAt'], 'RTP observedAt')):
+        raise ReadinessError('RTP fault changed between loss and recovery')
 
 
 def _validated_config_stream_gate(
@@ -851,7 +908,7 @@ def _validated_config_stream_gate(
         }
         if (
             type(document.get("schemaVersion")) is not int
-            or document.get("schemaVersion") != 1
+            or document.get("schemaVersion") != 2
             or document.get("kind") != "nuvion-iq9075-config-stream-e2e-evidence"
             or document.get("runId") != fleet_manifest.get("runId")
             or not isinstance(identity, dict)
@@ -998,7 +1055,7 @@ def _validated_config_stream_gate(
         )
         if (
             preparation.get("syntheticSource") != "videotestsrc"
-            or preparation.get("connectivityShim") != "scoped-iw-ping"
+            or preparation.get("connectivityShim") != "socket-scoped-rtp-drop"
             or not isinstance(preparation.get("configBeforeSha256"), str)
             or SHA256.fullmatch(preparation["configBeforeSha256"]) is None
             or not isinstance(preparation.get("configTestSha256"), str)
@@ -1139,6 +1196,7 @@ def _validated_config_stream_gate(
                     "encoder",
                     "projectionShape",
                     "queue",
+                    "networkCondition",
                 },
                 label,
             )
@@ -1163,6 +1221,11 @@ def _validated_config_stream_gate(
         recovered = adaptation(
             stream.get("recoveredGood"), "recovered GOOD observation"
         )
+        poor_network = validate_network_condition(poor.get("networkCondition"), run_id=document["runId"], service_pid=initial_runtime_identity["servicePid"], phase="ACTIVE")
+        recovered_network = validate_network_condition(recovered.get("networkCondition"), run_id=document["runId"], service_pid=initial_runtime_identity["servicePid"], phase="RELEASED")
+        validate_network_transition(poor_network, recovered_network)
+        if not fleet_generated <= _rtp_timestamp(poor_network["appliedAt"], "RTP appliedAt") <= _rtp_timestamp(recovered_network["releasedAt"], "RTP releasedAt") <= config_generated:
+            raise ReadinessError("RTP fault evidence is outside the physical qualification interval")
         disabled = command(stream.get("disabled"), "STREAM_POLICY")
         expected_initial = max(400, min(2000, int(baseline_settings["video"]["bitrateKbps"])))
         minimum = max(100, expected_initial // 4)
@@ -1333,6 +1396,7 @@ def _validated_config_stream_gate(
                 "runtimeIdentity",
                 "exclusiveLeaseReleased",
                 "deadmanDisarmed",
+                "networkCondition",
             },
             "exact restoration",
         )
@@ -1368,6 +1432,7 @@ def _validated_config_stream_gate(
             or cleanup.get("runtimeRestarted") is not True
             or cleanup.get("exclusiveLeaseReleased") is not True
             or cleanup.get("deadmanDisarmed") is not True
+            or cleanup.get("networkCondition") != recovered_network
             or cleanup.get("configSha256") != preparation["configBeforeSha256"]
             or cleanup_settings != baseline_settings
             or not isinstance(cleanup_settings_sha, str)

@@ -30,6 +30,32 @@ ROLLBACK_COMMAND_ID = "00000000-0000-4000-8000-000000000004"
 COMMIT_COMMAND_ID = "00000000-0000-4000-8000-000000000005"
 
 
+def _board_namespace():
+    namespace = {"__name__": "rtp_board_test"}
+    exec(compile(MODULE.BOARD_PROGRAM.split("\ntry:\n    main()", 1)[0], "<rtp-board>", "exec"), namespace)
+    return namespace
+
+
+def _network_condition(phase, run_id=RUN_ID, service_pid=101, stamp="2026-09-02T23:59:"):
+    ns = _board_namespace()
+    table, unit = ns["packet_names"](run_id)
+    value = {
+        "kind": "socket-scoped-rtp-drop", "runId": run_id, "phase": phase,
+        "table": table, "timerUnit": unit + ".timer", "automaticRemovalSeconds": 60,
+        "dropPercent": 35, "servicePid": service_pid, "processStartTicks": 10000,
+        "uid": 997, "cgroup": "0::/system.slice/nuv-agent.service", "udpSourcePorts": [31000, 31001],
+        "previousTablesSha256": "a" * 64,
+        "ruleShapeSha256": ns["sha"](ns["canonical"](ns["packet_shape"](table, 997, [31000, 31001]))),
+        "appliedAt": stamp + "10.000Z", "timerArmed": True,
+        "counter": {"packets": 100, "bytes": 120000},
+    }
+    if phase == "ACTIVE":
+        value["observedAt"] = stamp + "20.000Z"
+    else:
+        value.update(releasedAt=stamp + "25.000Z", exactNetworkRestoration=True, timerDisarmed=True, tableAbsent=True)
+    return value
+
+
 class NativeSyntheticSourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -102,6 +128,7 @@ class _Board:
     def __init__(self) -> None:
         self.commands: dict[str, dict] = {}
         self.quality = "GOOD"
+        self.fault_attempted = False
         self.restore_calls = 0
         self.prepared = False
         self.settings = self.baseline()
@@ -137,7 +164,7 @@ class _Board:
             "runId": run_id,
             "prepared": True,
             "syntheticSource": "videotestsrc",
-            "connectivityShim": "scoped-iw-ping",
+            "connectivityShim": "socket-scoped-rtp-drop",
             "baseline": self.baseline(),
             "configBeforeSha256": "b" * 64,
             "configTestSha256": "c" * 64,
@@ -202,6 +229,7 @@ class _Board:
 
     def set_link(self, *, run_id: str, quality: str) -> dict:
         self.quality = quality
+        self.fault_attempted = self.fault_attempted or quality == "POOR"
         for command in self.commands.values():
             payload = command["payload"]
             if command["type"] != "STREAM_POLICY" or payload.get("mode") != "ADAPTIVE":
@@ -211,7 +239,7 @@ class _Board:
                     payload["initialBitrateKbps"] * payload["decreaseFactor"]
                 )
                 command["reported"]["lastAdjustmentReason"] = (
-                    "connectivity_poor,packet_loss_high,round_trip_time_high"
+                    "packet_loss_high,round_trip_time_high"
                 )
                 command["revision"] += 1
             elif command["reported"]["appliedBitrateKbps"] < payload["initialBitrateKbps"]:
@@ -255,6 +283,7 @@ class _Board:
                 MODULE.canonical_json(self.settings)
             ).hexdigest(),
             "serviceActive": True,
+            "networkCondition": _network_condition("ACTIVE" if self.quality == "POOR" else "RELEASED", run_id) if self.fault_attempted else None,
         }
 
     def restore(self, *, run_id: str) -> dict:
@@ -278,6 +307,7 @@ class _Board:
             "runtimeIdentity": _runtime_identity(service_pid=202),
             "exclusiveLeaseReleased": True,
             "deadmanDisarmed": True,
+            "networkCondition": _network_condition("RELEASED", run_id),
         }
 
 
@@ -993,12 +1023,14 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
 
         self.assertEqual(board.restore_calls, 1)
 
-    def test_remote_program_uses_scoped_shims_without_link_mutation_or_camera(self) -> None:
+    def test_remote_program_uses_scoped_rtp_fault_without_interface_or_camera_mutation(self) -> None:
         program = MODULE.BOARD_PROGRAM
         compile(program, "<iq9075-config-stream-board>", "exec")
         self.assertIn("/run/nuvion-config-stream-e2e", program)
-        self.assertIn('runtime / "bin/iw"', program)
-        self.assertIn('runtime / "bin/ping"', program)
+        self.assertNotIn('runtime / "bin/iw"', program)
+        self.assertNotIn('runtime / "bin/ping"', program)
+        self.assertIn("udp sport", program)
+        self.assertIn("--on-active=60s", program)
         self.assertIn("videotestsrc is-live=true", program)
         self.assertNotIn("ip link", program)
         self.assertNotIn("/dev/video", program)
@@ -1145,6 +1177,166 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             value[field] = 1
             with self.assertRaises(MODULE.ConfigStreamError):
                 MODULE.validate_queue_drained(value)
+
+
+class RtpFaultLifecycleTest(unittest.TestCase):
+    def _fixture(self, work):
+        ns = _board_namespace()
+        state = {"testServicePid": 101}
+        kernel = {"present": False, "timer": False, "counter": {"packets": 100, "bytes": 120000}, "lost": None}
+        binding = {k: _network_condition("ACTIVE")[k] for k in ("servicePid", "processStartTicks", "uid", "cgroup", "udpSourcePorts")}
+        ns["atomic"] = lambda path, payload: path.write_bytes(payload)
+        ns["packet_binding"] = lambda rid: dict(binding)
+        ns["packet_tables"] = lambda: []
+        ns["packet_counter"] = lambda fault, **kwargs: dict(kernel["counter"]) if kernel["present"] else None
+        def systemctl(*args, **kwargs):
+            if args[0] == "stop": kernel["timer"] = False
+            return SimpleNamespace(stdout="active" if kernel["timer"] else "inactive", returncode=0)
+        ns["systemctl"] = systemctl
+        def run(args, **kwargs):
+            saved = json.loads((work / "state.json").read_bytes())
+            if args[0] == "/usr/bin/systemd-run":
+                self.assertEqual(saved["packetFault"]["phase"], "ARMING")
+                kernel["timer"] = True
+                if kernel["lost"] == "arm": raise TimeoutError("lost timer response")
+            elif args[:3] == ["/usr/sbin/nft", "-f", "-"]:
+                self.assertTrue(kernel["timer"])
+                self.assertEqual(saved["packetFault"]["phase"], "ARMING")
+                kernel["present"] = True
+                if kernel["lost"] == "apply": raise TimeoutError("lost apply response")
+            elif args[:2] == ["/usr/sbin/nft", "delete"]:
+                self.assertEqual(saved["packetFault"]["phase"], "RELEASING")
+                kernel["present"] = False
+                if kernel["lost"] == "release": raise TimeoutError("lost removal response")
+            return SimpleNamespace(returncode=0, stdout="")
+        ns["subprocess"] = SimpleNamespace(run=run, DEVNULL=-3, PIPE=-1)
+        return ns, state, kernel
+
+    def test_timer_and_apply_response_loss_restore_from_durable_intent(self):
+        for stage in ("arm", "apply"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as d:
+                work = Path(d); ns, state, kernel = self._fixture(work); kernel["lost"] = stage
+                with self.assertRaises(TimeoutError): ns["packet_apply"](RUN_ID, state, work)
+                recovered = json.loads((work / "state.json").read_bytes())
+                self.assertEqual(recovered["packetFault"]["phase"], "ARMING")
+                kernel["lost"] = None
+                result = ns["packet_release"](RUN_ID, recovered, work)
+                self.assertTrue(result["exactNetworkRestoration"])
+                self.assertFalse(kernel["present"] or kernel["timer"])
+                self.assertEqual(ns["packet_release"](RUN_ID, recovered, work), result)
+
+    def test_release_response_loss_is_reconciled_without_reapplying_fault(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); ns, state, kernel = self._fixture(work)
+            ns["packet_apply"](RUN_ID, state, work); kernel["lost"] = "release"
+            with self.assertRaises(TimeoutError): ns["packet_release"](RUN_ID, state, work, require_active=True)
+            recovered = json.loads((work / "state.json").read_bytes())
+            self.assertEqual(recovered["packetFault"]["phase"], "RELEASING")
+            kernel["lost"] = None
+            result = ns["packet_release"](RUN_ID, recovered, work)
+            self.assertEqual(result["counter"]["packets"], 100)
+            self.assertTrue(result["tableAbsent"])
+            with self.assertRaises(ns["Failure"]): ns["packet_apply"](RUN_ID, recovered, work)
+
+    def test_expired_timer_and_reboot_absence_recover_but_cannot_qualify(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); ns, state, kernel = self._fixture(work)
+            ns["packet_apply"](RUN_ID, state, work)
+            kernel.update(present=False, timer=False)
+            with self.assertRaises(ns["Failure"]): ns["packet_release"](RUN_ID, state, work, require_active=True)
+            self.assertTrue(ns["packet_release"](RUN_ID, state, work)["exactNetworkRestoration"])
+
+    def test_changed_or_foreign_rule_is_not_deleted(self):
+        ns = _board_namespace(); fault = _network_condition("ACTIVE")
+        original = ns["packet_shape"](fault["table"], fault["uid"], fault["udpSourcePorts"])
+        for index in (0, 1, 2):
+            with self.subTest(index=index):
+                changed = json.loads(json.dumps(original))
+                changed[2]["rule"]["expr"].pop(index)
+                ns["nft_json"] = lambda *args, **kwargs: {"nftables": changed}
+                with self.assertRaises(ns["Failure"]): ns["packet_counter"](fault)
+
+    def test_host_and_independent_verifier_reject_incomplete_or_broad_evidence(self):
+        spec = importlib.util.spec_from_file_location("rtp_readiness", ROOT / "packaging/release/verify-release-readiness.py")
+        verifier = importlib.util.module_from_spec(spec); spec.loader.exec_module(verifier)
+        for check, error in ((MODULE, MODULE.ConfigStreamError), (verifier, verifier.ReadinessError)):
+            for phase in ("ACTIVE", "RELEASED"):
+                original = _network_condition(phase)
+                self.assertEqual(check.validate_network_condition(original, run_id=RUN_ID, service_pid=101, phase=phase), original)
+                mutations = [("runId", str(uuid.uuid4())), ("uid", 0), ("uid", True), ("servicePid", 202),
+                             ("udpSourcePorts", []), ("udpSourcePorts", [22]), ("udpSourcePorts", [31000, 31000]),
+                             ("ruleShapeSha256", "b" * 64), ("dropPercent", 100), ("timerArmed", False),
+                             ("counter", {"packets": 0, "bytes": 0}), ("counter", {"packets": True, "bytes": 5}),
+                             ("automaticRemovalSeconds", 600), ("cgroup", "0::/other.service")]
+                if phase == "RELEASED": mutations += [("timerDisarmed", False), ("tableAbsent", False)]
+                for field, value in mutations:
+                    with self.subTest(check=check.__name__, phase=phase, field=field):
+                        modified = {**original, field: value}
+                        with self.assertRaises(error): check.validate_network_condition(modified, run_id=RUN_ID, service_pid=101, phase=phase)
+            poor, recovered = _network_condition("ACTIVE"), _network_condition("RELEASED")
+            check.validate_network_transition(poor, recovered)
+            for field, value in (("processStartTicks", 99999), ("previousTablesSha256", "f" * 64), ("counter", {"packets": 99, "bytes": 120000})):
+                with self.assertRaises(error): check.validate_network_transition(poor, {**recovered, field: value})
+
+
+class NativeRtpSocketScopeTest(unittest.TestCase):
+    def test_packet_loss_only_affects_selected_unprivileged_udp_socket(self):
+        import shutil
+        import subprocess
+        if sys.platform != "linux" or any(shutil.which(x) is None for x in ("nft", "ip", "unshare")):
+            if os.environ.get("NUV_REQUIRE_NATIVE_NFT") == "1": self.fail("native nft prerequisites are missing")
+            self.skipTest("native nft network namespaces are unavailable")
+        prefix = [] if os.geteuid() == 0 else ["sudo", "-n"]
+        program = r"""
+import json, os, socket, subprocess, threading, time
+ns = {"__name__": "native_socket_scope"}
+exec(DEFINITIONS, ns)
+subprocess.run(['/usr/sbin/ip', 'link', 'set', 'lo', 'up'], check=True)
+table = 'nuvion_rtp_12345678123441238123123456789abc'
+ports = [31000, 31001]
+assert ns['packet_tables']() == []
+for scoped_ports in ([31000], ports):
+    rules = ns['packet_rules'](table, 65534, scoped_ports)
+    subprocess.run(['/usr/sbin/nft', '-f', '-'], input=rules, text=True, check=True)
+    fault = {'table': table, 'uid': 65534, 'udpSourcePorts': scoped_ports,
+             'ruleShapeSha256': ns['sha'](ns['canonical'](ns['packet_shape'](table, 65534, scoped_ports)))}
+    assert ns['packet_counter'](fault) == {'packets': 0, 'bytes': 0}
+    subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], check=True)
+
+def traffic():
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    rx.bind(('127.0.0.1', 54000)); rx.settimeout(0.1)
+    received = {'selected': 0, 'control': 0}; done = threading.Event()
+    def receive():
+        while not done.is_set():
+            try: packet, addr = rx.recvfrom(2048)
+            except socket.timeout: continue
+            received[packet.decode()] += 1
+    thread = threading.Thread(target=receive); thread.start()
+    sender = "import os,socket,time; os.setgroups([]); os.setgid(65534); os.setuid(65534); a=socket.socket(2,2); b=socket.socket(2,2); a.bind(('127.0.0.1',31000)); b.bind(('127.0.0.1',31002));\nfor i in range(1000):\n try: a.sendto(b'selected',('127.0.0.1',54000))\n except PermissionError: pass\n b.sendto(b'control',('127.0.0.1',54000)); time.sleep(.001)"
+    try:
+        subprocess.run(['/usr/bin/python3', '-c', sender], check=True, timeout=10)
+        time.sleep(.2)
+    finally:
+        done.set(); thread.join(2); rx.close()
+    return received
+try:
+    subprocess.run(['/usr/sbin/nft', '-f', '-'], input=ns['packet_rules'](table,65534,ports), text=True, check=True)
+    affected = traffic(); count = ns['packet_counter'](fault)
+    assert affected['control'] == 1000, affected
+    assert 450 < affected['selected'] < 850, affected
+    assert count['packets'] == 1000 - affected['selected'], (count, affected)
+finally:
+    subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], check=True)
+assert ns['packet_tables']() == []
+assert traffic() == {'selected': 1000, 'control': 1000}
+print(json.dumps({'socketScopeVerified':True,'affected':affected,'dropped':count,'exactRestoration':True}))
+""".replace("DEFINITIONS", repr(MODULE.BOARD_PROGRAM.split("\ntry:\n    main()", 1)[0]))
+        result = subprocess.run(prefix + ["unshare", "--net", "/usr/bin/python3", "-B", "-c", program], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertTrue(outcome["socketScopeVerified"] and outcome["exactRestoration"])
 
 
 if __name__ == "__main__":
