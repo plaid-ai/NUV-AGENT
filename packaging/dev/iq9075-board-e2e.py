@@ -304,7 +304,8 @@ SAFE_SECRET_LIKE_FIELDS = frozenset({"offerSdpHadPinnedProfile"})
 UPDATER_PROBE = r"""
 import json
 from nuvion_app.runtime.updater_client import UpdaterClient
-status = UpdaterClient().capability_status()
+client = UpdaterClient()
+status = client.capability_status()
 safe = {
     "capabilityAvailable": status.get("capabilityAvailable") is True,
     "authenticatedHelper": status.get("authenticatedHelper") is True,
@@ -312,11 +313,23 @@ safe = {
     "updaterVersion": str(status.get("updaterVersion") or "unknown")[:100],
 }
 update = status.get("update")
-if isinstance(update, dict):
-    safe["update"] = update
+if isinstance(update, dict) and safe["capabilityAvailable"] and safe["authenticatedHelper"]:
+    # Older baseline clients omit newer public fields from capability_status.
+    # STATUS still authenticates the kernel peer and selects the same command.
+    command_id = update.get("commandId")
+    if not isinstance(command_id, str) or not command_id:
+        raise RuntimeError("updater probe command identity is unavailable")
+    raw_update = client.status(command_id).get("update")
+    if not isinstance(raw_update, dict) or raw_update.get("commandId") != command_id:
+        raise RuntimeError("updater probe command identity changed")
+    safe["update"] = {
+        key: value for key, value in raw_update.items()
+        if key in __ALLOWED_UPDATE_FIELDS__
+        and (value is None or isinstance(value, (str, int, bool, float)))
+    }
 print(json.dumps(safe, sort_keys=True, separators=(",", ":")))
 raise SystemExit(0 if safe["capabilityAvailable"] and safe["authenticatedHelper"] else 3)
-""".strip()
+""".strip().replace("__ALLOWED_UPDATE_FIELDS__", repr(sorted(ALLOWED_UPDATE_FIELDS)))
 
 
 class HarnessError(RuntimeError):

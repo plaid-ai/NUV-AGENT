@@ -818,6 +818,58 @@ class HarnessFixture:
 
 
 class Iq9075FleetBoardHarnessTest(unittest.TestCase):
+    def test_probe_uses_authenticated_status_after_legacy_capability_filter(self) -> None:
+        command_id = str(uuid.uuid4())
+        client = mock.Mock()
+        client.capability_status.return_value = {
+            "capabilityAvailable": True, "authenticatedHelper": True,
+            "reason": "READY", "updaterVersion": "0.2.0",
+            "update": {"commandId": command_id, "phase": "ROLLED_BACK"},
+        }
+        client.status.return_value = {"update": {
+            "commandId": command_id, "phase": "ROLLED_BACK",
+            "commandExpiresAt": "2026-09-09T04:01:20.260796Z",
+            "compactCommandJws": "must-stay-private",
+            "unexpectedObject": {"secret": "must-stay-private"},
+        }}
+        output = io.StringIO()
+        module = SimpleNamespace(UpdaterClient=lambda: client)
+        with mock.patch.dict(sys.modules, {"nuvion_app.runtime.updater_client": module}), mock.patch("sys.stdout", output):
+            with self.assertRaises(SystemExit) as exited:
+                exec(BOARD.UPDATER_PROBE, {})
+        self.assertEqual(exited.exception.code, 0)
+        client.status.assert_called_once_with(command_id)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["update"]["commandExpiresAt"], "2026-09-09T04:01:20.260796Z")
+        self.assertNotIn("must-stay-private", output.getvalue())
+        self.assertEqual(set(result["update"]), {"commandId", "phase", "commandExpiresAt"})
+
+    def test_probe_rejects_changed_command_and_unauthenticated_status(self) -> None:
+        for defect in ("identity", "unauthenticated", "socket-failure"):
+            with self.subTest(defect=defect):
+                command_id = str(uuid.uuid4())
+                client = mock.Mock()
+                client.capability_status.return_value = {
+                    "capabilityAvailable": True,
+                    "authenticatedHelper": defect != "unauthenticated",
+                    "reason": "READY", "updaterVersion": "0.2.0",
+                    "update": {"commandId": command_id},
+                }
+                if defect == "socket-failure":
+                    client.status.side_effect = OSError("unavailable")
+                else:
+                    client.status.return_value = {"update": {"commandId": str(uuid.uuid4())}}
+                module = SimpleNamespace(UpdaterClient=lambda: client)
+                with mock.patch.dict(sys.modules, {"nuvion_app.runtime.updater_client": module}), mock.patch("sys.stdout", io.StringIO()):
+                    if defect == "unauthenticated":
+                        with self.assertRaises(SystemExit) as exited:
+                            exec(BOARD.UPDATER_PROBE, {})
+                        self.assertEqual(exited.exception.code, 3)
+                        client.status.assert_not_called()
+                    else:
+                        with self.assertRaises((RuntimeError, OSError)):
+                            exec(BOARD.UPDATER_PROBE, {})
+
     def test_command_runner_drains_but_retains_only_bounded_output(self) -> None:
         script = (
             "import sys; "
@@ -6461,6 +6513,15 @@ class Iq9075FleetHostHarnessTest(unittest.TestCase):
         )
         same_second["generatedAt"] = "2026-09-02T00:00:02.901Z"
         HOST.validate_final_evidence(same_second, manifest)
+        for suffix in ("Z", ".1Z", ".123Z", ".260796Z", ".260796123Z"):
+            fractional_expiry = copy.deepcopy(evidence)
+            fractional_expiry["updater"]["update"]["commandExpiresAt"] = "2026-09-02T01:00:00" + suffix
+            HOST.validate_final_evidence(fractional_expiry, manifest)
+        for suffix in (".Z", ".1234567890Z", ".123456+00:00", "z"):
+            invalid_expiry = copy.deepcopy(evidence)
+            invalid_expiry["updater"]["update"]["commandExpiresAt"] = "2026-09-02T01:00:00" + suffix
+            with self.assertRaisesRegex(HOST.RunnerError, "commandExpiresAt"):
+                HOST.validate_final_evidence(invalid_expiry, manifest)
         generated_too_early = copy.deepcopy(same_second)
         generated_too_early["generatedAt"] = "2026-09-02T00:00:02.899Z"
         with self.assertRaisesRegex(HOST.RunnerError, "predates"):
