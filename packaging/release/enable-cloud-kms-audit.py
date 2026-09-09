@@ -16,6 +16,8 @@ def main():
     def gcloud(*command):
         result = subprocess.run(["gcloud", *command, *flags], capture_output=True, text=True, check=True, timeout=60)
         return json.loads(result.stdout)
+    if args.apply:
+        gcloud("services", "enable", "logging.googleapis.com", "--project=plaid-451114")
     policy = gcloud("projects", "get-iam-policy", "plaid-451114")
     before = json.dumps(policy, sort_keys=True)
     if not policy.get("etag"):
