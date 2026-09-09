@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v16`, Agent `0.1.121`, release sequence
-`13`, schema `12`, minimum updater `0.2.0`. Sequences 2–12 and publishers v1–v15
+Current publisher: `candidate-publisher-v17`, Agent `0.1.121`, release sequence
+`14`, schema `12`, minimum updater `0.2.0`. Sequences 2–13 and publishers v1–v16
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v16 \
-     -f tag_message='NUVION IQ9075 candidate publisher v16'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v17 \
+     -f tag_message='NUVION IQ9075 candidate publisher v17'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v16
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v17
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v15 to v16 and verify them.
+   existing candidate-sign/stage tag policies from v16 to v17 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v16 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=13
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v17 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=14
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -150,3 +150,19 @@ worker to deliver it before returning prepared evidence. Pending command work,
 reservations, DLQ rows, or a 30-second drain timeout still abort. No observation
 ACK or lifecycle record is fabricated. New v16/sequence13 proof uses the signed
 sequence12 runtime as its last known good rollback baseline.
+
+## Candidate v17 bounded updater probe retry
+
+The sequence-13 rollback harness stopped before recording or applying an OAK
+fault when its authenticated updater status probe timed out. The device later
+automatically rolled back to the already committed sequence-12 slot. This
+failed attempt does not qualify sequence 13 for release.
+
+The updater's functional probe can occupy its single RPC server. Both status
+reads now produce the same unavailable result on socket timeout. Only an
+unavailable pre-fault read is retryable under the existing host deadline;
+incorrect authentication, version or command identity still abort immediately.
+No fault journal, deadman or USB write occurs until the authenticated identity
+and current candidate process are confirmed. Publisher v17/sequence14 requires
+fresh complete physical evidence. Earlier tags, artifacts and results remain
+immutable.

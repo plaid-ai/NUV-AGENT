@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -868,14 +869,113 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                     client.status.return_value = {"update": {"commandId": str(uuid.uuid4())}}
                 module = SimpleNamespace(UpdaterClient=lambda: client)
                 with mock.patch.dict(sys.modules, {"nuvion_app.runtime.updater_client": module}), mock.patch("sys.stdout", io.StringIO()):
-                    if defect == "unauthenticated":
+                    if defect in {"unauthenticated", "socket-failure"}:
                         with self.assertRaises(SystemExit) as exited:
                             exec(BOARD.UPDATER_PROBE, {})
                         self.assertEqual(exited.exception.code, 3)
-                        client.status.assert_not_called()
+                        if defect == "unauthenticated":
+                            client.status.assert_not_called()
                     else:
                         with self.assertRaises((RuntimeError, OSError)):
                             exec(BOARD.UPDATER_PROBE, {})
+
+    @unittest.skipUnless(
+        hasattr(socket, "SO_PEERCRED") or hasattr(socket.socket, "getpeereid"),
+        "native Unix peer credentials are required",
+    )
+    def test_second_status_socket_timeout_is_retryable_without_traceback(self) -> None:
+        from nuvion_app.runtime.updater_client import UpdaterClient
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            endpoint = Path(directory) / "updater.sock"
+            release = threading.Event()
+            requests = []
+            errors = []
+            command_id = str(uuid.uuid4())
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(endpoint))
+                endpoint.chmod(0o600)
+                server.listen(2)
+                server.settimeout(3)
+
+                def serve() -> None:
+                    try:
+                        for index in range(2):
+                            connection, _ = server.accept()
+                            with connection:
+                                connection.settimeout(3)
+                                with connection.makefile("rb") as reader:
+                                    requests.append(json.loads(reader.readline()))
+                                if index == 0:
+                                    connection.sendall(json.dumps({
+                                        "ok": True,
+                                        "result": {
+                                            "capabilityAvailable": True,
+                                            "updaterVersion": "0.2.0",
+                                            "update": {"commandId": command_id},
+                                        },
+                                    }).encode())
+                                else:
+                                    release.wait(3)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                worker = threading.Thread(target=serve, daemon=True)
+                worker.start()
+                client = UpdaterClient(endpoint, timeout_seconds=0.2,
+                                       require_root_owner=False, expected_peer_uid=os.getuid())
+                output = io.StringIO()
+                try:
+                    module = SimpleNamespace(UpdaterClient=lambda: client)
+                    with mock.patch.dict(sys.modules, {"nuvion_app.runtime.updater_client": module}), mock.patch("sys.stdout", output):
+                        with self.assertRaises(SystemExit) as exited:
+                            exec(BOARD.UPDATER_PROBE, {})
+                    self.assertEqual(exited.exception.code, 3)
+                finally:
+                    release.set()
+                    worker.join(timeout=4)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual([request["operation"] for request in requests], ["STATUS", "STATUS"])
+                self.assertEqual(requests[1]["commandId"], command_id)
+                self.assertEqual(json.loads(output.getvalue()), {
+                    "capabilityAvailable": False,
+                    "authenticatedHelper": False,
+                    "reason": "UPDATER_UNAVAILABLE",
+                })
+
+    def test_busy_updater_probe_cannot_arm_fault_or_bypass_authentication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                original_run = fixture.runner.run
+                reason = "UPDATER_UNAVAILABLE"
+                def unavailable(args, **kwargs):
+                    if BOARD.UPDATER_PROBE in args:
+                        return BOARD.CommandResult(3, json.dumps({
+                            "capabilityAvailable": False, "authenticatedHelper": False,
+                            "reason": reason}) + "\n", "")
+                    return original_run(args, **kwargs)
+                fixture.runner.run = unavailable
+                with self.assertRaises(BOARD.HarnessError):
+                    fixture.harness._probe_updater()
+                result = fixture.harness.arm_oak_fault(fixture.run_id)
+                self.assertFalse(result["armed"])
+                self.assertTrue(result["retryable"])
+                self.assertNotIn("oakFault", fixture.harness._load_state(fixture.run_id))
+                self.assertNotIn(fixture.harness._deadman_unit(fixture.run_id), fixture.runner.deadmen)
+                for port in fixture.harness._oak_port_pair("2-1.1"):
+                    self.assertEqual((port / "disable").read_text().strip(), "0")
+                reason = "UNAUTHORIZED_PEER"
+                with self.assertRaises(BOARD.HarnessError):
+                    fixture.harness.arm_oak_fault(fixture.run_id)
+                fixture.runner.run = original_run
+                self.assertTrue(fixture.harness.arm_oak_fault(fixture.run_id)["recovered"])
+            finally:
+                fixture.close()
 
     def test_command_runner_drains_but_retains_only_bounded_output(self) -> None:
         script = (

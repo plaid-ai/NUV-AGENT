@@ -17,7 +17,7 @@ from typing import Any
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID = re.compile(r"^[1-9][0-9]*$")
-TAG = "candidate-publisher-v16"
+TAG = "candidate-publisher-v17"
 TAG_REF = f"refs/tags/{TAG}"
 WORKFLOW_REF = (
     "plaid-ai/NUV-AGENT/.github/workflows/"
