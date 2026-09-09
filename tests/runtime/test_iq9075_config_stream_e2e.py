@@ -9,6 +9,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -959,6 +960,35 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
                 candidate = {**recovery, field: invalid}
                 with self.assertRaises(MODULE.ConfigStreamError):
                     MODULE.validate_reboot_recovery(candidate, run_id=RUN_ID)
+
+    def test_shutdown_observation_is_preserved_until_worker_acknowledges(self) -> None:
+        definitions = MODULE.BOARD_PROGRAM.split("\ntry:\n    main()", 1)[0]
+        namespace = {"__name__": "board_drain_test"}
+        exec(compile(definitions, "<board-drain-test>", "exec"), namespace)
+        empty = {"inboxPendingRows": 0, "observationPendingRows": 0,
+                 "observationReservedRows": 0, "observationDlqRows": 0}
+        clock = [0.0]
+        polls = []
+        def counts():
+            polls.append(clock[0])
+            return {**empty, "observationPendingRows": int(clock[0] < 0.4)}
+        def sleep(seconds):
+            clock[0] += seconds
+        namespace["time"] = SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)
+        namespace["db_counts"] = counts
+        self.assertEqual(namespace["wait_observation_drain"](1), empty)
+        self.assertGreaterEqual(clock[0], 0.4)
+        self.assertGreaterEqual(len(polls), 3)
+        namespace["db_counts"] = lambda: {**empty, "observationPendingRows": 1}
+        with self.assertRaisesRegex(namespace["Failure"], "deadline"):
+            namespace["wait_observation_drain"](0.4)
+        self.assertLess(clock[0], 1.1)
+        for key in ("inboxPendingRows", "observationReservedRows", "observationDlqRows"):
+            namespace["db_counts"] = lambda key=key: {**empty, key: 1}
+            before = clock[0]
+            with self.assertRaisesRegex(namespace["Failure"], "not drained"):
+                namespace["wait_observation_drain"](1)
+            self.assertEqual(clock[0], before)
 
     def test_restored_targets_verify_after_snapshot_payloads_are_purged(self) -> None:
         definitions = MODULE.BOARD_PROGRAM.split("\ntry:\n    main()", 1)[0]
