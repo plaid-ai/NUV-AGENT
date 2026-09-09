@@ -760,6 +760,13 @@ class HarnessFixture:
         current.symlink_to(f"releases/{self.current_digest}")
         previous.unlink()
         previous.symlink_to(f"releases/{self.previous_digest}")
+        self.paths.boot_id.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.boot_id.write_text("11111111-1111-4111-8111-111111111111\n")
+        pid = self.runner.units["nuv-agent.service"]["pid"]
+        proc = self.paths.proc_root / str(pid)
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / "stat").write_text(f"{pid} (agent) S " + "0 " * 18 + "12345 0\n")
+        (proc / "environ").write_bytes(f"NUVION_ACTIVE_SLOT=releases/{self.current_digest}\0".encode())
 
     def update_state(self, phase: str) -> dict[str, object]:
         state: dict[str, object] = {
@@ -1726,6 +1733,57 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_fault_preflight_race_has_no_side_effects_and_can_retry(self) -> None:
+        for drift in ("old-process", "inactive", "usb-enumeration", "pid-change"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                fixture = HarnessFixture(Path(directory))
+                try:
+                    fixture.provision("oak-fault-rollback")
+                    fixture.activate_candidate()
+                    fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                    unit = fixture.runner.units["nuv-agent.service"]
+                    env = fixture.paths.proc_root / str(unit["pid"]) / "environ"
+                    original_env = env.read_bytes()
+                    original_oak = fixture.harness.verify_oak
+                    original_status = fixture.harness._unit_status
+                    calls = 0
+
+                    def changing_pid(name):
+                        nonlocal calls
+                        calls += 1
+                        result = original_status(name)
+                        if calls >= 3:
+                            result["mainPid"] += 1
+                        return result
+
+                    if drift == "old-process":
+                        env.write_bytes(f"NUVION_ACTIVE_SLOT=releases/{fixture.previous_digest}\0".encode())
+                    elif drift == "inactive":
+                        unit["active"] = False
+                    elif drift == "usb-enumeration":
+                        fixture.harness.verify_oak = mock.Mock(side_effect=FileNotFoundError())
+                    else:
+                        fixture.harness._unit_status = changing_pid
+                    writes = []
+                    original_write = fixture.harness.usb_write_hook
+                    fixture.harness.usb_write_hook = lambda *args: writes.append(args)
+                    result = fixture.harness.arm_oak_fault(fixture.run_id)
+                    self.assertTrue(result["retryable"])
+                    self.assertFalse(result["armed"])
+                    self.assertEqual(writes, [])
+                    self.assertNotIn("oakFault", fixture.harness._load_state(fixture.run_id))
+                    self.assertNotIn(fixture.harness._deadman_unit(fixture.run_id), fixture.runner.deadmen)
+                    env.write_bytes(original_env)
+                    unit["active"] = True
+                    fixture.harness.verify_oak = original_oak
+                    fixture.harness._unit_status = original_status
+                    fixture.harness.usb_write_hook = original_write
+                    self.assertTrue(fixture.harness.arm_oak_fault(fixture.run_id)["recovered"])
+                    with self.assertRaisesRegex(BOARD.HarnessError, "never rearmed"):
+                        fixture.harness.arm_oak_fault(fixture.run_id)
+                finally:
+                    fixture.close()
+
     def test_port_fault_holds_both_companions_and_recovers_exact_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
@@ -1770,7 +1828,7 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                     nonlocal calls
                     calls += 1
                     result = original(unit)
-                    if calls > 1:
+                    if calls > 3:
                         result["active"] = fixture.clock.monotonic() - start >= 60
                     return result
                 fixture.harness._unit_status = delayed_baseline
@@ -1803,7 +1861,7 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                         nonlocal calls
                         calls += 1
                         result = original(unit)
-                        if calls > 1:
+                        if calls > 3:
                             result["active"] = recover and fixture.clock.monotonic() - start >= 149
                         return result
 
@@ -5193,6 +5251,54 @@ class PollingRunTransport:
 
 
 class Iq9075FleetHostHarnessTest(unittest.TestCase):
+    def test_fault_window_retries_only_exact_unarmed_preflight_response(self) -> None:
+        scenario = {
+            "expectedCommandId": str(uuid.uuid4()),
+            "expectedBomDigest": "sha256:" + "a" * 64,
+            "expectedCandidateSlot": "/opt/nuv-agent/releases/" + "a" * 64,
+            "holdSeconds": 75,
+        }
+        ready = {
+            "complete": False,
+            "gates": dict.fromkeys(("foundation", "backup", "trust", "updater2", "oak", "services"), True),
+            "slots": {"current": "releases/" + "a" * 64},
+            "updater": {"update": {
+                "commandId": scenario["expectedCommandId"],
+                "bomDigest": scenario["expectedBomDigest"],
+                "candidateSlot": scenario["expectedCandidateSlot"],
+                "phase": "ACTIVATING",
+            }},
+        }
+        for outcome in ("recovered", "timeout", "armed", "response-loss"):
+            with self.subTest(outcome=outcome):
+                clock = FakeClock()
+                runner = HOST.FleetRunner(transport=None, journal=None, output_dir=Path("unused"),
+                    run_id=str(uuid.uuid4()), monotonic=clock.monotonic, sleeper=clock.sleep)
+                attempts = []
+                retry = {"schemaVersion": 1, "runId": runner.run_id, "fault": "oak-usb-disconnect",
+                    "armed": False, "retryable": True, "reason": "CANDIDATE_RUNTIME_TRANSITION"}
+
+                def call(step, command, *args, **kwargs):
+                    if command == "evidence":
+                        return ready
+                    attempts.append(command)
+                    if outcome == "response-loss":
+                        raise HOST.RunnerError("lost SSH response")
+                    if outcome == "armed":
+                        return {**retry, "armed": True}
+                    if outcome == "recovered" and len(attempts) == 2:
+                        return {"runId": runner.run_id, "recovered": True}
+                    return retry
+
+                runner._call = call
+                if outcome == "recovered":
+                    runner._arm_oak_fault_when_ready({"scenario": scenario}, deadline=3, poll_seconds=1)
+                    self.assertEqual(len(attempts), 2)
+                else:
+                    with self.assertRaises(HOST.RunnerError):
+                        runner._arm_oak_fault_when_ready({"scenario": scenario}, deadline=3, poll_seconds=1)
+                    self.assertEqual(len(attempts), 3 if outcome == "timeout" else 1)
+
     def test_candidate_cli_returns_nonzero_but_prints_failed_evidence(self) -> None:
         run_id = str(uuid.uuid4())
         arguments = SimpleNamespace(

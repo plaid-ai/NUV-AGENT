@@ -7141,6 +7141,8 @@ class BoardHarness:
             scenario = manifest["scenario"]
             if scenario["type"] != "oak-fault-rollback":
                 raise HarnessError("immutable scenario is not OAK fault rollback")
+            if state.get("oakFault") is not None:
+                raise HarnessError("existing OAK fault must be reconciled, never rearmed")
             hold = int(scenario["holdSeconds"])
             updater = self._probe_updater()
             update = updater.get("update")
@@ -7162,16 +7164,31 @@ class BoardHarness:
             digest = str(scenario["expectedBomDigest"])[7:]
             if self._slot_link("current", required=True) != f"releases/{digest}":
                 raise HarnessError("active slot is not the exact candidate")
-            candidate_service = self._unit_status("nuv-agent.service")
-            candidate_pid = candidate_service.get("mainPid")
+            # Activation changes current before systemd finishes replacing the
+            # baseline process; the exclusive functional probe restarts it too.
+            # A host observation is therefore only a hint. Retry only this
+            # read-only preflight, before creating a fault journal or deadman.
+            not_ready = {
+                "schemaVersion": 1,
+                "runId": run_id,
+                "fault": "oak-usb-disconnect",
+                "armed": False,
+                "retryable": True,
+                "reason": "CANDIDATE_RUNTIME_TRANSITION",
+            }
+            try:
+                candidate = self._agent_process_identity(f"releases/{digest}")
+                oak = self.verify_oak()
+            except (HarnessError, OSError):
+                return not_ready
+            candidate_pid = candidate["pid"]
+            confirmed = self._unit_status("nuv-agent.service")
             if (
-                candidate_service.get("active") is not True
-                or isinstance(candidate_pid, bool)
-                or not isinstance(candidate_pid, int)
-                or candidate_pid < 2
+                confirmed.get("active") is not True
+                or confirmed.get("mainPid") != candidate_pid
+                or self._slot_link("current", required=True) != f"releases/{digest}"
             ):
-                raise HarnessError("candidate Agent PID is unavailable before OAK fault")
-            oak = self.verify_oak()
+                return not_ready
             port = canonical_oak_port(oak["port"])
             pair = self._oak_port_pair(port)
             if any((path / "disable").read_text().strip() != "0" for path in pair):

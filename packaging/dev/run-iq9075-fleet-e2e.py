@@ -3769,65 +3769,9 @@ class FleetRunner:
         scenario = manifest["scenario"]
         deadline = self.monotonic() + wait_seconds
         if scenario["type"] == "oak-fault-rollback":
-            expected_candidate = "releases/" + scenario["expectedBomDigest"][7:]
-            rollback_already_complete = False
-            while True:
-                readiness = self._call(
-                    "fault-readiness", "evidence", ["--run-id", self.run_id]
-                )
-                if readiness.get("complete") is True:
-                    validate_final_evidence(readiness, manifest)
-                    rollback_already_complete = True
-                    break
-                update = (
-                    readiness.get("updater", {}).get("update")
-                    if isinstance(readiness.get("updater"), Mapping)
-                    else None
-                )
-                slots = readiness.get("slots")
-                gates = readiness.get("gates")
-                faultable = (
-                    isinstance(update, Mapping)
-                    and isinstance(slots, Mapping)
-                    and isinstance(gates, Mapping)
-                    and all(
-                        gates.get(name) is True
-                        for name in (
-                            "foundation",
-                            "backup",
-                            "trust",
-                            "updater2",
-                            "oak",
-                            "services",
-                        )
-                    )
-                    and update.get("commandId") == scenario["expectedCommandId"]
-                    and update.get("bomDigest") == scenario["expectedBomDigest"]
-                    and update.get("candidateSlot") == scenario["expectedCandidateSlot"]
-                    and update.get("phase")
-                    in {
-                        "ACTIVATING",
-                        "BOOT_HEALTHY",
-                        "FUNCTIONAL_HEALTHY",
-                        "COMMIT_GATE",
-                    }
-                    and slots.get("current") == expected_candidate
-                )
-                if faultable:
-                    break
-                if self.monotonic() >= deadline:
-                    raise RunnerError(
-                        "timed out waiting for the exact OTA candidate fault window"
-                    )
-                self.sleeper(float(poll_seconds))
-            if not rollback_already_complete:
-                self._call(
-                    "oak-fault",
-                    "arm-oak-fault",
-                    ["--run-id", self.run_id],
-                    # 75s normal recovery plus systemd startup/status/retirement.
-                    timeout=int(scenario["holdSeconds"]) + 135,
-                )
+            self._arm_oak_fault_when_ready(
+                manifest, deadline=deadline, poll_seconds=poll_seconds
+            )
         while True:
             evidence = self._call("evidence", "evidence", ["--run-id", self.run_id])
             if evidence.get("complete") is True:
@@ -3871,6 +3815,88 @@ class FleetRunner:
                 read_regular(evidence_path, MAX_OUTPUT_BYTES)
             ).hexdigest(),
         }
+
+    def _arm_oak_fault_when_ready(
+        self, manifest: Mapping[str, Any], *, deadline: float, poll_seconds: float
+    ) -> None:
+        scenario = manifest["scenario"]
+        expected_candidate = "releases/" + scenario["expectedBomDigest"][7:]
+        while True:
+            if self.monotonic() >= deadline:
+                raise RunnerError("timed out waiting for the exact OTA candidate fault window")
+            readiness = self._call(
+                "fault-readiness", "evidence", ["--run-id", self.run_id]
+            )
+            if readiness.get("complete") is True:
+                validate_final_evidence(readiness, manifest)
+                return
+            update = (
+                readiness.get("updater", {}).get("update")
+                if isinstance(readiness.get("updater"), Mapping)
+                else None
+            )
+            slots = readiness.get("slots")
+            gates = readiness.get("gates")
+            faultable = (
+                isinstance(update, Mapping)
+                and isinstance(slots, Mapping)
+                and isinstance(gates, Mapping)
+                and all(
+                    gates.get(name) is True
+                    for name in (
+                        "foundation",
+                        "backup",
+                        "trust",
+                        "updater2",
+                        "oak",
+                        "services",
+                    )
+                )
+                and update.get("commandId") == scenario["expectedCommandId"]
+                and update.get("bomDigest") == scenario["expectedBomDigest"]
+                and update.get("candidateSlot") == scenario["expectedCandidateSlot"]
+                and update.get("phase")
+                in {
+                    "ACTIVATING",
+                    "BOOT_HEALTHY",
+                    "FUNCTIONAL_HEALTHY",
+                    "COMMIT_GATE",
+                }
+                and slots.get("current") == expected_candidate
+            )
+            if faultable:
+                if self.monotonic() >= deadline:
+                    raise RunnerError("timed out waiting for the exact OTA candidate fault window")
+                fault = self._call(
+                    "oak-fault",
+                    "arm-oak-fault",
+                    ["--run-id", self.run_id],
+                    timeout=int(scenario["holdSeconds"]) + 135,
+                )
+                if fault == {
+                    "schemaVersion": 1,
+                    "runId": self.run_id,
+                    "fault": "oak-usb-disconnect",
+                    "armed": False,
+                    "retryable": True,
+                    "reason": "CANDIDATE_RUNTIME_TRANSITION",
+                }:
+                    # Only the exact pre-mutation response may retry. A
+                    # lost response or any armed/failed fault still aborts.
+                    pass
+                elif (
+                    fault.get("recovered") is True
+                    and fault.get("runId") == self.run_id
+                    and fault.get("retryable") is not True
+                ):
+                    return
+                else:
+                    raise RunnerError("OAK fault returned no recovery proof")
+            if self.monotonic() >= deadline:
+                raise RunnerError(
+                    "timed out waiting for the exact OTA candidate fault window"
+                )
+            self.sleeper(float(poll_seconds))
 
     def candidate_soak(
         self,

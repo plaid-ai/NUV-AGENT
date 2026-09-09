@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v11`, Agent `0.1.121`, release sequence
-`8`, schema `12`, minimum updater `0.2.0`. Sequences 2–7 and publishers v1–v10
+Current publisher: `candidate-publisher-v12`, Agent `0.1.121`, release sequence
+`9`, schema `12`, minimum updater `0.2.0`. Sequences 2–8 and publishers v1–v11
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v11 \
-     -f tag_message='NUVION IQ9075 candidate publisher v11'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v12 \
+     -f tag_message='NUVION IQ9075 candidate publisher v12'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v11
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v12
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v10 to v11 and verify them.
+   existing candidate-sign/stage tag policies from v11 to v12 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v11 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=8
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v12 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=9
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -62,3 +62,21 @@ acceptance are separate. Main-branch protection was disabled by the repository
 owner; the formal release settings gate still requires its configured protection
 and signed evidence. No successful settings/OTA attestation is implied here.
 APT signing and GCS publishing credentials are outside this OTA key migration.
+
+## Candidate v12 physical validation retry
+
+The v11 sequence-8 attempt on IQ9075 (command
+`9eb50d02-3892-4a3f-95b1-48724bb4d54b`) stopped before the OAK fault journal
+or USB write. The updater selected the candidate slot before the Agent restart
+completed, invalidating the host's readiness snapshot. The boot watchdog later
+restored the signed 0.1.120 slot. This is failed diagnostic evidence; C was not
+issued and no physical acceptance is claimed for that chain.
+
+The board now checks the candidate process's slot, PID/start time and boot ID,
+then confirms its PID after the USB check. A transient preflight returns an
+explicit unarmed result before any fault journal, deadman or USB mutation.
+Only that exact result may retry under the original host deadline. Response
+loss, a recorded fault, identity mismatch and recovery failure still abort.
+Sequence 9 and publisher v12 require fresh bootstrap/R/C evidence. Their WIF
+providers are `candidate-v12` and `release-main-v12`; previous providers and
+immutable artifacts remain unchanged.
