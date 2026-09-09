@@ -74,6 +74,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify native synthetic Fleet frames before physical qualification
+        env:
+          NUV_REQUIRE_NATIVE_GST: "1"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base
+          /usr/bin/python3 -B -m unittest tests.runtime.test_iq9075_config_stream_e2e.NativeSyntheticSourceTest
+
       - name: Stamp exact checked-out candidate identity
         run: |
           set -euo pipefail

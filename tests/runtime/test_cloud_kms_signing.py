@@ -246,7 +246,7 @@ class OtaKmsFederationTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         plan = module.plan("a" * 40)
-        self.assertEqual(set(plan), {"candidate-v19", "release-main-v19"})
+        self.assertEqual(set(plan), {"candidate-v20", "release-main-v20"})
         for name, config in plan.items():
             condition = config["condition"]
             for expected in ("assertion.workflow_sha == '" + "a" * 40 + "'",
@@ -255,7 +255,7 @@ class OtaKmsFederationTest(unittest.TestCase):
                              "assertion.event_name == 'workflow_dispatch'",
                              "assertion.actor_id in ['57535980', '89565530']", config["subject"]):
                 self.assertIn(expected, condition)
-            self.assertIn("refs/tags/candidate-publisher-v19" if name == "candidate-v19" else "refs/heads/main", condition)
+            self.assertIn("refs/tags/candidate-publisher-v20" if name == "candidate-v20" else "refs/heads/main", condition)
         with self.assertRaises(ValueError):
             module.plan("main")
 

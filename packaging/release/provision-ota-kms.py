@@ -16,11 +16,11 @@ spec.loader.exec_module(base)
 def plan(publisher_sha: str):
     if not re.fullmatch(r"[0-9a-f]{40}", publisher_sha):
         raise ValueError("An exact approved workflow commit is required")
-    tag = "candidate-publisher-v19"
+    tag = "candidate-publisher-v20"
     providers = {}
     for name, environment, ref, workflow in (
-        ("candidate-v19", "iq9075-candidate-sign", f"refs/tags/{tag}", "iq9075-candidate-trusted-publish.yml"),
-        ("release-main-v19", "iq9075-release", "refs/heads/main", "release-publish.yml"),
+        ("candidate-v20", "iq9075-candidate-sign", f"refs/tags/{tag}", "iq9075-candidate-trusted-publish.yml"),
+        ("release-main-v20", "iq9075-release", "refs/heads/main", "release-publish.yml"),
     ):
         subject = f"repo:{base.REPOSITORY}:environment:{environment}"
         condition = (

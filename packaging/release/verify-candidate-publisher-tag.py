@@ -17,7 +17,7 @@ COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT = re.compile(r"^[0-9A-F]{40}$")
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 CONFIG_SCHEMA = re.compile(r"^[1-9][0-9]*$")
-EXPECTED_TAG = "candidate-publisher-v19"
+EXPECTED_TAG = "candidate-publisher-v20"
 EXPECTED_TAG_REF = f"refs/tags/{EXPECTED_TAG}"
 EXPECTED_WORKFLOW = ".github/workflows/iq9075-candidate-trusted-publish.yml"
 EXPECTED_RULESET = "protected-candidate-publisher"
@@ -174,6 +174,7 @@ def _candidate_policy(policy_path: Path) -> tuple[dict[str, Any], set[str]]:
             "refs/tags/candidate-publisher-v16",
             "refs/tags/candidate-publisher-v17",
             "refs/tags/candidate-publisher-v18",
+            "refs/tags/candidate-publisher-v19",
         ]
         or candidate.get("workflow") != EXPECTED_WORKFLOW
         or candidate.get("rulesetName") != EXPECTED_RULESET

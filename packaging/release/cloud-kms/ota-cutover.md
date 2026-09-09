@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v19`, Agent `0.1.121`, release sequence
-`16`, schema `12`, minimum updater `0.2.0`. Sequences 2–15 and publishers v1–v18
+Current publisher: `candidate-publisher-v20`, Agent `0.1.121`, release sequence
+`17`, schema `12`, minimum updater `0.2.0`. Sequences 2–16 and publishers v1–v19
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v19 \
-     -f tag_message='NUVION IQ9075 candidate publisher v19'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v20 \
+     -f tag_message='NUVION IQ9075 candidate publisher v20'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v19
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v20
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v18 to v19 and verify them.
+   existing candidate-sign/stage tag policies from v19 to v20 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v19 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=16
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v20 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=17
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -205,3 +205,21 @@ Publisher v19 signs sequence 16. The already committed, signed sequence-15 BOM
 is explicitly allowlisted as its physical rollback baseline; the promoted APT
 baseline remains 0.1.120/sequence 1. Preserve all older candidate tags, artifacts,
 failed commands and proofs. A fresh complete chain is required for promotion.
+
+## Candidate v20 native synthetic-frame contract
+
+Sequence16 passed physical rollback and commit, and its CONFIG_APPLY change and
+restore succeeded. Adaptive streaming correctly rejected the synthetic runtime
+with MISSING_CAPABILITY because its source negotiated I420 while the frame
+reader requires packed RGB. No frame proof or capability was fabricated.
+
+The test-only source now explicitly negotiates RGB. A native GStreamer test
+checks consecutive frames from the exact configured source and verifies the
+I420 negative control. The required CI job executes these tests with system
+GStreamer before another physical qualification. The production Agent and
+its capability gates remain unchanged. Native tests also passed on IQ9075.
+
+Publisher v20/sequence17 requires fresh complete evidence, using the exact
+committed sequence16 BOM as its allowed physical rollback baseline. Previous
+failed chains and immutable artifacts remain preserved. The DISABLED-policy
+preflight remains mandatory before bootstrap/R/C.
