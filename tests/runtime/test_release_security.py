@@ -2960,6 +2960,47 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                         )
                     self.assertEqual(list(output.iterdir()), [])
 
+    def test_config_stream_gate_preserves_api_timestamp_precision(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            inputs = self._fleet_runtime_fixture(Path(raw_root), component_sha="a" * 40)
+            def read(name):
+                return json.loads(inputs[name].read_bytes())
+            original = read("config_stream_evidence")
+            def validate(document):
+                return READINESS._validated_config_stream_gate(
+                    config_stream_evidence=document,
+                    fleet_manifest=read("commit_manifest"), fleet_manifest_raw=inputs["commit_manifest"].read_bytes(),
+                    fleet_evidence=read("commit_evidence"), fleet_evidence_raw=inputs["commit_evidence"].read_bytes(),
+                    cleanup_evidence=read("commit_cleanup_evidence"), rollback_manifest=read("rollback_manifest"),
+                    rollback_evidence=read("rollback_evidence"),
+                    candidate_config_stream_runner=ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                )[0]
+            for fraction in ("1", "123456", "123456789"):
+                with self.subTest(fraction=fraction):
+                    document = json.loads(json.dumps(original))
+                    for field in ("releaseCommand", "priorRollbackCommand"):
+                        document[field]["issuedAt"] = document[field]["issuedAt"].removesuffix("Z") + "." + fraction + "Z"
+                    for item in document["expiredPredecessors"]:
+                        item["expiresAt"] = item["expiresAt"].removesuffix("Z") + "." + fraction + "Z"
+                    before = canonical_bytes(document); gate = validate(document)
+                    self.assertEqual(canonical_bytes(document), before)
+                    self.assertEqual(gate["releaseCommand"], document["releaseCommand"])
+                    self.assertEqual(gate["priorRollbackCommand"], document["priorRollbackCommand"])
+            for field in ("releaseCommand", "priorRollbackCommand", "expiredPredecessors"):
+                for suffix in (".1234567890Z", ".123456+00:00", ".Z", "Z\n"):
+                    with self.subTest(field=field, suffix=suffix):
+                        document = json.loads(json.dumps(original))
+                        target = document[field][0] if field == "expiredPredecessors" else document[field]
+                        key = "expiresAt" if field == "expiredPredecessors" else "issuedAt"
+                        target[key] = target[key].removesuffix("Z") + suffix
+                        with self.assertRaises(READINESS.ReadinessError): validate(document)
+            for field in ("generatedAt", "cleanup"):
+                document = json.loads(json.dumps(original))
+                target = document if field == "generatedAt" else document["cleanup"]
+                key = "generatedAt" if field == "generatedAt" else "completedAt"
+                target[key] = target[key].removesuffix("Z") + ".123456Z"
+                with self.assertRaises(READINESS.ReadinessError): validate(document)
+
     def test_fleet_runtime_chain_accepts_later_healthy_observations(self) -> None:
         component_sha = "a" * 40
         with tempfile.TemporaryDirectory() as raw_root:
@@ -2990,6 +3031,50 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 output_directory=output, version="0.1.121", component_sha=component_sha,
             )
             self.assertTrue(Path(result["summary"]).is_file())
+
+    def test_fleet_runtime_chain_accepts_api_precision_without_rewriting_source_times(self) -> None:
+        component_sha = "a" * 40
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            inputs = self._fleet_runtime_fixture(root, component_sha=component_sha)
+            document = json.loads(inputs["config_stream_evidence"].read_bytes())
+            for purpose, field in (("rollback", "priorRollbackCommand"), ("commit", "releaseCommand")):
+                issued_path = inputs[purpose + "_rollout_issuance"]
+                terminal_path = inputs[purpose + "_rollout_terminal"]
+                issued = json.loads(issued_path.read_bytes())
+                value = issued["command"]["issuedAt"].removesuffix("Z") + ".123456Z"
+                issued["command"]["issuedAt"] = value
+                issued_path.write_bytes(canonical_bytes(issued))
+                terminal = json.loads(terminal_path.read_bytes())
+                terminal["command"]["issuedAt"] = value
+                terminal["issuanceEvidenceSha256"] = hashlib.sha256(issued_path.read_bytes()).hexdigest()
+                terminal_path.write_bytes(canonical_bytes(terminal))
+                document[field]["issuedAt"] = value
+            for item in document["expiredPredecessors"]:
+                item["expiresAt"] = item["expiresAt"].removesuffix("Z") + ".123456Z"
+            inputs["config_stream_evidence"].write_bytes(canonical_bytes(document))
+            originals = {str(p): p.read_bytes() for p in inputs.values() if p.is_file()}
+            output = root / "output"; output.mkdir(mode=0o700)
+            result = FLEET_RUNTIME_EVIDENCE.assemble(
+                rollback_manifest_path=inputs["rollback_manifest"],
+                rollback_evidence_path=inputs["rollback_evidence"],
+                rollback_cleanup_evidence_path=inputs["rollback_cleanup_evidence"],
+                commit_manifest_path=inputs["commit_manifest"],
+                commit_evidence_path=inputs["commit_evidence"],
+                config_stream_evidence_path=inputs["config_stream_evidence"],
+                commit_cleanup_evidence_path=inputs["commit_cleanup_evidence"],
+                bootstrap_evidence_path=inputs["bootstrap_evidence"],
+                **self._rollout_assembly_inputs(inputs),
+                artifact_path=inputs["artifact"], deb_path=inputs["deb"], bom_path=inputs["bom"],
+                candidate_fleet_runner=ROOT / "packaging/dev/run-iq9075-fleet-e2e.py",
+                candidate_config_stream_runner=ROOT / "packaging/dev/run-iq9075-config-stream-e2e.py",
+                candidate_board_tool=ROOT / "packaging/dev/iq9075-board-e2e.py",
+                candidate_installer=ROOT / "packaging/dev/install-iq9075.sh",
+                security_policy_path=ROOT / "packaging/release/release-security-policy.json",
+                output_directory=output, version="0.1.121", component_sha=component_sha,
+            )
+            self.assertTrue(Path(result["summary"]).is_file())
+            self.assertEqual(originals, {p: Path(p).read_bytes() for p in originals})
 
     def test_fleet_runtime_chain_rejects_config_stream_runner_drift(self) -> None:
         component_sha = "a" * 40
