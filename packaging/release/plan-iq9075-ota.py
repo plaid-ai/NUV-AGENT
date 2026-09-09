@@ -232,7 +232,8 @@ def _verify_pinned_keyring(
         or payload.get("schemaVersion") != 1
         or payload.get("trustDomain") != iq_policy["trustDomain"]
         or not isinstance(payload.get("keys"), dict)
-        or set(payload["keys"]) != {publisher_key_id}
+        or not 1 <= len(payload["keys"]) <= 32
+        or publisher_key_id not in payload["keys"]
     ):
         raise SequencePlanError("release public keyring identity does not match policy")
     return publisher_key_id

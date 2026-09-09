@@ -4,8 +4,18 @@
   "requiredStatusContext": "agent-release-gate",
   "releaseAdminTeamId": 16128529,
   "releaseAdminUsers": [
-    {"id": 57535980, "login": "swiftsjh02", "role": "maintainer", "repositoryPermission": "admin"},
-    {"id": 89565530, "login": "taewan2002", "role": "maintainer", "repositoryPermission": "admin"}
+    {
+      "id": 57535980,
+      "login": "swiftsjh02",
+      "role": "maintainer",
+      "repositoryPermission": "admin"
+    },
+    {
+      "id": 89565530,
+      "login": "taewan2002",
+      "role": "maintainer",
+      "repositoryPermission": "admin"
+    }
   ],
   "immutableReleases": true,
   "trustedTagSignerFingerprints": [
@@ -20,18 +30,33 @@
     "requireLastPushApproval": true,
     "requireExtraApprovalForUnattributedChanges": true,
     "requiredReviewThreadResolution": true,
-    "allowedMergeMethods": ["merge", "squash", "rebase"],
+    "allowedMergeMethods": [
+      "merge",
+      "squash",
+      "rebase"
+    ],
     "environmentReviewers": 0,
     "requiredStatusContext": "agent-release-gate",
     "requiredStatusIntegrationId": 15368
   },
   "candidatePublisher": {
-    "tag": "candidate-publisher-v10",
-    "tagRef": "refs/tags/candidate-publisher-v10",
-    "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9"],
+    "tag": "candidate-publisher-v11",
+    "tagRef": "refs/tags/candidate-publisher-v11",
+    "retiredTagRefs": [
+      "refs/tags/candidate-publisher-v1",
+      "refs/tags/candidate-publisher-v2",
+      "refs/tags/candidate-publisher-v3",
+      "refs/tags/candidate-publisher-v4",
+      "refs/tags/candidate-publisher-v5",
+      "refs/tags/candidate-publisher-v6",
+      "refs/tags/candidate-publisher-v7",
+      "refs/tags/candidate-publisher-v8",
+      "refs/tags/candidate-publisher-v9",
+      "refs/tags/candidate-publisher-v10"
+    ],
     "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
     "agentVersion": "0.1.121",
-    "releaseSequence": 7,
+    "releaseSequence": 8,
     "configSchema": "12",
     "minUpdaterVersion": "0.2.0",
     "rulesetName": "protected-candidate-publisher"
@@ -46,9 +71,18 @@
         "protectedBranches": false,
         "customBranchPolicies": true
       },
-      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
-      "protectionRuleTypes": ["branch_policy"],
-      "requiredSecrets": ["HOMEBREW_TAP_TOKEN"]
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
+      "requiredSecrets": [
+        "HOMEBREW_TAP_TOKEN"
+      ]
     },
     "apt-release": {
       "requireReviewers": false,
@@ -59,8 +93,15 @@
         "protectedBranches": false,
         "customBranchPolicies": true
       },
-      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
-      "protectionRuleTypes": ["branch_policy"],
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
       "requiredSecrets": [
         "APT_GPG_PASSPHRASE",
         "APT_GPG_PRIVATE_KEY",
@@ -77,12 +118,18 @@
         "protectedBranches": false,
         "customBranchPolicies": true
       },
-      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
-      "protectionRuleTypes": ["branch_policy"],
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
       "requiredSecrets": [
         "GCP_PROJECT_ID",
-        "GCP_SA_KEY",
-        "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
+        "GCP_SA_KEY"
       ]
     },
     "iq9075-candidate-sign": {
@@ -96,16 +143,14 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v10",
+          "name": "candidate-publisher-v11",
           "type": "tag"
         }
       ],
       "protectionRuleTypes": [
         "branch_policy"
       ],
-      "requiredSecrets": [
-        "IQ9075_RELEASE_SIGNING_PRIVATE_KEY"
-      ]
+      "requiredSecrets": []
     },
     "iq9075-candidate-stage": {
       "requireReviewers": false,
@@ -118,7 +163,7 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v10",
+          "name": "candidate-publisher-v11",
           "type": "tag"
         }
       ],
@@ -139,9 +184,19 @@
         "protectedBranches": false,
         "customBranchPolicies": true
       },
-      "deploymentBranchPolicies": [{"name": "main", "type": "branch"}],
-      "protectionRuleTypes": ["branch_policy"],
-      "requiredSecrets": ["GCP_PROJECT_ID", "GCP_SA_KEY"]
+      "deploymentBranchPolicies": [
+        {
+          "name": "main",
+          "type": "branch"
+        }
+      ],
+      "protectionRuleTypes": [
+        "branch_policy"
+      ],
+      "requiredSecrets": [
+        "GCP_PROJECT_ID",
+        "GCP_SA_KEY"
+      ]
     }
   },
   "forbiddenRepositorySecrets": [
@@ -162,11 +217,18 @@
   },
   "iq9075": {
     "bucket": "apt.plaidai.io",
-    "retiredCandidateSequences": [2, 3, 4, 5, 6],
+    "retiredCandidateSequences": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
     "trustDomain": "iq9075-dev",
     "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
-    "publicKeyringSha256": "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",
-    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+    "publicKeyringSha256": "971c4b7ec139ca21acf782cd34ac4b9226364bc05a528c82f0e7084b49fffde6",
+    "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
     "fleetTrustRoots": {
       "command": {
         "file": "trusted-fleet-keyrings/iq9075-dev-command.json",

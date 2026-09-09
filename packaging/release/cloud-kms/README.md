@@ -25,8 +25,9 @@ their existing administrative access; this change does not alter project roles.
 
 The GitHub environments allow only the `main` branch, disable admin bypass and
 contain no signing secrets. Explicit dispatch is restricted to the release admin
-IDs in `release-security-policy.json`; the existing required main-branch PR
-approval remains the code authorization gate. This matches the existing release
+IDs in `release-security-policy.json`; main-branch protection was disabled by the repository owner during this
+migration. Formal release settings verification still requires its configured
+main-branch protection and will fail until that policy is satisfied. This matches the existing release
 policy's zero environment-reviewer setting.
 
 KMS `ADMIN_READ` and `DATA_READ` audit logging is enabled. `AsymmetricSign` is a
@@ -48,17 +49,24 @@ is added alongside the old company key so existing signed evidence remains valid
 The development approval key is deliberately absent from production tag trust.
 
 This change does **not** mark `0.1.121` READY or resume the paused IQ9075 OTA test.
-`candidate-publisher-v10` and the existing IQ9075 OTA publisher still use their
-original immutable policy and legacy signing secret. Their old public key is
-pinned in the Agent/device/BE trust chain. Newly generated OTA keys need a separate
-reviewed trust distribution and a new immutable publisher before activation.
-The new `ota-keyring.json` files are staged public trust material, not an already
-deployed device configuration. APT's separate GPG key is also unchanged.
+`candidate-publisher-v11` signs sequence 8 with the development OTA KMS key.
+The IQ9075 development board must not trust the production OTA key. The active
+IQ9075 keyring contains the new development key and the previous public key so
+existing releases remain verifiable for rollback. Readiness still requires the
+new candidate to be signed by the policy's active publisher key.
 
-After this PR is merged, run `Cloud KMS signing verification` for `dev` and `prod`
-to prove the actual GitHub OIDC exchange. A successful local signer test does not
-prove the GitHub federation path. Do not remove the old keys/secrets until the
-replacement publisher and device verification have passed end to end.
+GitHub OIDC smoke verification passed for development (run 34311921321) and
+production (run 34311923274), including BOM, detached evidence and signed Git tags.
+The candidate and final IQ9075 OTA publishers use dedicated WIF providers pinned
+to the exact approved workflow commit. Provision them only after merging and
+creating the new signed immutable publisher tag. The final publisher keeps its
+GCS credentials separate from KMS credentials; KMS never uses a stored private key.
+
+Deploy the public keyring to BE and the updater, verify both old and new signed
+BOMs, then remove `IQ9075_RELEASE_SIGNING_PRIVATE_KEY` from the two old signing
+environments. Keep the old public key while any rollback release depends on it.
+Changing trust does not authorize an OTA command or interrupt a device benchmark.
+APT's separate GPG signing key is unchanged.
 
 ## Use without a GPG password
 

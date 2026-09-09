@@ -215,5 +215,50 @@ class ApprovalAuthorizationTest(unittest.TestCase):
                 self.module.authorize()
 
 
+
+
+class KmsCredentialsIsolationTest(unittest.TestCase):
+    def test_explicit_kms_credentials_do_not_use_or_replace_publisher_adc(self):
+        import os
+        from cloud_kms_signer import kms_client
+        credentials = object()
+        environment = {"GOOGLE_APPLICATION_CREDENTIALS": "/publisher/gcs.json",
+                       "NUVION_KMS_CREDENTIALS_FILE": "/oidc/kms.json", "GITHUB_ACTIONS": "true"}
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "google.auth.load_credentials_from_file", return_value=(credentials, None)
+        ) as load, patch.object(kms_v1, "KeyManagementServiceClient") as client:
+            kms_client()
+            load.assert_called_once_with("/oidc/kms.json", scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            client.assert_called_once_with(credentials=credentials, transport="rest")
+            self.assertEqual(os.environ["GOOGLE_APPLICATION_CREDENTIALS"], "/publisher/gcs.json")
+
+    def test_conflicting_local_and_ci_credentials_fail_closed(self):
+        from cloud_kms_signer import kms_client
+        with patch.dict("os.environ", {"NUVION_KMS_CREDENTIALS_FILE": "/oidc/kms.json",
+                                     "NUVION_KMS_GCLOUD_ACCOUNT": "owner@example.com"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "either"):
+                kms_client()
+
+
+class OtaKmsFederationTest(unittest.TestCase):
+    def test_each_provider_pins_workflow_sha_subject_ref_actor_and_repository(self):
+        spec = importlib.util.spec_from_file_location("ota_provision_test", ROOT / "packaging/release/provision-ota-kms.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        plan = module.plan("a" * 40)
+        self.assertEqual(set(plan), {"candidate-v11", "release-main"})
+        for name, config in plan.items():
+            condition = config["condition"]
+            for expected in ("assertion.workflow_sha == '" + "a" * 40 + "'",
+                             "assertion.repository_id == '1149331364'",
+                             "assertion.repository_owner_id == '199492120'",
+                             "assertion.event_name == 'workflow_dispatch'",
+                             "assertion.actor_id in ['57535980', '89565530']", config["subject"]):
+                self.assertIn(expected, condition)
+            self.assertIn("refs/tags/candidate-publisher-v11" if name == "candidate-v11" else "refs/heads/main", condition)
+        with self.assertRaises(ValueError):
+            module.plan("main")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,16 @@ def kms_client():
     from google.cloud import kms_v1
 
     account = os.environ.get("NUVION_KMS_GCLOUD_ACCOUNT")
+    credentials_file = os.environ.get("NUVION_KMS_CREDENTIALS_FILE")
+    if credentials_file:
+        if account:
+            raise ValueError("Choose either KMS credentials file or local gcloud account")
+        import google.auth
+
+        credentials, _ = google.auth.load_credentials_from_file(
+            credentials_file, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        return kms_v1.KeyManagementServiceClient(credentials=credentials, transport="rest")
     if not account:
         return kms_v1.KeyManagementServiceClient(transport="rest")
     if os.environ.get("GITHUB_ACTIONS") == "true":

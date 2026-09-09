@@ -1144,6 +1144,7 @@ jobs:
       actions: read
       checks: read
       contents: read
+      id-token: write
     env:
       APT_RUNTIME_ROOT: ${{ github.workspace }}/nuv-ota-publish-runtime
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
@@ -1315,6 +1316,38 @@ jobs:
             dist/iq9075-sequence-reservation.json \
             apt.plaidai.io "$RESERVATION_OBJECT"
 
+      - name: Install pinned Cloud KMS signing runtime
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kms-signing"
+          "$RUNNER_TEMP/kms-signing/bin/python" -m pip install --require-hashes \
+            -r publisher/packaging/release/requirements-cloud-kms.txt
+
+      - name: Revalidate trust immediately before OTA KMS authentication
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
+
+      - name: Authenticate OTA release to Cloud KMS
+        id: kms-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-dev/providers/release-main
+          service_account: nuv-agent-sign-dev@plaid-451114.iam.gserviceaccount.com
+          create_credentials_file: true
+          export_environment_variables: false
+
       - name: Revalidate trust after CAS and immediately before IQ signing key use
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -1344,11 +1377,11 @@ jobs:
           MIN_UPDATER_VERSION: ${{ needs.iq9075-ota-build.outputs.min_updater_version }}
           EXPECTED_BOM_DIGEST: ${{ steps.sequence.outputs.expected_bom_digest }}
           PHYSICAL_BOM_SHA256: ${{ needs.release-preflight.outputs.physical_bom_sha256 }}
-          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
+          NUVION_KMS_CREDENTIALS_FILE: ${{ steps.kms-auth.outputs.credentials_file_path }}
           RELEASE_SIGNING_KEY_ID: ${{ steps.sequence.outputs.publisher_key_id }}
         run: |
           set -euo pipefail
-          [ -n "$RELEASE_SIGNING_PRIVATE_KEY" ]
+          [ -n "$NUVION_KMS_CREDENTIALS_FILE" ]
           [ -n "$RELEASE_SIGNING_KEY_ID" ]
           BUNDLE_PATH="dist/$BUNDLE_NAME"
           [ "$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')" = "$BUNDLE_SHA256" ]
@@ -1358,8 +1391,7 @@ jobs:
           if [ "$RELEASE_SEQUENCE" -ge 3 ]; then
             BOM_ID="${BOM_ID}-seq${RELEASE_SEQUENCE}"
           fi
-          NUVION_IQ9075_RELEASE_SIGNING_KEY="$RELEASE_SIGNING_PRIVATE_KEY" \
-          PYTHONPATH=publisher python3 \
+          PYTHONPATH=publisher "$RUNNER_TEMP/kms-signing/bin/python" \
             publisher/packaging/release/generate-release-bom.py \
               --schema-version 2 \
               --bom-id "$BOM_ID" \
@@ -1375,14 +1407,14 @@ jobs:
               --output "$BOM_PATH" \
               --signature-output "$SIGNATURE_PATH" \
               --signing-key-id "$RELEASE_SIGNING_KEY_ID" \
-              --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+              --signing-kms-key-version "$(jq -er .keyVersion publisher/packaging/release/cloud-kms/dev/ota.json)" \
+              --signing-kms-public-key-sha256 "$(jq -er .publicKeySha256 publisher/packaging/release/cloud-kms/dev/ota.json)"
           ACTUAL_BOM_DIGEST=$(python3 -c \
             "import json; print(json.load(open('$BOM_PATH', encoding='utf-8'))['bomDigest'])")
           [ "$ACTUAL_BOM_DIGEST" = "$EXPECTED_BOM_DIGEST" ] \
             || { echo "signed BOM differs from reserved identity" >&2; exit 1; }
           [ "$(sha256sum "$BOM_PATH" | awk '{print $1}')" = "$PHYSICAL_BOM_SHA256" ] \
             || { echo "release BOM differs from signed IQ9075 physical evidence" >&2; exit 1; }
-          unset RELEASE_SIGNING_PRIVATE_KEY NUVION_IQ9075_RELEASE_SIGNING_KEY
 
       - name: Verify signed BOM with independent public keyring
         env:
