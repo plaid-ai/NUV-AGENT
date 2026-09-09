@@ -1752,6 +1752,23 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_port_recovery_waits_for_agent_after_exclusive_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                statuses = [False, True]
+                observed = []
+                def runtime_status(_unit):
+                    active = statuses.pop(0)
+                    observed.append(active)
+                    return {"active": active}
+                fixture.harness._unit_status = runtime_status
+                fixture.harness._recover_oak("2-1.1", require_runtime_active=True)
+                self.assertEqual(observed, [False, True])
+                self.assertGreaterEqual(fixture.clock.monotonic(), 0.5)
+            finally:
+                fixture.close()
+
     def test_oak_recovery_waits_for_original_runtime_before_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))

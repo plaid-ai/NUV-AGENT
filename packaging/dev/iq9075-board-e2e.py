@@ -7043,7 +7043,7 @@ class BoardHarness:
             self._set_oak_ports_disabled(port, False)
         elif method != "usb-driver-unbind":
             raise HarnessError("OAK fault method is invalid")
-        self._recover_oak(port)
+        self._recover_oak(port, require_runtime_active=method == "usb-port-disable")
 
     def _poll_detached(self, port: str, timeout: float = 15) -> None:
         safe_port = canonical_oak_port(port)
@@ -7070,7 +7070,9 @@ class BoardHarness:
             self.sleeper(0.25)
         raise HarnessError("OAK USB device did not detach after unbind")
 
-    def _recover_oak(self, port: str, timeout: float = 30) -> None:
+    def _recover_oak(
+        self, port: str, timeout: float = 30, *, require_runtime_active: bool = False
+    ) -> None:
         safe_port = canonical_oak_port(port)
         deadline = self.monotonic() + timeout
         last_error: BaseException | None = None
@@ -7091,6 +7093,13 @@ class BoardHarness:
                     last_error = exc
             try:
                 self.verify_oak(require_bound=True, expected_port=safe_port)
+                if (
+                    require_runtime_active
+                    and self._unit_status("nuv-agent.service").get("active") is not True
+                ):
+                    # The root readiness probe owns OAK while Agent is stopped.
+                    # Its short-lived USB3 enumeration is not runtime recovery.
+                    raise HarnessError("waiting for Agent after exclusive OAK probe")
                 return
             except (HarnessError, OSError) as exc:
                 last_error = exc
