@@ -292,7 +292,7 @@ def _candidate_tag_publisher_sha(
         raise SettingsError("candidate publisher annotated tag identity is invalid")
     signature = verification["signature"]
     payload = verification["payload"]
-    expected_message = "NUVION IQ9075 candidate publisher v12\n"
+    expected_message = "NUVION IQ9075 candidate publisher v13\n"
     header, separator, unsigned_message = payload.partition("\n\n")
     header_lines = header.split("\n")
     if (
@@ -505,12 +505,12 @@ def verify_settings(
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     expected_candidate_publisher = {
-        "tag": "candidate-publisher-v12",
-        "tagRef": "refs/tags/candidate-publisher-v12",
-        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11"],
+        "tag": "candidate-publisher-v13",
+        "tagRef": "refs/tags/candidate-publisher-v13",
+        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11", "refs/tags/candidate-publisher-v12"],
         "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
         "agentVersion": "0.1.121",
-        "releaseSequence": 9,
+        "releaseSequence": 10,
         "configSchema": "12",
         "minUpdaterVersion": "0.2.0",
         "rulesetName": "protected-candidate-publisher",
@@ -824,7 +824,7 @@ def verify_settings(
             "customBranchPolicies": True,
         }
         expected_deployment_policies = (
-            [{"name": "candidate-publisher-v12", "type": "tag"}]
+            [{"name": "candidate-publisher-v13", "type": "tag"}]
             if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
             else [{"name": default_branch, "type": "branch"}]
         )

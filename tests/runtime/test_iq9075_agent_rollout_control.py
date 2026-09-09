@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import http.cookiejar
 import importlib.util
@@ -1352,8 +1353,10 @@ class RolloutControlTest(unittest.TestCase):
                 command_status="ROLLED_BACK",
                 rollback=True,
             )
+            paused = copy.deepcopy(acknowledged)
+            paused["status"] = "PAUSED_HEALTH_UNKNOWN"
             result = MODULE.wait_terminal(
-                _Api([acknowledged, terminal]),
+                _Api([acknowledged, paused, terminal]),
                 space_id=SPACE_ID,
                 device_id=DEVICE_ID,
                 issuance_path=issuance_path,

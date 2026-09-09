@@ -2167,10 +2167,12 @@ def _terminal_state(
         purpose == "rollback"
         and command_status == "ROLLED_BACK"
         and target.get("status") == "COMMAND_ISSUED"
-        and projection.get("status") == "RUNNING"
+        and projection.get("status") in {"RUNNING", "PAUSED_HEALTH_UNKNOWN"}
     ):
         # The command ACK and rollout projection are committed by separate BE
-        # transactions. Keep polling during that bounded, expected interval.
+        # transactions. A restart may temporarily pause for a fresh heartbeat.
+        # Keep polling during that bounded, expected interval; only the final
+        # exact ROLLED_BACK projection can satisfy acceptance below.
         return None
     if (
         command["commandId"] != expected_command["commandId"]
@@ -2217,6 +2219,8 @@ def _terminal_state(
     }
     if purpose == "rollback":
         evidence = target.get("rollbackEvidence")
+        if not isinstance(evidence, dict):
+            raise RolloutControlError("rollback terminal evidence is not strong/exact")
         previous_version = identity.get("agentVersion")
         previous_slot = _rollback_baseline_slot(identity, evidence)
         expected = {

@@ -180,7 +180,10 @@ class WebRTCStatsAccumulator:
         outbound: dict[str, Any] = {}
         remote: dict[str, Any] = {}
         for item in structures:
-            stats_type = str(item.get("type") or item.get("statsType") or "").lower()
+            value = item.get("type") or item.get("statsType") or ""
+            # PyGObject returns WebRTCStatsType enums, whose string form uses
+            # GST_WEBRTC_STATS_OUTBOUND_RTP rather than the protocol nickname.
+            stats_type = str(getattr(value, "value_nick", value)).lower()
             if "remote-inbound-rtp" in stats_type:
                 remote.update(item)
             elif "outbound-rtp" in stats_type:
