@@ -582,6 +582,65 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             )
             self.assertEqual(persisted, MODULE.canonical_json(evidence))
 
+    def test_delayed_controller_observations_complete_the_entire_flow(self) -> None:
+        class DelayedBoard(_Board):
+            def register(self, command_id, sequence, command_type, payload):
+                super().register(command_id, sequence, command_type, payload)
+                if payload.get("mode") == "ADAPTIVE":
+                    self.commands[command_id]["reported"]["lastAdjustmentReason"] = "awaiting_hysteresis:stable"
+                    self.commands[command_id]["revision"] = 3
+
+            def set_link(self, *, run_id, quality):
+                result = super().set_link(run_id=run_id, quality=quality)
+                for command in self.commands.values():
+                    if command["payload"].get("mode") == "ADAPTIVE":
+                        command["reported"]["lastAdjustmentReason"] = (
+                            "cooldown:connectivity_poor,packet_loss_high" if quality == "POOR"
+                            else "awaiting_hysteresis:stable"
+                        )
+                        command["revision"] += 2
+                return result
+
+        clock = _Clock(); board = DelayedBoard(); api = _Api(board)
+        evidence = MODULE.ConfigStreamOrchestrator(
+            api=api, board=board, monotonic=clock.monotonic, sleeper=clock.sleep,
+            wall_clock=lambda: datetime(2026, 9, 3, tzinfo=timezone.utc),
+        ).run(run_id=RUN_ID, manifest=_manifest(), manifest_sha256="1" * 64,
+              ota_evidence_sha256="2" * 64, wait_seconds=120)
+        self.assertTrue(all(evidence["gates"].values()))
+        self.assertEqual(evidence["stream"]["initialGood"]["policyRevision"], 3)
+        self.assertLess(evidence["stream"]["poor"]["appliedBitrateKbps"], evidence["stream"]["initialGood"]["appliedBitrateKbps"])
+        self.assertGreater(evidence["stream"]["recoveredGood"]["appliedBitrateKbps"], evidence["stream"]["poor"]["appliedBitrateKbps"])
+        self.assertEqual(board.restore_calls, 1)
+
+    def test_sampled_reason_gates_match_real_controller_and_reject_stale_health(self) -> None:
+        from nuvion_app.inference.stream_policy import AdaptiveBitrateController, StreamPolicy
+        spec = importlib.util.spec_from_file_location("sampled_readiness", ROOT / "packaging/release/verify-release-readiness.py")
+        verifier = importlib.util.module_from_spec(spec); spec.loader.exec_module(verifier)
+        payload = {"policyVersion": 1, "mode": "ADAPTIVE", "minBitrateKbps": 250,
+                   "maxBitrateKbps": 2000, "initialBitrateKbps": 1000,
+                   "congestionSamples": 2, "recoverySamples": 2, "cooldownSeconds": 1,
+                   "increaseStepKbps": 200, "decreaseFactor": 0.5}
+        controller = AdaptiveBitrateController(StreamPolicy.from_payload(payload))
+        healthy = {"outboundPacketLossPct": 0, "outboundRttMs": 20,
+                   "outboundPacketsDelta": 10, "outboundBytesDelta": 1000,
+                   "connectivityQuality": "GOOD"}
+        decisions = [controller.observe(healthy, now_ms=i * 1000) for i in range(14)]
+        self.assertIn("awaiting_hysteresis:stable", {d.reason for d in decisions})
+        self.assertIn("healthy_recovery", {d.reason for d in decisions})
+        self.assertIn("at_maximum", {d.reason for d in decisions})
+        for check in (MODULE, verifier):
+            for decision in decisions:
+                self.assertTrue(check._good_stream_reason(decision.reason, decision.bitrate_kbps, 2000, startup=True))
+            self.assertTrue(check._poor_stream_reason("cooldown:connectivity_poor,packet_loss_high", 500, 250))
+            self.assertTrue(check._poor_stream_reason("at_minimum", 250, 250))
+            self.assertFalse(check._poor_stream_reason("at_minimum", 500, 250))
+            self.assertFalse(check._good_stream_reason("at_maximum", 1000, 2000))
+            for reason in ["not_connectivity_poor", "connectivity_poorish", "connectivity_poor,", "cooldown: connectiv ity_poor", {}, None]:
+                self.assertFalse(check._poor_stream_reason(reason, 500, 250))
+            for reason in ["outbound_progress_idle", "outbound_progress_unproven", "primary_stats_stale", "connectivity_poor", {}, None]:
+                self.assertFalse(check._good_stream_reason(reason, 1000, 2000, startup=True))
+
     def test_failure_after_prepare_still_restores_board(self) -> None:
         clock = _Clock()
         board = _Board()

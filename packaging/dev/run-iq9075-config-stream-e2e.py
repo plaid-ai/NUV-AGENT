@@ -1621,6 +1621,31 @@ def validate_runtime_identity(
     return dict(identity)
 
 
+def _good_stream_reason(reason: object, bitrate: int, maximum: int, *, startup: bool = False) -> bool:
+    # Telemetry is sampled after the ACK; a later healthy controller tick can
+    # replace the activation/change reason before the observer reads it.
+    if not isinstance(reason, str):
+        return False
+    if reason in {"healthy_recovery", "awaiting_hysteresis:stable", "cooldown:stable"}:
+        return True
+    if reason == "at_maximum":
+        return bitrate == maximum
+    return startup and reason == "policy_activated"
+
+
+def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
+    if not isinstance(reason, str):
+        return False
+    if reason == "at_minimum":
+        return bitrate == minimum
+    for prefix in ("awaiting_hysteresis:", "cooldown:"):
+        if reason.startswith(prefix):
+            reason = reason.removeprefix(prefix)
+            break
+    tokens = reason.split(",")
+    return "connectivity_poor" in tokens and all(token and token == token.strip() for token in tokens)
+
+
 class ConfigStreamOrchestrator:
     def __init__(
         self,
@@ -1672,6 +1697,7 @@ class ConfigStreamOrchestrator:
         desired: Mapping[str, Any],
         run_id: str,
         deadline: float,
+        state_test: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         while self.monotonic() < deadline:
             status = self._journal_status(
@@ -1706,6 +1732,7 @@ class ConfigStreamOrchestrator:
                 and isinstance(reported, Mapping)
                 and _desired_is_reported(desired, reported)
                 and board.get("serviceActive") is True
+                and (state_test is None or state_test(reported))
             )
             if complete:
                 queue = board.get("queue")
@@ -1763,6 +1790,7 @@ class ConfigStreamOrchestrator:
         after_revision: int,
         bitrate_test: Callable[[int], bool],
         deadline: float,
+        reason_test: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         while self.monotonic() < deadline:
             status = self._journal_status(
@@ -1798,6 +1826,7 @@ class ConfigStreamOrchestrator:
                 and reported.get("health") == "STREAM_CONTINUOUS"
                 and type(reported.get("appliedBitrateKbps")) is int
                 and bitrate_test(reported["appliedBitrateKbps"])
+                and (reason_test is None or reason_test(reported))
             ):
                 try:
                     queue = validate_queue_drained(board.get("queue"))
@@ -2107,6 +2136,13 @@ class ConfigStreamOrchestrator:
                 desired=adaptive_payload,
                 run_id=run_id,
                 deadline=deadline,
+                state_test=lambda state: (
+                    type(state.get("appliedBitrateKbps")) is int
+                    and adaptive_payload["minBitrateKbps"] <= state["appliedBitrateKbps"] <= adaptive_payload["maxBitrateKbps"]
+                    and state.get("health") == "STREAM_CONTINUOUS"
+                    and state.get("encoder") == "x264enc"
+                    and _good_stream_reason(state.get("lastAdjustmentReason"), state["appliedBitrateKbps"], adaptive_payload["maxBitrateKbps"], startup=True)
+                ),
             )
             initial_state = {
                 "commandId": issued_adaptive.command_id,
@@ -2132,8 +2168,10 @@ class ConfigStreamOrchestrator:
                 or adaptive["reportedState"].get("mode") != "ADAPTIVE"
                 or adaptive["reportedState"].get("encoder") != "x264enc"
                 or adaptive["reportedState"].get("health") != "STREAM_CONTINUOUS"
-                or adaptive["reportedState"].get("lastAdjustmentReason")
-                != "policy_activated"
+                or not _good_stream_reason(
+                    adaptive["reportedState"].get("lastAdjustmentReason"),
+                    initial_applied, adaptive_payload["maxBitrateKbps"], startup=True,
+                )
             ):
                 raise ConfigStreamError("adaptive initial bitrate readback is invalid")
 
@@ -2147,11 +2185,12 @@ class ConfigStreamOrchestrator:
                     adaptive["localObservationRevision"],
                     adaptive["reportedRevision"],
                 ),
-                bitrate_test=lambda bitrate: bitrate < initial_applied,
+                bitrate_test=lambda bitrate: adaptive_payload["minBitrateKbps"] <= bitrate < initial_applied,
+                reason_test=lambda state: _poor_stream_reason(
+                    state.get("lastAdjustmentReason"), state["appliedBitrateKbps"], adaptive_payload["minBitrateKbps"],
+                ),
                 deadline=deadline,
             )
-            if "connectivity_poor" not in poor["lastAdjustmentReason"].split(","):
-                raise ConfigStreamError("adaptive poor-link reason is invalid")
             self.board.set_link(run_id=run_id, quality="GOOD")
             recovered = self._wait_adaptation(
                 issued_adaptive,
@@ -2159,11 +2198,12 @@ class ConfigStreamOrchestrator:
                 device_id=device_id,
                 run_id=run_id,
                 after_revision=poor["policyRevision"],
-                bitrate_test=lambda bitrate: bitrate > poor["appliedBitrateKbps"],
+                bitrate_test=lambda bitrate: poor["appliedBitrateKbps"] < bitrate <= adaptive_payload["maxBitrateKbps"],
+                reason_test=lambda state: _good_stream_reason(
+                    state.get("lastAdjustmentReason"), state["appliedBitrateKbps"], adaptive_payload["maxBitrateKbps"],
+                ),
                 deadline=deadline,
             )
-            if recovered["lastAdjustmentReason"] != "healthy_recovery":
-                raise ConfigStreamError("adaptive recovery reason is invalid")
             disabled_payload = {"policyVersion": version + 3, "mode": "DISABLED"}
             issued_disabled = self.api.issue(
                 space_id=space_id,
