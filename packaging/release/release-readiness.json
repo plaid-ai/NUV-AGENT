@@ -1,14 +1,1 @@
-{
-  "schemaVersion": 2,
-  "releases": {
-    "0.1.121": {
-      "status": "BLOCKED",
-      "blockers": [
-        {
-          "id": "IQ9075-FLEET-RUNTIME-OTA-ROLLBACK-EVIDENCE"
-        }
-      ],
-      "evidence": null
-    }
-  }
-}
+{"releases":{"0.1.121":{"blockers":[],"evidence":{"agentReleaseGate":{"checkRunId":102459287162,"checkSuiteId":93049278567,"componentSha":"3af736d3a62784b59ed77f608d339c697ed5425f","context":"agent-release-gate","integrationId":15368,"workflow":".github/workflows/agent-release-gate.yml","workflowRunId":34349556131,"workflowSha256":"50bc857a7852254a5815ed69a4bf672bc21348b470e9ea97a9c1f04627a2c71c"},"componentSha":"3af736d3a62784b59ed77f608d339c697ed5425f","iq9075FleetRuntime":{"evidenceFile":"iq9075-v0.1.121-fleet-runtime-evidence.json","evidenceSha256":"c5f3ec12a968864e2fd412a258ce037cf524c1faaadf88308ec1687958cf7fac","signatureFile":"iq9075-v0.1.121-fleet-runtime-evidence.json.asc","signatureSha256":"e778dcd2160a5a796285120778f2428b81b688d9ddc5ef8f45be10373073bef7","signerFingerprint":"775BFCAAF6E7D56F457A6BCF953DEEF5D40EBD20"}},"status":"READY"}},"schemaVersion":2}
