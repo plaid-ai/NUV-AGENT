@@ -2937,9 +2937,11 @@ def validate_final_evidence(
         if field not in update:
             continue
         value = update[field]
+        # Command expiry preserves the signed BE Instant (up to nanoseconds).
+        # Locally generated updater timestamps remain seconds/milliseconds.
+        suffix = r"(?:\.[0-9]{1,9})?Z" if field == "commandExpiresAt" else r"(?:\.[0-9]{3})?Z"
         if not isinstance(value, str) or re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-            r"(?:\.[0-9]{3})?Z",
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}" + suffix,
             value,
         ) is None:
             raise RunnerError(f"final updater {field} is invalid")

@@ -1897,7 +1897,7 @@ def _validated_rollout_control_gate(
             physical_update.get("updatedAt"),
             label=f"IQ9075 {purpose} physical update completion",
         )
-        physical_expires = _timestamp(
+        physical_expires = _api_timestamp(
             physical_update.get("commandExpiresAt"),
             label=f"IQ9075 {purpose} physical command expiry",
         )
