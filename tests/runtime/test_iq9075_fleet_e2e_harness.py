@@ -1704,6 +1704,32 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_fault_waits_for_watchdog_restored_agent_beyond_usb_settle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state("ACTIVATING")
+                start = fixture.clock.monotonic()
+                original = fixture.harness._unit_status
+                calls = 0
+                def delayed_baseline(unit):
+                    nonlocal calls
+                    calls += 1
+                    result = original(unit)
+                    if calls > 1:
+                        result["active"] = fixture.clock.monotonic() - start >= 60
+                    return result
+                fixture.harness._unit_status = delayed_baseline
+                # Ten-second fixture hold plus fifty-second watchdog recovery.
+                # The former thirty-second recovery budget fails this case.
+                self.assertTrue(fixture.harness.arm_oak_fault(fixture.run_id)["recovered"])
+                self.assertGreaterEqual(fixture.clock.monotonic() - start, 60)
+                self.assertFalse(fixture.harness._load_state(fixture.run_id)["oakFault"]["armed"])
+            finally:
+                fixture.close()
+
     def test_invalid_companion_pair_prevents_any_fault_write(self) -> None:
         for defect in ("peer", "attribute-symlink", "already-disabled"):
             with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:

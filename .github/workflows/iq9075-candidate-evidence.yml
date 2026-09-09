@@ -16,5 +16,5 @@ jobs:
         shell: bash
         run: |
           echo "This entry point is permanently disabled." >&2
-          echo "Dispatch iq9075-candidate-trusted-publish.yml at candidate-publisher-v7." >&2
+          echo "Dispatch iq9075-candidate-trusted-publish.yml at candidate-publisher-v8." >&2
           exit 1

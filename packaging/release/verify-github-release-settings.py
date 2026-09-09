@@ -292,7 +292,7 @@ def _candidate_tag_publisher_sha(
         raise SettingsError("candidate publisher annotated tag identity is invalid")
     signature = verification["signature"]
     payload = verification["payload"]
-    expected_message = "NUVION IQ9075 candidate publisher v7\n"
+    expected_message = "NUVION IQ9075 candidate publisher v8\n"
     header, separator, unsigned_message = payload.partition("\n\n")
     header_lines = header.split("\n")
     if (
@@ -506,12 +506,12 @@ def verify_settings(
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     expected_candidate_publisher = {
-        "tag": "candidate-publisher-v7",
-        "tagRef": "refs/tags/candidate-publisher-v7",
-        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6"],
+        "tag": "candidate-publisher-v8",
+        "tagRef": "refs/tags/candidate-publisher-v8",
+        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7"],
         "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
         "agentVersion": "0.1.121",
-        "releaseSequence": 4,
+        "releaseSequence": 5,
         "configSchema": "12",
         "minUpdaterVersion": "0.2.0",
         "rulesetName": "protected-candidate-publisher",
@@ -825,7 +825,7 @@ def verify_settings(
             "customBranchPolicies": True,
         }
         expected_deployment_policies = (
-            [{"name": "candidate-publisher-v7", "type": "tag"}]
+            [{"name": "candidate-publisher-v8", "type": "tag"}]
             if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
             else [{"name": default_branch, "type": "branch"}]
         )
