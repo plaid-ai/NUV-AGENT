@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v21`, Agent `0.1.121`, release sequence
-`18`, schema `12`, minimum updater `0.2.0`. Sequences 2–16 and publishers v1–v19
+Current publisher: `candidate-publisher-v22`, Agent `0.1.121`, release sequence
+`19`, schema `12`, minimum updater `0.2.0`. Sequences 2–16 and publishers v1–v19
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v21 \
-     -f tag_message='NUVION IQ9075 candidate publisher v21'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v22 \
+     -f tag_message='NUVION IQ9075 candidate publisher v22'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v21
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v22
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v20 to v21 and verify them.
+   existing candidate-sign/stage tag policies from v21 to v22 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v21 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=18
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v22 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=19
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -239,3 +239,14 @@ drained queues. Runtime controller behavior is unchanged. Publisher v21 uses
 sequence18 and requires a fresh complete physical chain. Sequence17 is an
 explicit physical rollback baseline; the legacy promoted APT baseline remains
 sequence1. Earlier signed candidates and failed evidence remain immutable.
+
+## Candidate v22 exact approval tag message
+
+Publisher v21 was stopped before any physical device changes. Its signed tag
+used a descriptive message instead of the exact message required by the live
+settings audit. Its immutable tag and sequence18 candidate remain preserved.
+Publisher v22/sequence19 uses exactly `NUVION IQ9075 candidate publisher v22`
+as the signed tag message. Full governance preflight must pass before dispatch.
+The committed sequence17 remains the physical rollback baseline. Runtime and
+sampled-observation verifier code are unchanged from PR92. Fresh physical
+proof is still mandatory for the new component identity.
