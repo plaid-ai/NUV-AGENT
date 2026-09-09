@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v22`, Agent `0.1.121`, release sequence
-`19`, schema `12`, minimum updater `0.2.0`. Sequences 2–16 and publishers v1–v19
+Current publisher: `candidate-publisher-v23`, Agent `0.1.121`, release sequence
+`20`, schema `12`, minimum updater `0.2.0`. Sequences 2–19 and publishers v1–v22
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v22 \
-     -f tag_message='NUVION IQ9075 candidate publisher v22'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v23 \
+     -f tag_message='NUVION IQ9075 candidate publisher v23'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v22
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v23
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v21 to v22 and verify them.
+   existing candidate-sign/stage tag policies from v22 to v23 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v22 \
-     -f component_sha="$P" -f version=0.1.121 -f release_sequence=19
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v23 \
+     -f component_sha="$P" -f version=0.1.121 -f release_sequence=20
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -250,3 +250,38 @@ as the signed tag message. Full governance preflight must pass before dispatch.
 The committed sequence17 remains the physical rollback baseline. Runtime and
 sampled-observation verifier code are unchanged from PR92. Fresh physical
 proof is still mandatory for the new component identity.
+
+## Candidate v23 viewer phases for physical stream qualification
+
+Sequence 19 completed automatic rollback and normal commit on IQ9075. Its
+config/stream run restored the test environment after timing out on adaptive
+observation. It is not complete release acceptance evidence. Keep the failed
+run, signed candidate, and immutable publisher v22 tag unchanged. Sequence 19
+is only an additional exact physical rollback baseline; the published APT
+baseline remains sequence 1 (0.1.120).
+
+The production controller gives fresh outbound WebRTC statistics priority over
+auxiliary Wi-Fi/ping samples. A connected viewer therefore masks the scoped
+connectivity shim used by this test. Conversely, a disconnected viewer cannot
+prove media progress for bitrate recovery. Neither behavior should be relaxed.
+For a fresh sequence-20 qualification, coordinate the ordinary viewer with the
+existing board-owned test phases, without injecting application observations:
+
+1. Before the configuration child starts, verify the Factory browser login.
+   Reconnect its video subscription after the synthetic-source restart and
+   confirm advancing video time. Keep it connected until the runner records
+   its initial healthy bitrate and changes the scoped quality file to POOR.
+2. During POOR, disconnect only the test viewer. The stale primary signal then
+   yields to auxiliary connectivity; the existing validator still requires an
+   acknowledged decreasing bitrate and a connectivity_poor reason.
+3. When the runner changes quality back to GOOD, reconnect the viewer. Only
+   actual advancing RTP counters may satisfy the unchanged recovery predicate.
+4. Preserve the same run and deadlines throughout. On failure, preserve the
+   original evidence and perform the existing child/parent restoration. Do not
+   edit signed artifacts, increase deadlines, or claim success from a live
+   preview. All command, ACK, revision, queue, health, identity, bitrate bounds,
+   and exact restoration checks remain required.
+
+Publisher v23 pins fresh sequence 20 and new exact-workflow OIDC providers.
+Agent, updater, configuration runner and independent readiness verifier bytes
+are unchanged from publisher v22.
