@@ -12,6 +12,7 @@ import os
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -357,6 +358,7 @@ class FakeBoardRunner:
             },
         }
         self.deadmen: dict[str, bool] = {}
+        self.sleep_exec_fails = False
         self.updater: dict[str, object] = {
             "capabilityAvailable": True,
             "authenticatedHelper": True,
@@ -376,7 +378,7 @@ class FakeBoardRunner:
         timeout: float,
         input_bytes: bytes | None = None,
     ):
-        del timeout, input_bytes
+        del input_bytes
         call = tuple(argv)
         self.calls.append(call)
         if call[:2] == ("/usr/bin/dpkg", "--print-architecture"):
@@ -384,9 +386,26 @@ class FakeBoardRunner:
         if call and call[0] == "/usr/sbin/runuser":
             return BOARD.CommandResult(0, json.dumps(self.updater) + "\n", "")
         if call and call[0] == "/usr/bin/systemd-run":
+            # A synchronous oneshot start waits for ExecStart to exit. A long
+            # sleep cannot become active within the caller's start deadline.
+            if (
+                "--property=Type=oneshot" in call
+                and "--no-block" not in call
+                and "/usr/bin/sleep" in call
+                and float(call[-1]) > timeout
+            ):
+                raise subprocess.TimeoutExpired(call, timeout)
             unit = next(
                 value.split("=", 1)[1] for value in call if value.startswith("--unit=")
             )
+            # simple may report active before exec fails; exec propagates the
+            # failure before a caller can rely on the recovery process.
+            if (
+                self.sleep_exec_fails
+                and "/usr/bin/sleep" in call
+                and "--property=Type=exec" in call
+            ):
+                return BOARD.CommandResult(1, "", "Failed at step EXEC")
             if any(value.startswith("--on-active=") for value in call):
                 self.deadmen[unit] = False
                 self.deadmen[unit.removesuffix(".service") + ".timer"] = True
@@ -1634,6 +1653,30 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 ]
                 self.assertTrue(final["liveVerified"])
                 self.assertIn("appliedPids", final)
+            finally:
+                fixture.close()
+
+    def test_deadman_exec_failure_prevents_usb_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                fixture.provision("oak-fault-rollback")
+                fixture.activate_candidate()
+                fixture.runner.updater["update"] = fixture.update_state(
+                    "FUNCTIONAL_HEALTHY"
+                )
+                fixture.runner.sleep_exec_fails = True
+                usb_writes = []
+                fixture.harness.usb_write_hook = lambda action, port: usb_writes.append(
+                    (action, port)
+                )
+                with self.assertRaisesRegex(BOARD.HarnessError, "cannot arm"):
+                    fixture.harness.arm_oak_fault(fixture.run_id)
+                self.assertEqual(usb_writes, [])
+                self.assertNotIn(
+                    fixture.harness._deadman_unit(fixture.run_id),
+                    fixture.runner.deadmen,
+                )
             finally:
                 fixture.close()
 
