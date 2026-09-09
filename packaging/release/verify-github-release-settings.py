@@ -292,7 +292,7 @@ def _candidate_tag_publisher_sha(
         raise SettingsError("candidate publisher annotated tag identity is invalid")
     signature = verification["signature"]
     payload = verification["payload"]
-    expected_message = "NUVION IQ9075 candidate publisher v10\n"
+    expected_message = "NUVION IQ9075 candidate publisher v11\n"
     header, separator, unsigned_message = payload.partition("\n\n")
     header_lines = header.split("\n")
     if (
@@ -499,19 +499,18 @@ def verify_settings(
         "iq9075-release": [
             "GCP_PROJECT_ID",
             "GCP_SA_KEY",
-            "IQ9075_RELEASE_SIGNING_PRIVATE_KEY",
         ],
-        "iq9075-candidate-sign": ["IQ9075_RELEASE_SIGNING_PRIVATE_KEY"],
+        "iq9075-candidate-sign": [],
         "iq9075-candidate-stage": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     expected_candidate_publisher = {
-        "tag": "candidate-publisher-v10",
-        "tagRef": "refs/tags/candidate-publisher-v10",
-        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9"],
+        "tag": "candidate-publisher-v11",
+        "tagRef": "refs/tags/candidate-publisher-v11",
+        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10"],
         "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
         "agentVersion": "0.1.121",
-        "releaseSequence": 7,
+        "releaseSequence": 8,
         "configSchema": "12",
         "minUpdaterVersion": "0.2.0",
         "rulesetName": "protected-candidate-publisher",
@@ -825,7 +824,7 @@ def verify_settings(
             "customBranchPolicies": True,
         }
         expected_deployment_policies = (
-            [{"name": "candidate-publisher-v10", "type": "tag"}]
+            [{"name": "candidate-publisher-v11", "type": "tag"}]
             if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
             else [{"name": default_branch, "type": "branch"}]
         )

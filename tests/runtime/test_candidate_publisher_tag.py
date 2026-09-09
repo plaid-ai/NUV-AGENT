@@ -166,8 +166,8 @@ class CandidatePublisherTagTest(unittest.TestCase):
             "defaultBranch": "main",
             "trustedTagSignerFingerprints": [self.fingerprint],
             "candidatePublisher": {
-                "tag": "candidate-publisher-v10",
-                "tagRef": "refs/tags/candidate-publisher-v10",
+                "tag": "candidate-publisher-v11",
+                "tagRef": "refs/tags/candidate-publisher-v11",
                 "retiredTagRefs": [
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
@@ -178,10 +178,11 @@ class CandidatePublisherTagTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v7",
                     "refs/tags/candidate-publisher-v8",
                     "refs/tags/candidate-publisher-v9",
+                    "refs/tags/candidate-publisher-v10",
                 ],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
                 "agentVersion": "0.1.121",
-                "releaseSequence": 7,
+                "releaseSequence": 8,
                 "configSchema": "12",
                 "minUpdaterVersion": "0.2.0",
                 "rulesetName": "protected-candidate-publisher",
@@ -213,14 +214,14 @@ class CandidatePublisherTagTest(unittest.TestCase):
             signer_directory=signers,
         )
 
-    def test_accepts_v10_signed_with_new_key_frozen_in_publisher(self) -> None:
+    def test_accepts_v11_signed_with_new_key_frozen_in_publisher(self) -> None:
         repository, publisher_sha, component_sha, policy, signers = self._fixture()
         result = self._verify(
             repository, publisher_sha, component_sha, policy, signers
         )
-        self.assertEqual(result["candidate_publisher_tag"], "candidate-publisher-v10")
+        self.assertEqual(result["candidate_publisher_tag"], "candidate-publisher-v11")
         self.assertEqual(
-            result["candidate_publisher_tag_ref"], "refs/tags/candidate-publisher-v10"
+            result["candidate_publisher_tag_ref"], "refs/tags/candidate-publisher-v11"
         )
         self.assertEqual(result["candidate_publisher_sha"], publisher_sha)
         self.assertEqual(result["component_sha"], component_sha)
@@ -319,7 +320,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v2"]),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v3"]),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v4"]),
-            ("retiredTagRefs", ["refs/tags/candidate-publisher-v10"]),
+            ("retiredTagRefs", ["refs/tags/candidate-publisher-v11"]),
             (
                 "retiredTagRefs",
                 ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"],
@@ -347,7 +348,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
                     "refs/tags/candidate-publisher-v3",
-                    "refs/tags/candidate-publisher-v10",
+                    "refs/tags/candidate-publisher-v11",
                 ],
             ),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v1"] * 2),

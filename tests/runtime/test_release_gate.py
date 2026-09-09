@@ -98,10 +98,11 @@ class ReleaseGateTest(unittest.TestCase):
         )
         self.assertIn("RELEASE_TRUST_DOMAIN=iq9075-dev", workflow)
         self.assertIn("SKIP_APT_PUBLISH=true", workflow)
-        self.assertIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", workflow)
+        self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", workflow)
         self.assertNotIn("secrets.IQ9075_RELEASE_PUBLIC_KEYRING_JSON", workflow)
         self.assertIn("trusted-release-keyrings/iq9075-dev.json", workflow)
-        self.assertIn("--signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY", workflow)
+        self.assertIn("--signing-kms-key-version", workflow)
+        self.assertIn("--signing-kms-public-key-sha256", workflow)
         self.assertIn("build-agent-bundle.sh", workflow)
         ota_build = workflow.split("  iq9075-ota-build:", maxsplit=1)[1].split(
             "  github-release-publish:", maxsplit=1
@@ -115,7 +116,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", ota_build)
         self.assertNotIn("GCP_SA_KEY", ota_build)
         self.assertRegex(ota_build, r"actions/upload-artifact@[0-9a-f]{40} # v4")
-        self.assertIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", ota_publish)
+        self.assertNotIn("IQ9075_RELEASE_SIGNING_PRIVATE_KEY", ota_publish)
         self.assertNotIn("APT_GPG_PRIVATE_KEY", ota_publish)
         self.assertNotIn("build-agent-bundle.sh", ota_publish)
         self.assertNotIn("aptly", ota_publish)
@@ -125,7 +126,7 @@ class ReleaseGateTest(unittest.TestCase):
             "      - name: Publish verified exact bundle with trusted publisher",
             maxsplit=1,
         )
-        self.assertIn("RELEASE_SIGNING_PRIVATE_KEY", private_sign_step)
+        self.assertIn("NUVION_KMS_CREDENTIALS_FILE", private_sign_step)
         self.assertNotIn("RELEASE_SIGNING_PRIVATE_KEY", publish_step)
         self.assertIn("BOOTSTRAP_BUNDLE_PATH=\"$BUNDLE_PATH\"", ota_build)
         self.assertIn("deb_sha256", ota_build)
@@ -133,7 +134,7 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertIn("iq9075-ota-global-publisher", ota_publish)
         self.assertLess(
             ota_publish.index("Independently verify latest sequence"),
-            ota_publish.index("IQ9075_RELEASE_SIGNING_PRIVATE_KEY"),
+            ota_publish.index("Authenticate OTA release to Cloud KMS"),
         )
         self.assertIn("publish-immutable-gcs-file.sh", ota_publish)
         self.assertIn("generate-release-promotion.py ota", ota_publish)

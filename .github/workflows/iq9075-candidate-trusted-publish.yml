@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       release_sequence:
-        description: "Exact IQ9075 release sequence (publisher v10 allows only 7)"
+        description: "Exact IQ9075 release sequence (publisher v11 allows only 8)"
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: iq9075-candidate-publisher-v10-global
+  group: iq9075-candidate-publisher-v11-global
   cancel-in-progress: false
 
 env:
@@ -39,20 +39,25 @@ jobs:
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
           PUBLISHER_SHA: ${{ github.workflow_sha }}
           PUBLISHER_REF: ${{ github.workflow_ref }}
+          RELEASE_ACTOR_ID: ${{ github.actor_id }}
         shell: bash
         run: |
           set -euo pipefail
+          case "$RELEASE_ACTOR_ID" in
+            57535980|89565530) ;;
+            *) echo "release administrator required" >&2; exit 1 ;;
+          esac
           [ "$GITHUB_REPOSITORY" = "plaid-ai/NUV-AGENT" ]
           [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v10" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v11" ]
           [ "$GITHUB_RUN_ATTEMPT" = "1" ] \
             || { echo "candidate publisher attempts are not rerunnable; dispatch a new run" >&2; exit 1; }
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v10" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v11" ]
           [[ "$COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$VERSION" = "0.1.121" ]
-          [ "$RELEASE_SEQUENCE" = "7" ]
+          [ "$RELEASE_SEQUENCE" = "8" ]
 
   build:
     name: Build exact secretless arm64 candidate
@@ -60,7 +65,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v10'
+      github.ref == 'refs/tags/candidate-publisher-v11'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     permissions:
@@ -103,11 +108,11 @@ jobs:
           set -euo pipefail
           [[ "$REQUESTED_COMPONENT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "7" ]
+          [ "$REQUESTED_SEQUENCE" = "8" ]
           [[ "$PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v10" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v11" ]
           [ "$GITHUB_SHA" = "$PUBLISHER_SHA" ]
-          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v10" ]
+          [ "$PUBLISHER_REF" = "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v11" ]
           [ "$(git rev-parse HEAD)" = "$REQUESTED_COMPONENT_SHA" ]
           [ -z "$(git status --porcelain --untracked-files=all)" ]
           git cat-file -e "${PUBLISHER_SHA}^{commit}"
@@ -229,7 +234,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v10' &&
+      github.ref == 'refs/tags/candidate-publisher-v11' &&
       needs.build.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -261,7 +266,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v10" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v11" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -349,7 +354,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v10 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v11 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -371,7 +376,7 @@ jobs:
           [ "$CONFIG_SCHEMA" = "$trusted_config_schema" ]
           [ "$MIN_UPDATER_VERSION" = "$trusted_updater_version" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "7" ]
+          [ "$REQUESTED_SEQUENCE" = "8" ]
           [ "$CONFIG_SCHEMA" = "12" ]
           [ "$MIN_UPDATER_VERSION" = "0.2.0" ]
           python3 - "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" \
@@ -441,9 +446,21 @@ jobs:
           signing_key_id="$(jq -er .iq9075.publisherKeyId publisher/packaging/release/release-security-policy.json)"
           echo "signing_key_id=$signing_key_id" >> "$GITHUB_OUTPUT"
 
-      - name: Sign exact canonical BOM with the isolated key
+      - name: Install pinned Cloud KMS signing runtime
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kms-signing"
+          "$RUNNER_TEMP/kms-signing/bin/python" -m pip install --require-hashes \
+            -r publisher/packaging/release/requirements-cloud-kms.txt
+
+      - name: Authenticate exact immutable candidate to Cloud KMS
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/472626352998/locations/global/workloadIdentityPools/nuv-agent-sign-dev/providers/candidate-v11
+          service_account: nuv-agent-sign-dev@plaid-451114.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Sign exact canonical BOM with Cloud KMS
         env:
-          NUVION_IQ9075_RELEASE_SIGNING_KEY: ${{ secrets.IQ9075_RELEASE_SIGNING_PRIVATE_KEY }}
           COMPONENT_SHA: ${{ inputs.component_sha }}
           VERSION: ${{ inputs.version }}
           RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
@@ -455,12 +472,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "$NUVION_IQ9075_RELEASE_SIGNING_KEY" ] \
-            || { echo "IQ9075 candidate signer is unavailable" >&2; exit 1; }
           bundle_path="dist/$BUNDLE_NAME"
           bom_path="dist/nuv-agent_${VERSION}_iq9075-aarch64.release-bom.json"
           signature_path="$bom_path.sig"
-          PYTHONPATH=publisher python3 publisher/packaging/release/generate-release-bom.py \
+          PYTHONPATH=publisher "$RUNNER_TEMP/kms-signing/bin/python" publisher/packaging/release/generate-release-bom.py \
             --schema-version 2 \
             --bom-id "nuv-agent-${VERSION}-iq9075-aarch64-seq${RELEASE_SEQUENCE}" \
             --version "$VERSION" \
@@ -475,7 +490,8 @@ jobs:
             --output "$bom_path" \
             --signature-output "$signature_path" \
             --signing-key-id "$SIGNING_KEY_ID" \
-            --signing-private-key-env NUVION_IQ9075_RELEASE_SIGNING_KEY
+            --signing-kms-key-version "$(jq -er .keyVersion publisher/packaging/release/cloud-kms/dev/ota.json)" \
+            --signing-kms-public-key-sha256 "$(jq -er .publicKeySha256 publisher/packaging/release/cloud-kms/dev/ota.json)"
 
       - name: Verify the signed candidate without signing material
         env:
@@ -584,7 +600,7 @@ jobs:
     if: >-
       github.repository == 'plaid-ai/NUV-AGENT' &&
       github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/tags/candidate-publisher-v10' &&
+      github.ref == 'refs/tags/candidate-publisher-v11' &&
       needs.build.result == 'success' &&
       needs.sign.result == 'success'
     runs-on: ubuntu-24.04
@@ -617,7 +633,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v10" ]
+          [ "$GITHUB_REF" = "refs/tags/candidate-publisher-v11" ]
           [ "$GITHUB_SHA" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$EXPECTED_TRUSTED_WORKFLOW_SHA" ]
           python3 publisher/packaging/release/verify-candidate-publisher-tag.py \
@@ -702,7 +718,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v10 ]
+          [ "$GITHUB_REF" = refs/tags/candidate-publisher-v11 ]
           [ "$GITHUB_SHA" = "$TRUSTED_WORKFLOW_SHA" ]
           [ "$(git -C publisher rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA" ]
           [ -z "$(git -C publisher status --porcelain --untracked-files=all)" ]
@@ -722,7 +738,7 @@ jobs:
           [ "$(sha256sum "$deb_path" | awk '{print $1}')" = "$DEB_SHA256" ]
           [ "$(stat -c %s "$deb_path")" = "$DEB_SIZE" ]
           [ "$REQUESTED_VERSION" = "0.1.121" ]
-          [ "$REQUESTED_SEQUENCE" = "7" ]
+          [ "$REQUESTED_SEQUENCE" = "8" ]
           PYTHONPATH=publisher python3 - "$bom_path" "$signature_path" "$bundle_path" \
             "$REQUESTED_COMPONENT_SHA" "$REQUESTED_VERSION" "$REQUESTED_SEQUENCE" <<'PY'
           from pathlib import Path

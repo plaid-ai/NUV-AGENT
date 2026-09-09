@@ -1562,7 +1562,8 @@ def _validated_rollout_control_gate(
         or keyring_payload.get("schemaVersion") != 1
         or keyring_payload.get("trustDomain") != iq_policy.get("trustDomain")
         or not isinstance(raw_keys, dict)
-        or set(raw_keys) != {iq_policy.get("publisherKeyId")}
+        or not 1 <= len(raw_keys) <= 32
+        or iq_policy.get("publisherKeyId") not in raw_keys
     ):
         raise ReadinessError("IQ9075 release keyring contract is invalid")
     try:

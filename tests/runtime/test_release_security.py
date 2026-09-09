@@ -498,7 +498,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "artifactDigest": "sha256:" + artifact_sha256,
             "componentSha": component_sha,
             "configSchema": "12",
-            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+            "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
         }
         fleet_manifest = FLEET_E2E.build_manifest(
             run_id=run_id,
@@ -508,7 +508,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             input_digests={
                 "commandSha256": "6" * 64,
                 "releaseSha256": (
-                    "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
+                    "971c4b7ec139ca21acf782cd34ac4b9226364bc05a528c82f0e7084b49fffde6"
                 ),
                 "healthSha256": "8" * 64,
                 "bindingSha256": "9" * 64,
@@ -596,7 +596,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "artifactDigest": "sha256:" + "e" * 64,
                     "componentSha": "f" * 40,
                     "configSchema": "12",
-                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                    "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
                 },
                 "previousRelease": {
                     "schemaVersion": 2,
@@ -627,7 +627,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "artifactDigest": "sha256:" + artifact_sha256,
                     "componentSha": component_sha,
                     "configSchema": "12",
-                    "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                    "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
                     "bomVerificationStatus": "VERIFIED",
                     "slot": baseline_relative,
                     "rollbackSlot": baseline_relative,
@@ -1185,11 +1185,10 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         bom_signature = {
             "schemaVersion": 1,
-            "keyId": "release-iq9075-dev-2026-09-01",
+            "keyId": "release-iq9075-dev-kms-2026-09-v1",
             "algorithm": "Ed25519",
             "signature": (
-                "KMi5WXAywCuJ1m5PPF02iDiC2jEh5wW/2/L4/2e6A8FY16xLZpDr3PQidcYOd7OC"
-                "5qt8Jow6hXDVt4iGOzp4Dw=="
+                "HU3ARNzSa7/utCHgyjqagjBB0O27SNzDuPQFelv7UjGp2EbE6xHyeLb5uA3xJZj+xX7LFd9Q8NjfzNITa0+xAg=="
             ),
         }
         bom_signature_path.write_text(
@@ -1206,14 +1205,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "artifactDigest": "sha256:" + artifact_sha256,
             "componentSha": component_sha,
             "configSchema": "12",
-            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+            "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
         }
         input_digests = {
             "commandSha256": (
                 "35672171575a676888721b6c5048e4774750176771bf32c6ebdae6d3ed8081fe"
             ),
             "releaseSha256": (
-                "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a"
+                "971c4b7ec139ca21acf782cd34ac4b9226364bc05a528c82f0e7084b49fffde6"
             ),
             "healthSha256": (
                 "fad92b480dd513e0c7ccf397573d1e1e8d5c8a78fe3330469bc77a4ca9f3ac7c"
@@ -1301,7 +1300,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "artifactDigest": "sha256:" + "e" * 64,
             "componentSha": "f" * 40,
             "configSchema": "12",
-            "publisherKeyId": "release-iq9075-dev-2026-09-01",
+            "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
         }
         candidate_release = {
             "schemaVersion": 2,
@@ -1333,7 +1332,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                 "artifactDigest": "sha256:" + artifact_sha256,
                 "componentSha": component_sha,
                 "configSchema": "12",
-                "publisherKeyId": "release-iq9075-dev-2026-09-01",
+                "publisherKeyId": "release-iq9075-dev-kms-2026-09-v1",
                 "bomVerificationStatus": "VERIFIED",
             }
             if phase == "ROLLED_BACK":
@@ -2079,7 +2078,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "github-release-publish": 2,
             "homebrew-publish": 2,
             "apt-publish": 6,
-            "iq9075-ota-publish": 7,
+            "iq9075-ota-publish": 8,
         }
         for name in job_names:
             section = self._job(name)
@@ -2136,6 +2135,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ],
             "iq9075-ota-publish": [
                 "Authenticate OTA-only GCP publisher",
+                "Authenticate OTA release to Cloud KMS",
                 "Setup gcloud",
                 "Atomically reserve exact release sequence",
                 "Sign exact bundle BOM with trusted signer",
@@ -2152,7 +2152,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.publish.count(
                 "publisher/packaging/release/revalidate-live-release-authorization.sh"
             ),
-            13,
+            14,
         )
 
     def test_homebrew_token_never_enters_argv_or_git_config(self) -> None:
@@ -5367,14 +5367,14 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             ):
                 RELEASE_GATE.verify_workflow_identity(candidate, trusted)
 
-    def test_ota_sequence_failure_precedes_private_key_and_uses_global_cas(
+    def test_ota_sequence_failure_precedes_kms_signing_and_uses_global_cas(
         self,
     ) -> None:
         ota = self.publish.split("  iq9075-ota-publish:", maxsplit=1)[1]
         self.assertIn("group: iq9075-ota-global-publisher", ota)
         self.assertLess(
             ota.index("Independently verify latest sequence and version absence"),
-            ota.index("IQ9075_RELEASE_SIGNING_PRIVATE_KEY"),
+            ota.index("Authenticate OTA release to Cloud KMS"),
         )
         self.assertLess(
             ota.index("Atomically reserve exact release sequence"),
@@ -5399,11 +5399,11 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(
             policy["iq9075"]["publicKeyringSha256"],
-            "2d72a28745e14014d5988ecf7970dc6f09c2f077be35105b3ad233cda0d0969a",
+            "971c4b7ec139ca21acf782cd34ac4b9226364bc05a528c82f0e7084b49fffde6",
         )
         self.assertEqual(
             policy["iq9075"]["publisherKeyId"],
-            "release-iq9075-dev-2026-09-01",
+            "release-iq9075-dev-kms-2026-09-v1",
         )
         public_map = json.loads(keyring_path.read_text(encoding="utf-8"))["keys"]
         self.assertEqual(
@@ -5412,7 +5412,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
                     "utf-8"
                 )
             ).hexdigest(),
-            "fe087dd340fbec31604a8c7910bc95a5c1615c5157c526cae5b4e18090a774c7",
+            "208c9f857bb88b4f5ebb00275381c3afa7153806e5bd265a39398e6efbbf56e5",
         )
         self.assertNotIn("IQ9075_RELEASE_PUBLIC_KEYRING_JSON", self.publish)
         self.assertNotIn("secrets.IQ9075_RELEASE_SIGNING_KEY_ID", self.publish)
@@ -5698,17 +5698,17 @@ class SequenceAndPromotionTest(unittest.TestCase):
                     artifact_path=artifact,
                     version="0.1.121",
                     component_sha="a" * 40,
-                    requested_sequence=7,
+                    requested_sequence=8,
                     config_schema="12",
                     min_updater_version="0.2.0",
                     built_at="2026-09-02T00:00:00+00:00",
                 )
-                self.assertEqual(reservation["releaseSequence"], 7)
+                self.assertEqual(reservation["releaseSequence"], 8)
                 self.assertEqual(output["latest_sequence"], "1")
                 self.assertEqual(
-                    output["reservation_object"], "releases/reservations/iq9075/7.json"
+                    output["reservation_object"], "releases/reservations/iq9075/8.json"
                 )
-                for rejected in (1, 2, 3, 4, 5, 6, 8):
+                for rejected in (1, 2, 3, 4, 5, 6, 7, 9):
                     with self.assertRaises(PLAN_OTA.SequencePlanError):
                         PLAN_OTA.plan_sequence(
                             policy_path=ROOT
@@ -5735,7 +5735,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
                             policy_path=ROOT / "packaging/release/release-security-policy.json",
                             keyring_path=keyring, artifact_path=artifact,
                             version="0.1.121", component_sha="a" * 40,
-                            requested_sequence=7, config_schema="12",
+                            requested_sequence=8, config_schema="12",
                             min_updater_version="0.2.0", built_at="2026-09-02T00:00:00+00:00",
                         )
 
@@ -6187,7 +6187,7 @@ esac
                     )
 
 
-def candidate_publisher_tag_response(version: int = 10) -> dict[str, object]:
+def candidate_publisher_tag_response(version: int = 11) -> dict[str, object]:
     # Preserve the real v2 API shape and use an adapted v6 payload for metadata
     # tests. This reused signature is opaque here; local crypto is tested separately.
     signature = (
@@ -6231,7 +6231,7 @@ def candidate_publisher_tag_response(version: int = 10) -> dict[str, object]:
 
 
 class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
-    TAG = "candidate-publisher-v10"
+    TAG = "candidate-publisher-v11"
     TAG_OBJECT_SHA = candidate_publisher_tag_response()["sha"]
     PUBLISHER_SHA = "f8211ffaf2c127d66a540c00e6516c407b6beec8"
 
@@ -6255,7 +6255,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         self.assertEqual(self._rehashed(tag_object), self.TAG_OBJECT_SHA)
         self.assertEqual(
             tag_object["message"],
-            "NUVION IQ9075 candidate publisher v10\n"
+            "NUVION IQ9075 candidate publisher v11\n"
             + tag_object["verification"]["signature"],
         )
         self.assertEqual(self._verify(tag_object), self.PUBLISHER_SHA)
@@ -6276,7 +6276,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
     def test_rejects_unsigned_or_different_api_message(self) -> None:
         for message in (
             None,
-            "NUVION IQ9075 candidate publisher v10\n",
+            "NUVION IQ9075 candidate publisher v11\n",
             "NUVION IQ9075 candidate publisher v1\n",
             "",
         ):
@@ -6294,7 +6294,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 tag_object["verification"]["signature"] = malformed
                 object_sha = self.TAG_OBJECT_SHA
                 if isinstance(malformed, str):
-                    tag_object["message"] = "NUVION IQ9075 candidate publisher v10\n" + malformed
+                    tag_object["message"] = "NUVION IQ9075 candidate publisher v11\n" + malformed
                     object_sha = self._rehashed(tag_object)
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object, object_sha=object_sha)
@@ -6314,7 +6314,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 verification[field] = verification[field].replace(before, after)
                 if field == "signature":
                     tag_object["message"] = (
-                        "NUVION IQ9075 candidate publisher v10\n" + verification[field]
+                        "NUVION IQ9075 candidate publisher v11\n" + verification[field]
                     )
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object)
@@ -6323,7 +6323,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         cases = (
             ("object " + self.PUBLISHER_SHA, "object " + "1" * 40),
             ("type commit", "type tag"),
-            ("tag candidate-publisher-v10", "tag candidate-publisher-v1"),
+            ("tag candidate-publisher-v11", "tag candidate-publisher-v1"),
             ("tagger Plaid Platform Admin", "committer Plaid Platform Admin"),
             ("\n\nNUVION", "\nencoding UTF-8\n\nNUVION"),
         )
@@ -6339,11 +6339,11 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         tag_object = candidate_publisher_tag_response()
         verification = tag_object["verification"]
         verification["payload"] = verification["payload"].replace(
-            "NUVION IQ9075 candidate publisher v10\n",
-            "NUVION IQ9075 candidate publisher v10\nextra\n",
+            "NUVION IQ9075 candidate publisher v11\n",
+            "NUVION IQ9075 candidate publisher v11\nextra\n",
         )
         tag_object["message"] = (
-            "NUVION IQ9075 candidate publisher v10\nextra\n"
+            "NUVION IQ9075 candidate publisher v11\nextra\n"
             + verification["signature"]
         )
         with self.assertRaises(SETTINGS.SettingsError):
@@ -6429,7 +6429,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertEqual(
                 environment["deploymentBranchPolicies"],
                 (
-                    [{"name": "candidate-publisher-v10", "type": "tag"}]
+                    [{"name": "candidate-publisher-v11", "type": "tag"}]
                     if name
                     in {
                         "iq9075-candidate-sign",
@@ -6553,6 +6553,7 @@ class SettingsPolicyTest(unittest.TestCase):
                         "refs/tags/candidate-publisher-v8",
                         "refs/tags/candidate-publisher-v9",
                         "refs/tags/candidate-publisher-v10",
+                        "refs/tags/candidate-publisher-v11",
                     ],
                     "exclude": [],
                 }
@@ -6632,8 +6633,8 @@ class SettingsPolicyTest(unittest.TestCase):
             "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/3": candidate_tag_ruleset,
-            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v10": {
-                "ref": "refs/tags/candidate-publisher-v10",
+            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v11": {
+                "ref": "refs/tags/candidate-publisher-v11",
                 "object": {"type": "tag", "sha": candidate_tag_object_sha},
             },
             "/repos/plaid-ai/NUV-AGENT/git/tags/" + candidate_tag_object_sha: candidate_tag_object,
@@ -6656,7 +6657,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "face-artifacts-release",
         ):
             expected_deployment_policy = (
-                {"id": 1, "name": "candidate-publisher-v10", "type": "tag"}
+                {"id": 1, "name": "candidate-publisher-v11", "type": "tag"}
                 if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
                 else {"id": 1, "name": "main", "type": "branch"}
             )
@@ -6722,8 +6723,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 SETTINGS,
                 "_verify_local_candidate_publisher",
                 return_value={
-                    "candidate_publisher_tag": "candidate-publisher-v10",
-                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v10",
+                    "candidate_publisher_tag": "candidate-publisher-v11",
+                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v11",
                     "candidate_publisher_tag_object_sha": candidate_tag_object_sha,
                     "candidate_publisher_sha": candidate_publisher_sha,
                     "component_sha": "b" * 40,
@@ -6775,7 +6776,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertTrue(result["secretScopesChecked"])
             candidate_ruleset_path = "/repos/plaid-ai/NUV-AGENT/rulesets/3"
             for tag_refs in (
-                ["refs/tags/candidate-publisher-v10"],
+                ["refs/tags/candidate-publisher-v11"],
                 ["refs/tags/candidate-publisher-v4"],
                 ["refs/tags/candidate-publisher-v1"],
                 ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"],
@@ -6807,7 +6808,7 @@ class SettingsPolicyTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
                     "refs/tags/candidate-publisher-v3",
-                    "refs/tags/candidate-publisher-v10",
+                    "refs/tags/candidate-publisher-v11",
                 ],
             ):
                 invalid_ruleset = copy.deepcopy(candidate_tag_ruleset)
@@ -7554,8 +7555,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v10",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v10",
+                        "candidate_publisher_tag": "candidate-publisher-v11",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v11",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
@@ -7739,8 +7740,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v10",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v10",
+                        "candidate_publisher_tag": "candidate-publisher-v11",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v11",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
