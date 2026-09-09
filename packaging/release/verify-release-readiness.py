@@ -998,11 +998,11 @@ def _validated_config_stream_gate(
             if isinstance(rollback_updater, dict)
             else None
         )
-        release_issued = _timestamp(
+        release_issued = _api_timestamp(
             release_command.get("issuedAt"),
             label="IQ9075 committed release command issue",
         )
-        prior_rollback_issued = _timestamp(
+        prior_rollback_issued = _api_timestamp(
             prior_rollback_command.get("issuedAt"),
             label="IQ9075 rollback release command issue",
         )
@@ -1331,7 +1331,7 @@ def _validated_config_stream_gate(
                 or item.get("type")
                 not in {"AGENT_UPDATE", "CONFIG_APPLY", "STREAM_POLICY"}
                 or item.get("status") != "EXPIRED"
-                or _timestamp(
+                or _api_timestamp(
                     item.get("expiresAt"),
                     label="IQ9075 expired predecessor expiry",
                 )
@@ -2586,7 +2586,7 @@ def _validate_fleet_runtime_documents(
         rollback_evidence=rollback_evidence,
         candidate_config_stream_runner=candidate_config_stream_runner,
     )
-    committed_release_issued = _timestamp(
+    committed_release_issued = _api_timestamp(
         config_stream_gate["releaseCommand"].get("issuedAt"),
         label="IQ9075 committed release command issue",
     )
@@ -2681,7 +2681,7 @@ def _validate_fleet_runtime_documents(
         rollback_evidence.get("generatedAt"),
         label="IQ9075 rollback result generation",
     )
-    rollback_command_issued = _timestamp(
+    rollback_command_issued = _api_timestamp(
         config_stream_gate["priorRollbackCommand"].get("issuedAt"),
         label="IQ9075 rollback command issue",
     )
