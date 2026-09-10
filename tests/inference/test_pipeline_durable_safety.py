@@ -34,6 +34,7 @@ def _install_gi_stub_when_native_bindings_are_unavailable() -> None:
         Pipeline=object,
         Element=object,
         Promise=object,
+        State=types.SimpleNamespace(NULL="NULL"),
     )
     repository.GstSdp = types.SimpleNamespace()
     repository.GstWebRTC = types.SimpleNamespace()
@@ -462,7 +463,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
     def test_continuous_htp_worker_unwraps_frame_and_reports_arrival_age(self):
         pixels = object()
         with mock.patch.object(pipeline.time, "monotonic", return_value=100.0):
-            state, _ = self._run_visualad_frame(
+            state, coordinator = self._run_visualad_frame(
                 (
                     False,
                     {
@@ -478,6 +479,9 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(state.last_inference_frame_arrived_at, 99.975)
         self.assertIn("queueWaitSeconds=0.025", state.send_status.call_args.args[2])
         self.assertIn("frameToResultSeconds=0.025", state.send_status.call_args.args[2])
+        self.assertEqual(
+            coordinator.runtime_statuses, [pipeline.RUNTIME_STATUS_RUNNING]
+        )
 
     def test_sampled_backends_keep_existing_sampling_contract(self):
         for backend in ("visualad_htp", "visualad", "siglip", "triton"):
@@ -657,6 +661,27 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             ],
         )
         state.send_status.assert_not_called()
+
+    def test_htp_worker_waits_for_control_plane_gate_before_preparing(self):
+        state = object.__new__(pipeline.NuvionEventState)
+        state.running = True
+        state.backend = "visualad_htp"
+        state.inference_failed = False
+        state._htp_initialization_allowed = mock.Mock()
+        detector = mock.Mock(enabled=True)
+        state.zero_shot = detector
+
+        def stop_before_prepare(timeout):
+            self.assertEqual(timeout, 15.0)
+            state.running = False
+            return True
+
+        state._htp_initialization_allowed.wait.side_effect = stop_before_prepare
+
+        state._zsad_worker()
+
+        state._htp_initialization_allowed.wait.assert_called_once_with(timeout=15.0)
+        detector.prepare.assert_not_called()
 
     def test_stream_runtime_evidence_reads_playing_state_and_frame_without_webrtc(
         self,
@@ -1443,6 +1468,73 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(len(callbacks), 1)
         callbacks[0]()
         self.assertEqual(shutdown_calls, ["shutdown"])
+
+    def test_shutdown_stops_sources_joins_workers_and_is_idempotent(self) -> None:
+        calls: list[str] = []
+        app = object.__new__(pipeline.GStreamerInferenceApp)
+        app._shutdown_lock = threading.Lock()
+        app._shutdown_complete = False
+        app.user_data = types.SimpleNamespace(
+            request_stop=lambda: calls.append("request_stop"),
+            wait_for_workers=lambda: calls.append("wait_for_workers"),
+            motor_controller=types.SimpleNamespace(
+                close=lambda: calls.append("motor_close")
+            ),
+        )
+        app.depthai_bridge = types.SimpleNamespace(
+            close=lambda: calls.append("depthai_close")
+        )
+        app.webrtc_uplink = types.SimpleNamespace(
+            stop=lambda **_kwargs: calls.append("webrtc_stop")
+        )
+        app.pipeline = types.SimpleNamespace(
+            set_state=lambda _state: calls.append("pipeline_stop")
+        )
+        app.loop = types.SimpleNamespace(
+            is_running=lambda: True,
+            quit=lambda: calls.append("loop_quit"),
+        )
+
+        app.shutdown()
+        app.shutdown()
+
+        self.assertEqual(
+            calls,
+            [
+                "request_stop",
+                "depthai_close",
+                "webrtc_stop",
+                "pipeline_stop",
+                "loop_quit",
+                "wait_for_workers",
+                "motor_close",
+            ],
+        )
+
+    def test_worker_wait_joins_before_releasing_native_detector(self) -> None:
+        calls: list[str] = []
+        state = object.__new__(pipeline.NuvionEventState)
+        state._shutdown_lock = threading.Lock()
+        state._workers_stopped = False
+        state.worker_thread = mock.Mock(
+            is_alive=lambda: True,
+            join=lambda: calls.append("inference_join"),
+        )
+        state.tracking_thread = mock.Mock(
+            is_alive=lambda: True,
+            join=lambda: calls.append("tracking_join"),
+        )
+        state.zero_shot = types.SimpleNamespace(
+            close=lambda: calls.append("detector_close")
+        )
+
+        state.wait_for_workers()
+        state.wait_for_workers()
+
+        self.assertEqual(
+            calls,
+            ["inference_join", "tracking_join", "detector_close"],
+        )
 
     def test_sigterm_quits_main_loop_and_runs_graceful_shutdown(self) -> None:
         class _SignalSource:

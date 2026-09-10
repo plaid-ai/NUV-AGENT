@@ -66,6 +66,7 @@ from nuvion_app.inference.device_state import (
     INSPECTION_STATUS_NORMAL,
     RUNTIME_STATUS_ERROR,
     RUNTIME_STATUS_RUNNING,
+    RUNTIME_STATUS_STARTING,
     DeviceStateCoordinator,
 )
 from nuvion_app.inference.durable_events import (
@@ -1881,6 +1882,7 @@ def build_dynamic_runtime_telemetry(
             "manifestSha256": getattr(detector, "loaded_manifest_sha256", None),
             "inferenceSeconds": getattr(detector, "last_inference_seconds", None),
             "inferenceCount": getattr(detector, "inference_count", 0),
+            "contextCacheHit": getattr(detector, "context_cache_hit", False),
             "processingMode": "continuous_latest" if user_data.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0 else "sampled",
             "configuredSampleSeconds": ZERO_SHOT_SAMPLE_SEC,
             "frameArrivalAgeSeconds": round(frame_age, 3) if frame_age is not None else None,
@@ -2577,6 +2579,12 @@ async def _signaling_transport_main(command_runtime):
                 fleet_command_poll_task = None
                 webrtc_stats_task = None
                 fleet_observation_task = None
+                # Replay STARTING before first-boot HTP preparation can occupy
+                # the interpreter. Offline devices continue after a bounded wait.
+                get_device_state_coordinator().emit_heartbeat()
+                await asyncio.sleep(0)
+                if g_app is not None:
+                    g_app.user_data.allow_htp_initialization()
                 if CONNECTIVITY_ENABLED:
                     connectivity_target_host = CONNECTIVITY_TARGET_HOST or extract_host_from_server_url(SERVER_BASE_URL)
                     connectivity_thresholds = ConnectivityThresholds(
@@ -2692,6 +2700,9 @@ class NuvionEventState:
     def __init__(self, overlay_callback=None, demo_source: MvtecDemoSource | None = None):
         self.pipeline_started_at = time.time()
         self.running = True
+        self._shutdown_lock = threading.Lock()
+        self._workers_stopped = False
+        self._htp_initialization_allowed = threading.Event()
         self.last_anomaly_at = 0.0
         self.last_production_at = 0.0
         self.zero_shot_last_sample = 0.0
@@ -2774,6 +2785,10 @@ class NuvionEventState:
                 )
             if not self.zero_shot.enabled:
                 self.backend = "none"
+            else:
+                get_device_state_coordinator().set_runtime_status(
+                    RUNTIME_STATUS_STARTING
+                )
         elif self.backend == "visualad":
             self.zero_shot = VisualADAnomalyDetector(
                 enabled=ZERO_SHOT_ENABLED,
@@ -2803,6 +2818,9 @@ class NuvionEventState:
         else:
             self.backend = "none"
 
+        if self.backend != "visualad_htp":
+            self._htp_initialization_allowed.set()
+
         if self.face_tracking_enabled:
             if self.face_detector is None or not self.face_detector.ready:
                 reason = self.face_detector.error if self.face_detector is not None else "detector unavailable"
@@ -2826,10 +2844,57 @@ class NuvionEventState:
                 )
                 self.tracking_status_text = "TRACK idle"
 
-        self.worker_thread = threading.Thread(target=self._zsad_worker, daemon=True)
+        self.worker_thread = threading.Thread(
+            target=self._zsad_worker,
+            name="nuvion-inference",
+            daemon=False,
+        )
         self.worker_thread.start()
-        self.tracking_thread = threading.Thread(target=self._tracking_worker, daemon=True)
+        self.tracking_thread = threading.Thread(
+            target=self._tracking_worker,
+            name="nuvion-tracking",
+            daemon=False,
+        )
         self.tracking_thread.start()
+
+    def allow_htp_initialization(self) -> None:
+        self._htp_initialization_allowed.set()
+
+    @staticmethod
+    def _wake_worker(queue_: queue.Queue) -> None:
+        try:
+            queue_.put_nowait(None)
+            return
+        except queue.Full:
+            pass
+        try:
+            queue_.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            queue_.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def request_stop(self) -> None:
+        with self._shutdown_lock:
+            self.running = False
+            self._htp_initialization_allowed.set()
+            self._wake_worker(self.zero_shot_queue)
+            self._wake_worker(self.tracking_queue)
+
+    def wait_for_workers(self) -> None:
+        with self._shutdown_lock:
+            if self._workers_stopped:
+                return
+            self._workers_stopped = True
+        current_thread = threading.current_thread()
+        for worker in (self.worker_thread, self.tracking_thread):
+            if worker is not current_thread and worker.is_alive():
+                worker.join()
+        close_detector = getattr(self.zero_shot, "close", None)
+        if callable(close_detector):
+            close_detector()
 
     def reset_demo_timing(self) -> None:
         self.demo_started_at = time.time()
@@ -3306,15 +3371,29 @@ class NuvionEventState:
 
     def _zsad_worker(self):
         if self.running and self.backend == "visualad_htp" and self.zero_shot and self.zero_shot.enabled:
+            initialization_gate = getattr(self, "_htp_initialization_allowed", None)
+            if initialization_gate is not None and not initialization_gate.wait(timeout=15.0):
+                log.warning(
+                    "[ZSAD] HTP initialization proceeding without control-plane connection"
+                )
+            if not self.running:
+                return
             # Initial HTP compilation can take minutes. Discard the one queued
             # startup frame afterwards and wait for a freshly captured frame.
             # A compiled graph alone must not mark inference ready/healthy.
             prepare = getattr(self.zero_shot, "prepare", None)
-            if callable(prepare) and prepare():
-                try:
-                    self.zero_shot_queue.get_nowait()
-                except queue.Empty:
-                    pass
+            if callable(prepare):
+                if prepare():
+                    try:
+                        self.zero_shot_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                else:
+                    self.inference_failed = True
+                    get_device_state_coordinator().set_runtime_status(
+                        RUNTIME_STATUS_ERROR
+                    )
+                    return
         while self.running:
             if critical_event_safety_gate.is_stopped():
                 time.sleep(0.25)
@@ -3360,7 +3439,7 @@ class NuvionEventState:
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
-                    if self.inference_failed:
+                    if self.inference_failed or self.backend == "visualad_htp":
                         self.inference_failed = False
                         get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
                     self.last_inference_at = time.monotonic()
@@ -3378,6 +3457,7 @@ class NuvionEventState:
                         if self.backend == "visualad_htp":
                             provenance += (
                                 f"provider=QNN/HTP graph={result.get('graph_sha256', 'unknown')} "
+                                f"contextCache={'hit' if result.get('context_cache_hit') else 'miss'} "
                                 f"inferenceSeconds={result.get('inference_seconds', 0):.3f} "
                                 f"processingSeconds={time.monotonic() - processing_started:.3f} "
                             )
@@ -3890,6 +3970,8 @@ class GStreamerInferenceApp:
         self._demo_last_restart_at = 0.0
         self._supervisor_restart_lock = threading.Lock()
         self._supervisor_restart_requested = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
 
         self.create_pipeline()
 
@@ -4394,7 +4476,12 @@ class GStreamerInferenceApp:
                     self.depthai_bridge.start()
                     log.info("[DEPTHAI] RGB source started")
 
-                get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
+                get_device_state_coordinator().set_runtime_status(
+                    RUNTIME_STATUS_STARTING
+                    if getattr(getattr(self, "user_data", None), "backend", None)
+                    == "visualad_htp"
+                    else RUNTIME_STATUS_RUNNING
+                )
                 log.info("Starting signaling thread...")
                 signaling_thread = threading.Thread(
                     target=lambda: asyncio.run(signaling_client_main()),
@@ -4425,8 +4512,11 @@ class GStreamerInferenceApp:
             _start()
 
     def shutdown(self):
-        self.user_data.running = False
-        self.user_data.motor_controller.close()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutdown_complete = True
+        self.user_data.request_stop()
         if self.depthai_bridge is not None:
             self.depthai_bridge.close()
         if self.webrtc_uplink:
@@ -4435,6 +4525,8 @@ class GStreamerInferenceApp:
             self.pipeline.set_state(Gst.State.NULL)
         if self.loop and self.loop.is_running():
             self.loop.quit()
+        self.user_data.wait_for_workers()
+        self.user_data.motor_controller.close()
 
 
 def main():

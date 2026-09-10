@@ -14,6 +14,7 @@ CONNECTIVITY_QUALITY_GOOD = "GOOD"
 CONNECTIVITY_QUALITY_POOR = "POOR"
 
 RUNTIME_STATUS_RUNNING = "RUNNING"
+RUNTIME_STATUS_STARTING = "STARTING"
 RUNTIME_STATUS_ERROR = "ERROR"
 INSPECTION_STATUS_NORMAL = "NORMAL"
 INSPECTION_STATUS_DEFECT = "DEFECT"
@@ -23,6 +24,7 @@ STATE_MESSAGE_BY_STATUS = {
     DEVICE_STATE_NETWORK_ISSUE: "통신 상태 확인 필요",
 }
 RUNTIME_ERROR_MESSAGE = "Agent runtime error"
+RUNTIME_STARTING_MESSAGE = "HTP 모델 초기화 중"
 INSPECTION_DEFECT_MESSAGE = "불량 감지됨"
 
 
@@ -71,7 +73,11 @@ class DeviceStateCoordinator:
 
     def set_runtime_status(self, status: str) -> None:
         normalized = status.strip().upper()
-        if normalized not in {RUNTIME_STATUS_RUNNING, RUNTIME_STATUS_ERROR}:
+        if normalized not in {
+            RUNTIME_STATUS_RUNNING,
+            RUNTIME_STATUS_STARTING,
+            RUNTIME_STATUS_ERROR,
+        }:
             return
         self._update_state(runtime_status=normalized)
 
@@ -174,6 +180,8 @@ class DeviceStateCoordinator:
     def _message_locked(self, status: str) -> str:
         if self._runtime_status == RUNTIME_STATUS_ERROR:
             return RUNTIME_ERROR_MESSAGE
+        if self._runtime_status == RUNTIME_STATUS_STARTING:
+            return RUNTIME_STARTING_MESSAGE
         if self._inspection_status == INSPECTION_STATUS_DEFECT:
             return INSPECTION_DEFECT_MESSAGE
         return STATE_MESSAGE_BY_STATUS[status]

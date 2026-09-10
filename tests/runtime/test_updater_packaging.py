@@ -106,6 +106,7 @@ class UpdaterPackagingTest(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=300", unit)
         self.assertIn("StartLimitBurst=3", unit)
         self.assertIn("Restart=always", unit)
+        self.assertIn("TimeoutStopSec=180", unit)
         self.assertIn("MemoryHigh=50%", unit)
         self.assertIn("MemoryMax=60%", unit)
         self.assertIn("MemorySwapMax=0", unit)

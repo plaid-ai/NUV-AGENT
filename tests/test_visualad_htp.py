@@ -105,7 +105,7 @@ class VisualADHTPContractTests(unittest.TestCase):
         graph = self.root / "visualad.onnx"
         original = graph.read_bytes()
 
-        def create_session(pinned):
+        def create_session(pinned, _graph_sha256):
             graph.rename(self.root / "original.onnx")
             graph.write_bytes(b"unverified replacement")
             self.assertEqual(Path(pinned).read_bytes(), original)
@@ -224,8 +224,8 @@ class VisualADHTPContractTests(unittest.TestCase):
         detector = htp.VisualADHTPAnomalyDetector(True, path, digest, str(self.root))
         plugin = self.root / "libonnxruntime_providers_qnn.so"
         backend = self.root / "libQnnHtp.so"
-        plugin.touch()
-        backend.touch()
+        plugin.write_bytes(b"qnn provider")
+        backend.write_bytes(b"qnn htp backend")
         options = mock.Mock()
         session = mock.Mock()
         session.get_providers.return_value = [
@@ -279,15 +279,63 @@ class VisualADHTPContractTests(unittest.TestCase):
             ),
         ):
             detector._load()
-        options.add_session_config_entry.assert_called_once_with(
+        options.add_session_config_entry.assert_any_call(
             "session.disable_cpu_ep_fallback", "1"
         )
+        options.add_session_config_entry.assert_any_call("ep.context_enable", "1")
+        options.add_session_config_entry.assert_any_call("ep.context_embed_mode", "1")
         devices, provider_options = options.add_provider_for_devices.call_args.args
         self.assertEqual(devices, [npu])
         self.assertEqual(provider_options["offload_graph_io_quantization"], "0")
         self.assertEqual(provider_options["backend_path"], str(backend))
         session.disable_fallback.assert_called_once()
         session.run.assert_not_called()
+
+    def test_context_cache_metadata_is_atomic_and_tampering_forces_regeneration(self):
+        cache = self.root / "visualad-htp-test-ctx.onnx"
+        generated = self.root / ".generated.tmp.onnx"
+        metadata = cache.with_suffix(".json")
+        identity = {
+            "schemaVersion": htp._CONTEXT_CACHE_SCHEMA_VERSION,
+            "graphSha256": "a" * 64,
+            "ortVersion": "1.26.0",
+            "qnnVersion": "2.5.0",
+            "pluginSha256": "b" * 64,
+            "backendSha256": "c" * 64,
+            "providerProfile": "htp-fp16-ioquant0-balanced-v1",
+        }
+        generated.write_bytes(b"compiled qnn context")
+
+        htp.VisualADHTPAnomalyDetector._publish_context_cache(
+            generated, cache, metadata, identity
+        )
+
+        record = htp.VisualADHTPAnomalyDetector._read_context_cache(
+            cache, metadata, identity
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record["cacheSha256"], hashlib.sha256(cache.read_bytes()).hexdigest())
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(metadata.stat().st_mode & 0o777, 0o600)
+
+        cache.write_bytes(b"tampered")
+        self.assertIsNone(
+            htp.VisualADHTPAnomalyDetector._read_context_cache(
+                cache, metadata, identity
+            )
+        )
+        self.assertFalse(cache.exists())
+        self.assertFalse(metadata.exists())
+
+    def test_close_releases_native_session_and_clears_health(self):
+        detector = htp.VisualADHTPAnomalyDetector(True, "", "", str(self.root))
+        detector._session = object()
+        detector.ready = True
+
+        detector.close()
+
+        self.assertIsNone(detector._session)
+        self.assertFalse(detector.ready)
 
 
 try:

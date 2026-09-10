@@ -17,6 +17,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from nuvion_app.runtime.visualad import (
@@ -35,6 +36,18 @@ _registered_library = None
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _INPUT = {"name": "image", "shape": [1, 3, 518, 518], "dtype": "float32"}
 _OUTPUT = {"name": "patch_maps", "shape": [1, 4, 37, 37], "dtype": "float32"}
+_CONTEXT_CACHE_SCHEMA_VERSION = 1
+_CONTEXT_CACHE_MAX_BYTES = 2_000_000_000
+
+
+def _sha256_regular_file(path: Path, *, max_bytes: int) -> tuple[int, str]:
+    with _opened_regular_file(path) as (descriptor, metadata):
+        if not 1 <= metadata.st_size <= max_bytes:
+            raise ValueError(f"Invalid file size for digest: {path}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    return metadata.st_size, digest.hexdigest()
 
 
 def verify_manifest(path: str, expected_sha256: str) -> tuple[dict, Path]:
@@ -217,6 +230,7 @@ class VisualADHTPAnomalyDetector:
         self.last_anomaly_map = None
         self.last_inference_seconds = None
         self.inference_count = 0
+        self.context_cache_hit = False
         self.labels = ["anomaly_score"]
         self.anomaly_labels = {"defect"}
         self._session = None
@@ -233,7 +247,7 @@ class VisualADHTPAnomalyDetector:
         # creation. A pathname replacement must not change the loaded bytes.
         with _verified_artifact(graph, artifact["size"], artifact["sha256"]) as pinned:
             _require_embedded_graph(pinned)
-            self._load_session(pinned)
+            self._load_session(pinned, artifact["sha256"])
         self._verified_graph_sha256 = artifact["sha256"]
 
     def _validate_threshold(self):
@@ -245,7 +259,7 @@ class VisualADHTPAnomalyDetector:
         ):
             raise ValueError("VisualAD raw threshold must be finite in [-8,8]")
 
-    def _load_session(self, graph):
+    def _load_session(self, graph, graph_sha256):
         global _registered_library
         state = Path(self.state_dir)
         if not state.is_absolute() or not state.is_dir():
@@ -283,42 +297,206 @@ class VisualADHTPAnomalyDetector:
             raise RuntimeError(
                 "QNN did not enumerate an NPU; CPU/GPU fallback is forbidden"
             )
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        options.enable_profiling = True
-        options.profile_file_prefix = str(state / "visualad-htp-ort")
-        options.add_provider_for_devices(
-            [devices[0]],
-            {
-                "backend_path": str(backend),
-                "enable_htp_fp16_precision": "1",
-                "offload_graph_io_quantization": "0",
-                "skip_qnn_version_check": "0",
-                "htp_performance_mode": "balanced",
-                # Detailed DSP tracing is performed by the bounded deployment
-                # probe, not continuously in a long-running camera service.
-                "profiling_level": "off",
-            },
-        )
-        session = ort.InferenceSession(str(graph), sess_options=options)
-        session.disable_fallback()
-        if "QNNExecutionProvider" not in session.get_providers():
-            raise RuntimeError("VisualAD session lost QNN; refusing to execute")
-        _require_one_htp_bundle(backend.parent)
-        inputs, outputs = session.get_inputs(), session.get_outputs()
-        for values, expected in ((inputs, _INPUT), (outputs, _OUTPUT)):
-            if (
-                len(values) != 1
-                or values[0].name != expected["name"]
-                or values[0].shape != expected["shape"]
-                or values[0].type != "tensor(float)"
-            ):
-                raise ValueError(
-                    "VisualAD ONNX input/output differs from the pinned contract"
+        _, plugin_sha256 = _sha256_regular_file(Path(library), max_bytes=512 * 1024 * 1024)
+        _, backend_sha256 = _sha256_regular_file(backend, max_bytes=512 * 1024 * 1024)
+        cache_identity = {
+            "schemaVersion": _CONTEXT_CACHE_SCHEMA_VERSION,
+            "graphSha256": graph_sha256,
+            "ortVersion": ort.__version__,
+            "qnnVersion": qnn.__version__,
+            "pluginSha256": plugin_sha256,
+            "backendSha256": backend_sha256,
+            "providerProfile": "htp-fp16-ioquant0-balanced-v1",
+        }
+        identity_sha256 = hashlib.sha256(
+            json.dumps(cache_identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        cache_path = state / f"visualad-htp-{identity_sha256[:24]}-ctx.onnx"
+        metadata_path = cache_path.with_suffix(".json")
+        provider_options = {
+            "backend_path": str(backend),
+            "enable_htp_fp16_precision": "1",
+            "offload_graph_io_quantization": "0",
+            "skip_qnn_version_check": "0",
+            "htp_performance_mode": "balanced",
+            # Detailed DSP tracing is performed by the bounded deployment
+            # probe, not continuously in a long-running camera service.
+            "profiling_level": "off",
+        }
+
+        def create_session(model_path: str, context_output: Path | None = None):
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+            if context_output is not None:
+                options.add_session_config_entry("ep.context_enable", "1")
+                options.add_session_config_entry("ep.context_embed_mode", "1")
+                options.add_session_config_entry(
+                    "ep.context_file_path", str(context_output)
                 )
+            options.enable_profiling = True
+            options.profile_file_prefix = str(state / "visualad-htp-ort")
+            options.add_provider_for_devices([devices[0]], provider_options)
+            return ort.InferenceSession(model_path, sess_options=options)
+
+        def validate_session(candidate):
+            candidate.disable_fallback()
+            if "QNNExecutionProvider" not in candidate.get_providers():
+                raise RuntimeError("VisualAD session lost QNN; refusing to execute")
+            _require_one_htp_bundle(backend.parent)
+            inputs, outputs = candidate.get_inputs(), candidate.get_outputs()
+            for values, expected in ((inputs, _INPUT), (outputs, _OUTPUT)):
+                if (
+                    len(values) != 1
+                    or values[0].name != expected["name"]
+                    or values[0].shape != expected["shape"]
+                    or values[0].type != "tensor(float)"
+                ):
+                    raise ValueError(
+                        "VisualAD ONNX input/output differs from the pinned contract"
+                    )
+            return candidate
+
+        session = None
+        cache_record = self._read_context_cache(
+            cache_path, metadata_path, cache_identity
+        )
+        if cache_record is not None:
+            try:
+                with _verified_artifact(
+                    cache_path,
+                    cache_record["cacheSize"],
+                    cache_record["cacheSha256"],
+                ) as pinned_cache:
+                    session = validate_session(create_session(pinned_cache))
+                self.context_cache_hit = True
+                log.info("VisualAD HTP context cache hit: %s", cache_path)
+            except Exception as exc:  # noqa: BLE001 - regenerate from signed source.
+                log.warning("VisualAD HTP context cache rejected; regenerating: %s", exc)
+                self._remove_context_cache(cache_path, metadata_path)
+
+        if session is None:
+            temporary_cache = cache_path.with_name(
+                f".{cache_path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp.onnx"
+            )
+            try:
+                try:
+                    session = validate_session(
+                        create_session(str(graph), temporary_cache)
+                    )
+                except Exception as exc:  # noqa: BLE001 - keep QNN JIT available.
+                    log.warning(
+                        "VisualAD HTP context generation unavailable; using verified graph: %s",
+                        exc,
+                    )
+                    session = validate_session(create_session(str(graph)))
+                else:
+                    try:
+                        self._publish_context_cache(
+                            temporary_cache,
+                            cache_path,
+                            metadata_path,
+                            cache_identity,
+                        )
+                    except (OSError, TypeError, ValueError) as exc:
+                        log.warning(
+                            "VisualAD HTP context cache could not be persisted: %s",
+                            exc,
+                        )
+                        self._remove_context_cache(cache_path, metadata_path)
+            finally:
+                temporary_cache.unlink(missing_ok=True)
+            self.context_cache_hit = False
         self._session = session
+
+    @staticmethod
+    def _remove_context_cache(cache_path: Path, metadata_path: Path) -> None:
+        cache_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_context_cache(
+        cache_path: Path,
+        metadata_path: Path,
+        expected_identity: dict,
+    ) -> dict | None:
+        if not cache_path.exists() or not metadata_path.exists():
+            return None
+        try:
+            with _opened_regular_file(metadata_path) as (descriptor, metadata):
+                if not 1 <= metadata.st_size <= 16_384:
+                    raise ValueError("context cache metadata size is invalid")
+                record = json.loads(os.read(descriptor, 16_385))
+            if not isinstance(record, dict):
+                raise ValueError("context cache metadata must be an object")
+            for key, value in expected_identity.items():
+                if record.get(key) != value:
+                    raise ValueError(f"context cache identity mismatch: {key}")
+            size = record.get("cacheSize")
+            digest = record.get("cacheSha256")
+            if (
+                type(size) is not int
+                or not 1 <= size <= _CONTEXT_CACHE_MAX_BYTES
+                or not isinstance(digest, str)
+                or not _HASH.fullmatch(digest)
+            ):
+                raise ValueError("context cache digest contract is invalid")
+            actual_size, actual_digest = _sha256_regular_file(
+                cache_path, max_bytes=_CONTEXT_CACHE_MAX_BYTES
+            )
+            if actual_size != size or actual_digest != digest:
+                raise ValueError("context cache bytes do not match metadata")
+            return record
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            log.warning("VisualAD HTP context cache metadata rejected: %s", exc)
+            VisualADHTPAnomalyDetector._remove_context_cache(
+                cache_path, metadata_path
+            )
+            return None
+
+    @staticmethod
+    def _publish_context_cache(
+        temporary_cache: Path,
+        cache_path: Path,
+        metadata_path: Path,
+        identity: dict,
+    ) -> None:
+        if not temporary_cache.is_file():
+            log.warning("VisualAD HTP did not produce a context cache")
+            return
+        temporary_cache.chmod(0o600)
+        cache_size, cache_sha256 = _sha256_regular_file(
+            temporary_cache, max_bytes=_CONTEXT_CACHE_MAX_BYTES
+        )
+        os.replace(temporary_cache, cache_path)
+        metadata_tmp = metadata_path.with_name(
+            f".{metadata_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            metadata_tmp.write_text(
+                json.dumps(
+                    {
+                        **identity,
+                        "cacheSize": cache_size,
+                        "cacheSha256": cache_sha256,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            metadata_tmp.chmod(0o600)
+            os.replace(metadata_tmp, metadata_path)
+        finally:
+            metadata_tmp.unlink(missing_ok=True)
+        log.info(
+            "VisualAD HTP context cache generated path=%s size=%d sha256=%s",
+            cache_path,
+            cache_size,
+            cache_sha256,
+        )
 
     def _fail(self, exc):
         self.ready = False
@@ -330,6 +508,12 @@ class VisualADHTPAnomalyDetector:
         self.last_anomaly_map = None
         self._session = None
         log.error("VisualAD HTP unavailable (no CPU fallback): %s", self.last_error)
+
+    def close(self) -> None:
+        """Release the native session after the inference worker has stopped."""
+        with self._lock:
+            self.ready = False
+            self._session = None
 
     def prepare(self) -> bool:
         """Compile before selecting a camera frame; compilation is not health."""
@@ -411,6 +595,7 @@ class VisualADHTPAnomalyDetector:
                     "ln_post_policy": LN_POST_POLICY,
                     "image_size": IMAGE_SIZE,
                     "inference_seconds": self.last_inference_seconds,
+                    "context_cache_hit": self.context_cache_hit,
                 }
             except Exception as exc:  # noqa: BLE001 - fail closed at the hardware boundary.
                 self._fail(exc)
