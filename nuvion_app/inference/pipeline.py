@@ -2990,12 +2990,12 @@ class NuvionEventState:
             "clipObject": clip_object,
             "clipStatus": clip_status,
             "executionMode": "DEMO" if self.demo_mode else "PRODUCTION",
+            "modeRevision": self.demo_mode_revision,
         }
         if self.demo_mode:
             payload.update(
                 {
                     "demoSessionId": self.demo_session_id,
-                    "modeRevision": self.demo_mode_revision,
                     "demoProfileId": self.demo_profile_id,
                     "sampleId": demo_context.sample_id if demo_context else None,
                     "loopIndex": demo_context.loop_index if demo_context else None,
