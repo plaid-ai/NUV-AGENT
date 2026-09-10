@@ -459,7 +459,8 @@ def build_video_source_pipeline(
             "videorate ! "
             f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
             "videoconvert ! "
-            "video/x-raw,format=RGB"
+            "video/x-raw,format=RGB ! "
+            "identity name=demo_realtime_clock sync=true"
         )
         return _append_video_transforms(pipeline)
 
