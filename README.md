@@ -163,6 +163,21 @@ nuv-agent run --demo
 - 데모 슬라이드쇼는 EOS 시 자동으로 처음부터 재생됩니다(`NUVION_DEMO_LOOP=true`).
 - anomaly 이벤트 message에는 `[DEMO]` prefix가 붙습니다(기본 `NUVION_DEMO_TAG=[DEMO]`).
 
+Fleet 관리형 전환:
+
+- heartbeat에 `command.device.mode.set` capability가 표시된 systemd 장치는 플랫폼 관리자의
+  `DEVICE_MODE_SET` 명령으로 `PRODUCTION`/`DEMO`를 전환할 수 있습니다.
+- 관리형 `metal-nut-showcase-v1`은 `metal_nut` 정상 20개와 defect 4개를 고정 순서로 섞고,
+  이미지당 2초씩 반복합니다. profile digest가 다르면 preflight에서 거부합니다.
+- 전환은 dynamic settings overlay를 atomic하게 활성화하고 supervisor restart 후 새 frame과 실제
+  inference를 확인합니다. 10분 안에 functional health가 확인되지 않으면 이전 모드로 자동
+  rollback합니다.
+- DEMO anomaly에는 session, mode revision, profile, sample, loop 정보를 포함하며 production count는
+  만들지 않습니다.
+- MVTec 이미지를 제품에 번들하거나 상업 전시에 사용하기 전에는 적용되는 dataset license를
+  확인해야 합니다. 필요하면 같은 profile manifest 계약을 사용하는 사내 촬영 dataset으로
+  대체합니다.
+
 기본 샘플 영상 출처(CC BY 3.0):
 - Gigaset Smartphone Production IV Quality Inspection (Wikimedia Commons)
   - https://commons.wikimedia.org/wiki/File:Gigaset_Smartphone_Production_IV_Quality_Inspection.webm

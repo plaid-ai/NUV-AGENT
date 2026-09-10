@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from nuvion_app.inference.demo_mvtec import build_slideshow_caps
+from nuvion_app.inference.demo_mvtec import build_managed_demo_playlist
 from nuvion_app.inference.demo_mvtec import build_stage_dir
 from nuvion_app.inference.demo_mvtec import collect_mvtec_demo_images
 from nuvion_app.inference.demo_mvtec import infer_mvtec_ground_truth_label
@@ -76,6 +77,20 @@ class DemoMvtecTest(unittest.TestCase):
             infer_mvtec_ground_truth_label(Path("/tmp/capsule/test/scratch/002.png")),
             "defect",
         )
+
+    def test_managed_playlist_is_fixed_and_interleaves_four_defects(self) -> None:
+        normal = [Path(f"/tmp/metal_nut/test/good/{index:03d}.png") for index in range(25)]
+        defect = [Path(f"/tmp/metal_nut/test/scratch/{index:03d}.png") for index in range(7)]
+
+        playlist = build_managed_demo_playlist(normal + defect)
+
+        self.assertEqual(len(playlist), 24)
+        self.assertEqual(
+            [index for index, path in enumerate(playlist) if "good" not in path.parts],
+            [5, 11, 17, 23],
+        )
+        self.assertEqual(playlist[0], normal[0])
+        self.assertEqual(playlist[-1], defect[3])
 
 
 if __name__ == "__main__":

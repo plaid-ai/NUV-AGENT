@@ -268,8 +268,11 @@ class FleetEffectCoordinator:
                 command = self.inbox.rehydrate(record)
                 reconciler = self.registry.get(command.command_type)
                 restart_payload = (
-                    command.command_type == "CONFIG_APPLY"
-                    and command.payload.get("activation") == "RESTART"
+                    (
+                        command.command_type == "CONFIG_APPLY"
+                        and command.payload.get("activation") == "RESTART"
+                    )
+                    or command.command_type == "DEVICE_MODE_SET"
                 )
                 encoder_conflict = (
                     command.command_type == "CONFIG_APPLY"

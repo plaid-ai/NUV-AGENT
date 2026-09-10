@@ -259,6 +259,21 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertIn("NUVION_VIDEO_BITRATE_KBPS=1500", active.read_text())
         self.assertNotIn("NUVION_DEVICE_PASSWORD", active.read_text())
 
+    def test_config_apply_is_rejected_while_device_is_in_demo_mode(self) -> None:
+        runtime = _Runtime()
+        reconciler = SettingsReconciler(
+            store=AtomicSettingsStore(self.config_path, self.root / "state"),
+            runtime=runtime,
+            process_instance_id="process-a",
+            operation_mode_provider=lambda: "DEMO",
+        )
+
+        outcome = reconciler.reconcile(_command(8))
+
+        self.assertEqual(outcome.status, "FAILED")
+        self.assertEqual(outcome.code, "DEVICE_MODE_CONFLICT")
+        self.assertFalse((self.root / "state" / "active.env").exists())
+
     def test_base_secret_file_inode_mode_and_content_are_preserved(self) -> None:
         self.config_path.chmod(0o640)
         before = self.config_path.stat()

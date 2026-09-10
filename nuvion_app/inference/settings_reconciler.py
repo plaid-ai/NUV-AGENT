@@ -425,6 +425,7 @@ class SettingsReconciler:
         config_schema: str = DEFAULT_CONFIG_SCHEMA,
         event_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
         command_outbox_health_provider: Callable[[], Mapping[str, Any]] | None = None,
+        operation_mode_provider: Callable[[], str] | None = None,
         startup_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store = store
@@ -433,6 +434,7 @@ class SettingsReconciler:
         self.config_schema = str(config_schema)
         self._event_outbox_health_provider = event_outbox_health_provider
         self._command_outbox_health_provider = command_outbox_health_provider
+        self._operation_mode_provider = operation_mode_provider
         self._effect_fence: Callable[[], None] = lambda: None
         self._startup_clock = startup_clock
         self._startup_started = startup_clock()
@@ -474,6 +476,20 @@ class SettingsReconciler:
         self, command: VerifiedFleetCommand
     ) -> CommandEffectOutcome | ReconcileDeferred:
         digest = canonical_settings_digest(command.payload)
+        if self._operation_mode_provider is not None:
+            try:
+                operation_mode = str(self._operation_mode_provider() or "").upper()
+            except Exception:
+                operation_mode = "UNKNOWN"
+            if operation_mode != "PRODUCTION":
+                return CommandEffectOutcome(
+                    status=COMMAND_STATUS_FAILED,
+                    code="DEVICE_MODE_CONFLICT",
+                    message="CONFIG_APPLY is allowed only in PRODUCTION mode",
+                    reported_state=self._reported(
+                        command, digest, health="NOT_APPLIED"
+                    ),
+                )
         try:
             marker = self.store.marker()
         except ValueError as exc:
