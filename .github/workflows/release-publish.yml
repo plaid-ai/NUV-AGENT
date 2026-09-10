@@ -225,7 +225,7 @@ jobs:
           GATE_WORKFLOW_SHA256: ${{ steps.release-gate.outputs.gate_workflow_sha256 }}
         run: |
           set -euo pipefail
-          env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
+          env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \
             publisher/packaging/release/verify-release-readiness.py \
             --policy publisher/packaging/release/release-readiness.json \
             --version "$VERSION" \

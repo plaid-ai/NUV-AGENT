@@ -16,7 +16,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 publisher_root="$(cd "$script_dir/../.." && pwd -P)"
 workflow="$publisher_root/.github/workflows/agent-release-gate.yml"
 
-env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
+env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \
   "$script_dir/verify-agent-release-gate.py" \
   --repository "$GITHUB_REPOSITORY" \
   --component-sha "$RELEASE_AUTH_COMPONENT_SHA" \
@@ -28,7 +28,7 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
   --expected-check-suite-id "$RELEASE_AUTH_GATE_CHECK_SUITE_ID" \
   --expected-workflow-sha256 "$RELEASE_AUTH_GATE_WORKFLOW_SHA256"
 
-env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I \
+env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \
   "$script_dir/verify-release-readiness.py" \
   --policy "$script_dir/release-readiness.json" \
   --version "$RELEASE_AUTH_VERSION" \
