@@ -35,6 +35,7 @@ COMMAND_CAPABILITY_BY_TYPE = {
     "CONFIG_APPLY": "command.config.apply",
     "STREAM_POLICY": "command.stream.policy",
     "AGENT_UPDATE": "command.agent.update",
+    "DEVICE_MODE_SET": "command.device.mode.set",
 }
 
 AUTHENTICATED_REJECTION_CODES = frozenset(
@@ -511,6 +512,57 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
                 "INVALID_PAYLOAD_SCHEMA",
                 "AGENT_UPDATE bomDigest must be sha256:<64 lowercase hex>",
             )
+        return
+
+    if command_type == "DEVICE_MODE_SET":
+        mode = payload.get("mode")
+        if mode not in {"PRODUCTION", "DEMO"}:
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "DEVICE_MODE_SET mode must be PRODUCTION or DEMO",
+            )
+        common = {"modeRevision", "mode"}
+        optional = {"reason"}
+        if mode == "DEMO":
+            _require_exact_payload_keys(
+                payload,
+                required=common | {"profileId", "profileDigest"},
+                optional=optional,
+            )
+            profile_id = payload.get("profileId")
+            profile_digest = payload.get("profileDigest")
+            if (
+                not isinstance(profile_id, str)
+                or not profile_id
+                or profile_id != profile_id.strip()
+                or len(profile_id) > 100
+            ):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "DEVICE_MODE_SET profileId must be canonical text",
+                )
+            if not isinstance(profile_digest, str) or not _DIGEST_PATTERN.fullmatch(
+                profile_digest
+            ):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "DEVICE_MODE_SET profileDigest must be sha256:<64 lowercase hex>",
+                )
+        else:
+            _require_exact_payload_keys(payload, required=common, optional=optional)
+        _positive_payload_int(payload, "modeRevision")
+        if "reason" in payload:
+            reason = payload.get("reason")
+            if (
+                not isinstance(reason, str)
+                or not reason
+                or reason != reason.strip()
+                or len(reason) > 1000
+            ):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "DEVICE_MODE_SET reason must be canonical text up to 1000 characters",
+                )
         return
 
     raise CommandValidationError("UNSUPPORTED_COMMAND", "command type is not supported")

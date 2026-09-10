@@ -26,6 +26,11 @@ SETTING_KEYS = frozenset(
         "NUVION_VIDEO_HEIGHT",
         "NUVION_VIDEO_FPS",
         "NUVION_VIDEO_BITRATE_KBPS",
+        "NUVION_DEMO_MODE",
+        "NUVION_DEMO_PROFILE_ID",
+        "NUVION_DEMO_PROFILE_DIGEST",
+        "NUVION_DEMO_MODE_REVISION",
+        "NUVION_DEMO_SESSION_ID",
     }
 )
 
@@ -116,6 +121,27 @@ def validate_overlay_value(key: str, value: Any) -> str:
         if value not in {"true", "false"}:
             raise SettingsOverlayError("clip enabled must be true or false")
         return value
+    if key == "NUVION_DEMO_MODE":
+        if value not in {"true", "false"}:
+            raise SettingsOverlayError("demo mode must be true or false")
+        return value
+    if key == "NUVION_DEMO_PROFILE_ID":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
+            raise SettingsOverlayError("demo profile id is invalid")
+        return value
+    if key == "NUVION_DEMO_PROFILE_DIGEST":
+        if not SHA256_PATTERN.fullmatch(value):
+            raise SettingsOverlayError("demo profile digest must be canonical sha256")
+        return value
+    if key == "NUVION_DEMO_MODE_REVISION":
+        if not value.isdigit() or int(value) < 1:
+            raise SettingsOverlayError("demo mode revision must be a positive integer")
+        return str(int(value))
+    if key == "NUVION_DEMO_SESSION_ID":
+        try:
+            return str(__import__("uuid").UUID(value))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise SettingsOverlayError("demo session id must be a UUID") from exc
     if key in _INTEGER_BOUNDS:
         if not value.isdigit():
             raise SettingsOverlayError(f"dynamic integer is invalid: {key}")

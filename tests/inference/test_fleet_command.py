@@ -710,12 +710,43 @@ class FleetCommandVerifierTest(unittest.TestCase):
                 {"type": "AGENT_UPDATE"},
                 "INVALID_PAYLOAD_SCHEMA",
             ),
+            (
+                {
+                    "modeRevision": 7,
+                    "mode": "DEMO",
+                    "profileId": "metal-nut-showcase-v1",
+                    "profileDigest": "sha256:" + "b" * 64,
+                    "reason": "Trade show",
+                },
+                {"type": "DEVICE_MODE_SET"},
+                None,
+            ),
+            (
+                {"modeRevision": 8, "mode": "PRODUCTION"},
+                {"type": "DEVICE_MODE_SET"},
+                None,
+            ),
+            (
+                {"modeRevision": 9, "mode": "DEMO"},
+                {"type": "DEVICE_MODE_SET"},
+                "INVALID_PAYLOAD_SCHEMA",
+            ),
+            (
+                {
+                    "modeRevision": 10,
+                    "mode": "PRODUCTION",
+                    "profileId": "metal-nut-showcase-v1",
+                },
+                {"type": "DEVICE_MODE_SET"},
+                "INVALID_PAYLOAD_SCHEMA",
+            ),
         )
         capabilities = frozenset(
             {
                 "command.config.apply",
                 "command.stream.policy",
                 "command.agent.update",
+                "command.device.mode.set",
             }
         )
         verifier = self._verifier(

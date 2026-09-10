@@ -433,6 +433,10 @@ def build_video_source_pipeline(
     platform_name: str | None = None,
     demo_source: MvtecDemoSource | None = None,
 ) -> str:
+    if demo_mode and gst_source_override and gst_source_override.strip():
+        raise ValueError(
+            "NUVION_GST_SOURCE cannot override the managed DEMO dataset source"
+        )
     if gst_source_override and gst_source_override.strip():
         return _append_video_transforms(gst_source_override.strip())
 

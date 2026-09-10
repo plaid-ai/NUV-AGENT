@@ -51,6 +51,12 @@ from nuvion_app.inference.fleet_command import (
 )
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
+from nuvion_app.inference.device_mode import (
+    DeviceModeReconciler,
+    DeviceModeStore,
+    rollback_failed_mode_startup,
+    validate_managed_demo_profile,
+)
 from nuvion_app.inference.depthai_gst import DepthAIGStreamerBridge
 from nuvion_app.inference.depthai_source import DepthAIConfig
 from nuvion_app.inference.depthai_source import DepthAIFrameSource
@@ -2671,6 +2677,15 @@ class TimedInferenceFrame:
 
     pixels: np.ndarray
     arrived_at_monotonic: float
+    demo_context: "DemoSampleContext | None" = None
+
+
+@dataclass(frozen=True)
+class DemoSampleContext:
+    sample_id: str
+    sample_index: int
+    loop_index: int
+    ground_truth: str
 
 
 class NuvionEventState:
@@ -2697,9 +2712,25 @@ class NuvionEventState:
         self.demo_tag = DEMO_TAG
         self.demo_source = demo_source
         self.demo_ground_truth_labels = tuple(demo_source.ground_truth_labels) if demo_source else ()
+        self.demo_sample_ids = tuple(demo_source.sample_ids) if demo_source else ()
         self.demo_image_duration_sec = float(demo_source.image_duration_sec) if demo_source else 0.0
         self.demo_started_at = time.time()
         self.current_demo_ground_truth = self.demo_ground_truth_labels[0] if self.demo_ground_truth_labels else None
+        self.demo_profile_id = (
+            demo_source.profile_id if demo_source else os.getenv("NUVION_DEMO_PROFILE_ID")
+        )
+        self.demo_profile_digest = (
+            demo_source.profile_digest
+            if demo_source
+            else os.getenv("NUVION_DEMO_PROFILE_DIGEST")
+        )
+        self.demo_mode_revision = parse_int_with_default(
+            os.getenv("NUVION_DEMO_MODE_REVISION"), 1
+        )
+        self.demo_session_id = (
+            (os.getenv("NUVION_DEMO_SESSION_ID") or "").strip()
+            or (str(uuid.uuid4()) if self.demo_mode else None)
+        )
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
@@ -2805,9 +2836,9 @@ class NuvionEventState:
         if self.demo_ground_truth_labels:
             self.current_demo_ground_truth = self.demo_ground_truth_labels[0]
 
-    def update_demo_ground_truth(self, pts_ns: int | None) -> None:
+    def resolve_demo_sample(self, pts_ns: int | None) -> DemoSampleContext | None:
         if not self.demo_mode or not self.demo_ground_truth_labels:
-            return
+            return None
 
         index: int | None = None
         if pts_ns is not None and pts_ns != Gst.CLOCK_TIME_NONE and self.demo_image_duration_sec > 0:
@@ -2818,9 +2849,25 @@ class NuvionEventState:
             index = int(elapsed / self.demo_image_duration_sec)
 
         if index is None:
-            return
+            return None
 
-        self.current_demo_ground_truth = self.demo_ground_truth_labels[index % len(self.demo_ground_truth_labels)]
+        sample_index = index % len(self.demo_ground_truth_labels)
+        ground_truth = self.demo_ground_truth_labels[sample_index]
+        self.current_demo_ground_truth = ground_truth
+        sample_id = (
+            self.demo_sample_ids[sample_index]
+            if sample_index < len(self.demo_sample_ids)
+            else f"sample-{sample_index:05d}"
+        )
+        return DemoSampleContext(
+            sample_id=sample_id,
+            sample_index=sample_index,
+            loop_index=index // len(self.demo_ground_truth_labels),
+            ground_truth=ground_truth,
+        )
+
+    def update_demo_ground_truth(self, pts_ns: int | None) -> None:
+        self.resolve_demo_sample(pts_ns)
 
     def _resolve_tracking_status(self) -> str:
         if not self.face_tracking_enabled:
@@ -2897,6 +2944,7 @@ class NuvionEventState:
         snapshot_object: str | None = None,
         clip_object: str | None = None,
         clip_status: str | None = None,
+        demo_context: DemoSampleContext | None = None,
     ):
         now = time.time()
         inspection_status = INSPECTION_STATUS_DEFECT if status == "DEFECT" else INSPECTION_STATUS_NORMAL
@@ -2936,7 +2984,18 @@ class NuvionEventState:
             "snapshotObject": snapshot_object,
             "clipObject": clip_object,
             "clipStatus": clip_status,
+            "executionMode": "DEMO" if self.demo_mode else "PRODUCTION",
         }
+        if self.demo_mode:
+            payload.update(
+                {
+                    "demoSessionId": self.demo_session_id,
+                    "modeRevision": self.demo_mode_revision,
+                    "demoProfileId": self.demo_profile_id,
+                    "sampleId": demo_context.sample_id if demo_context else None,
+                    "loopIndex": demo_context.loop_index if demo_context else None,
+                }
+            )
         event = persist_critical_event(
             EVENT_TYPE_ANOMALY,
             "/app/device/anomaly",
@@ -3194,13 +3253,19 @@ class NuvionEventState:
             except Exception:
                 pass
 
-    def maybe_enqueue_frame(self, frame_rgb):
+    def maybe_enqueue_frame(
+        self,
+        frame_rgb,
+        demo_context: DemoSampleContext | None = None,
+    ):
         now = time.time()
         if self.backend != "none":
             if self.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0:
                 # One appsink producer and one inference worker: keep at most
                 # one pending frame, replacing stale work without blocking video.
-                latest = TimedInferenceFrame(frame_rgb, time.monotonic())
+                latest = TimedInferenceFrame(
+                    frame_rgb, time.monotonic(), demo_context
+                )
                 try:
                     self.zero_shot_queue.put_nowait(latest)
                 except queue.Full:
@@ -3216,7 +3281,12 @@ class NuvionEventState:
                 self.zero_shot_last_sample = now
                 if not self.zero_shot_queue.full():
                     try:
-                        self.zero_shot_queue.put_nowait(frame_rgb)
+                        queued_frame = (
+                            TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context)
+                            if getattr(self, "demo_mode", False)
+                            else frame_rgb
+                        )
+                        self.zero_shot_queue.put_nowait(queued_frame)
                     except queue.Full:
                         pass
 
@@ -3255,8 +3325,10 @@ class NuvionEventState:
                 continue
 
             frame_arrived_at = None
+            demo_context = None
             if isinstance(frame, TimedInferenceFrame):
                 frame_arrived_at = frame.arrived_at_monotonic
+                demo_context = frame.demo_context
                 frame = frame.pixels
 
             if self.backend in {"siglip", "visualad", "visualad_htp"} and self.zero_shot and self.zero_shot.enabled:
@@ -3321,7 +3393,11 @@ class NuvionEventState:
                         status=status,
                         label=label,
                         score=score,
-                        ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
+                        ground_truth=(
+                            demo_context.ground_truth
+                            if self.demo_mode and demo_context
+                            else None
+                        ),
                     )
                     live_overlay = f"{status} {label} {score:.2f}"
                     if self.backend in {"visualad", "visualad_htp"} and os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true":
@@ -3329,14 +3405,14 @@ class NuvionEventState:
                     self._set_anomaly_overlay(overlay if self.demo_mode else live_overlay)
                     try:
                         if status == "DEFECT":
-                            self.send_status("DEFECT", label, f"{provenance}Zero-shot anomaly: {label} ({score:.2f})", "WARNING")
+                            self.send_status("DEFECT", label, f"{provenance}Zero-shot anomaly: {label} ({score:.2f})", "WARNING", demo_context=demo_context)
                         else:
-                            self.send_status("NORMAL", label, f"{provenance}Recovered to normal: {label} ({score:.2f})", "INFO")
+                            self.send_status("NORMAL", label, f"{provenance}Recovered to normal: {label} ({score:.2f})", "INFO", demo_context=demo_context)
                     except CriticalEventBackpressureError as exc:
                         log.critical("[SAFETY-STOP] %s", exc)
                         continue
 
-                    if self.backend == "siglip" and PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
+                    if not self.demo_mode and self.backend == "siglip" and PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                         now = time.time()
                         if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
                             try:
@@ -3369,20 +3445,24 @@ class NuvionEventState:
                     status=status,
                     label=label,
                     score=score,
-                    ground_truth=self.current_demo_ground_truth if self.demo_mode else None,
+                    ground_truth=(
+                        demo_context.ground_truth
+                        if self.demo_mode and demo_context
+                        else None
+                    ),
                 )
                 self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
 
                 try:
                     if status == "DEFECT":
-                        self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING")
+                        self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING", demo_context=demo_context)
                     else:
-                        self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO")
+                        self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO", demo_context=demo_context)
                 except CriticalEventBackpressureError as exc:
                     log.critical("[SAFETY-STOP] %s", exc)
                     continue
 
-                if PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
+                if not self.demo_mode and PRODUCTION_LABELS and label.lower() in PRODUCTION_LABELS and score >= PRODUCTION_CONFIDENCE_THRESHOLD:
                     now = time.time()
                     if now - self.last_production_at >= PRODUCTION_DEDUP_SEC:
                         try:
@@ -3477,9 +3557,11 @@ def on_new_sample(appsink, user_data: NuvionEventState):
         return Gst.FlowReturn.OK
 
     buffer.unmap(mapinfo)
-    user_data.update_demo_ground_truth(int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None)
+    demo_context = user_data.resolve_demo_sample(
+        int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None
+    )
     user_data.remember_latest_frame(frame)
-    user_data.maybe_enqueue_frame(frame)
+    user_data.maybe_enqueue_frame(frame, demo_context)
     return Gst.FlowReturn.OK
 
 
@@ -3696,6 +3778,66 @@ class PipelineSettingsRuntimeAdapter:
         return dict(desired)
 
 
+class PipelineDeviceModeRuntime:
+    """Preflight and prove a managed device mode against the live pipeline."""
+
+    def __init__(self, app: "GStreamerInferenceApp") -> None:
+        self.app = app
+
+    def preflight(self, desired: Mapping[str, Any]) -> None:
+        if desired.get("mode") == "DEMO":
+            validate_managed_demo_profile(desired)
+            if self.app.user_data.backend == "none":
+                raise RuntimeError("DEMO requires an active inference backend")
+            prepare_mvtec_demo_source(
+                base_url=os.getenv("NUVION_DEMO_MVTEC_BASE_URL"),
+                cache_dir=os.getenv("NUVION_DEMO_MVTEC_CACHE_DIR"),
+                profile_id=str(desired["profileId"]),
+                profile_digest=str(desired["profileDigest"]),
+            )
+            return
+        if not str(self.app.video_source or "").strip():
+            raise RuntimeError("PRODUCTION requires a configured camera source")
+
+    def snapshot(self) -> dict[str, Any]:
+        data = self.app.user_data
+        pipeline_healthy = False
+        if self.app.pipeline is not None and data.running:
+            try:
+                state_result, current_state, _pending = self.app.pipeline.get_state(0)
+                pipeline_healthy = (
+                    state_result != Gst.StateChangeReturn.FAILURE
+                    and current_state == Gst.State.PLAYING
+                )
+            except Exception:
+                pipeline_healthy = False
+        inference_ready = (
+            data.backend != "none"
+            and data.last_inference_at is not None
+            and not data.inference_failed
+        )
+        mode = "DEMO" if self.app.demo_mode else "PRODUCTION"
+        return {
+            "effectiveMode": mode,
+            "inputSource": "DATASET" if self.app.demo_mode else "CAMERA",
+            "modeRevision": data.demo_mode_revision,
+            "profileId": data.demo_profile_id if self.app.demo_mode else None,
+            "profileDigest": data.demo_profile_digest if self.app.demo_mode else None,
+            "sessionId": data.demo_session_id if self.app.demo_mode else None,
+            "frameReady": data.last_frame_monotonic is not None,
+            "inferenceReady": inference_ready,
+            "health": (
+                "FUNCTIONAL_HEALTHY"
+                if pipeline_healthy and data.last_frame_monotonic is not None and inference_ready
+                else "STARTUP_PENDING"
+            ),
+        }
+
+    def startup_pending(self) -> bool:
+        snapshot = self.snapshot()
+        return self.app.user_data.running and snapshot["health"] == "STARTUP_PENDING"
+
+
 class GStreamerInferenceApp:
     def __init__(self, video_source: str):
         self.video_width = VIDEO_WIDTH
@@ -3704,7 +3846,17 @@ class GStreamerInferenceApp:
         self.video_source = video_source
         self.demo_mode = DEMO_MODE
         self.demo_loop = DEMO_LOOP
-        self.demo_source = self._prepare_demo_source() if self.demo_mode else None
+        try:
+            self.demo_source = self._prepare_demo_source() if self.demo_mode else None
+        except (OSError, RuntimeError, ValueError):
+            if systemd_restart_enabled(os.environ):
+                rollback_failed_mode_startup(
+                    AtomicSettingsStore(
+                        resolve_config_path(), resolve_settings_state_dir(os.environ)
+                    ),
+                    process_instance_id=FLEET_PROCESS_INSTANCE_ID,
+                )
+            raise
         self.rtp_ssrc = get_rtp_ssrc()
         self.overlay = None
         self.tracking_overlay = None
@@ -3745,6 +3897,10 @@ class GStreamerInferenceApp:
             categories=os.getenv("NUVION_DEMO_MVTEC_CATEGORIES"),
             cache_dir=os.getenv("NUVION_DEMO_MVTEC_CACHE_DIR"),
             image_duration_sec=float(os.getenv("NUVION_DEMO_IMAGE_DURATION_SEC", "1.0")),
+            profile_id=(os.getenv("NUVION_DEMO_PROFILE_ID") or "").strip() or None,
+            profile_digest=(
+                (os.getenv("NUVION_DEMO_PROFILE_DIGEST") or "").strip() or None
+            ),
         )
 
     def _stream_runtime_evidence(self) -> StreamRuntimeEvidence:
@@ -3987,6 +4143,9 @@ class GStreamerInferenceApp:
                         command_outbox_health_provider=(
                             build_command_observation_runtime_health
                         ),
+                        operation_mode_provider=(
+                            lambda: "DEMO" if self.demo_mode else "PRODUCTION"
+                        ),
                     )
                 )
                 log.info("[CONFIG-APPLY] transactional reconciler registered")
@@ -3996,6 +4155,26 @@ class GStreamerInferenceApp:
                     "[CONFIG-APPLY] capability disabled: %s",
                     exc,
                 )
+
+        if systemd_restart_enabled(os.environ):
+            try:
+                mode_settings_store = AtomicSettingsStore(
+                    resolve_config_path(),
+                    resolve_settings_state_dir(os.environ),
+                )
+                fleet_effect_registry.register(
+                    DeviceModeReconciler(
+                        store=DeviceModeStore(mode_settings_store),
+                        runtime=PipelineDeviceModeRuntime(self),
+                        process_instance_id=FLEET_PROCESS_INSTANCE_ID,
+                    )
+                )
+                log.info("[DEVICE-MODE] transactional reconciler registered")
+            except (OSError, RuntimeError, ValueError) as exc:
+                fleet_effect_registry.unregister("DEVICE_MODE_SET")
+                log.error("[DEVICE-MODE] capability disabled: %s", exc)
+        else:
+            fleet_effect_registry.unregister("DEVICE_MODE_SET")
 
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None

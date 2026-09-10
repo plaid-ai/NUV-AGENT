@@ -443,6 +443,22 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIs(newest.pixels, frames[-1])
         self.assertEqual(newest.arrived_at_monotonic, 500.0)
 
+    def test_demo_sample_context_is_bound_to_pts_and_loop_before_inference(self):
+        state = object.__new__(pipeline.NuvionEventState)
+        state.demo_mode = True
+        state.demo_ground_truth_labels = ("normal", "defect")
+        state.demo_sample_ids = ("metal_nut/test/good/000.png", "metal_nut/test/scratch/001.png")
+        state.demo_image_duration_sec = 2.0
+        state.current_demo_ground_truth = "normal"
+
+        with mock.patch.object(pipeline.Gst, "SECOND", 1_000_000_000, create=True):
+            context = state.resolve_demo_sample(7_000_000_000)
+
+        self.assertEqual(context.sample_index, 1)
+        self.assertEqual(context.loop_index, 1)
+        self.assertEqual(context.ground_truth, "defect")
+        self.assertEqual(context.sample_id, "metal_nut/test/scratch/001.png")
+
     def test_continuous_htp_worker_unwraps_frame_and_reports_arrival_age(self):
         pixels = object()
         with mock.patch.object(pipeline.time, "monotonic", return_value=100.0):
@@ -1579,6 +1595,45 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             )
 
         persist.assert_called_once()
+
+    def test_demo_anomaly_event_contains_structured_origin_and_sample_identity(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.last_sent_status = None
+        state.last_status = None
+        state.last_sent_at = 0.0
+        state.demo_mode = True
+        state.demo_tag = "[DEMO]"
+        state.demo_session_id = "cbeebd56-853b-4f6f-b87c-0f3578500841"
+        state.demo_mode_revision = 12
+        state.demo_profile_id = "metal-nut-showcase-v1"
+        context = pipeline.DemoSampleContext(
+            sample_id="metal_nut/test/scratch/001.png",
+            sample_index=5,
+            loop_index=2,
+            ground_truth="defect",
+        )
+        coordinator = _Coordinator()
+
+        with (
+            mock.patch.object(pipeline, "get_device_state_coordinator", return_value=coordinator),
+            mock.patch.object(pipeline, "persist_critical_event", return_value=object()) as persist,
+        ):
+            state.send_status(
+                "DEFECT",
+                "scratch",
+                "detected",
+                "WARNING",
+                snapshot_object="snapshot.jpg",
+                clip_status="SKIPPED",
+                demo_context=context,
+            )
+
+        payload = persist.call_args.args[2]
+        self.assertEqual(payload["executionMode"], "DEMO")
+        self.assertEqual(payload["demoSessionId"], state.demo_session_id)
+        self.assertEqual(payload["modeRevision"], 12)
+        self.assertEqual(payload["sampleId"], context.sample_id)
+        self.assertEqual(payload["loopIndex"], 2)
 
     def test_uncorrelated_terminal_409_stops_replay_instead_of_poison_loop(
         self,

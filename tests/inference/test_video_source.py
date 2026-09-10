@@ -53,6 +53,17 @@ class VideoSourceTest(unittest.TestCase):
         )
         self.assertFalse(should_use_depthai_source("oak", demo_mode=True))
 
+    def test_managed_demo_rejects_custom_gstreamer_source_override(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot override"):
+            build_video_source_pipeline(
+                "auto",
+                640,
+                480,
+                30,
+                gst_source_override="videotestsrc pattern=smpte",
+                demo_mode=True,
+            )
+
     def test_depthai_device_id_resolution_rejects_conflicting_sources(self) -> None:
         self.assertEqual(resolve_depthai_device_id("oak:inline", None), "inline")
         self.assertEqual(resolve_depthai_device_id("oak", "configured"), "configured")
@@ -276,17 +287,17 @@ class VideoSourceTest(unittest.TestCase):
         prepare_mock.assert_not_called()
         self.assertIn(fake_source.stage_pattern, pipeline)
 
-    def test_gst_override_takes_priority(self) -> None:
-        pipeline = build_video_source_pipeline(
-            "/dev/video0",
-            640,
-            480,
-            30,
-            gst_source_override="videotestsrc pattern=smpte",
-            demo_mode=True,
-            platform_name="linux",
-        )
-        self.assertEqual(pipeline, "videotestsrc pattern=smpte")
+    def test_managed_demo_source_cannot_be_replaced_by_gst_override(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot override"):
+            build_video_source_pipeline(
+                "/dev/video0",
+                640,
+                480,
+                30,
+                gst_source_override="videotestsrc pattern=smpte",
+                demo_mode=True,
+                platform_name="linux",
+            )
 
     def test_video_transforms_are_applied_to_standard_pipeline(self) -> None:
         with mock.patch.dict(
