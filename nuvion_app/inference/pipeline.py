@@ -2841,7 +2841,12 @@ class NuvionEventState:
             return None
 
         index: int | None = None
-        if pts_ns is not None and pts_ns != Gst.CLOCK_TIME_NONE and self.demo_image_duration_sec > 0:
+        clock_time_none = getattr(Gst, "CLOCK_TIME_NONE", None)
+        if (
+            pts_ns is not None
+            and (clock_time_none is None or pts_ns != clock_time_none)
+            and self.demo_image_duration_sec > 0
+        ):
             duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
             index = int(pts_ns // duration_ns)
         elif self.demo_image_duration_sec > 0:
