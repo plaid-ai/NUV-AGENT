@@ -106,9 +106,34 @@ class GitHubApi:
                 "GET", f"/repos/{self.repository}/releases/tags/{encoded}"
             )
         except GitHubApiError as exc:
-            if exc.status == 404:
-                return None
-            raise
+            if exc.status != 404:
+                raise
+            # The tag endpoint only returns published releases. Drafts must
+            # be resolved through the authenticated release listing, including
+            # when recovering a previous upload or a raced draft creation.
+            matches: list[dict[str, Any]] = []
+            for page in range(1, 21):
+                releases = self.request(
+                    "GET", f"/repos/{self.repository}/releases?per_page=100&page={page}"
+                )
+                if not isinstance(releases, list) or len(releases) > 100:
+                    raise GitHubReleaseError("GitHub release listing is invalid")
+                for release in releases:
+                    if not isinstance(release, dict):
+                        raise GitHubReleaseError("GitHub release listing entry is invalid")
+                    if release.get("tag_name") == tag:
+                        if (
+                            type(release.get("id")) is not int
+                            or release["id"] < 1
+                            or not isinstance(release.get("draft"), bool)
+                        ):
+                            raise GitHubReleaseError("GitHub draft release identity is invalid")
+                        matches.append(release)
+                if len(matches) > 1:
+                    raise GitHubReleaseError("GitHub release tag has ambiguous draft identities")
+                if len(releases) < 100:
+                    return matches[0] if matches else None
+            raise GitHubReleaseError("GitHub draft release listing exceeds page limit")
         if not isinstance(payload, dict):
             raise GitHubReleaseError("GitHub release response is invalid")
         return payload
