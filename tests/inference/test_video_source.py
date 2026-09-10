@@ -286,6 +286,28 @@ class VideoSourceTest(unittest.TestCase):
             )
         prepare_mock.assert_not_called()
         self.assertIn(fake_source.stage_pattern, pipeline)
+        self.assertIn("identity name=demo_realtime_clock sync=true", pipeline)
+
+    def test_demo_mode_paces_dataset_frames_against_the_pipeline_clock(self) -> None:
+        fake_source = mock.Mock(
+            stage_pattern="/tmp/mvtec/slides/metal_nut/%05d.png",
+            slideshow_caps="image/png,framerate=1/2",
+            decoder="pngdec",
+        )
+
+        pipeline = build_video_source_pipeline(
+            "/dev/video0",
+            640,
+            480,
+            30,
+            demo_mode=True,
+            platform_name="linux",
+            demo_source=fake_source,
+        )
+
+        self.assertIn("videorate", pipeline)
+        self.assertIn("framerate=30/1", pipeline)
+        self.assertIn("identity name=demo_realtime_clock sync=true", pipeline)
 
     def test_managed_demo_source_cannot_be_replaced_by_gst_override(self) -> None:
         with self.assertRaisesRegex(ValueError, "cannot override"):
