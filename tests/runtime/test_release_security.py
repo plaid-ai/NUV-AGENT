@@ -2529,6 +2529,12 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
         script = helper.read_text(encoding="utf-8")
         self.assertIn("verify-agent-release-gate.py", script)
         self.assertIn("verify-release-readiness.py", script)
+        self.assertEqual(script.count("python3 -I -B \\\n"), 2)
+        self.assertNotIn("python3 -I \\\n", script)
+        self.assertIn(
+            "env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \\\n",
+            self._job("release-preflight"),
+        )
         for option in (
             "--expected-run-id",
             "--expected-check-id",
