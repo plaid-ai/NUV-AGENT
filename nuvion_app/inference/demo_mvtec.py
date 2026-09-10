@@ -36,6 +36,10 @@ MANAGED_DEMO_PROFILE_DIGEST = "sha256:" + hashlib.sha256(
         sort_keys=True,
     ).encode("utf-8")
 ).hexdigest()
+MANAGED_DEMO_BASE_URL = "https://apt.plaidai.io/demo/mvtec/v1"
+MANAGED_DEMO_ARCHIVE_SHA256 = (
+    "5cb21300368f8cb40bd1f477d6ad97ffcd374de39a55c2dbf1ebb0b4d51ae6fb"
+)
 
 
 @dataclass(frozen=True)
@@ -89,23 +93,39 @@ def prepare_mvtec_demo_source(
     profile_id: str | None = None,
     profile_digest: str | None = None,
 ) -> MvtecDemoSource:
-    resolved_base_url = (base_url or DEFAULT_MVTEC_BASE_URL).rstrip("/")
     managed_profile = profile_id == MANAGED_DEMO_PROFILE_ID
     if profile_id is not None and not managed_profile:
         raise ValueError(f"Unsupported managed demo profile: {profile_id}")
     if managed_profile and profile_digest != MANAGED_DEMO_PROFILE_DIGEST:
         raise ValueError("Managed demo profile digest does not match the built-in manifest")
-    resolved_categories = (
-        (str(MANAGED_DEMO_PROFILE["category"]),)
-        if managed_profile
-        else parse_mvtec_categories(categories)
-    )
-    resolved_cache_dir = Path(cache_dir or DEFAULT_MVTEC_CACHE_DIR).expanduser()
+    if managed_profile:
+        resolved_base_url = MANAGED_DEMO_BASE_URL
+        resolved_categories = (str(MANAGED_DEMO_PROFILE["category"]),)
+        settings_state_dir = (os.getenv("NUVION_SETTINGS_STATE_DIR") or "").strip()
+        cache_root = (
+            Path(settings_state_dir).expanduser().parent / "demo" / "mvtec"
+            if settings_state_dir
+            else Path(cache_dir or DEFAULT_MVTEC_CACHE_DIR).expanduser()
+        )
+        resolved_cache_dir = (
+            cache_root / f"managed-{MANAGED_DEMO_ARCHIVE_SHA256[:16]}"
+        )
+    else:
+        resolved_base_url = (base_url or DEFAULT_MVTEC_BASE_URL).rstrip("/")
+        resolved_categories = parse_mvtec_categories(categories)
+        resolved_cache_dir = Path(cache_dir or DEFAULT_MVTEC_CACHE_DIR).expanduser()
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
 
     rng = chooser or random.SystemRandom()
     category = resolved_categories[0] if managed_profile else rng.choice(resolved_categories)
-    extracted_dir = ensure_mvtec_category_cached(resolved_base_url, resolved_cache_dir, category)
+    extracted_dir = ensure_mvtec_category_cached(
+        resolved_base_url,
+        resolved_cache_dir,
+        category,
+        expected_archive_sha256=(
+            MANAGED_DEMO_ARCHIVE_SHA256 if managed_profile else None
+        ),
+    )
     image_paths = collect_mvtec_demo_images(extracted_dir, category)
     if managed_profile:
         image_paths = build_managed_demo_playlist(image_paths)
@@ -169,7 +189,13 @@ def _sample_id(image_path: Path, category: str) -> str:
     return "/".join(image_path.parts[category_index:])
 
 
-def ensure_mvtec_category_cached(base_url: str, cache_dir: Path, category: str) -> Path:
+def ensure_mvtec_category_cached(
+    base_url: str,
+    cache_dir: Path,
+    category: str,
+    *,
+    expected_archive_sha256: str | None = None,
+) -> Path:
     archives_dir = cache_dir / "archives"
     extracted_root = cache_dir / "extracted"
     archives_dir.mkdir(parents=True, exist_ok=True)
@@ -177,12 +203,23 @@ def ensure_mvtec_category_cached(base_url: str, cache_dir: Path, category: str) 
 
     archive_path = archives_dir / f"{category}.tar.xz"
     extracted_dir = extracted_root / category
+    digest_marker = extracted_dir / ".archive-sha256"
     if extracted_dir.exists():
+        if expected_archive_sha256:
+            try:
+                recorded_digest = digest_marker.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError("Managed demo cache has no archive identity") from exc
+            if recorded_digest != expected_archive_sha256:
+                raise ValueError("Managed demo cache archive identity does not match")
         return extracted_dir
 
     download_url = f"{base_url}/{category}.tar.xz"
     if not archive_path.exists():
         download_to_path(download_url, archive_path)
+    if expected_archive_sha256 and _sha256_file(archive_path) != expected_archive_sha256:
+        archive_path.unlink(missing_ok=True)
+        raise ValueError("Managed demo archive SHA-256 does not match")
 
     tmp_extract_dir = extracted_root / f".{category}.tmp"
     if tmp_extract_dir.exists():
@@ -190,12 +227,24 @@ def ensure_mvtec_category_cached(base_url: str, cache_dir: Path, category: str) 
     tmp_extract_dir.mkdir(parents=True, exist_ok=True)
     try:
         with tarfile.open(archive_path, mode="r:xz") as tar:
-            tar.extractall(tmp_extract_dir)
+            tar.extractall(tmp_extract_dir, filter="data")
+        if expected_archive_sha256:
+            (tmp_extract_dir / ".archive-sha256").write_text(
+                expected_archive_sha256 + "\n", encoding="utf-8"
+            )
         tmp_extract_dir.rename(extracted_dir)
     finally:
         if tmp_extract_dir.exists():
             shutil.rmtree(tmp_extract_dir)
     return extracted_dir
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def download_to_path(url: str, target_path: Path) -> None:

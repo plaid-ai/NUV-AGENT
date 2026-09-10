@@ -9,8 +9,14 @@ from nuvion_app.inference.demo_mvtec import build_slideshow_caps
 from nuvion_app.inference.demo_mvtec import build_managed_demo_playlist
 from nuvion_app.inference.demo_mvtec import build_stage_dir
 from nuvion_app.inference.demo_mvtec import collect_mvtec_demo_images
+from nuvion_app.inference.demo_mvtec import ensure_mvtec_category_cached
 from nuvion_app.inference.demo_mvtec import infer_mvtec_ground_truth_label
+from nuvion_app.inference.demo_mvtec import MANAGED_DEMO_ARCHIVE_SHA256
+from nuvion_app.inference.demo_mvtec import MANAGED_DEMO_BASE_URL
+from nuvion_app.inference.demo_mvtec import MANAGED_DEMO_PROFILE_DIGEST
+from nuvion_app.inference.demo_mvtec import MANAGED_DEMO_PROFILE_ID
 from nuvion_app.inference.demo_mvtec import parse_mvtec_categories
+from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
 
 
@@ -91,6 +97,70 @@ class DemoMvtecTest(unittest.TestCase):
         )
         self.assertEqual(playlist[0], normal[0])
         self.assertEqual(playlist[-1], defect[3])
+
+    def test_managed_profile_pins_archive_url_and_writable_state_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            extracted = root / "extracted"
+            for index in range(20):
+                image = extracted / "metal_nut" / "test" / "good" / f"{index:03d}.png"
+                image.parent.mkdir(parents=True, exist_ok=True)
+                image.write_bytes(f"normal-{index}".encode())
+            for index in range(4):
+                image = extracted / "metal_nut" / "test" / "defect" / f"{index:03d}.png"
+                image.parent.mkdir(parents=True, exist_ok=True)
+                image.write_bytes(f"defect-{index}".encode())
+
+            with (
+                mock.patch.dict(
+                    "os.environ", {"NUVION_SETTINGS_STATE_DIR": str(root / "settings")}
+                ),
+                mock.patch(
+                    "nuvion_app.inference.demo_mvtec.ensure_mvtec_category_cached",
+                    return_value=extracted,
+                ) as ensure_cached,
+            ):
+                source = prepare_mvtec_demo_source(
+                    base_url="https://invalid.example",
+                    cache_dir="/unwritable/legacy-cache",
+                    profile_id=MANAGED_DEMO_PROFILE_ID,
+                    profile_digest=MANAGED_DEMO_PROFILE_DIGEST,
+                )
+
+            ensure_cached.assert_called_once_with(
+                MANAGED_DEMO_BASE_URL,
+                root
+                / "demo"
+                / "mvtec"
+                / f"managed-{MANAGED_DEMO_ARCHIVE_SHA256[:16]}",
+                "metal_nut",
+                expected_archive_sha256=MANAGED_DEMO_ARCHIVE_SHA256,
+            )
+            self.assertEqual(source.image_count, 24)
+            self.assertEqual(source.ground_truth_labels.count("normal"), 20)
+            self.assertEqual(source.ground_truth_labels.count("defect"), 4)
+
+    def test_managed_archive_digest_mismatch_removes_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+
+            def write_wrong_archive(_url: str, target: Path) -> None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"not-the-pinned-archive")
+
+            with mock.patch(
+                "nuvion_app.inference.demo_mvtec.download_to_path",
+                side_effect=write_wrong_archive,
+            ):
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    ensure_mvtec_category_cached(
+                        MANAGED_DEMO_BASE_URL,
+                        cache,
+                        "metal_nut",
+                        expected_archive_sha256=MANAGED_DEMO_ARCHIVE_SHA256,
+                    )
+
+            self.assertFalse((cache / "archives" / "metal_nut.tar.xz").exists())
 
 
 if __name__ == "__main__":
