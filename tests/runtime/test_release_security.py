@@ -50,6 +50,10 @@ PREPARE_APT = load_script(
 PROMOTION = load_script(
     "generate_release_promotion", "packaging/release/generate-release-promotion.py"
 )
+SOURCE_PLAN_RECOVERY = load_script(
+    "resolve_distribution_source_publisher",
+    "packaging/release/resolve-distribution-source-publisher.py",
+)
 SETTINGS = load_script(
     "verify_github_release_settings",
     "packaging/release/verify-github-release-settings.py",
@@ -2121,7 +2125,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             "iq9075-ota-publish": "${{ secrets.",
         }
         verifier_count = {
-            "github-release-publish": 2,
+            "github-release-publish": 3,
             "homebrew-publish": 2,
             "apt-publish": 6,
             "iq9075-ota-publish": 8,
@@ -2169,6 +2173,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
 
         credential_steps = {
             "github-release-publish": [
+                "Verify exact immutable source plan recovery",
                 "Finalize exact immutable GitHub release before live channels"
             ],
             "homebrew-publish": ["Update Homebrew tap with trusted publisher"],
@@ -2198,7 +2203,7 @@ class ReleaseSecurityWorkflowTest(unittest.TestCase):
             self.publish.count(
                 "publisher/packaging/release/revalidate-live-release-authorization.sh"
             ),
-            14,
+            15,
         )
 
     def test_homebrew_token_never_enters_argv_or_git_config(self) -> None:
@@ -5814,6 +5819,116 @@ class ReleaseSourceVerificationTest(unittest.TestCase):
                 verified["tag_object_sha"],
                 self._git(repository, "rev-parse", "refs/tags/v1.2.3^{tag}"),
             )
+
+
+class DistributionSourcePlanRecoveryTest(unittest.TestCase):
+    def _repository(self, root: Path) -> tuple[Path, str, str]:
+        repository = root / "repository"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Release Test"], cwd=repository, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "release@example.invalid"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "publisher.txt").write_text("source\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "source publisher"], cwd=repository, check=True, capture_output=True)
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+        (repository / "publisher.txt").write_text("current\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-m", "current publisher"], cwd=repository, check=True, capture_output=True)
+        current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+        return repository, source, current
+
+    @staticmethod
+    def _registry(path: Path, *, source: str) -> Path:
+        registry = path / "recoveries.json"
+        registry.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "recoveries": {
+                        "v0.1.121": {
+                            "sourcePublisherSha": source,
+                            "sourcePlanSha256": "a" * 64,
+                            "evidenceRunId": 123,
+                            "evidenceAssetName": "source-plan.json",
+                        }
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        return registry
+
+    def test_exact_partial_release_recovery_preserves_source_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            repository, source, current = self._repository(root)
+            result = SOURCE_PLAN_RECOVERY.resolve(
+                registry_path=self._registry(root, source=source),
+                repository=repository,
+                tag="v0.1.121",
+                current_publisher_sha=current,
+            )
+            self.assertEqual(result["publisher_sha"], source)
+            self.assertEqual(result["expected_sha256"], "a" * 64)
+            self.assertEqual(result["evidence_run_id"], "123")
+
+    def test_unlisted_release_uses_current_publisher_without_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            repository, source, current = self._repository(root)
+            result = SOURCE_PLAN_RECOVERY.resolve(
+                registry_path=self._registry(root, source=source),
+                repository=repository,
+                tag="v0.1.122",
+                current_publisher_sha=current,
+            )
+            self.assertEqual(
+                result,
+                {
+                    "publisher_sha": current,
+                    "expected_sha256": "",
+                    "evidence_run_id": "",
+                    "evidence_asset_name": "",
+                },
+            )
+
+    def test_recovery_publisher_outside_current_lineage_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            repository, _, current = self._repository(root)
+            tree = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=repository, text=True
+            ).strip()
+            unrelated = subprocess.check_output(
+                ["git", "commit-tree", tree],
+                cwd=repository,
+                input="unrelated\n",
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Release Test",
+                    "GIT_AUTHOR_EMAIL": "release@example.invalid",
+                    "GIT_COMMITTER_NAME": "Release Test",
+                    "GIT_COMMITTER_EMAIL": "release@example.invalid",
+                },
+            ).strip()
+            with self.assertRaisesRegex(
+                SOURCE_PLAN_RECOVERY.RecoveryError,
+                "outside the current trusted lineage",
+            ):
+                SOURCE_PLAN_RECOVERY.resolve(
+                    registry_path=self._registry(root, source=unrelated),
+                    repository=repository,
+                    tag="v0.1.121",
+                    current_publisher_sha=current,
+                )
 
 
 class SequenceAndPromotionTest(unittest.TestCase):
