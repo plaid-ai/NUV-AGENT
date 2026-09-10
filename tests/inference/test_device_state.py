@@ -12,6 +12,7 @@ from nuvion_app.inference.device_state import (
     INSPECTION_STATUS_NORMAL,
     RUNTIME_STATUS_ERROR,
     RUNTIME_STATUS_RUNNING,
+    RUNTIME_STATUS_STARTING,
     DeviceStateCoordinator,
 )
 
@@ -126,6 +127,16 @@ class DeviceStateCoordinatorTest(unittest.TestCase):
         self.assertEqual(payload["connectivityStatus"], CONNECTIVITY_QUALITY_POOR)
         self.assertEqual(payload["status"], DEVICE_STATE_ERROR)
         self.assertEqual(payload["message"], "Agent runtime error")
+
+    def test_starting_is_running_liveness_with_unhealthy_functional_state(self) -> None:
+        self.coordinator.set_runtime_status(RUNTIME_STATUS_STARTING)
+
+        payload = self.coordinator.current_payload()
+
+        self.assertEqual(payload["status"], DEVICE_STATE_RUNNING)
+        self.assertEqual(payload["runtimeStatus"], RUNTIME_STATUS_STARTING)
+        self.assertEqual(payload["message"], "HTP 모델 초기화 중")
+        self.assertEqual(payload["functionalHealth"], "FUNCTIONAL_UNHEALTHY")
 
     def test_inspection_defect_message_is_not_runtime_error(self) -> None:
         self.coordinator.set_inspection_status(INSPECTION_STATUS_DEFECT)

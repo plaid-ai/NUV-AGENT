@@ -28,6 +28,9 @@ ExecStartPre=/opt/nuv-agent/current/venv/bin/python -s -c 'from nuvion_app.confi
 ExecStart=/usr/bin/nuv-agent run
 Restart=always
 RestartSec=3
+# HTP graph preparation is native work and cannot be interrupted safely.
+# Keep systemd from sending SIGKILL while the worker releases its QNN session.
+TimeoutStopSec=180
 # A leaking camera/media path must be replaced before it can exhaust unified
 # board memory. Percentage limits retain consistent host headroom across SKUs.
 MemoryHigh=50%
