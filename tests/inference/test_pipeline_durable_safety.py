@@ -1635,6 +1635,36 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(payload["sampleId"], context.sample_id)
         self.assertEqual(payload["loopIndex"], 2)
 
+    def test_production_anomaly_event_contains_mode_revision_without_demo_context(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.last_sent_status = "DEFECT"
+        state.last_status = None
+        state.last_sent_at = 0.0
+        state.demo_mode = False
+        state.demo_tag = "[DEMO]"
+        state.demo_mode_revision = 13
+        coordinator = _Coordinator()
+
+        with (
+            mock.patch.object(pipeline, "get_device_state_coordinator", return_value=coordinator),
+            mock.patch.object(pipeline, "persist_critical_event", return_value=object()) as persist,
+        ):
+            state.send_status(
+                "NORMAL",
+                "none",
+                "healthy",
+                "INFO",
+                clip_status="SKIPPED",
+            )
+
+        payload = persist.call_args.args[2]
+        self.assertEqual(payload["executionMode"], "PRODUCTION")
+        self.assertEqual(payload["modeRevision"], 13)
+        self.assertNotIn("demoSessionId", payload)
+        self.assertNotIn("demoProfileId", payload)
+        self.assertNotIn("sampleId", payload)
+        self.assertNotIn("loopIndex", payload)
+
     def test_uncorrelated_terminal_409_stops_replay_instead_of_poison_loop(
         self,
     ) -> None:
