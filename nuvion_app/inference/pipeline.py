@@ -2990,7 +2990,7 @@ class NuvionEventState:
             "clipObject": clip_object,
             "clipStatus": clip_status,
             "executionMode": "DEMO" if self.demo_mode else "PRODUCTION",
-            "modeRevision": self.demo_mode_revision,
+            "modeRevision": getattr(self, "demo_mode_revision", 1),
         }
         if self.demo_mode:
             payload.update(
