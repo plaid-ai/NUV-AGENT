@@ -60,6 +60,10 @@ jobs:
       tested_deb_sha256: ${{ steps.readiness.outputs.tested_deb_sha256 }}
       tested_deb_size: ${{ steps.readiness.outputs.tested_deb_size }}
       requested_sequence: ${{ steps.request.outputs.requested_sequence }}
+      source_plan_publisher_sha: ${{ steps.source-plan-recovery.outputs.publisher_sha }}
+      expected_source_plan_sha256: ${{ steps.source-plan-recovery.outputs.expected_sha256 }}
+      source_plan_evidence_run_id: ${{ steps.source-plan-recovery.outputs.evidence_run_id }}
+      source_plan_evidence_asset_name: ${{ steps.source-plan-recovery.outputs.evidence_asset_name }}
     steps:
       - name: Resolve request without credentials
         id: request
@@ -197,6 +201,20 @@ jobs:
             --event-name "$GITHUB_EVENT_NAME" \
             --policy publisher/packaging/release/release-security-policy.json \
             --signer-directory publisher/packaging/release/trusted-tag-signers \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Resolve immutable source plan recovery
+        id: source-plan-recovery
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          TRUSTED_PUBLISHER_SHA: ${{ steps.identity.outputs.trusted_publisher_sha }}
+        run: |
+          set -euo pipefail
+          python3 publisher/packaging/release/resolve-distribution-source-publisher.py \
+            --registry publisher/packaging/release/distribution-source-plan-recoveries.json \
+            --repository release-source \
+            --tag "$RELEASE_TAG" \
+            --current-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Verify trusted release gate for exact component SHA
@@ -559,7 +577,8 @@ jobs:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
-          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          SOURCE_PLAN_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.source_plan_publisher_sha }}
+          EXPECTED_SOURCE_PLAN_SHA256: ${{ needs.release-preflight.outputs.expected_source_plan_sha256 }}
           GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
           GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
           GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
@@ -596,7 +615,7 @@ jobs:
               --version "$VERSION" \
               --tag "$RELEASE_TAG" \
               --component-sha "$COMPONENT_SHA" \
-              --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --trusted-publisher-sha "$SOURCE_PLAN_PUBLISHER_SHA" \
               --gate-run-id "$GATE_RUN_ID" \
               --gate-check-id "$GATE_CHECK_ID" \
               --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
@@ -608,14 +627,62 @@ jobs:
               --bundle "dist/$BUNDLE_NAME" \
               --deb "dist/$DEB_NAME" \
               --output "dist/$NAME"
+          SOURCE_PLAN_SHA256="$(sha256sum "dist/$NAME" | awk '{print $1}')"
+          if [ -n "$EXPECTED_SOURCE_PLAN_SHA256" ]; then
+            [ "$SOURCE_PLAN_SHA256" = "$EXPECTED_SOURCE_PLAN_SHA256" ] \
+              || { echo "recovered immutable source plan digest differs" >&2; exit 1; }
+          fi
           {
             echo "name=$NAME"
-            echo "sha256=$(sha256sum "dist/$NAME" | awk '{print $1}')"
+            echo "sha256=$SOURCE_PLAN_SHA256"
             echo "formula_name=$FORMULA_NAME"
             echo "formula_sha256=$(sha256sum "dist/$FORMULA_NAME" | awk '{print $1}')"
           } >> "$GITHUB_OUTPUT"
 
       - name: Revalidate trust immediately before GitHub credential use
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 publisher/packaging/release/verify-release-settings-attestation.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+            --publisher-root publisher \
+            --executing-workflow settings-evidence/.github/workflows/release-publish.yml \
+            --policy publisher/packaging/release/release-security-policy.json \
+            --attestation settings-evidence/packaging/release/release-settings-attestation.json \
+            --signature settings-evidence/packaging/release/release-settings-attestation.json.asc \
+            --signer-directory publisher/packaging/release/trusted-tag-signers
+          publisher/packaging/release/revalidate-live-release-authorization.sh
+
+      - name: Verify exact immutable source plan recovery
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          EXPECTED_SOURCE_PLAN_SHA256: ${{ needs.release-preflight.outputs.expected_source_plan_sha256 }}
+          SOURCE_PLAN_NAME: ${{ steps.source-plan.outputs.name }}
+          EVIDENCE_RUN_ID: ${{ needs.release-preflight.outputs.source_plan_evidence_run_id }}
+          EVIDENCE_ASSET_NAME: ${{ needs.release-preflight.outputs.source_plan_evidence_asset_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_SOURCE_PLAN_SHA256" ]; then
+            [ -z "$EVIDENCE_RUN_ID" ]
+            [ -z "$EVIDENCE_ASSET_NAME" ]
+            exit 0
+          fi
+          [ "$SOURCE_PLAN_NAME" = "$EVIDENCE_ASSET_NAME" ]
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          jq -e '.draft == false and .immutable == true' <<<"$release_json" >/dev/null
+          remote_digest="$(
+            jq -er --arg name "$SOURCE_PLAN_NAME" \
+              '[.assets[] | select(.name == $name and .state == "uploaded") | .digest] | if length == 1 then .[0] else error("source plan asset identity is ambiguous") end' \
+              <<<"$release_json"
+          )"
+          [ "$remote_digest" = "sha256:$EXPECTED_SOURCE_PLAN_SHA256" ] \
+            || { echo "immutable source plan recovery asset differs from audited evidence run $EVIDENCE_RUN_ID" >&2; exit 1; }
+
+      - name: Revalidate trust after source plan recovery
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
@@ -908,7 +975,7 @@ jobs:
           VERSION: ${{ needs.release-preflight.outputs.release_version }}
           RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
           COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
-          TRUSTED_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.trusted_publisher_sha }}
+          SOURCE_PLAN_PUBLISHER_SHA: ${{ needs.release-preflight.outputs.source_plan_publisher_sha }}
           GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
           GATE_CHECK_ID: ${{ needs.release-preflight.outputs.gate_check_id }}
           GATE_CHECK_SUITE_ID: ${{ needs.release-preflight.outputs.gate_check_suite_id }}
@@ -933,7 +1000,7 @@ jobs:
               --version "$VERSION" \
               --tag "$RELEASE_TAG" \
               --component-sha "$COMPONENT_SHA" \
-              --trusted-publisher-sha "$TRUSTED_PUBLISHER_SHA" \
+              --trusted-publisher-sha "$SOURCE_PLAN_PUBLISHER_SHA" \
               --gate-run-id "$GATE_RUN_ID" \
               --gate-check-id "$GATE_CHECK_ID" \
               --gate-check-suite-id "$GATE_CHECK_SUITE_ID" \
