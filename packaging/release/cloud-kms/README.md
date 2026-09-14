@@ -58,7 +58,7 @@ new candidate to be signed by the policy's active publisher key.
 GitHub OIDC smoke verification passed for development (run 34311921321) and
 production (run 34311923274), including BOM, detached evidence and signed Git tags.
 The candidate and final IQ9075 OTA publishers use dedicated WIF providers pinned
-to the exact approved workflow commit. Provision v25 only after merging and
+to the exact approved workflow commit. Provision v26 only after merging and
 creating the new signed immutable publisher tag. The final publisher keeps its
 GCS credentials separate from KMS credentials; KMS never uses a stored private key.
 
