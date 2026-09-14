@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PKG_NAME="nuv-agent"
-VERSION="${VERSION:-0.1.121}"
+VERSION="${VERSION:-0.1.122}"
 ARCH="${ARCH:-arm64}"
 BUILD_ROOT="${BUILD_ROOT:-}"
 SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-}"

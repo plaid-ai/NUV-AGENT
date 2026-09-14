@@ -187,13 +187,13 @@ class ApprovalAuthorizationTest(unittest.TestCase):
     def env(self):
         return dict(GITHUB_REPOSITORY="plaid-ai/NUV-AGENT", GITHUB_REF="refs/heads/main",
                     GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_RUN_ATTEMPT="1", ACTOR_ID="57535980",
-                    TARGET_SHA="a" * 40, TAG_NAME="v0.1.121", TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
+                    TARGET_SHA="a" * 40, TAG_NAME="v0.1.122", TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
 
     def test_valid_request_must_match_current_main(self):
         with patch.dict("os.environ", self.env(), clear=True), patch.object(
             self.module, "run", side_effect=[json.dumps({"object": {"sha": "a" * 40}}), "a" * 40, ""]
         ):
-            self.assertEqual(self.module.authorize()[:2], ("a" * 40, "v0.1.121"))
+            self.assertEqual(self.module.authorize()[:2], ("a" * 40, "v0.1.122"))
 
     def test_rejects_unauthorized_events_identities_and_tag_values(self):
         for field, value in (("GITHUB_REF", "refs/heads/feature"), ("GITHUB_REPOSITORY", "other/repo"),
@@ -246,7 +246,7 @@ class OtaKmsFederationTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         plan = module.plan("a" * 40)
-        self.assertEqual(set(plan), {"candidate-v24", "release-main-v24"})
+        self.assertEqual(set(plan), {"candidate-v25", "release-main-v25"})
         for name, config in plan.items():
             condition = config["condition"]
             for expected in ("assertion.workflow_sha == '" + "a" * 40 + "'",
@@ -255,7 +255,7 @@ class OtaKmsFederationTest(unittest.TestCase):
                              "assertion.event_name == 'workflow_dispatch'",
                              "assertion.actor_id in ['57535980', '89565530']", config["subject"]):
                 self.assertIn(expected, condition)
-            self.assertIn("refs/tags/candidate-publisher-v24" if name == "candidate-v24" else "refs/heads/main", condition)
+            self.assertIn("refs/tags/candidate-publisher-v25" if name == "candidate-v25" else "refs/heads/main", condition)
         with self.assertRaises(ValueError):
             module.plan("main")
 
