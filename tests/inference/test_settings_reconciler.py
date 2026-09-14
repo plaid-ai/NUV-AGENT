@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -1037,6 +1038,102 @@ class SettingsReconcilerTest(unittest.TestCase):
                 environment,
                 base_config_path=self.config_path,
             )
+
+    def test_boot_guard_finalizes_terminal_job_when_lkg_is_active(self) -> None:
+        for index, durable_phase in enumerate(("FAILED", "ROLLED_BACK", "SUPERSEDED")):
+            with self.subTest(durable_phase=durable_phase):
+                command = _command(41 + index, activation="RESTART")
+                state_dir = self.root / f"state-{durable_phase.lower()}"
+                reconciler = SettingsReconciler(
+                    store=AtomicSettingsStore(self.config_path, state_dir),
+                    runtime=_Runtime(),
+                    process_instance_id="staging-process",
+                    event_outbox_health_provider=_healthy_event_outbox,
+                    command_outbox_health_provider=_healthy_command_outbox,
+                )
+                deferred = reconciler.reconcile(command)
+                self.assertIsInstance(deferred, ReconcileDeferred)
+                inbox_path = self.root / f"terminal-{durable_phase.lower()}.sqlite3"
+                with sqlite3.connect(inbox_path) as connection:
+                    connection.execute(
+                        "CREATE TABLE fleet_reconcile_job (command_id TEXT, phase TEXT)"
+                    )
+                    connection.execute(
+                        "INSERT INTO fleet_reconcile_job(command_id, phase) VALUES (?, ?)",
+                        (command.command_id, "PENDING"),
+                    )
+                environment = {
+                    "NUVION_SETTINGS_STATE_DIR": str(state_dir),
+                    "NUVION_COMMAND_INBOX_PATH": str(inbox_path),
+                }
+
+                self.assertEqual(
+                    run_settings_boot_guard(
+                        environment,
+                        base_config_path=self.config_path,
+                    ),
+                    "CANDIDATE_BOOT_ATTEMPT",
+                )
+                self.assertEqual(
+                    run_settings_boot_guard(
+                        environment,
+                        base_config_path=self.config_path,
+                    ),
+                    "LKG_RESTORED",
+                )
+                with sqlite3.connect(inbox_path) as connection:
+                    connection.execute(
+                        "UPDATE fleet_reconcile_job SET phase = ? WHERE command_id = ?",
+                        (durable_phase, command.command_id),
+                    )
+                self.assertEqual(
+                    run_settings_boot_guard(
+                        environment,
+                        base_config_path=self.config_path,
+                    ),
+                    "DURABLE_TERMINAL_LKG_RESTORED",
+                )
+                marker = AtomicSettingsStore(self.config_path, state_dir).marker()
+                self.assertEqual(marker["phase"], "ROLLED_BACK")
+                self.assertEqual(marker["durableJobPhase"], durable_phase)
+                self.assertEqual(
+                    marker["recoveryReason"],
+                    "DURABLE_JOB_TERMINAL_LKG_ACTIVE",
+                )
+
+    def test_boot_guard_keeps_operator_block_when_terminal_job_lkg_is_invalid(self) -> None:
+        command = _command(45, activation="RESTART")
+        reconciler = self._reconciler(_Runtime(), "staging-process")
+        deferred = reconciler.reconcile(command)
+        self.assertIsInstance(deferred, ReconcileDeferred)
+        inbox_path = self.root / "terminal-invalid-lkg.sqlite3"
+        with sqlite3.connect(inbox_path) as connection:
+            connection.execute(
+                "CREATE TABLE fleet_reconcile_job (command_id TEXT, phase TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO fleet_reconcile_job(command_id, phase) VALUES (?, 'FAILED')",
+                (command.command_id,),
+            )
+        environment = {
+            "NUVION_SETTINGS_STATE_DIR": str(self.root / "state"),
+            "NUVION_COMMAND_INBOX_PATH": str(inbox_path),
+        }
+        self.assertEqual(
+            run_settings_boot_guard(environment, base_config_path=self.config_path),
+            "CANDIDATE_BOOT_ATTEMPT",
+        )
+        self.assertEqual(
+            run_settings_boot_guard(environment, base_config_path=self.config_path),
+            "LKG_RESTORED",
+        )
+        store = AtomicSettingsStore(self.config_path, self.root / "state")
+        store.lkg_path.unlink()
+        store.lkg_path.mkdir()
+
+        with self.assertRaises(SettingsBootGuardError):
+            run_settings_boot_guard(environment, base_config_path=self.config_path)
+        self.assertEqual(store.marker()["phase"], "ROLLBACK_STAGED")
 
     def test_boot_guard_never_loads_superseded_uncommitted_candidate(self) -> None:
         inbox_path = self.root / "boot-supersession.sqlite3"
