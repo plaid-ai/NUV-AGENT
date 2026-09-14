@@ -363,7 +363,7 @@ class AtomicSettingsStore:
             active = self._read_bytes(self.active_path, missing=b"")
             lkg = self._read_bytes(self.lkg_path)
             return self._sha256(active) == self._sha256(lkg)
-        except OSError:
+        except (OSError, ValueError):
             return False
 
     def rollback(
