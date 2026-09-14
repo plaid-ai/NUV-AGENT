@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -1037,6 +1038,57 @@ class SettingsReconcilerTest(unittest.TestCase):
                 environment,
                 base_config_path=self.config_path,
             )
+
+    def test_boot_guard_finalizes_terminal_failed_job_when_lkg_is_active(self) -> None:
+        command = _command(41, activation="RESTART")
+        reconciler = self._reconciler(_Runtime(), "staging-process")
+        deferred = reconciler.reconcile(command)
+        self.assertIsInstance(deferred, ReconcileDeferred)
+        inbox_path = self.root / "terminal-failed.sqlite3"
+        with sqlite3.connect(inbox_path) as connection:
+            connection.execute(
+                "CREATE TABLE fleet_reconcile_job (command_id TEXT, phase TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO fleet_reconcile_job(command_id, phase) VALUES (?, ?)",
+                (command.command_id, "FAILED"),
+            )
+        environment = {
+            "NUVION_SETTINGS_STATE_DIR": str(self.root / "state"),
+            "NUVION_COMMAND_INBOX_PATH": str(inbox_path),
+        }
+
+        self.assertEqual(
+            run_settings_boot_guard(
+                environment,
+                base_config_path=self.config_path,
+            ),
+            "CANDIDATE_BOOT_ATTEMPT",
+        )
+        self.assertEqual(
+            run_settings_boot_guard(
+                environment,
+                base_config_path=self.config_path,
+            ),
+            "LKG_RESTORED",
+        )
+        self.assertEqual(
+            run_settings_boot_guard(
+                environment,
+                base_config_path=self.config_path,
+            ),
+            "DURABLE_TERMINAL_LKG_RESTORED",
+        )
+        marker = AtomicSettingsStore(
+            self.config_path,
+            self.root / "state",
+        ).marker()
+        self.assertEqual(marker["phase"], "ROLLED_BACK")
+        self.assertEqual(marker["durableJobPhase"], "FAILED")
+        self.assertEqual(
+            marker["recoveryReason"],
+            "DURABLE_JOB_TERMINAL_LKG_ACTIVE",
+        )
 
     def test_boot_guard_never_loads_superseded_uncommitted_candidate(self) -> None:
         inbox_path = self.root / "boot-supersession.sqlite3"

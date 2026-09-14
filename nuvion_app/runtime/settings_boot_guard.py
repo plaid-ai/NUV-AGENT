@@ -15,6 +15,9 @@ class SettingsBootGuardError(RuntimeError):
     pass
 
 
+_TERMINAL_LKG_JOB_PHASES = frozenset({"FAILED", "ROLLED_BACK", "SUPERSEDED"})
+
+
 def _durable_job_phase(
     values: Mapping[str, str],
     command_id: str,
@@ -82,6 +85,19 @@ def run_settings_boot_guard(
         store.update_marker({"bootAttempts": attempts + 1})
         return "CANDIDATE_BOOT_ATTEMPT"
     if phase == "ROLLBACK_STAGED":
+        command_id = str(marker.get("commandId") or "")
+        durable_phase = (
+            _durable_job_phase(values, command_id) if command_id else None
+        )
+        if durable_phase in _TERMINAL_LKG_JOB_PHASES and store.lkg_is_active():
+            store.update_marker(
+                {
+                    "phase": "ROLLED_BACK",
+                    "recoveryReason": "DURABLE_JOB_TERMINAL_LKG_ACTIVE",
+                    "durableJobPhase": durable_phase,
+                }
+            )
+            return "DURABLE_TERMINAL_LKG_RESTORED"
         rollback_attempts = int(marker.get("rollbackBootAttempts") or 0)
         if rollback_attempts >= 1:
             raise SettingsBootGuardError(
