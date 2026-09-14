@@ -62,7 +62,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("permissions: {}", self.header)
         self.assertNotIn("secrets:", self.header)
         self.assertEqual(
-            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v24'"),
+            self.publisher.count("github.ref == 'refs/tags/candidate-publisher-v25'"),
             3,
         )
         self.assertNotRegex(self.publisher, r"refs/tags/candidate-publisher-v1(?![0-9])")
@@ -76,7 +76,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", self.header)
 
     @unittest.skipUnless(shutil.which("bash"), "bash is required")
-    def test_authorization_accepts_only_exact_v24_ref_and_workflow_identity(self) -> None:
+    def test_authorization_accepts_only_exact_v25_ref_and_workflow_identity(self) -> None:
         script = textwrap.dedent(
             self.authorize.split("        run: |\n", maxsplit=1)[1]
         )
@@ -84,9 +84,9 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             "plaid-ai/NUV-AGENT/.github/workflows/"
             "iq9075-candidate-trusted-publish.yml@"
         )
-        active_ref = "refs/tags/candidate-publisher-v24"
+        active_ref = "refs/tags/candidate-publisher-v25"
         cases = [
-            (active_ref, active_ref, "21", True),
+            (active_ref, active_ref, "22", True),
             (active_ref, active_ref, "2", False),
             (active_ref, active_ref, "3", False),
             (active_ref, active_ref, "4", False),
@@ -106,8 +106,8 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             (active_ref, active_ref, "15", False),
             (active_ref, active_ref, "13", False),
             (active_ref, active_ref, "14", False),
-            (active_ref, active_ref, "22", False),
-            (active_ref + "0", active_ref + "0", "21", False),
+            (active_ref, active_ref, "21", False),
+            (active_ref + "0", active_ref + "0", "22", False),
         ]
         for retired_ref in (
             "refs/tags/candidate-publisher-v1",
@@ -133,12 +133,13 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
             "refs/tags/candidate-publisher-v21",
             "refs/tags/candidate-publisher-v22",
             "refs/tags/candidate-publisher-v23",
+            "refs/tags/candidate-publisher-v24",
         ):
             cases.extend(
                 (
-                    (retired_ref, retired_ref, "21", False),
-                    (retired_ref, active_ref, "21", False),
-                    (active_ref, retired_ref, "21", False),
+                    (retired_ref, retired_ref, "22", False),
+                    (retired_ref, active_ref, "22", False),
+                    (active_ref, retired_ref, "22", False),
                 )
             )
         for ref, workflow_ref, sequence, accepted in cases:
@@ -159,7 +160,7 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                         "PUBLISHER_SHA": "1" * 40,
                         "PUBLISHER_REF": workflow + workflow_ref,
                         "COMPONENT_SHA": "2" * 40,
-                        "VERSION": "0.1.121",
+                        "VERSION": "0.1.122",
                         "RELEASE_SEQUENCE": sequence,
                     },
                 )
@@ -215,11 +216,11 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                 self.assertIn("--main-ref refs/remotes/origin/main", job)
                 self.assertIn("verify-github-oidc.py", job)
                 self.assertIn(
-                    "refs/tags/candidate-publisher-v24", job
+                    "refs/tags/candidate-publisher-v25", job
                 )
                 self.assertEqual(
                     OIDC.WORKFLOW_REF,
-                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v24",
+                    "plaid-ai/NUV-AGENT/.github/workflows/iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v25",
                 )
                 self.assertNotIn("ref: ${{ inputs.component_sha }}", job)
                 self.assertNotIn("stamp-build-info.py", job)
@@ -292,8 +293,8 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         )
 
     def test_candidate_v24_prevents_downgrade_or_scope_expansion(self) -> None:
-        self.assertGreaterEqual(self.publisher.count('= "0.1.121" ]'), 3)
-        self.assertGreaterEqual(self.publisher.count('= "21" ]'), 3)
+        self.assertGreaterEqual(self.publisher.count('= "0.1.122" ]'), 3)
+        self.assertGreaterEqual(self.publisher.count('= "22" ]'), 3)
         self.assertGreaterEqual(self.publisher.count('= "12" ]'), 2)
         self.assertGreaterEqual(self.publisher.count('= "0.2.0" ]'), 2)
         forbidden = (
@@ -338,8 +339,8 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         self.assertEqual(
             policy["candidatePublisher"],
             {
-                "tag": "candidate-publisher-v24",
-                "tagRef": "refs/tags/candidate-publisher-v24",
+                "tag": "candidate-publisher-v25",
+                "tagRef": "refs/tags/candidate-publisher-v25",
                 "retiredTagRefs": [
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
@@ -364,10 +365,11 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v21",
                     "refs/tags/candidate-publisher-v22",
                     "refs/tags/candidate-publisher-v23",
+                    "refs/tags/candidate-publisher-v24",
                 ],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
-                "agentVersion": "0.1.121",
-                "releaseSequence": 21,
+                "agentVersion": "0.1.122",
+                "releaseSequence": 22,
                 "configSchema": "12",
                 "minUpdaterVersion": "0.2.0",
                 "rulesetName": "protected-candidate-publisher",
@@ -376,13 +378,13 @@ class Iq9075CandidateEvidenceWorkflowTest(unittest.TestCase):
         for name in ("iq9075-candidate-sign", "iq9075-candidate-stage"):
             self.assertEqual(
                 policy["requiredEnvironments"][name]["deploymentBranchPolicies"],
-                [{"name": "candidate-publisher-v24", "type": "tag"}],
+                [{"name": "candidate-publisher-v25", "type": "tag"}],
             )
             self.assertFalse(
                 policy["requiredEnvironments"][name]["canAdminsBypass"]
             )
         current_runbook = (ROOT / "packaging/release/cloud-kms/ota-cutover.md").read_text()
-        self.assertIn("--ref candidate-publisher-v24", current_runbook)
+        self.assertIn("--ref candidate-publisher-v25", current_runbook)
         self.assertIn("kms-approve-release.yml", current_runbook)
         # The old runbook is retained as historical v10 migration evidence.
         runbook = RUNBOOK.read_text(encoding="utf-8")
@@ -562,7 +564,7 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             self.assertEqual(
                 result["workflowRef"],
                 "plaid-ai/NUV-AGENT/.github/workflows/"
-                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v24",
+                "iq9075-candidate-trusted-publish.yml@refs/tags/candidate-publisher-v25",
             )
 
     def test_accepts_signed_exact_optional_job_workflow_pair(self) -> None:
@@ -588,13 +590,13 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             {"job_workflow_ref": OIDC.WORKFLOW_REF, "job_workflow_sha": "2" * 40},
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v24", "candidate-publisher-v2"
+                    "candidate-publisher-v25", "candidate-publisher-v2"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v24", "candidate-publisher-v3"
+                    "candidate-publisher-v25", "candidate-publisher-v3"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
@@ -604,7 +606,7 @@ class StandalonePublisherOidcTest(unittest.TestCase):
             },
             {
                 "job_workflow_ref": OIDC.WORKFLOW_REF.replace(
-                    "candidate-publisher-v24", "candidate-publisher-v4"
+                    "candidate-publisher-v25", "candidate-publisher-v4"
                 ),
                 "job_workflow_sha": "1" * 40,
             },
