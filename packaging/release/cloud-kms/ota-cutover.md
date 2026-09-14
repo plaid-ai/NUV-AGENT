@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v25`, Agent `0.1.122`, release sequence
-`22`, schema `12`, minimum updater `0.2.0`. Sequences 2–21 and publishers v1–v24
+Current publisher: `candidate-publisher-v26`, Agent `0.1.122`, release sequence
+`23`, schema `12`, minimum updater `0.2.0`. Sequences 2–22 and publishers v1–v25
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v25 \
-     -f tag_message='NUVION IQ9075 candidate publisher v25'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v26 \
+     -f tag_message='NUVION IQ9075 candidate publisher v26'
    ```
 
 2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v25
-   to the existing immutable candidate tag ruleset without changing old tags,
+   and v26 to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v24 to v25 and verify them.
+   existing candidate-sign/stage tag policies from v24 to v26 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v25 \
-     -f component_sha="$P" -f version=0.1.122 -f release_sequence=22
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v26 \
+     -f component_sha="$P" -f version=0.1.122 -f release_sequence=23
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -62,6 +62,11 @@ acceptance are separate. Main-branch protection has been restored. The formal
 release settings gate still requires a fresh live settings audit and signed
 evidence. No successful settings/OTA attestation is implied here.
 APT signing and GCS publishing credentials are outside this OTA key migration.
+
+Publisher v25/sequence 22 was retired after its KMS approval tag was created:
+the frozen candidate verifier omitted the newly retired v24 ref. The failure was
+detected by local signed-tag verification before candidate build, GCS staging, or
+device commands. Keep the v25 tag immutable and use v26/sequence 23 only.
 
 ## Candidate v12 physical validation retry
 
