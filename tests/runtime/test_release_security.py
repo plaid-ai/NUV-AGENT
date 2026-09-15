@@ -6414,7 +6414,9 @@ esac
                         "BUCKET": "test-bucket",
                         "SKIP_APT_PUBLISH": "true",
                         "APT_PUBLIC_DIR": str(public),
-                        "RELEASE_KEYRING_PATH": str(keyring),
+                        # The release workflow passes a path relative to its
+                        # checkout and APT_RUNTIME_ROOT changes the script cwd.
+                        "RELEASE_KEYRING_PATH": os.path.relpath(keyring, ROOT),
                         "RELEASE_TRUST_DOMAIN": "test-ota",
                         "FAKE_GCLOUD_LOG": str(log),
                         "FAKE_GCLOUD_REMOTE": str(remote),
@@ -6434,6 +6436,7 @@ esac
                         capture_output=True,
                         text=True,
                         env=environment,
+                        cwd=ROOT,
                     )
                     self.assertNotEqual(first.returncode, 0)
                     environment["FAKE_FAIL_STAGE"] = "0"
@@ -6443,6 +6446,7 @@ esac
                         capture_output=True,
                         text=True,
                         env=environment,
+                        cwd=ROOT,
                     )
                     self.assertEqual(second.returncode, 0, second.stderr)
                     third = subprocess.run(
@@ -6451,6 +6455,7 @@ esac
                         capture_output=True,
                         text=True,
                         env=environment,
+                        cwd=ROOT,
                     )
                     self.assertEqual(third.returncode, 0, third.stderr)
                     objects = sorted(
