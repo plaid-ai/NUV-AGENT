@@ -1052,18 +1052,18 @@ def packet_tables():
         raise Failure('nft table inventory is invalid')
     return sorted(records, key=lambda x: (x['family'], x['name']))
 
-def packet_rules(table, uid, ports):
-    if re.fullmatch(r'nuvion_rtp_[0-9a-f]{32}', table) is None or type(uid) is not int or uid < 1 or not isinstance(ports, list) or ports != sorted(set(ports)) or not 1 <= len(ports) <= 16 or any(type(p) is not int or not 1024 < p < 65536 for p in ports):
+def packet_rules(table, uid, protocol, ports):
+    if re.fullmatch(r'nuvion_rtp_[0-9a-f]{32}', table) is None or type(uid) is not int or uid < 1 or protocol not in {'udp', 'tcp'} or not isinstance(ports, list) or ports != sorted(set(ports)) or not 1 <= len(ports) <= 16 or any(type(p) is not int or not 1024 < p < 65536 for p in ports):
         raise Failure('RTP fault socket scope is invalid')
-    return ('add table inet ' + table + '\nadd chain inet ' + table + ' output { type filter hook output priority 0; policy accept; }\nadd rule inet ' + table + ' output meta skuid ' + str(uid) + ' udp sport { ' + ', '.join(map(str, ports)) + ' } numgen random mod 100 < 35 counter drop\n')
+    return ('add table inet ' + table + '\nadd chain inet ' + table + ' output { type filter hook output priority 0; policy accept; }\nadd rule inet ' + table + ' output meta skuid ' + str(uid) + ' ' + protocol + ' sport { ' + ', '.join(map(str, ports)) + ' } numgen random mod 100 < 35 counter drop\n')
 
-def packet_shape(table, uid, ports):
+def packet_shape(table, uid, protocol, ports):
     return [
         {'table': {'family': 'inet', 'name': table}},
         {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
         {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
             {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': uid}},
-            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': protocol, 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
             {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
             {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
         ]}},
@@ -1084,11 +1084,35 @@ def packet_counter(fault, *, absent=False):
         records[2]['rule']['expr'][3]['counter'] = {'packets': 0, 'bytes': 0}
     except (IndexError, KeyError, TypeError) as exc:
         raise Failure('RTP fault rule shape is invalid') from exc
-    if records != packet_shape(fault['table'], fault['uid'], fault['udpSourcePorts']) or sha(canonical(records)) != fault['ruleShapeSha256']:
+    if records != packet_shape(fault['table'], fault['uid'], fault['transportProtocol'], fault['sourcePorts']) or sha(canonical(records)) != fault['ruleShapeSha256']:
         raise Failure('RTP fault rule changed outside its socket scope')
     return counter
 
-def packet_binding(rid):
+def tcp_bytes_by_source_port(output, pid, uid):
+    tcp = {}
+    current = None
+    for raw in output.splitlines():
+        row = raw.strip()
+        if not raw[:1].isspace():
+            current = None
+            if 'pid=' + str(pid) + ',' not in row or not row.startswith('ESTAB '):
+                continue
+            if 'uid:' + str(uid) + ' ' not in row or 'cgroup:/system.slice/nuv-agent.service' not in row:
+                raise Failure('RTP socket owner differs from Agent process')
+            fields = row.split()
+            port = int(fields[3].rsplit(':', 1)[1])
+            if port in tcp:
+                raise Failure('Agent TCP source port is ambiguous')
+            tcp[port] = None
+            current = port
+        elif current is not None:
+            match = re.search(r'\bbytes_sent:(\d+)\b', row)
+            if match is not None:
+                tcp[current] = int(match.group(1))
+                current = None
+    return {port: sent for port, sent in tcp.items() if sent is not None}
+
+def packet_socket_inventory(rid):
     pid = service_pid()
     proc = Path('/proc') / str(pid)
     uid = pwd.getpwnam('nuvion').pw_uid
@@ -1099,20 +1123,47 @@ def packet_binding(rid):
     if uid < 1 or uid_lines != [[str(uid)] * 4] or cgroup != '0::/system.slice/nuv-agent.service' or ('NUVION_RTP_QUALIFICATION_RUN_ID=' + rid).encode() not in env:
         raise Failure('RTP fault process identity is invalid')
     start_ticks = int((proc / 'stat').read_text().rsplit(') ', 1)[1].split()[19])
-    output = subprocess.run(['/usr/bin/ss', '-H', '-uanpe'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True, text=True).stdout
-    if len(output) > 1024 * 1024:
+    udp_output = subprocess.run(['/usr/bin/ss', '-H', '-uanpe'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True, text=True).stdout
+    tcp_output = subprocess.run(['/usr/bin/ss', '-H', '-tinpe'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True, text=True).stdout
+    if len(udp_output) > 1024 * 1024 or len(tcp_output) > 1024 * 1024:
         raise Failure('RTP socket inventory exceeds bound')
-    rows = [x for x in output.splitlines() if 'pid=' + str(pid) + ',' in x]
-    ports = []
-    for row in rows:
+    udp_rows = [x for x in udp_output.splitlines() if 'pid=' + str(pid) + ',' in x]
+    udp_ports = []
+    for row in udp_rows:
         if 'uid:' + str(uid) + ' ' not in row or 'cgroup:/system.slice/nuv-agent.service' not in row:
             raise Failure('RTP socket owner differs from Agent process')
-        ports.append(int(row.split()[3].rsplit(':', 1)[1]))
-    ports = sorted(set(ports))
-    packet_rules(packet_names(rid)[0], uid, ports)
+        udp_ports.append(int(row.split()[3].rsplit(':', 1)[1]))
+    udp_ports = sorted(set(udp_ports))
+    tcp = tcp_bytes_by_source_port(tcp_output, pid, uid)
     if service_pid() != pid or int((proc / 'stat').read_text().rsplit(') ', 1)[1].split()[19]) != start_ticks:
         raise Failure('Agent process changed while binding RTP sockets')
-    return {'servicePid': pid, 'processStartTicks': start_ticks, 'uid': uid, 'cgroup': cgroup, 'udpSourcePorts': ports}
+    return {'servicePid': pid, 'processStartTicks': start_ticks, 'uid': uid, 'cgroup': cgroup, 'udpSourcePorts': udp_ports, 'tcpBytesSentBySourcePort': tcp}
+
+def packet_binding(rid):
+    first = packet_socket_inventory(rid)
+    time.sleep(1.0)
+    second = packet_socket_inventory(rid)
+    identity = ('servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts')
+    if any(first[k] != second[k] for k in identity) or set(first['tcpBytesSentBySourcePort']) != set(second['tcpBytesSentBySourcePort']):
+        raise Failure('Agent socket inventory changed during RTP transport selection')
+    activity = sorted(((max(0, second['tcpBytesSentBySourcePort'][port] - sent), port) for port, sent in first['tcpBytesSentBySourcePort'].items()), reverse=True)
+    if activity and activity[0][0] >= 16384 and (len(activity) == 1 or activity[0][0] >= max(16384, activity[1][0] * 4)):
+        protocol, ports = 'tcp', [activity[0][1]]
+    else:
+        protocol, ports = 'udp', second['udpSourcePorts']
+    packet_rules(packet_names(rid)[0], second['uid'], protocol, ports)
+    return {k: second[k] for k in ('servicePid', 'processStartTicks', 'uid', 'cgroup')} | {'transportProtocol': protocol, 'sourcePorts': ports}
+
+def packet_binding_current(rid, expected):
+    current = packet_socket_inventory(rid)
+    for key in ('servicePid', 'processStartTicks', 'uid', 'cgroup'):
+        if current[key] != expected.get(key):
+            raise Failure('RTP fault active process identity changed')
+    protocol, ports = expected.get('transportProtocol'), expected.get('sourcePorts')
+    present = current['udpSourcePorts'] if protocol == 'udp' else sorted(current['tcpBytesSentBySourcePort']) if protocol == 'tcp' else []
+    if not isinstance(ports, list) or any(port not in present for port in ports):
+        raise Failure('RTP fault active socket disappeared')
+    return dict(expected)
 
 def packet_apply(rid, state, work):
     if state.get('packetFault') is not None:
@@ -1126,15 +1177,15 @@ def packet_apply(rid, state, work):
         raise Failure('RTP fault table already exists')
     if any(systemctl('is-active', target, check=False).stdout.strip() in {'active', 'activating', 'deactivating'} for target in (unit + '.timer', unit + '.service')):
         raise Failure('RTP fault recovery unit already exists')
-    fault = {'kind': 'socket-scoped-rtp-drop', 'runId': rid, 'phase': 'ARMING', 'table': table, 'timerUnit': unit + '.timer', 'automaticRemovalSeconds': 60, 'dropPercent': 35, **binding, 'previousTablesSha256': sha(canonical(before)), 'ruleShapeSha256': sha(canonical(packet_shape(table, binding['uid'], binding['udpSourcePorts'])))}
+    fault = {'kind': 'socket-scoped-rtp-drop', 'runId': rid, 'phase': 'ARMING', 'table': table, 'timerUnit': unit + '.timer', 'automaticRemovalSeconds': 60, 'dropPercent': 35, **binding, 'previousTablesSha256': sha(canonical(before)), 'ruleShapeSha256': sha(canonical(packet_shape(table, binding['uid'], binding['transportProtocol'], binding['sourcePorts'])))}
     state['packetFault'] = fault
     atomic(work / 'state.json', canonical(state))
-    rules = packet_rules(table, binding['uid'], binding['udpSourcePorts'])
+    rules = packet_rules(table, binding['uid'], binding['transportProtocol'], binding['sourcePorts'])
     subprocess.run(['/usr/sbin/nft', '-c', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
     subprocess.run(['/usr/bin/systemd-run', '--quiet', '--collect', '--unit=' + unit, '--on-active=60s', '--timer-property=AccuracySec=1s', '--property=Type=oneshot', '/usr/sbin/nft', 'delete', 'table', 'inet', table], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True)
     if systemctl('is-active', unit + '.timer', check=False).stdout.strip() != 'active':
         raise Failure('RTP fault automatic recovery timer is not active')
-    if packet_binding(rid) != binding:
+    if packet_binding_current(rid, binding) != binding:
         raise Failure('RTP socket binding changed before fault application')
     subprocess.run(['/usr/sbin/nft', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
     fault.update({'phase': 'ACTIVE', 'appliedAt': utc_now(), 'timerArmed': True, 'counter': packet_counter(fault)})
@@ -1150,7 +1201,7 @@ def packet_inspect(rid, state):
     if fault.get('phase') == 'ACTIVE':
         if systemctl('is-active', fault['timerUnit'], check=False).stdout.strip() != 'active':
             raise Failure('RTP fault independent recovery timer is not active')
-        binding = packet_binding(rid)
+        binding = packet_binding_current(rid, {k: fault[k] for k in ('servicePid', 'processStartTicks', 'uid', 'cgroup', 'transportProtocol', 'sourcePorts')})
         if any(fault.get(k) != v for k, v in binding.items()):
             raise Failure('RTP fault active process or sockets changed')
         return {**fault, 'counter': packet_counter(fault), 'observedAt': utc_now()}
@@ -1814,17 +1865,20 @@ def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
             reason = reason.removeprefix(prefix)
             break
     tokens = reason.split(",")
-    return "packet_loss_high" in tokens and set(tokens) <= {"packet_loss_high", "round_trip_time_high", "connectivity_poor", "nack_increase", "pli_increase", "queue_pressure_high"}
+    media_congestion = {"packet_loss_high", "round_trip_time_high", "nack_increase", "pli_increase", "queue_pressure_high"}
+    allowed = media_congestion | {"connectivity_poor"}
+    return bool(set(tokens) & media_congestion) and set(tokens) <= allowed
 
 
 def validate_network_condition(value, *, run_id, service_pid, phase):
     """Require an actual, narrowly scoped RTP fault and its bounded recovery."""
-    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
+    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'transportProtocol', 'sourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
     extra = {'observedAt'} if phase == 'ACTIVE' else {'releasedAt', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
     if not isinstance(value, dict) or set(value) != common | extra or phase not in {'ACTIVE', 'RELEASED'}:
         raise ConfigStreamError('RTP network condition fields are invalid')
     table = 'nuvion_rtp_' + run_id.replace('-', '')
-    ports = value.get('udpSourcePorts')
+    protocol = value.get('transportProtocol')
+    ports = value.get('sourcePorts')
     if (value['kind'] != 'socket-scoped-rtp-drop' or value['runId'] != run_id or value['phase'] != phase
         or value['table'] != table or value['timerUnit'] != 'nuvion-rtp-' + run_id.replace('-', '') + '.timer'
         or type(value['automaticRemovalSeconds']) is not int or value['automaticRemovalSeconds'] != 60
@@ -1833,6 +1887,7 @@ def validate_network_condition(value, *, run_id, service_pid, phase):
         or type(value['processStartTicks']) is not int or value['processStartTicks'] < 1
         or type(value['uid']) is not int or value['uid'] < 1
         or value['cgroup'] != '0::/system.slice/nuv-agent.service'
+        or protocol not in {'udp', 'tcp'}
         or not isinstance(ports, list) or not 1 <= len(ports) <= 16
         or any(type(p) is not int or not 1024 < p < 65536 for p in ports)
         or ports != sorted(set(ports)) or value['timerArmed'] is not True):
@@ -1845,7 +1900,7 @@ def validate_network_condition(value, *, run_id, service_pid, phase):
         {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
         {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
             {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': value['uid']}},
-            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': protocol, 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
             {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
             {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
         ]}},

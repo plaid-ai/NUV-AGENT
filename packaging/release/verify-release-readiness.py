@@ -538,7 +538,9 @@ def _poor_stream_reason(reason: object, bitrate: int, minimum: int) -> bool:
             reason = reason.removeprefix(prefix)
             break
     tokens = reason.split(",")
-    return "packet_loss_high" in tokens and set(tokens) <= {"packet_loss_high", "round_trip_time_high", "connectivity_poor", "nack_increase", "pli_increase", "queue_pressure_high"}
+    media_congestion = {"packet_loss_high", "round_trip_time_high", "nack_increase", "pli_increase", "queue_pressure_high"}
+    allowed = media_congestion | {"connectivity_poor"}
+    return bool(set(tokens) & media_congestion) and set(tokens) <= allowed
 
 
 def _rtp_timestamp(value, label):
@@ -547,12 +549,13 @@ def _rtp_timestamp(value, label):
 
 def validate_network_condition(value, *, run_id, service_pid, phase):
     """Require an actual, narrowly scoped RTP fault and its bounded recovery."""
-    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
+    common = {'kind', 'runId', 'phase', 'table', 'timerUnit', 'automaticRemovalSeconds', 'dropPercent', 'servicePid', 'processStartTicks', 'uid', 'cgroup', 'transportProtocol', 'sourcePorts', 'previousTablesSha256', 'ruleShapeSha256', 'appliedAt', 'timerArmed', 'counter'}
     extra = {'observedAt'} if phase == 'ACTIVE' else {'releasedAt', 'exactNetworkRestoration', 'timerDisarmed', 'tableAbsent'}
     if not isinstance(value, dict) or set(value) != common | extra or phase not in {'ACTIVE', 'RELEASED'}:
         raise ReadinessError('RTP network condition fields are invalid')
     table = 'nuvion_rtp_' + run_id.replace('-', '')
-    ports = value.get('udpSourcePorts')
+    protocol = value.get('transportProtocol')
+    ports = value.get('sourcePorts')
     if (value['kind'] != 'socket-scoped-rtp-drop' or value['runId'] != run_id or value['phase'] != phase
         or value['table'] != table or value['timerUnit'] != 'nuvion-rtp-' + run_id.replace('-', '') + '.timer'
         or type(value['automaticRemovalSeconds']) is not int or value['automaticRemovalSeconds'] != 60
@@ -561,6 +564,7 @@ def validate_network_condition(value, *, run_id, service_pid, phase):
         or type(value['processStartTicks']) is not int or value['processStartTicks'] < 1
         or type(value['uid']) is not int or value['uid'] < 1
         or value['cgroup'] != '0::/system.slice/nuv-agent.service'
+        or protocol not in {'udp', 'tcp'}
         or not isinstance(ports, list) or not 1 <= len(ports) <= 16
         or any(type(p) is not int or not 1024 < p < 65536 for p in ports)
         or ports != sorted(set(ports)) or value['timerArmed'] is not True):
@@ -573,7 +577,7 @@ def validate_network_condition(value, *, run_id, service_pid, phase):
         {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 0, 'policy': 'accept'}},
         {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
             {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': value['uid']}},
-            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': protocol, 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
             {'match': {'op': '<', 'left': {'numgen': {'mode': 'random', 'mod': 100, 'offset': 0}}, 'right': 35}},
             {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
         ]}},
