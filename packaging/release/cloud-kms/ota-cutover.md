@@ -301,15 +301,18 @@ phase workaround above is superseded by this socket-scoped test fixture.
 
 Publisher v24 / sequence 21 requires a fresh complete physical chain. The
 synthetic RGB source remains camera independent. The root runner binds a
-35-percent UDP loss rule to the prepared Agent PID/start time, dedicated UID,
-service cgroup, run marker and existing UDP source ports. TCP/control traffic
-and other sockets are outside that rule. Intent is journaled before applying
-it, and an independent systemd timer removes its owned table after 60 seconds.
+35-percent loss rule to the prepared Agent PID/start time, dedicated UID,
+service cgroup and run marker. It uses the existing UDP source-port set when
+RTP is on UDP. When ICE selects TCP, the runner samples per-socket byte growth
+and binds only the single dominant media source port; low-volume HTTPS and
+Fleet control sockets remain outside the rule. Intent is journaled before
+applying it, and an independent systemd timer removes its owned table after
+60 seconds.
 GOOD and normal/failure/reboot restoration reconcile only that owned table and
 stop its timer. Changed rules or an incomplete recovery fail closed.
 
 Config/stream evidence schema 2 requires positive dropped-packet counters,
-actual RTP packet-loss reasons with a lower bitrate, and later healthy bitrate
+an actual media congestion reason with a lower bitrate, and later healthy bitrate
 recovery after exact rule removal. The independent readiness verifier checks
 socket identity, rule fingerprint, counter continuity and cleanup. Existing
 ACK, revision, twin, queue, release-binding and bitrate-bound gates remain.

@@ -36,16 +36,17 @@ def _board_namespace():
     return namespace
 
 
-def _network_condition(phase, run_id=RUN_ID, service_pid=101, stamp="2026-09-02T23:59:"):
+def _network_condition(phase, run_id=RUN_ID, service_pid=101, stamp="2026-09-02T23:59:", protocol="udp"):
     ns = _board_namespace()
     table, unit = ns["packet_names"](run_id)
+    ports = [31000, 31001] if protocol == "udp" else [31001]
     value = {
         "kind": "socket-scoped-rtp-drop", "runId": run_id, "phase": phase,
         "table": table, "timerUnit": unit + ".timer", "automaticRemovalSeconds": 60,
         "dropPercent": 35, "servicePid": service_pid, "processStartTicks": 10000,
-        "uid": 997, "cgroup": "0::/system.slice/nuv-agent.service", "udpSourcePorts": [31000, 31001],
+        "uid": 997, "cgroup": "0::/system.slice/nuv-agent.service", "transportProtocol": protocol, "sourcePorts": ports,
         "previousTablesSha256": "a" * 64,
-        "ruleShapeSha256": ns["sha"](ns["canonical"](ns["packet_shape"](table, 997, [31000, 31001]))),
+        "ruleShapeSha256": ns["sha"](ns["canonical"](ns["packet_shape"](table, 997, protocol, ports))),
         "appliedAt": stamp + "10.000Z", "timerArmed": True,
         "counter": {"packets": 100, "bytes": 120000},
     }
@@ -663,6 +664,7 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
             for decision in decisions:
                 self.assertTrue(check._good_stream_reason(decision.reason, decision.bitrate_kbps, 2000, startup=True))
             self.assertTrue(check._poor_stream_reason("cooldown:connectivity_poor,packet_loss_high", 500, 250))
+            self.assertTrue(check._poor_stream_reason("round_trip_time_high", 500, 250))
             self.assertTrue(check._poor_stream_reason("at_minimum", 250, 250))
             self.assertFalse(check._poor_stream_reason("at_minimum", 500, 250))
             self.assertFalse(check._good_stream_reason("at_maximum", 1000, 2000))
@@ -1029,7 +1031,8 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
         self.assertIn("/run/nuvion-config-stream-e2e", program)
         self.assertNotIn('runtime / "bin/iw"', program)
         self.assertNotIn('runtime / "bin/ping"', program)
-        self.assertIn("udp sport", program)
+        self.assertIn("protocol not in {'udp', 'tcp'}", program)
+        self.assertIn("'transportProtocol': protocol", program)
         self.assertIn("--on-active=60s", program)
         self.assertIn("videotestsrc is-live=true", program)
         self.assertNotIn("ip link", program)
@@ -1180,13 +1183,71 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
 
 
 class RtpFaultLifecycleTest(unittest.TestCase):
+    def test_tcp_socket_byte_parser_requires_agent_owned_established_rows(self):
+        ns = _board_namespace()
+        output = (
+            'ESTAB 0 0 192.168.0.233:38734 211.188.62.105:31001 '
+            'users:(("python3",pid=101,fd=25)) uid:997 ino:123 '
+            'cgroup:/system.slice/nuv-agent.service <->\n'
+            '\t ts sack cubic wscale:7,7 bytes_sent:675872 bytes_acked:675821\n'
+            'ESTAB 0 0 192.168.0.233:43836 34.111.54.25:443 '
+            'users:(("python3",pid=101,fd=19)) uid:997 ino:456 '
+            'cgroup:/system.slice/nuv-agent.service <->\n'
+            '\t ts sack cubic wscale:7,7 bytes_sent:52 bytes_acked:53\n'
+        )
+        self.assertEqual(
+            ns["tcp_bytes_by_source_port"](output, 101, 997),
+            {38734: 675872, 43836: 52},
+        )
+        with self.assertRaises(ns["Failure"]):
+            ns["tcp_bytes_by_source_port"](output.replace("uid:997", "uid:0", 1), 101, 997)
+
+    def test_binding_selects_dominant_ice_tcp_flow_and_udp_fallback(self):
+        ns = _board_namespace()
+        base = {
+            "servicePid": 101,
+            "processStartTicks": 10000,
+            "uid": 997,
+            "cgroup": "0::/system.slice/nuv-agent.service",
+            "udpSourcePorts": [31000, 31001],
+        }
+        samples = iter(
+            [
+                {**base, "tcpBytesSentBySourcePort": {41000: 1_000, 41001: 500}},
+                {**base, "tcpBytesSentBySourcePort": {41000: 90_000, 41001: 700}},
+            ]
+        )
+        ns["packet_socket_inventory"] = lambda rid: dict(next(samples))
+        ns["time"] = SimpleNamespace(sleep=lambda seconds: None)
+        self.assertEqual(
+            ns["packet_binding"](RUN_ID),
+            {
+                "servicePid": 101,
+                "processStartTicks": 10000,
+                "uid": 997,
+                "cgroup": "0::/system.slice/nuv-agent.service",
+                "transportProtocol": "tcp",
+                "sourcePorts": [41000],
+            },
+        )
+
+        samples = iter(
+            [
+                {**base, "tcpBytesSentBySourcePort": {41000: 1_000}},
+                {**base, "tcpBytesSentBySourcePort": {41000: 2_000}},
+            ]
+        )
+        ns["packet_socket_inventory"] = lambda rid: dict(next(samples))
+        self.assertEqual(ns["packet_binding"](RUN_ID)["transportProtocol"], "udp")
+
     def _fixture(self, work):
         ns = _board_namespace()
         state = {"testServicePid": 101}
         kernel = {"present": False, "timer": False, "counter": {"packets": 100, "bytes": 120000}, "lost": None}
-        binding = {k: _network_condition("ACTIVE")[k] for k in ("servicePid", "processStartTicks", "uid", "cgroup", "udpSourcePorts")}
+        binding = {k: _network_condition("ACTIVE")[k] for k in ("servicePid", "processStartTicks", "uid", "cgroup", "transportProtocol", "sourcePorts")}
         ns["atomic"] = lambda path, payload: path.write_bytes(payload)
         ns["packet_binding"] = lambda rid: dict(binding)
+        ns["packet_binding_current"] = lambda rid, expected: dict(expected)
         ns["packet_tables"] = lambda: []
         ns["packet_counter"] = lambda fault, **kwargs: dict(kernel["counter"]) if kernel["present"] else None
         def systemctl(*args, **kwargs):
@@ -1248,7 +1309,7 @@ class RtpFaultLifecycleTest(unittest.TestCase):
 
     def test_changed_or_foreign_rule_is_not_deleted(self):
         ns = _board_namespace(); fault = _network_condition("ACTIVE")
-        original = ns["packet_shape"](fault["table"], fault["uid"], fault["udpSourcePorts"])
+        original = ns["packet_shape"](fault["table"], fault["uid"], fault["transportProtocol"], fault["sourcePorts"])
         for index in (0, 1, 2):
             with self.subTest(index=index):
                 changed = json.loads(json.dumps(original))
@@ -1263,8 +1324,10 @@ class RtpFaultLifecycleTest(unittest.TestCase):
             for phase in ("ACTIVE", "RELEASED"):
                 original = _network_condition(phase)
                 self.assertEqual(check.validate_network_condition(original, run_id=RUN_ID, service_pid=101, phase=phase), original)
+                tcp = _network_condition(phase, protocol="tcp")
+                self.assertEqual(check.validate_network_condition(tcp, run_id=RUN_ID, service_pid=101, phase=phase), tcp)
                 mutations = [("runId", str(uuid.uuid4())), ("uid", 0), ("uid", True), ("servicePid", 202),
-                             ("udpSourcePorts", []), ("udpSourcePorts", [22]), ("udpSourcePorts", [31000, 31000]),
+                             ("transportProtocol", "sctp"), ("sourcePorts", []), ("sourcePorts", [22]), ("sourcePorts", [31000, 31000]),
                              ("ruleShapeSha256", "b" * 64), ("dropPercent", 100), ("timerArmed", False),
                              ("counter", {"packets": 0, "bytes": 0}), ("counter", {"packets": True, "bytes": 5}),
                              ("automaticRemovalSeconds", 600), ("cgroup", "0::/other.service")]
@@ -1296,12 +1359,18 @@ table = 'nuvion_rtp_12345678123441238123123456789abc'
 ports = [31000, 31001]
 assert ns['packet_tables']() == []
 for scoped_ports in ([31000], ports):
-    rules = ns['packet_rules'](table, 65534, scoped_ports)
+    rules = ns['packet_rules'](table, 65534, 'udp', scoped_ports)
     subprocess.run(['/usr/sbin/nft', '-f', '-'], input=rules, text=True, check=True)
-    fault = {'table': table, 'uid': 65534, 'udpSourcePorts': scoped_ports,
-             'ruleShapeSha256': ns['sha'](ns['canonical'](ns['packet_shape'](table, 65534, scoped_ports)))}
+    fault = {'table': table, 'uid': 65534, 'transportProtocol': 'udp', 'sourcePorts': scoped_ports,
+             'ruleShapeSha256': ns['sha'](ns['canonical'](ns['packet_shape'](table, 65534, 'udp', scoped_ports)))}
     assert ns['packet_counter'](fault) == {'packets': 0, 'bytes': 0}
     subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], check=True)
+tcp_ports = [31003]
+subprocess.run(['/usr/sbin/nft', '-f', '-'], input=ns['packet_rules'](table, 65534, 'tcp', tcp_ports), text=True, check=True)
+tcp_fault = {'table': table, 'uid': 65534, 'transportProtocol': 'tcp', 'sourcePorts': tcp_ports,
+             'ruleShapeSha256': ns['sha'](ns['canonical'](ns['packet_shape'](table, 65534, 'tcp', tcp_ports)))}
+assert ns['packet_counter'](tcp_fault) == {'packets': 0, 'bytes': 0}
+subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], check=True)
 
 def traffic():
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1322,7 +1391,7 @@ def traffic():
         done.set(); thread.join(2); rx.close()
     return received
 try:
-    subprocess.run(['/usr/sbin/nft', '-f', '-'], input=ns['packet_rules'](table,65534,ports), text=True, check=True)
+    subprocess.run(['/usr/sbin/nft', '-f', '-'], input=ns['packet_rules'](table,65534,'udp',ports), text=True, check=True)
     affected = traffic(); count = ns['packet_counter'](fault)
     assert affected['control'] == 1000, affected
     assert 450 < affected['selected'] < 850, affected
