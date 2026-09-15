@@ -292,7 +292,7 @@ def _candidate_tag_publisher_sha(
         raise SettingsError("candidate publisher annotated tag identity is invalid")
     signature = verification["signature"]
     payload = verification["payload"]
-    expected_message = "NUVION IQ9075 candidate publisher v26\n"
+    expected_message = "NUVION IQ9075 candidate publisher v27\n"
     header, separator, unsigned_message = payload.partition("\n\n")
     header_lines = header.split("\n")
     if (
@@ -505,12 +505,12 @@ def verify_settings(
         "face-artifacts-release": ["GCP_PROJECT_ID", "GCP_SA_KEY"],
     }
     expected_candidate_publisher = {
-        "tag": "candidate-publisher-v26",
-        "tagRef": "refs/tags/candidate-publisher-v26",
-        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11", "refs/tags/candidate-publisher-v12", "refs/tags/candidate-publisher-v13", "refs/tags/candidate-publisher-v14", "refs/tags/candidate-publisher-v15", "refs/tags/candidate-publisher-v16", "refs/tags/candidate-publisher-v17", "refs/tags/candidate-publisher-v18", "refs/tags/candidate-publisher-v19", "refs/tags/candidate-publisher-v20", "refs/tags/candidate-publisher-v21", "refs/tags/candidate-publisher-v22", "refs/tags/candidate-publisher-v23", "refs/tags/candidate-publisher-v24", "refs/tags/candidate-publisher-v25"],
+        "tag": "candidate-publisher-v27",
+        "tagRef": "refs/tags/candidate-publisher-v27",
+        "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11", "refs/tags/candidate-publisher-v12", "refs/tags/candidate-publisher-v13", "refs/tags/candidate-publisher-v14", "refs/tags/candidate-publisher-v15", "refs/tags/candidate-publisher-v16", "refs/tags/candidate-publisher-v17", "refs/tags/candidate-publisher-v18", "refs/tags/candidate-publisher-v19", "refs/tags/candidate-publisher-v20", "refs/tags/candidate-publisher-v21", "refs/tags/candidate-publisher-v22", "refs/tags/candidate-publisher-v23", "refs/tags/candidate-publisher-v24", "refs/tags/candidate-publisher-v25", "refs/tags/candidate-publisher-v26"],
         "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
         "agentVersion": "0.1.122",
-        "releaseSequence": 23,
+        "releaseSequence": 24,
         "configSchema": "12",
         "minUpdaterVersion": "0.2.0",
         "rulesetName": "protected-candidate-publisher",
@@ -824,7 +824,7 @@ def verify_settings(
             "customBranchPolicies": True,
         }
         expected_deployment_policies = (
-            [{"name": "candidate-publisher-v26", "type": "tag"}]
+            [{"name": "candidate-publisher-v27", "type": "tag"}]
             if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
             else [{"name": default_branch, "type": "branch"}]
         )
