@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v26`, Agent `0.1.122`, release sequence
-`23`, schema `12`, minimum updater `0.2.0`. Sequences 2–22 and publishers v1–v25
+Current publisher: `candidate-publisher-v27`, Agent `0.1.122`, release sequence
+`24`, schema `12`, minimum updater `0.2.0`. Sequences 2–23 and publishers v1–v26
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v26 \
-     -f tag_message='NUVION IQ9075 candidate publisher v26'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v27 \
+     -f tag_message='NUVION IQ9075 candidate publisher v27'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v25
-   and v26 to the existing immutable candidate tag ruleset without changing old tags,
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v27
+   to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v24 to v26 and verify them.
+   existing candidate-sign/stage tag policies from v26 to v27 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -37,9 +37,9 @@ production KMS OTA key is not part of this development keyring.
 4. Dispatch the immutable candidate (no device update command is issued):
 
    ```sh
-   gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v26 \
-     -f component_sha="$P" -f version=0.1.122 -f release_sequence=23
+     gh workflow run iq9075-candidate-trusted-publish.yml \
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v27 \
+     -f component_sha="$P" -f version=0.1.122 -f release_sequence=24
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -66,7 +66,7 @@ APT signing and GCS publishing credentials are outside this OTA key migration.
 Publisher v25/sequence 22 was retired after its KMS approval tag was created:
 the frozen candidate verifier omitted the newly retired v24 ref. The failure was
 detected by local signed-tag verification before candidate build, GCS staging, or
-device commands. Keep the v25 tag immutable and use v26/sequence 23 only.
+device commands. Its tag and sequence remain immutable failed evidence.
 
 ## Candidate v12 physical validation retry
 
@@ -301,18 +301,15 @@ phase workaround above is superseded by this socket-scoped test fixture.
 
 Publisher v24 / sequence 21 requires a fresh complete physical chain. The
 synthetic RGB source remains camera independent. The root runner binds a
-35-percent loss rule to the prepared Agent PID/start time, dedicated UID,
-service cgroup and run marker. It uses the existing UDP source-port set when
-RTP is on UDP. When ICE selects TCP, the runner samples per-socket byte growth
-and binds only the single dominant media source port; low-volume HTTPS and
-Fleet control sockets remain outside the rule. Intent is journaled before
-applying it, and an independent systemd timer removes its owned table after
-60 seconds.
+35-percent UDP loss rule to the prepared Agent PID/start time, dedicated UID,
+service cgroup, run marker and existing UDP source ports. TCP/control traffic
+and other sockets are outside that rule. Intent is journaled before applying
+it, and an independent systemd timer removes its owned table after 60 seconds.
 GOOD and normal/failure/reboot restoration reconcile only that owned table and
 stop its timer. Changed rules or an incomplete recovery fail closed.
 
 Config/stream evidence schema 2 requires positive dropped-packet counters,
-an actual media congestion reason with a lower bitrate, and later healthy bitrate
+actual RTP packet-loss reasons with a lower bitrate, and later healthy bitrate
 recovery after exact rule removal. The independent readiness verifier checks
 socket identity, rule fingerprint, counter continuity and cleanup. Existing
 ACK, revision, twin, queue, release-binding and bitrate-bound gates remain.
@@ -323,3 +320,25 @@ controller priority, updater acceptance or release security gate is relaxed.
 The committed sequence-20 BOM is an explicitly pinned physical rollback
 baseline only. The published sequence-1 / 0.1.120 promotion baseline, old tags,
 artifacts and failed qualification evidence remain unchanged.
+
+## Candidate v27 active RTP transport qualification
+
+Publisher v26 / sequence 23 completed physical automatic rollback and normal
+commit, but its config/stream qualification was not promotable. The live WebRTC
+session selected ICE-TCP to the SFU while the verifier faulted only UDP source
+ports, so the owned nft rule recorded zero packets. The unsuccessful config run
+was restored exactly and its stale observation DLQ row was archived and cleared.
+Sequence 23 remains an exact signed physical rollback baseline only.
+
+Publisher v27 / sequence 24 selects the active RTP transport before applying
+the bounded fault. It samples Agent-owned established TCP sockets twice and
+uses a single source port only when its byte growth is at least 16 KiB and four
+times the next flow; otherwise it keeps the existing UDP socket set. PID, start
+time, UID, systemd cgroup and qualification run marker remain mandatory. HTTPS,
+Fleet control and other low-volume TCP sockets stay outside the rule.
+
+The verifier requires a positive dropped-packet counter, a lower bitrate with
+an actual media congestion reason, later healthy recovery, exact nft removal,
+timer disarm, command/ACK/twin convergence and drained queues. `connectivity_poor`
+alone is insufficient. A fresh complete bootstrap/rollback/commit/config chain
+is required before release promotion.
