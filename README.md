@@ -236,6 +236,13 @@ For dev, `.env` in the repo is used automatically.
 
 ## Device configuration
 - `NUVION_VIDEO_SOURCE`: camera source. Luxonis OAK는 `oak`/`oak:<MXID>`, Linux UVC는 `/dev/video0`, macOS는 `avf` 또는 `avf:<index>`, Raspberry Pi는 `rpi`
+- `NUVION_CAMERA_PROFILE`: 제품 카메라 계약. 기본형은 `arducam_b0272`, Ultra는 `arducam_b0273`, 개발/USB 카메라는 `generic`을 사용한다. `auto`는 Raspberry Pi CSI를 B0272, Jetson CSI를 B0273으로 해석한다.
+- `NUVION_CAMERA_FOCUS_MODE`: `startup-lock|continuous|manual|off`. 생산 기본값인 `startup-lock`은 시작 시 한 번 초점을 맞춘 뒤 렌즈를 고정한다. B0273은 `startup-lock|manual|off`를 지원한다.
+- `NUVION_CAMERA_FOCUS_REQUIRED`: `true`이면 IMX477 identity 또는 autofocus control이 확인되지 않을 때 Agent 시작을 실패시킨다. 장비 bring-up을 통과한 생산 설정에서 활성화한다.
+- `NUVION_CAMERA_FOCUS_SETTLE_SEC`: startup autofocus가 렌즈를 맞추는 최대 시간(기본 `3.0`).
+- `NUVION_CAMERA_FOCUS_STEP_FRAMES`: B0273 scan에서 렌즈 이동 뒤 건너뛸 안정화 frame 수(기본 `2`).
+- `NUVION_CAMERA_MANUAL_LENS_POSITION`: manual mode의 렌즈 위치. Raspberry Pi/libcamera는 dioptre, Jetson B0273은 `0..1000` 정수를 사용한다.
+- `NUVION_CAMERA_I2C_BUS`: B0273 렌즈 actuator가 연결된 I2C bus. Orin carrier와 CSI connector에 따라 달라지므로 생산 provisioning에서 명시한다.
 - `NUVION_DEPTHAI_DEVICE_ID`: 여러 OAK 장치가 있을 때 선택할 MXID. 하나면 비워둔다.
 - `NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC`, `NUVION_DEPTHAI_READ_TIMEOUT_SEC`, `NUVION_DEPTHAI_MAX_CONSECUTIVE_TIMEOUTS`: OAK startup/read fail-closed 경계
 - `NUVION_DEMO_MODE`: 데모 모드 활성화 (`true|false`)
@@ -299,6 +306,36 @@ CRITICAL event는 server application ACK(`ACCEPTED`/`DUPLICATE`)까지 outbox에
 - `NUVION_AGENT_ERROR_BACKOFF_MAX_SEC`: 재시도 최대 대기 시간(초) (기본 `15.0`)
 - `NUVION_CLIP_EVENT_ACK_WAIT_SEC`: anomaly 저장 ACK 후 clip finalize를 시도하기 위한 최대 대기(초, 기본 `60`)
 - `NUVION_CLIP_STATUS_MAX_RETRIES`: clip finalize API 최대 시도 횟수(기본 `5`)
+
+제품별 생산 camera 설정:
+
+```dotenv
+# NUVION 기본형: Raspberry Pi 5 + Arducam B0272
+NUVION_VIDEO_SOURCE=rpi
+NUVION_CAMERA_PROFILE=arducam_b0272
+NUVION_CAMERA_FOCUS_MODE=startup-lock
+NUVION_CAMERA_FOCUS_REQUIRED=true
+
+# NUVION Ultra: Jetson Orin NX + Arducam B0273
+NUVION_VIDEO_SOURCE=jetson
+NUVION_CAMERA_PROFILE=arducam_b0273
+NUVION_CAMERA_FOCUS_MODE=startup-lock
+NUVION_CAMERA_FOCUS_REQUIRED=true
+NUVION_CAMERA_I2C_BUS=9
+```
+
+기본형 OS image에는 Arducam의 IMX477 autofocus tuning file과 해당 Raspberry Pi
+camera driver가 설치되어 있어야 한다. Ultra에는 JetPack 버전에 맞는 IMX477 driver가
+필요하며, Orin NX carrier의 실제 CSI connector 배선에 따라 I2C bus 9 또는 10을
+provisioning 값으로 확정한다. 위의 bus 9는 예시이며 장비 실기 검증 없이 생산 기본값으로
+복제하지 않는다.
+
+Agent는 B0272에서 `libcamerasrc` AF control을 사용한다. B0273에서는 공식 방식과
+같이 I2C lens actuator를 움직이면서 Agent가 받는 frame의 Laplacian variance를 비교해
+가장 선명한 위치를 고정한다. 시작 초점 결과는 heartbeat의
+`runtimeTelemetry.camera`에 profile, sensor identity, control backend, focus state와
+lens position 및 focus score로 보고된다. control이 보이지 않으면 `UNSUPPORTED`, 초점 결과를 읽을
+수 없으면 `LOCKED_UNVERIFIED`로 보고하며 성공 상태를 추정하지 않는다.
 
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
 

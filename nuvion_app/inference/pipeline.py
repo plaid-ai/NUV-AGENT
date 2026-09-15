@@ -37,6 +37,10 @@ import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
 from nuvion_app.inference.clip_segments import list_stable_segments
+from nuvion_app.inference.camera_control import (
+    CAMERA_SOURCE_ELEMENT_NAME,
+    build_camera_controller,
+)
 from nuvion_app.inference.command_runtime import (
     FleetCommandRuntime,
     FleetCommandRuntimeError,
@@ -1832,6 +1836,21 @@ def build_dynamic_runtime_telemetry(
     merged["commandObservationOutbox"] = build_command_observation_runtime_health()
     merged["agentUpdate"] = updater_telemetry["agentUpdate"]
     merged["updaterVersion"] = updater_telemetry["updaterVersion"]
+    camera_capabilities: set[str] = set()
+    camera_controller = getattr(g_app, "camera_controller", None)
+    if camera_controller is not None:
+        try:
+            camera_snapshot = camera_controller.snapshot()
+            merged["camera"] = camera_snapshot
+            camera_capabilities.update(camera_controller.capabilities())
+            if camera_snapshot.get("focusRequired") and camera_snapshot.get(
+                "focusState"
+            ) in {"ERROR", "UNSUPPORTED"}:
+                merged["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
+        except Exception as exc:  # noqa: BLE001 - telemetry must remain available.
+            log.error("[CAMERA] runtime telemetry unavailable: %s", exc)
+            merged["camera"] = {"focusState": "ERROR", "error": str(exc)[:500]}
+            merged["functionalHealth"] = "FUNCTIONAL_UNHEALTHY"
     merged["capabilities"] = sorted(
         (
             (set(base_capabilities) | set(fleet_effect_registry.capabilities))
@@ -1839,6 +1858,7 @@ def build_dynamic_runtime_telemetry(
         )
         | runtime_authorization_capabilities(fleet_command_runtime)
         | build_model_config_capabilities()
+        | camera_capabilities
     )
     user_data = getattr(g_app, "user_data", None)
     if getattr(user_data, "backend", None) in {"visualad", "visualad_htp"}:
@@ -3441,7 +3461,9 @@ class NuvionEventState:
                     status = "DEFECT" if is_anomaly else "NORMAL"
                     if self.inference_failed or self.backend == "visualad_htp":
                         self.inference_failed = False
-                        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
+                        camera_controller = getattr(self, "camera_controller", None)
+                        if camera_controller is None or not camera_controller.blocks_runtime_health():
+                            get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_RUNNING)
                     self.last_inference_at = time.monotonic()
                     self.last_inference_frame_arrived_at = frame_arrived_at
                     self.last_inference_score = score
@@ -3642,6 +3664,9 @@ def on_new_sample(appsink, user_data: NuvionEventState):
         return Gst.FlowReturn.OK
 
     buffer.unmap(mapinfo)
+    camera_controller = getattr(user_data, "camera_controller", None)
+    if camera_controller is not None:
+        camera_controller.observe_frame(frame)
     demo_context = user_data.resolve_demo_sample(
         int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None
     )
@@ -3966,6 +3991,15 @@ class GStreamerInferenceApp:
         self.loop = None
         self.encoder_adapter: X264EncoderAdapter | None = None
         self.depthai_bridge: DepthAIGStreamerBridge | None = None
+        camera_environment = dict(os.environ)
+        if self.demo_mode or (GST_SOURCE_OVERRIDE and GST_SOURCE_OVERRIDE.strip()):
+            camera_environment["NUVION_CAMERA_PROFILE"] = "generic"
+        self.camera_controller = build_camera_controller(
+            self.video_source,
+            environ=camera_environment,
+            on_failure=self._on_camera_failure,
+        )
+        self.user_data.camera_controller = self.camera_controller
         self._demo_restarting = False
         self._demo_last_restart_at = 0.0
         self._supervisor_restart_lock = threading.Lock()
@@ -3977,6 +4011,11 @@ class GStreamerInferenceApp:
 
         global g_app
         g_app = self
+
+    @staticmethod
+    def _on_camera_failure(message: str) -> None:
+        log.error("[CAMERA] required focus operation failed: %s", message)
+        get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
 
     def _prepare_demo_source(self) -> MvtecDemoSource | None:
         return prepare_mvtec_demo_source(
@@ -4124,6 +4163,9 @@ class GStreamerInferenceApp:
         log.info("[PIPELINE] %s", pipeline_string)
         self.pipeline = Gst.parse_launch(pipeline_string)
         self.loop = GLib.MainLoop()
+        self.camera_controller.configure(
+            self.pipeline.get_by_name(CAMERA_SOURCE_ELEMENT_NAME)
+        )
 
         if should_use_depthai_source(
             self.video_source,
@@ -4482,6 +4524,9 @@ class GStreamerInferenceApp:
                     == "visualad_htp"
                     else RUNTIME_STATUS_RUNNING
                 )
+                camera_controller = getattr(self, "camera_controller", None)
+                if camera_controller is not None:
+                    camera_controller.start()
                 log.info("Starting signaling thread...")
                 signaling_thread = threading.Thread(
                     target=lambda: asyncio.run(signaling_client_main()),
@@ -4517,6 +4562,9 @@ class GStreamerInferenceApp:
                 return
             self._shutdown_complete = True
         self.user_data.request_stop()
+        camera_controller = getattr(self, "camera_controller", None)
+        if camera_controller is not None:
+            camera_controller.close()
         if self.depthai_bridge is not None:
             self.depthai_bridge.close()
         if self.webrtc_uplink:

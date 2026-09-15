@@ -72,6 +72,13 @@ ADVANCED_SECTION_META = {
 _LOADED = False
 _LOADED_PATH: Optional[Path] = None
 _CAMERA_PREFERENCE_CHOICES = ("auto", "csi", "usb")
+_CAMERA_PROFILE_CHOICES = (
+    "auto",
+    "generic",
+    "arducam_b0272",
+    "arducam_b0273",
+)
+_CAMERA_FOCUS_MODE_CHOICES = ("startup-lock", "continuous", "manual", "off")
 _CAMERA_WB_MODE_CHOICES = (
     "auto",
     "off",
@@ -144,6 +151,10 @@ def _depthai_usb_nodes() -> List[Tuple[Path, str]]:
 def _camera_choice_values(key: str) -> tuple[str, ...]:
     if key == "NUVION_CAMERA_PREFERENCE":
         return _CAMERA_PREFERENCE_CHOICES
+    if key == "NUVION_CAMERA_PROFILE":
+        return _CAMERA_PROFILE_CHOICES
+    if key == "NUVION_CAMERA_FOCUS_MODE":
+        return _CAMERA_FOCUS_MODE_CHOICES
     if key == "NUVION_CAMERA_WB_MODE":
         return _CAMERA_WB_MODE_CHOICES
     return ()
@@ -291,6 +302,10 @@ def _is_basic_setup_field(key: str) -> bool:
         "NUVION_DEVICE_PASSWORD",
         "NUVION_VIDEO_SOURCE",
         "NUVION_CAMERA_PREFERENCE",
+        "NUVION_CAMERA_PROFILE",
+        "NUVION_CAMERA_FOCUS_MODE",
+        "NUVION_CAMERA_FOCUS_REQUIRED",
+        "NUVION_CAMERA_I2C_BUS",
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
@@ -336,6 +351,13 @@ def _field_note(key: str) -> str:
         "NUVION_DEMO_MODE": "Turn this on only when testing without a real camera.",
         "NUVION_VIDEO_SOURCE": "Use oak for Luxonis OAK/DepthAI, or auto for V4L2/CSI detection.",
         "NUVION_CAMERA_PREFERENCE": "When NUVION_VIDEO_SOURCE=auto, choose whether CSI or USB should win first.",
+        "NUVION_CAMERA_PROFILE": "Use arducam_b0272 for NUVION/Raspberry Pi and arducam_b0273 for NUVION Ultra/Jetson.",
+        "NUVION_CAMERA_FOCUS_MODE": "startup-lock focuses once during startup and then fixes the lens for stable inspection.",
+        "NUVION_CAMERA_FOCUS_REQUIRED": "Production devices should enable this after physical camera validation.",
+        "NUVION_CAMERA_FOCUS_SETTLE_SEC": "Seconds allowed for the startup autofocus scan before locking the lens.",
+        "NUVION_CAMERA_FOCUS_STEP_FRAMES": "B0273 frames skipped after each lens move before measuring sharpness.",
+        "NUVION_CAMERA_MANUAL_LENS_POSITION": "Required in manual mode. Raspberry Pi uses dioptres; B0273 uses an integer from 0 to 1000.",
+        "NUVION_CAMERA_I2C_BUS": "Required for B0273. Set the I2C bus wired to the selected Orin CSI connector.",
         "NUVION_DEPTHAI_DEVICE_ID": "Optional OAK MXID. Leave empty when exactly one OAK camera is attached.",
         "NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC": "Maximum seconds to wait for the first OAK RGB frame.",
         "NUVION_DEPTHAI_READ_TIMEOUT_SEC": "Maximum seconds to wait for each OAK RGB frame.",
@@ -456,6 +478,10 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
     camera_fields = {
         "NUVION_VIDEO_SOURCE",
         "NUVION_CAMERA_PREFERENCE",
+        "NUVION_CAMERA_PROFILE",
+        "NUVION_CAMERA_FOCUS_MODE",
+        "NUVION_CAMERA_FOCUS_REQUIRED",
+        "NUVION_CAMERA_I2C_BUS",
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
@@ -465,6 +491,11 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
     for field in fields:
         key = field["key"]
         if key not in camera_fields:
+            continue
+        if (
+            key == "NUVION_CAMERA_I2C_BUS"
+            and values.get("NUVION_CAMERA_PROFILE") != "arducam_b0273"
+        ):
             continue
 
         default = values.get(key, field["default"])
@@ -483,6 +514,11 @@ def _prompt_camera_setup(fields: List[Dict[str, str]], existing: Dict[str, str])
         if _is_boolean_like(field["default"], default):
             values[key] = _prompt_boolean_setting(label, key, default)
             continue
+        prompt = f"{label} ({key})"
+        if default:
+            prompt += f" [{default}]"
+        entered = input(prompt + ": ").strip()
+        values[key] = entered or default
 
     return values
 
@@ -867,6 +903,11 @@ def prompt_cli(fields: List[Dict[str, str]], existing: Dict[str, str], advanced:
     required_keys = effective_required_keys(values)
     handled_keys = {
         "NUVION_VIDEO_SOURCE",
+        "NUVION_CAMERA_PREFERENCE",
+        "NUVION_CAMERA_PROFILE",
+        "NUVION_CAMERA_FOCUS_MODE",
+        "NUVION_CAMERA_FOCUS_REQUIRED",
+        "NUVION_CAMERA_I2C_BUS",
         "NUVION_VIDEO_ROTATION",
         "NUVION_VIDEO_FLIP_HORIZONTAL",
         "NUVION_VIDEO_FLIP_VERTICAL",
@@ -1318,7 +1359,27 @@ def _check_motor_backend(values: Dict[str, str]) -> Dict[str, str]:
 def run_camera_health_checks(values: Dict[str, str]) -> List[Dict[str, str]]:
     demo_mode = _is_truthy(values.get("NUVION_DEMO_MODE", "false"))
     source_check = _check_demo_video_source(values) if demo_mode else _check_camera_source(values)
-    return [source_check, *([] if demo_mode else [_check_camera_probe(values)])]
+    if demo_mode:
+        return [source_check]
+
+    from nuvion_app.inference.camera_control import (
+        camera_control_config_from_env,
+        probe_camera_hardware,
+        validate_camera_contract,
+    )
+
+    camera_config = camera_control_config_from_env(
+        values.get("NUVION_VIDEO_SOURCE"), environ=values
+    )
+    camera_status, camera_detail = validate_camera_contract(
+        camera_config, probe_camera_hardware()
+    )
+    profile_check = {
+        "name": "Camera product profile",
+        "status": camera_status,
+        "detail": camera_detail,
+    }
+    return [source_check, profile_check, _check_camera_probe(values)]
 
 
 def _run_preflight(values: Dict[str, str]) -> Dict[str, object]:

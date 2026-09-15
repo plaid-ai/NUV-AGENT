@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from nuvion_app.inference.camera_control import (
+    CAMERA_PROFILE_B0272,
+    CAMERA_PROFILE_B0273,
+    CAMERA_SOURCE_ELEMENT_NAME,
+    normalize_camera_profile,
+)
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 
@@ -324,7 +330,7 @@ def _build_depthai_appsrc_pipeline(width: int, height: int, fps: int) -> str:
 
 def _build_jetson_camera_source_prefix() -> str:
     sensor_id = _env_int("NUVION_JETSON_SENSOR_ID", 0)
-    properties = [f"sensor-id={sensor_id}"]
+    properties = [f"sensor-id={sensor_id}", f"name={CAMERA_SOURCE_ELEMENT_NAME}"]
 
     if not is_truthy(os.getenv("NUVION_CAMERA_AUTO_EXPOSURE", "true")):
         properties.append("aelock=true")
@@ -385,7 +391,25 @@ def _build_linux_camera_pipeline(video_source: str, width: int, height: int, fps
     lowered_source = resolved_source.lower()
     linux_devices = _linux_video_devices()
     preference = _camera_preference()
+    camera_profile = normalize_camera_profile(os.getenv("NUVION_CAMERA_PROFILE"))
     default_video_device = _pick_linux_v4l2_device(linux_devices, preference=preference)
+
+    if camera_profile == CAMERA_PROFILE_B0272:
+        if is_truthy(os.getenv("NUVION_CAMERA_FOCUS_REQUIRED")) and not _gst_element_available(
+            "libcamerasrc"
+        ):
+            raise RuntimeError("arducam_b0272 requires the libcamerasrc GStreamer plugin")
+        return _build_standard_camera_pipeline(
+            f"libcamerasrc name={CAMERA_SOURCE_ELEMENT_NAME}", width, height, fps
+        )
+    if camera_profile == CAMERA_PROFILE_B0273:
+        if _gst_element_available("nvarguscamerasrc"):
+            return _build_jetson_argus_pipeline(width, height, fps)
+        if is_truthy(os.getenv("NUVION_CAMERA_FOCUS_REQUIRED")):
+            raise RuntimeError("arducam_b0273 requires the nvarguscamerasrc GStreamer plugin")
+        return _build_standard_camera_pipeline(
+            f"autovideosrc name={CAMERA_SOURCE_ELEMENT_NAME}", width, height, fps
+        )
 
     if lowered_source in {"jetson", "argus", "csi"}:
         if _gst_element_available("nvarguscamerasrc"):
@@ -393,7 +417,9 @@ def _build_linux_camera_pipeline(video_source: str, width: int, height: int, fps
         return _build_standard_camera_pipeline("autovideosrc", width, height, fps)
 
     if lowered_source in {"rpi", "libcamera"}:
-        return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
+        return _build_standard_camera_pipeline(
+            f"libcamerasrc name={CAMERA_SOURCE_ELEMENT_NAME}", width, height, fps
+        )
 
     if resolved_source.startswith("/dev/"):
         if _is_jetson_platform() and _gst_element_available("nvarguscamerasrc"):
@@ -414,10 +440,14 @@ def _build_linux_camera_pipeline(video_source: str, width: int, height: int, fps
                 return _build_jetson_argus_pipeline(width, height, fps)
 
         if preference != "usb" and _gst_element_available("libcamerasrc"):
-            return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
+            return _build_standard_camera_pipeline(
+                f"libcamerasrc name={CAMERA_SOURCE_ELEMENT_NAME}", width, height, fps
+            )
 
         if preference == "usb" and _gst_element_available("libcamerasrc"):
-            return _build_standard_camera_pipeline("libcamerasrc", width, height, fps)
+            return _build_standard_camera_pipeline(
+                f"libcamerasrc name={CAMERA_SOURCE_ELEMENT_NAME}", width, height, fps
+            )
 
     return _build_standard_camera_pipeline("autovideosrc", width, height, fps)
 

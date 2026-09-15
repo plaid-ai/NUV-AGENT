@@ -1347,6 +1347,28 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertIn("updateEvidence", telemetry)
         self.assertIn("commandObservationOutbox", telemetry)
 
+    def test_required_camera_failure_withdraws_health_and_capabilities(self) -> None:
+        camera_controller = types.SimpleNamespace(
+            snapshot=lambda: {
+                "profile": "arducam_b0272",
+                "focusRequired": True,
+                "focusState": "ERROR",
+            },
+            capabilities=lambda: frozenset(),
+        )
+        app = types.SimpleNamespace(
+            pipeline=object(),
+            user_data=types.SimpleNamespace(running=True),
+            camera_controller=camera_controller,
+        )
+
+        with mock.patch.object(pipeline, "g_app", app):
+            telemetry = pipeline.build_dynamic_runtime_telemetry()
+
+        self.assertEqual(telemetry["functionalHealth"], "FUNCTIONAL_UNHEALTHY")
+        self.assertEqual(telemetry["camera"]["focusState"], "ERROR")
+        self.assertNotIn("camera.autofocus", telemetry["capabilities"])
+
     def test_visualad_health_requires_recent_successful_real_inference(self) -> None:
         self._assert_visualad_health("visualad")
         self._assert_visualad_health("visualad_htp")
