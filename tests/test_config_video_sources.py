@@ -4,9 +4,32 @@ import unittest
 from unittest import mock
 
 from nuvion_app.config import _check_camera_probe, _check_camera_source, _parse_gst_device_monitor_output, _render_form, _run_preflight, discover_video_source_options
+from nuvion_app.config import _prompt_camera_setup
 
 
 class ConfigVideoSourceTest(unittest.TestCase):
+    def test_camera_setup_prompts_i2c_bus_only_for_b0273(self) -> None:
+        fields = [
+            {
+                "key": "NUVION_CAMERA_I2C_BUS",
+                "default": "",
+                "comment": "Camera I2C bus",
+            }
+        ]
+        with mock.patch("builtins.input", return_value="9") as prompt:
+            values = _prompt_camera_setup(
+                fields, {"NUVION_CAMERA_PROFILE": "arducam_b0273"}
+            )
+        self.assertEqual(values["NUVION_CAMERA_I2C_BUS"], "9")
+        prompt.assert_called_once()
+
+        with mock.patch("builtins.input") as prompt:
+            values = _prompt_camera_setup(
+                fields, {"NUVION_CAMERA_PROFILE": "arducam_b0272"}
+            )
+        self.assertNotIn("NUVION_CAMERA_I2C_BUS", values)
+        prompt.assert_not_called()
+
     def test_parse_gst_device_monitor_output_macos(self) -> None:
         sample = """
 Device found:

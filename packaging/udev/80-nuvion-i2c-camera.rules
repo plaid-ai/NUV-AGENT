@@ -1,0 +1,4 @@
+# NUVION Base/Ultra camera lens actuator access for the unprivileged Agent.
+# Arducam documents buses 9 and 10 for the Orin Nano/NX CSI connectors.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-9", GROUP="nuvion", MODE="0660"
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-10", GROUP="nuvion", MODE="0660"

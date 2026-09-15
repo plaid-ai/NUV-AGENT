@@ -85,6 +85,53 @@ class VideoSourceTest(unittest.TestCase):
         self.assertIn("v4l2src device=/dev/video0", pipeline)
         self.assertIn("video/x-raw,format=RGB", pipeline)
 
+    def test_b0272_profile_pins_named_libcamera_source(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"NUVION_CAMERA_PROFILE": "arducam_b0272"}, clear=False
+        ):
+            pipeline = build_video_source_pipeline(
+                "auto", 640, 480, 30, platform_name="linux"
+            )
+
+        self.assertIn("libcamerasrc name=nuvion_camera_source", pipeline)
+
+    def test_b0273_profile_pins_named_jetson_argus_source(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"NUVION_CAMERA_PROFILE": "arducam_b0273"}, clear=False
+        ):
+            with mock.patch(
+                "nuvion_app.inference.video_source._gst_element_available",
+                return_value=True,
+            ):
+                pipeline = build_video_source_pipeline(
+                    "auto", 640, 480, 30, platform_name="linux"
+                )
+
+        self.assertIn("nvarguscamerasrc sensor-id=0 name=nuvion_camera_source", pipeline)
+
+    def test_required_product_camera_rejects_missing_capture_plugin(self) -> None:
+        for profile, plugin in (
+            ("arducam_b0272", "libcamerasrc"),
+            ("arducam_b0273", "nvarguscamerasrc"),
+        ):
+            with self.subTest(profile=profile):
+                with mock.patch.dict(
+                    "os.environ",
+                    {
+                        "NUVION_CAMERA_PROFILE": profile,
+                        "NUVION_CAMERA_FOCUS_REQUIRED": "true",
+                    },
+                    clear=False,
+                ):
+                    with mock.patch(
+                        "nuvion_app.inference.video_source._gst_element_available",
+                        return_value=False,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, plugin):
+                            build_video_source_pipeline(
+                                "auto", 640, 480, 30, platform_name="linux"
+                            )
+
     def test_build_camera_source_linux_auto_uses_first_v4l2_device(self) -> None:
         fake_devices = [
             LinuxVideoDeviceInfo(path="/dev/video2", name="USB Camera"),

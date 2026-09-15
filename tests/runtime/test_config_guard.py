@@ -94,6 +94,118 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertEqual(report.values["NUVION_DEPTHAI_STARTUP_TIMEOUT_SEC"], "15.0")
             self.assertEqual(report.values["NUVION_DEPTHAI_READ_TIMEOUT_SEC"], "2.0")
 
+    def test_guard_normalizes_invalid_camera_profile_and_focus_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_CAMERA_PROFILE=not-a-camera",
+                        "NUVION_CAMERA_FOCUS_MODE=not-a-mode",
+                        "NUVION_CAMERA_FOCUS_SETTLE_SEC=0",
+                        "NUVION_CAMERA_FOCUS_STEP_FRAMES=0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_CAMERA_PROFILE"], "auto")
+            self.assertEqual(
+                report.values["NUVION_CAMERA_FOCUS_MODE"], "startup-lock"
+            )
+            self.assertEqual(report.values["NUVION_CAMERA_FOCUS_SETTLE_SEC"], "3.0")
+            self.assertEqual(report.values["NUVION_CAMERA_FOCUS_STEP_FRAMES"], "2")
+
+    def test_guard_rejects_manual_focus_without_lens_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_CAMERA_PROFILE=arducam_b0272",
+                        "NUVION_VIDEO_SOURCE=rpi",
+                        "NUVION_CAMERA_FOCUS_MODE=manual",
+                        "NUVION_CAMERA_MANUAL_LENS_POSITION=",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(
+                    issue.key == "NUVION_CAMERA_MANUAL_LENS_POSITION"
+                    for issue in report.errors
+                )
+            )
+
+    def test_guard_rejects_camera_profile_source_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_CAMERA_PROFILE=arducam_b0273",
+                        "NUVION_VIDEO_SOURCE=/dev/video0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(issue.key == "NUVION_VIDEO_SOURCE" for issue in report.errors)
+            )
+
+    def test_guard_requires_b0273_i2c_bus_for_production_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_ZSAD_BACKEND=none",
+                        "NUVION_CAMERA_PROFILE=arducam_b0273",
+                        "NUVION_VIDEO_SOURCE=jetson",
+                        "NUVION_CAMERA_FOCUS_REQUIRED=true",
+                        "NUVION_CAMERA_I2C_BUS=",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertFalse(report.ok)
+            self.assertTrue(
+                any(issue.key == "NUVION_CAMERA_I2C_BUS" for issue in report.errors)
+            )
+
     def test_guard_rejects_fractional_depthai_timeout_threshold_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"

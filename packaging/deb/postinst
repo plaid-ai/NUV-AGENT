@@ -108,9 +108,9 @@ PY
   fi
 }
 
-reload_oak_udev_rules() {
+reload_camera_udev_rules() {
   if ! command -v udevadm >/dev/null 2>&1; then
-    echo "udevadm is unavailable; OAK permissions will apply after the next boot" >&2
+    echo "udevadm is unavailable; camera permissions will apply after the next boot" >&2
     return 0
   fi
   udevadm control --reload-rules || true
@@ -118,6 +118,9 @@ reload_oak_udev_rules() {
     --action=add \
     --subsystem-match=usb \
     --attr-match=idVendor=03e7 || true
+  udevadm trigger \
+    --action=add \
+    --subsystem-match=i2c-dev || true
   udevadm settle --timeout=10 || true
 }
 
@@ -524,7 +527,7 @@ if ! systemctl restart nuvion-fleet-e2e-reconcile.service; then
   echo "Fleet E2E recovery gate did not converge" >&2
   exit 1
 fi
-reload_oak_udev_rules
+reload_camera_udev_rules
 if [ -f /etc/nuvion-updater/device-binding.json ] \
   && [ -f /etc/nuvion-updater/command-keyring.json ] \
   && [ -f /etc/nuvion-updater/release-keyring.json ] \

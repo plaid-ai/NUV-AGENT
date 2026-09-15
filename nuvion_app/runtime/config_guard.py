@@ -8,6 +8,16 @@ from typing import Dict, List, Tuple
 
 from nuvion_app.config import effective_required_keys, load_template, read_env, write_env
 from nuvion_app.inference.demo_mvtec import validate_mvtec_demo_settings
+from nuvion_app.inference.camera_control import (
+    CAMERA_PROFILE_B0272,
+    CAMERA_PROFILE_B0273,
+    CAMERA_PROFILE_GENERIC,
+    FOCUS_MODE_MANUAL,
+    VALID_CAMERA_PROFILES,
+    VALID_FOCUS_MODES,
+    normalize_camera_profile,
+    normalize_focus_mode,
+)
 from nuvion_app.model_store import DEFAULT_MODEL_PROFILE, DEFAULT_MODEL_SOURCE
 from nuvion_app.runtime.inference_mode import (
     face_tracking_uses_triton,
@@ -245,6 +255,42 @@ def _apply_migrations(values: Dict[str, str]) -> List[str]:
     if camera_preference not in _VALID_CAMERA_PREFERENCES:
         update("NUVION_CAMERA_PREFERENCE", "auto", "normalize camera preference")
 
+    raw_camera_profile = (
+        values.get("NUVION_CAMERA_PROFILE", "auto") or "auto"
+    ).strip().lower()
+    camera_profile = normalize_camera_profile(raw_camera_profile)
+    if raw_camera_profile != camera_profile:
+        update("NUVION_CAMERA_PROFILE", camera_profile, "normalize camera profile")
+
+    raw_focus_mode = (
+        values.get("NUVION_CAMERA_FOCUS_MODE", "startup-lock") or "startup-lock"
+    ).strip().lower()
+    focus_mode = normalize_focus_mode(raw_focus_mode)
+    if raw_focus_mode != focus_mode:
+        update("NUVION_CAMERA_FOCUS_MODE", focus_mode, "normalize camera focus mode")
+
+    focus_settle = _normalize_float(
+        values.get("NUVION_CAMERA_FOCUS_SETTLE_SEC", ""), 3.0
+    )
+    if str(focus_settle) != str(values.get("NUVION_CAMERA_FOCUS_SETTLE_SEC", "")):
+        update(
+            "NUVION_CAMERA_FOCUS_SETTLE_SEC",
+            str(focus_settle),
+            "normalize camera focus settle time",
+        )
+
+    focus_step_frames = _normalize_int(
+        values.get("NUVION_CAMERA_FOCUS_STEP_FRAMES", ""), 2
+    )
+    if str(focus_step_frames) != str(
+        values.get("NUVION_CAMERA_FOCUS_STEP_FRAMES", "")
+    ):
+        update(
+            "NUVION_CAMERA_FOCUS_STEP_FRAMES",
+            str(focus_step_frames),
+            "normalize camera focus step frames",
+        )
+
     camera_wb_mode = (values.get("NUVION_CAMERA_WB_MODE", "auto") or "auto").strip().lower()
     if camera_wb_mode not in _VALID_CAMERA_WB_MODES:
         update("NUVION_CAMERA_WB_MODE", "auto", "normalize camera white balance mode")
@@ -401,6 +447,113 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
 
     if (values.get("NUVION_CAMERA_PREFERENCE", "auto") or "auto").strip().lower() not in _VALID_CAMERA_PREFERENCES:
         errors.append(ConfigIssue(key="NUVION_CAMERA_PREFERENCE", message="camera preference는 auto, csi, usb 중 하나여야 합니다."))
+
+    camera_profile = (
+        values.get("NUVION_CAMERA_PROFILE", "auto") or "auto"
+    ).strip().lower()
+    if camera_profile not in VALID_CAMERA_PROFILES:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_CAMERA_PROFILE",
+                message="camera profile 값이 지원되지 않습니다.",
+            )
+        )
+
+    focus_mode = (
+        values.get("NUVION_CAMERA_FOCUS_MODE", "startup-lock") or "startup-lock"
+    ).strip().lower().replace("_", "-")
+    if focus_mode not in VALID_FOCUS_MODES:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_CAMERA_FOCUS_MODE",
+                message="camera focus mode 값이 지원되지 않습니다.",
+            )
+        )
+
+    video_source = (values.get("NUVION_VIDEO_SOURCE", "auto") or "auto").strip().lower()
+    if camera_profile == CAMERA_PROFILE_B0272 and video_source not in {
+        "auto",
+        "rpi",
+        "libcamera",
+    }:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_VIDEO_SOURCE",
+                message="arducam_b0272는 auto, rpi 또는 libcamera source가 필요합니다.",
+            )
+        )
+    if camera_profile == CAMERA_PROFILE_B0273 and video_source not in {
+        "auto",
+        "jetson",
+        "argus",
+        "csi",
+    }:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_VIDEO_SOURCE",
+                message="arducam_b0273은 auto, jetson, argus 또는 csi source가 필요합니다.",
+            )
+        )
+    if _is_truthy(values.get("NUVION_CAMERA_FOCUS_REQUIRED", "false")) and camera_profile == CAMERA_PROFILE_GENERIC:
+        errors.append(
+            ConfigIssue(
+                key="NUVION_CAMERA_PROFILE",
+                message="focus required는 generic camera profile과 함께 사용할 수 없습니다.",
+            )
+        )
+    if focus_mode == FOCUS_MODE_MANUAL:
+        try:
+            manual_position = float(
+                (values.get("NUVION_CAMERA_MANUAL_LENS_POSITION") or "").strip()
+            )
+        except ValueError:
+            manual_position = -1.0
+        if not math.isfinite(manual_position) or manual_position < 0:
+            errors.append(
+                ConfigIssue(
+                    key="NUVION_CAMERA_MANUAL_LENS_POSITION",
+                    message="manual focus에는 0 이상의 lens position이 필요합니다.",
+                )
+            )
+        elif camera_profile == CAMERA_PROFILE_B0273 and manual_position > 1000:
+            errors.append(
+                ConfigIssue(
+                    key="NUVION_CAMERA_MANUAL_LENS_POSITION",
+                    message="arducam_b0273 lens position은 0 이상 1000 이하여야 합니다.",
+                )
+            )
+
+    raw_i2c_bus = (values.get("NUVION_CAMERA_I2C_BUS") or "").strip()
+    if raw_i2c_bus:
+        try:
+            i2c_bus = int(raw_i2c_bus)
+        except ValueError:
+            i2c_bus = -1
+        if i2c_bus < 0:
+            errors.append(
+                ConfigIssue(
+                    key="NUVION_CAMERA_I2C_BUS",
+                    message="camera I2C bus는 0 이상의 정수여야 합니다.",
+                )
+            )
+    if (
+        camera_profile == CAMERA_PROFILE_B0273
+        and _is_truthy(values.get("NUVION_CAMERA_FOCUS_REQUIRED", "false"))
+        and not raw_i2c_bus
+    ):
+        errors.append(
+            ConfigIssue(
+                key="NUVION_CAMERA_I2C_BUS",
+                message="arducam_b0273 production focus에는 I2C bus가 필요합니다.",
+            )
+        )
+    if camera_profile == CAMERA_PROFILE_B0273 and focus_mode == "continuous":
+        errors.append(
+            ConfigIssue(
+                key="NUVION_CAMERA_FOCUS_MODE",
+                message="arducam_b0273은 startup-lock, manual 또는 off를 사용해야 합니다.",
+            )
+        )
 
     if (values.get("NUVION_CAMERA_WB_MODE", "auto") or "auto").strip().lower() not in _VALID_CAMERA_WB_MODES:
         errors.append(ConfigIssue(key="NUVION_CAMERA_WB_MODE", message="camera wb mode 값이 지원되지 않습니다."))

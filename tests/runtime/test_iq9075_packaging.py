@@ -189,6 +189,26 @@ class Iq9075PackagingTest(unittest.TestCase):
         self.assertIn("udevadm control --reload-rules", postrm)
         self.assertIn("--attr-match=idVendor=03e7", postrm)
 
+    def test_camera_i2c_rule_is_packaged_for_unprivileged_agent(self) -> None:
+        rule_path = ROOT / "packaging/udev/80-nuvion-i2c-camera.rules"
+        rule = rule_path.read_text(encoding="utf-8")
+        build_script = (ROOT / "packaging/deb/build-deb.sh").read_text(
+            encoding="utf-8"
+        )
+        postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
+        postrm = (ROOT / "packaging/deb/postrm").read_text(encoding="utf-8")
+
+        self.assertIn('SUBSYSTEM=="i2c-dev"', rule)
+        self.assertIn('KERNEL=="i2c-9"', rule)
+        self.assertIn('KERNEL=="i2c-10"', rule)
+        self.assertNotIn('KERNEL=="i2c-[0-9]*"', rule)
+        self.assertIn('GROUP="nuvion"', rule)
+        self.assertIn('MODE="0660"', rule)
+        self.assertNotIn('MODE="0666"', rule)
+        self.assertIn("80-nuvion-i2c-camera.rules", build_script)
+        self.assertIn("--subsystem-match=i2c-dev", postinst)
+        self.assertIn("--subsystem-match=i2c-dev", postrm)
+
     def test_postinst_has_fail_closed_bounded_install_modes(self) -> None:
         postinst = (ROOT / "packaging/deb/postinst").read_text(encoding="utf-8")
         self.assertIn('NUVION_INSTALL_PROFILE:-base', postinst)
