@@ -31,6 +31,18 @@ fi
 BOM_PATH="${2:-}"
 SIGNATURE_PATH="${3:-}"
 BOM_ARTIFACT_PATH="${4:-$DEB_PATH}"
+RELEASE_KEYRING_PATH="${RELEASE_KEYRING_PATH:-}"
+if [ -n "$RELEASE_KEYRING_PATH" ]; then
+  if [ -L "$RELEASE_KEYRING_PATH" ]; then
+    echo "Release keyring path must not be a symbolic link" >&2
+    exit 1
+  fi
+  RELEASE_KEYRING_PATH="$(realpath "$RELEASE_KEYRING_PATH")"
+  if [ ! -f "$RELEASE_KEYRING_PATH" ]; then
+    echo "Release keyring not found: $RELEASE_KEYRING_PATH" >&2
+    exit 1
+  fi
+fi
 if [ -n "$BOM_PATH" ]; then
   if [ -L "$BOM_PATH" ]; then
     echo "Release BOM path must not be a symbolic link" >&2
@@ -253,11 +265,10 @@ PY
       echo "RELEASE_TRUST_DOMAIN is required to publish release-bom-v2" >&2
       exit 1
     fi
-    release_keyring_path="$(realpath "$RELEASE_KEYRING_PATH")"
     PYTHONPATH="$PROJECT_ROOT" python3 - \
       "$BOM_PATH" \
       "$SIGNATURE_PATH" \
-      "$release_keyring_path" \
+      "$RELEASE_KEYRING_PATH" \
       "$RELEASE_TRUST_DOMAIN" <<'PY'
 from pathlib import Path
 import sys
