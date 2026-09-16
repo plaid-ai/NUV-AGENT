@@ -337,6 +337,34 @@ Agent는 B0272에서 `libcamerasrc` AF control을 사용한다. B0273에서는 �
 lens position 및 focus score로 보고된다. control이 보이지 않으면 `UNSUPPORTED`, 초점 결과를 읽을
 수 없으면 `LOCKED_UNVERIFIED`로 보고하며 성공 상태를 추정하지 않는다.
 
+생산 장치 설정은 기존 credential과 로컬 확장 값을 보존하는 preset 명령으로 적용한다.
+Ultra의 I2C bus는 carrier/CSI connector 실물 배선을 확인한 값만 허용하며, 생략하면
+설정 파일을 변경하지 않고 실패한다.
+
+```bash
+# NUVION 기본형 (Raspberry Pi 5 + B0272)
+sudo nuv-agent configure-camera \
+  --product base \
+  --config /etc/nuv-agent/agent.env
+
+# NUVION Ultra (Jetson Orin NX + B0273): 검증한 bus를 명시
+sudo nuv-agent configure-camera \
+  --product ultra \
+  --i2c-bus 9 \
+  --config /etc/nuv-agent/agent.env
+```
+
+실기기가 준비되면 동일 설정으로 sensor identity, autofocus contract와 실제 frame 생성을
+검사하고 비밀 값이 없는 JSON 증적을 남긴다. `PASS`는 config와 모든 hardware check가
+통과한 경우에만 기록된다. `warn` 또는 `skip`도 실기기 승인에서는 `FAIL`이다.
+
+```bash
+sudo nuv-agent doctor \
+  --config /etc/nuv-agent/agent.env \
+  --hardware \
+  --hardware-report /var/lib/nuv-agent/camera-qualification.json
+```
+
 macOS note: use `NUVION_VIDEO_SOURCE=avf` (default camera) or `avf:<index>` to select a camera.
 
 ### Agent WebSocket error queue
