@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from nuvion_app.config import (
     DEFAULT_PORT,
@@ -17,16 +18,24 @@ from nuvion_app.config import (
 from nuvion_app.model_store import (
     DEFAULT_MODEL_POINTER,
     DEFAULT_MODEL_PRESIGN_TTL_SECONDS,
-    DEFAULT_MODEL_SERVER_BASE_URL,
     DEFAULT_MODEL_PROFILE,
+    DEFAULT_MODEL_SERVER_BASE_URL,
     anomalyclip_text_features_path,
     anomalyclip_triton_repository_path,
     pull_model_from_server,
     resolve_default_model_dir,
 )
-from nuvion_app.runtime.config_guard import ensure_runtime_config, guard_config, print_report
+from nuvion_app.runtime.camera_product import (
+    VALID_CAMERA_PRODUCTS,
+    apply_camera_product_preset,
+    write_camera_qualification_report,
+)
+from nuvion_app.runtime.config_guard import (
+    ensure_runtime_config,
+    guard_config,
+    print_report,
+)
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
-
 
 _BACKEND_CHOICES = ("triton", "siglip", "visualad", "visualad_htp", "mps", "none")
 _SIGLIP_DEVICE_CHOICES = ("auto", "mps", "cuda", "cpu")
@@ -133,10 +142,28 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="triton|siglip|mps(alias for siglip+mps)|none",
     )
+
     inference_parser.add_argument(
         "--siglip-device",
         choices=_SIGLIP_DEVICE_CHOICES,
         help="SigLIP device preference: auto|mps|cuda|cpu",
+    )
+
+    camera_parser = subparsers.add_parser(
+        "configure-camera",
+        help="Apply a production camera preset for NUVION Base or Ultra",
+    )
+    camera_parser.add_argument("--config", help="Path to config env file")
+    camera_parser.add_argument(
+        "--product",
+        choices=VALID_CAMERA_PRODUCTS,
+        required=True,
+        help="Product camera preset: base (B0272) or ultra (B0273)",
+    )
+    camera_parser.add_argument(
+        "--i2c-bus",
+        type=int,
+        help="Required for Ultra; carrier/CSI-specific B0273 actuator I2C bus",
     )
 
     doctor_parser = subparsers.add_parser("doctor", help="Validate/migrate agent config")
@@ -146,6 +173,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--hardware",
         action="store_true",
         help="Also probe the configured camera runtime, USB access, and device selection",
+    )
+    doctor_parser.add_argument(
+        "--hardware-report",
+        help="Write a secret-free camera qualification JSON report (requires --hardware)",
     )
 
     return parser
@@ -293,11 +324,34 @@ def main() -> None:
         sys.stdout.write(f"  NUVION_ZERO_SHOT_DEVICE={values['NUVION_ZERO_SHOT_DEVICE']}\n")
         return
 
+    if args.command == "configure-camera":
+        if args.product == "ultra" and args.i2c_bus is None:
+            parser.error("configure-camera --product ultra requires --i2c-bus")
+        if args.i2c_bus is not None and args.i2c_bus < 0:
+            parser.error("--i2c-bus must be a non-negative integer")
+        config_path = resolve_config_path(args.config)
+        try:
+            updates = apply_camera_product_preset(
+                config_path,
+                product=args.product,
+                i2c_bus=args.i2c_bus,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        sys.stdout.write(f"Configured {args.product} camera preset: {config_path}\n")
+        for key, value in updates.items():
+            sys.stdout.write(f"  {key}={value}\n")
+        sys.stdout.write("Run `nuv-agent doctor --hardware` on the target device.\n")
+        return
+
     if args.command == "doctor":
+        if args.hardware_report and not args.hardware:
+            parser.error("--hardware-report requires --hardware")
         config_path = resolve_config_path(args.config)
         report = guard_config(config_path=config_path, apply_fixes=args.fix)
         print_report(report)
         hardware_ok = True
+        hardware_checks: list[dict[str, str]] = []
         if args.hardware and report.ok:
             hardware_checks = run_camera_health_checks(report.values)
             for check in hardware_checks:
@@ -308,6 +362,19 @@ def main() -> None:
             hardware_ok = not any(
                 check["status"] == "fail" for check in hardware_checks
             )
+        if args.hardware_report:
+            qualification = write_camera_qualification_report(
+                Path(args.hardware_report).expanduser(),
+                config_path=config_path,
+                values=report.values,
+                config_ok=report.ok,
+                hardware_checks=hardware_checks,
+            )
+            sys.stdout.write(
+                f"[DOCTOR] hardware report: {args.hardware_report} "
+                f"({qualification['result']})\n"
+            )
+            hardware_ok = qualification["result"] == "PASS"
         if report.ok and hardware_ok:
             sys.stdout.write("[DOCTOR] result: OK\n")
             return
