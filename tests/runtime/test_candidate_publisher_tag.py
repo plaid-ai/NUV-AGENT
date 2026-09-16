@@ -166,8 +166,8 @@ class CandidatePublisherTagTest(unittest.TestCase):
             "defaultBranch": "main",
             "trustedTagSignerFingerprints": [self.fingerprint],
             "candidatePublisher": {
-                "tag": "candidate-publisher-v29",
-                "tagRef": "refs/tags/candidate-publisher-v29",
+                "tag": "candidate-publisher-v30",
+                "tagRef": "refs/tags/candidate-publisher-v30",
                 "retiredTagRefs": [
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
@@ -197,10 +197,11 @@ class CandidatePublisherTagTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v26",
                     "refs/tags/candidate-publisher-v27",
                     "refs/tags/candidate-publisher-v28",
+                    "refs/tags/candidate-publisher-v29",
                 ],
                 "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
-                "agentVersion": "0.1.124",
-                "releaseSequence": 26,
+                "agentVersion": "0.1.125",
+                "releaseSequence": 27,
                 "configSchema": "12",
                 "minUpdaterVersion": "0.2.0",
                 "rulesetName": "protected-candidate-publisher",
@@ -246,9 +247,9 @@ class CandidatePublisherTagTest(unittest.TestCase):
         result = self._verify(
             repository, publisher_sha, component_sha, policy, signers
         )
-        self.assertEqual(result["candidate_publisher_tag"], "candidate-publisher-v29")
+        self.assertEqual(result["candidate_publisher_tag"], "candidate-publisher-v30")
         self.assertEqual(
-            result["candidate_publisher_tag_ref"], "refs/tags/candidate-publisher-v29"
+            result["candidate_publisher_tag_ref"], "refs/tags/candidate-publisher-v30"
         )
         self.assertEqual(result["candidate_publisher_sha"], publisher_sha)
         self.assertEqual(result["component_sha"], component_sha)
@@ -347,7 +348,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v2"]),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v3"]),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v4"]),
-            ("retiredTagRefs", ["refs/tags/candidate-publisher-v29"]),
+            ("retiredTagRefs", ["refs/tags/candidate-publisher-v30"]),
             (
                 "retiredTagRefs",
                 ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"],
@@ -375,7 +376,7 @@ class CandidatePublisherTagTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
                     "refs/tags/candidate-publisher-v3",
-                    "refs/tags/candidate-publisher-v29",
+                    "refs/tags/candidate-publisher-v30",
                 ],
             ),
             ("retiredTagRefs", ["refs/tags/candidate-publisher-v1"] * 2),
