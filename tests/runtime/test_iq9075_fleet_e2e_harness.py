@@ -1225,6 +1225,54 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_nuvion_process_scan_ignores_disappearing_proc_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                control_group, _cgroup = seed_candidate_kernel_proof(fixture)
+                transient = fixture.paths.proc_root / "9002"
+                transient.mkdir()
+                status = transient / "status"
+                cgroup = transient / "cgroup"
+                status.write_text(
+                    "Name:\tpython3\nUid:\t4242\t4242\t4242\t4242\n",
+                    encoding="ascii",
+                )
+                cgroup.write_text(
+                    "0::/user.slice/user-4242.slice/session.scope\n",
+                    encoding="ascii",
+                )
+                read_regular = BOARD.read_regular
+
+                def race_status(path, **kwargs):
+                    if path == status:
+                        status.unlink()
+                    return read_regular(path, **kwargs)
+
+                with mock.patch.object(BOARD, "read_regular", side_effect=race_status):
+                    self.assertEqual(
+                        fixture.harness._nuvion_process_cgroups(),
+                        {9001: control_group},
+                    )
+
+                status.write_text(
+                    "Name:\tpython3\nUid:\t4242\t4242\t4242\t4242\n",
+                    encoding="ascii",
+                )
+
+                def race_cgroup(path, **kwargs):
+                    if path == cgroup:
+                        cgroup.unlink()
+                    return read_regular(path, **kwargs)
+
+                with mock.patch.object(BOARD, "read_regular", side_effect=race_cgroup):
+                    self.assertEqual(
+                        fixture.harness._nuvion_process_cgroups(),
+                        {9001: control_group},
+                    )
+            finally:
+                fixture.close()
+
     def test_default_os_release_uses_canonical_file_with_ubuntu_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
