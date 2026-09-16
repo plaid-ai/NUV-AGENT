@@ -1865,6 +1865,17 @@ class PipelineDurableSafetyTest(unittest.TestCase):
             )
             self.assertEqual(matched["shadow"]["result"], "DEFECT")
 
+            with mock.patch.object(pipeline, "SHADOW_MODEL_DIGEST", ""):
+                missing_digest = pipeline.build_observation_metadata(
+                    trigger_reason="THRESHOLD_NEAR",
+                    raw_score=0.65,
+                    threshold=0.5,
+                    model_digest="sha256:" + "b" * 64,
+                    content_digest=None,
+                    inference_seconds=0.01,
+                )
+            self.assertNotIn("shadow", missing_digest)
+
     def test_uncorrelated_terminal_409_stops_replay_instead_of_poison_loop(
         self,
     ) -> None:

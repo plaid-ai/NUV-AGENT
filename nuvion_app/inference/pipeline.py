@@ -2800,9 +2800,8 @@ def build_observation_metadata(
     if (
         SHADOW_BUNDLE_VERSION
         and SHADOW_THRESHOLD is not None
-        and (shadow_digest is None or shadow_digest == resolved_model_digest)
+        and shadow_digest == resolved_model_digest
     ):
-        shadow_digest = shadow_digest or resolved_model_digest
         payload["shadow"] = {
             "bundleVersion": SHADOW_BUNDLE_VERSION,
             "modelDigest": shadow_digest,

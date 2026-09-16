@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from unittest import mock
 
@@ -90,7 +91,11 @@ class SnapshotTest(unittest.TestCase):
             )
 
         self.assertEqual(result.object_name, "anomalies/1/snapshot.png")
-        self.assertRegex(result.content_digest, r"^sha256:[0-9a-f]{64}$")
+        uploaded_payload = upload_bytes_to_url.call_args.args[1]
+        self.assertEqual(
+            result.content_digest,
+            "sha256:" + hashlib.sha256(uploaded_payload).hexdigest(),
+        )
 
 
 if __name__ == "__main__":

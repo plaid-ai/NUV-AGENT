@@ -256,7 +256,8 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
 - `NUVION_DATA_COLLECTION_ENABLED`: 구조화된 검사 관측 metadata와 정상/불확실 표본 수집 활성화
-- `NUVION_NORMAL_SAMPLE_INTERVAL_SEC`: 정상 표본 업로드 최소 간격
+- `NUVION_NORMAL_SAMPLE_INTERVAL_SEC`: 정상 표본 업로드 최소 간격(기본 300초)
+- `NUVION_UNCERTAIN_SAMPLE_INTERVAL_SEC`: threshold 주변 불확실 표본의 별도 업로드 최소 간격(기본 30초)
 - `NUVION_UNCERTAINTY_MARGIN`: 운영 threshold 주변 hard-case 수집 범위
 - `NUVION_REFERENCE_BANK_VERSION` / `NUVION_CALIBRATION_VERSION` / `NUVION_INSPECTION_BUNDLE_VERSION`: 관측에 기록할 배포 lineage
 - `NUVION_SHADOW_BUNDLE_VERSION` + `NUVION_SHADOW_THRESHOLD`: 생산 판정과 분리된 후보 calibration 비교
