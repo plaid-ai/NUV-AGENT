@@ -2869,10 +2869,26 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                             encoding="utf-8",
                         )
                         output.chmod(0o600)
+                        # A clean DepthAI close commonly re-enumerates OAK in
+                        # its USB2 bootloader identity until the restored Agent
+                        # opens it again.
+                        product = fixture.paths.usb_devices / "2-1.1/idProduct"
+                        product.chmod(0o644)
+                        product.write_text("2485\n", encoding="ascii")
+                        product.chmod(0o444)
                         return BOARD.CommandResult(0, "", "")
-                    return original_run(
+                    result = original_run(
                         argv, timeout=timeout, input_bytes=input_bytes
                     )
+                    if (
+                        tuple(argv[:2]) == ("/usr/bin/systemctl", "start")
+                        and argv[-1] == "nuv-agent.service"
+                    ):
+                        product = fixture.paths.usb_devices / "2-1.1/idProduct"
+                        product.chmod(0o644)
+                        product.write_text("f63b\n", encoding="ascii")
+                        product.chmod(0o444)
+                    return result
 
                 fixture.runner.run = run_with_raw
                 slots_before = fixture.harness._slot_snapshot()
@@ -3810,6 +3826,88 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 self.assertFalse(proof["recursivePopulated"])
                 self.assertTrue(proof["cgroupRemoved"])
                 self.assertFalse(proof["resetPerformed"])
+            finally:
+                fixture.close()
+
+    def test_candidate_unit_stops_active_exited_unit_after_cgroup_removal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                unit = fixture.harness._candidate_unit(fixture.run_id)
+                original_run = fixture.runner.run
+                loaded = True
+
+                def run_active_exited(argv, *, timeout, input_bytes=None):
+                    nonlocal loaded
+                    call = tuple(argv)
+                    if (
+                        call[:3]
+                        == (
+                            "/usr/bin/systemctl",
+                            "show",
+                            "--property=ControlGroup",
+                        )
+                        and call[-1] == unit
+                    ):
+                        return BOARD.CommandResult(
+                            0 if loaded else 1,
+                            "\n" if loaded else "",
+                            "",
+                        )
+                    if (
+                        call[:2] == ("/usr/bin/systemctl", "show")
+                        and "--property=LoadState" in call
+                    ):
+                        names = {
+                            item.split("=", 1)[1]
+                            for item in call
+                            if item.startswith("--property=")
+                        }
+                        values = {
+                            "ActiveState": "active" if loaded else "inactive",
+                            "ControlGroup": "",
+                            "LoadState": "loaded" if loaded else "not-found",
+                        }
+                        return BOARD.CommandResult(
+                            0,
+                            "".join(
+                                f"{name}={values[name]}\n" for name in sorted(names)
+                            ),
+                            "",
+                        )
+                    if call[:2] == ("/usr/bin/systemctl", "is-active"):
+                        return BOARD.CommandResult(
+                            0 if loaded else 3,
+                            "active\n" if loaded else "inactive\n",
+                            "",
+                        )
+                    if call[:2] == ("/usr/bin/systemctl", "stop"):
+                        loaded = False
+                        fixture.runner.calls.append(call)
+                        return BOARD.CommandResult(0, "", "")
+                    return original_run(
+                        argv, timeout=timeout, input_bytes=input_bytes
+                    )
+
+                fixture.runner.run = run_active_exited
+                proof = fixture.harness._terminate_candidate_unit(
+                    unit,
+                    expected_control_group="/system.slice/" + unit,
+                )
+
+                self.assertFalse(proof["initialPresent"])
+                self.assertFalse(proof["initialPopulated"])
+                self.assertEqual(proof["loadState"], "not-found")
+                self.assertTrue(proof["cgroupRemoved"])
+                self.assertTrue(
+                    any(
+                        call[:2] == ("/usr/bin/systemctl", "stop")
+                        and call[-1] == unit
+                        for call in fixture.runner.calls
+                    )
+                )
             finally:
                 fixture.close()
 
