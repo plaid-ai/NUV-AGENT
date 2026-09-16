@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from io import BytesIO
+from dataclasses import dataclass
+import hashlib
 import struct
 import threading
 import zlib
@@ -9,6 +11,12 @@ import numpy as np
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+@dataclass(frozen=True)
+class SnapshotUploadResult:
+    object_name: str
+    content_digest: str
 
 
 class LatestFrameBuffer:
@@ -90,6 +98,21 @@ def capture_and_upload_snapshot(
     upload_bytes_to_url,
     preferred_content_type: str = "image/jpeg",
 ) -> str | None:
+    result = capture_and_upload_snapshot_with_metadata(
+        frame_rgb,
+        request_upload_url,
+        upload_bytes_to_url,
+        preferred_content_type,
+    )
+    return result.object_name if result else None
+
+
+def capture_and_upload_snapshot_with_metadata(
+    frame_rgb: np.ndarray | None,
+    request_upload_url,
+    upload_bytes_to_url,
+    preferred_content_type: str = "image/jpeg",
+) -> SnapshotUploadResult | None:
     if frame_rgb is None:
         return None
 
@@ -105,4 +128,7 @@ def capture_and_upload_snapshot(
 
     if not upload_bytes_to_url(upload_url, snapshot_bytes, content_type):
         return None
-    return object_name
+    return SnapshotUploadResult(
+        object_name=object_name,
+        content_digest="sha256:" + hashlib.sha256(snapshot_bytes).hexdigest(),
+    )

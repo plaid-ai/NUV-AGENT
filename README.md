@@ -255,6 +255,14 @@ For dev, `.env` in the repo is used automatically.
 - `NUVION_DEMO_VIDEO_FALLBACK_PATHS`: 추가 fallback 경로 CSV (예: `/data/demo1.webm,/data/demo2.mp4`)
 - `NUVION_ANOMALY_LABELS`: comma-separated labels treated as anomalies
 - `NUVION_PRODUCTION_LABELS`: comma-separated labels counted for production
+- `NUVION_DATA_COLLECTION_ENABLED`: 구조화된 검사 관측 metadata와 정상/불확실 표본 수집 활성화
+- `NUVION_NORMAL_SAMPLE_INTERVAL_SEC`: 정상 표본 업로드 최소 간격(기본 300초)
+- `NUVION_UNCERTAIN_SAMPLE_INTERVAL_SEC`: threshold 주변 불확실 표본의 별도 업로드 최소 간격(기본 30초)
+- `NUVION_UNCERTAINTY_MARGIN`: 운영 threshold 주변 hard-case 수집 범위
+- `NUVION_REFERENCE_BANK_VERSION` / `NUVION_CALIBRATION_VERSION` / `NUVION_INSPECTION_BUNDLE_VERSION`: 관측에 기록할 배포 lineage
+- `NUVION_SHADOW_BUNDLE_VERSION` + `NUVION_SHADOW_THRESHOLD`: 생산 판정과 분리된 후보 calibration 비교
+
+Fleet `CONFIG_APPLY.collection`은 위 수집 정책과 세 inference backend의 운영 threshold를 원격 overlay에 저장하며 `activation=RESTART`를 요구합니다. Shadow 결과는 설정된 model digest가 실제 로드된 model digest와 같을 때만 보고합니다.
 - `NUVION_DEVICE_STATE_INTERVAL_SEC`: `/app/device/state` heartbeat 주기(초, 기본 `30`)
 - `NUVION_EVENT_OUTBOX_PATH`: anomaly/production/state/connectivity SQLite outbox 경로 (systemd 기본 `/var/lib/nuv-agent/events.sqlite3`)
 - `NUVION_EVENT_REPLAY_INTERVAL_SEC`: terminal 확인 전 event 재전송 주기(초, 기본 `5`)

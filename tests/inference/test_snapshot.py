@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
 from unittest import mock
 
@@ -8,6 +9,7 @@ import numpy as np
 from nuvion_app.inference.snapshot import LatestFrameBuffer
 from nuvion_app.inference.snapshot import PNG_SIGNATURE
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot
+from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
 from nuvion_app.inference.snapshot import encode_snapshot
 
 
@@ -73,6 +75,27 @@ class SnapshotTest(unittest.TestCase):
             )
 
         self.assertIsNone(object_name)
+
+    def test_snapshot_metadata_contains_digest_of_uploaded_bytes(self) -> None:
+        request_upload_url = mock.Mock(
+            return_value={"objectName": "anomalies/1/snapshot.png", "uploadUrl": "https://example.com/upload"}
+        )
+        upload_bytes_to_url = mock.Mock(return_value=True)
+
+        with mock.patch("nuvion_app.inference.snapshot._encode_with_pillow", return_value=None):
+            result = capture_and_upload_snapshot_with_metadata(
+                self.frame,
+                request_upload_url=request_upload_url,
+                upload_bytes_to_url=upload_bytes_to_url,
+                preferred_content_type="image/jpeg",
+            )
+
+        self.assertEqual(result.object_name, "anomalies/1/snapshot.png")
+        uploaded_payload = upload_bytes_to_url.call_args.args[1]
+        self.assertEqual(
+            result.content_digest,
+            "sha256:" + hashlib.sha256(uploaded_payload).hexdigest(),
+        )
 
 
 if __name__ == "__main__":
