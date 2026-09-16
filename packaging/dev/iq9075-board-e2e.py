@@ -4616,11 +4616,10 @@ class BoardHarness:
         )
         raw = shown.stdout.strip()
         if shown.returncode != 0 or raw == "":
-            active = self.runner.run(
-                ["/usr/bin/systemctl", "is-active", unit], timeout=10
-            )
-            if active.returncode == 0 and active.stdout.strip() == "active":
-                raise HarnessError("active candidate unit has no cgroup identity")
+            # systemd may remove an empty cgroup and clear ControlGroup while
+            # a successful RemainAfterExit unit is still active/exited.  The
+            # caller separately proves the expected cgroup identity from the
+            # execution journal and must still stop the loaded unit.
             return None
         relative = Path(raw.removeprefix("/"))
         if (
@@ -5351,12 +5350,24 @@ class BoardHarness:
                     break
             else:
                 raise HarnessError("candidate execution cgroup is not empty")
-        elif cgroup is not None and initial_present:
-            stopped = self.runner.run(
-                ["/usr/bin/systemctl", "stop", unit], timeout=45
+        else:
+            # A successful transient Type=exec unit with RemainAfterExit=yes
+            # can become active/exited after systemd has already removed its
+            # empty cgroup and cleared ControlGroup.  The unit still needs an
+            # explicit stop before it can unload.  Keying the stop only on the
+            # cgroup path leaves that exact lifecycle stuck active forever.
+            lifecycle = self._show_candidate_properties(
+                unit, {"ActiveState", "LoadState"}
             )
-            if stopped.returncode != 0:
-                raise HarnessError("candidate systemd stop failed")
+            if initial_present or (
+                lifecycle["LoadState"] == "loaded"
+                and lifecycle["ActiveState"] != "inactive"
+            ):
+                stopped = self.runner.run(
+                    ["/usr/bin/systemctl", "stop", unit], timeout=45
+                )
+                if stopped.returncode != 0:
+                    raise HarnessError("candidate systemd stop failed")
 
         current_cgroup = self._candidate_unit_cgroup(unit)
         if current_cgroup is not None and cgroup is not None and current_cgroup != cgroup:
@@ -6000,13 +6011,6 @@ class BoardHarness:
                             raise HarnessError("signed slot pointers changed during soak")
                         if self._anti_replay_snapshot() != soak["antiReplay"]:
                             raise HarnessError("updater anti-replay journal changed during soak")
-                        oak_during = self.verify_oak()
-                        if (
-                            oak_during.get("port") != soak["oakBefore"].get("port")
-                            or oak_during.get("mxidSha256")
-                            != soak["oakBefore"].get("mxidSha256")
-                        ):
-                            raise HarnessError("OAK identity changed during candidate soak")
                         execution_unit = soak.get("executionUnit")
                         if soak.get("runningAt") is not None:
                             expected_unit = self._candidate_unit(run_id)
@@ -7675,14 +7679,8 @@ class BoardHarness:
                         "candidate soak recovery found changed anti-replay state"
                     )
                 oak_before = soak.get("oakBefore")
-                oak_current = self.verify_oak()
-                if (
-                    not isinstance(oak_before, Mapping)
-                    or oak_current.get("port") != oak_before.get("port")
-                    or oak_current.get("mxidSha256")
-                    != oak_before.get("mxidSha256")
-                ):
-                    raise HarnessError("candidate soak recovery found changed OAK")
+                if not isinstance(oak_before, Mapping):
+                    raise HarnessError("candidate soak recovery OAK baseline is missing")
                 if candidate_execution_started:
                     persistent_before = soak.get("persistentStateBefore")
                     if not isinstance(persistent_before, Mapping):
@@ -7723,7 +7721,11 @@ class BoardHarness:
                         str(slots.get("current") or "")
                     )
                 baseline = soak.get("baselineRuntime")
-                oak_after = self.verify_oak()
+                # DepthAI normally returns the device to its USB2 bootloader
+                # identity after the candidate process exits.  That transient
+                # state has no stable MXID to compare.  Restore the baseline
+                # Agent first, then require the exact USB3 port and MXID again.
+                oak_after = None if boot_recovery else self.verify_oak()
                 updater_after = None if boot_recovery else self._probe_updater()
                 update_after = (
                     updater_after.get("update")
@@ -7747,8 +7749,15 @@ class BoardHarness:
                         isinstance(anti_replay, Mapping)
                         and self._anti_replay_snapshot() != dict(anti_replay)
                     )
-                    or oak_after.get("port") != oak_before.get("port")
-                    or oak_after.get("mxidSha256") != oak_before.get("mxidSha256")
+                    or (
+                        not boot_recovery
+                        and (
+                            not isinstance(oak_after, Mapping)
+                            or oak_after.get("port") != oak_before.get("port")
+                            or oak_after.get("mxidSha256")
+                            != oak_before.get("mxidSha256")
+                        )
+                    )
                     or (
                         not boot_recovery
                         and (
