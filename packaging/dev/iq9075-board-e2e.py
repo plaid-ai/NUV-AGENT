@@ -4679,8 +4679,15 @@ class BoardHarness:
                     maximum=64 * 1024,
                     kernel_virtual_size=True,
                 )
-            except FileNotFoundError:
-                continue
+            except (FileNotFoundError, HarnessError) as exc:
+                # A PID discovered by /proc enumeration can exit before its
+                # status file is opened. read_regular wraps an lstat miss in
+                # HarnessError, while an open race can surface directly.
+                if isinstance(exc, FileNotFoundError) or isinstance(
+                    exc.__cause__, FileNotFoundError
+                ):
+                    continue
+                raise
             try:
                 uid_lines = [
                     line for line in status_payload.decode("ascii").splitlines()
@@ -4704,8 +4711,14 @@ class BoardHarness:
                     maximum=64 * 1024,
                     kernel_virtual_size=True,
                 )
-            except FileNotFoundError:
-                continue
+            except (FileNotFoundError, HarnessError) as exc:
+                # The same process may disappear after status was read but
+                # before its cgroup file is opened.
+                if isinstance(exc, FileNotFoundError) or isinstance(
+                    exc.__cause__, FileNotFoundError
+                ):
+                    continue
+                raise
             try:
                 cgroup_lines = cgroup_payload.decode("ascii").splitlines()
             except UnicodeError as exc:
