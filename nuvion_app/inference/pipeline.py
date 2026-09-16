@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
+from nuvion_app import build_info
 from nuvion_app.config import load_env, resolve_config_path
 import aiohttp
 import websockets
@@ -110,7 +111,7 @@ from nuvion_app.inference.face_tracking import draw_tracking_overlay
 from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.snapshot import LatestFrameBuffer
-from nuvion_app.inference.snapshot import capture_and_upload_snapshot
+from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
 from nuvion_app.inference.stream_policy import (
     GlibMainContextDispatcher,
     StreamPolicyReconciler,
@@ -359,6 +360,42 @@ ANOMALY_CONFIDENCE_THRESHOLD = parse_float(os.getenv("NUVION_ANOMALY_CONFIDENCE_
 PRODUCTION_CONFIDENCE_THRESHOLD = parse_float(os.getenv("NUVION_PRODUCTION_CONFIDENCE_THRESHOLD"), 0.5)
 ANOMALY_MIN_INTERVAL_SEC = parse_float(os.getenv("NUVION_ANOMALY_MIN_INTERVAL_SEC"), 5.0)
 PRODUCTION_DEDUP_SEC = parse_float(os.getenv("NUVION_PRODUCTION_DEDUP_SEC"), 3.0)
+DATA_COLLECTION_ENABLED = is_truthy(os.getenv("NUVION_DATA_COLLECTION_ENABLED", "true"))
+NORMAL_SAMPLE_INTERVAL_SEC = max(
+    parse_float(os.getenv("NUVION_NORMAL_SAMPLE_INTERVAL_SEC"), 300.0),
+    1.0,
+)
+UNCERTAIN_SAMPLE_INTERVAL_SEC = max(
+    parse_float(os.getenv("NUVION_UNCERTAIN_SAMPLE_INTERVAL_SEC"), 30.0),
+    1.0,
+)
+UNCERTAINTY_MARGIN = max(
+    parse_float(os.getenv("NUVION_UNCERTAINTY_MARGIN"), 0.05),
+    0.0,
+)
+PRODUCT_ID = (os.getenv("NUVION_PRODUCT_ID", "") or "").strip() or None
+REFERENCE_BANK_VERSION = (
+    os.getenv("NUVION_REFERENCE_BANK_VERSION", "") or ""
+).strip() or None
+CALIBRATION_VERSION = (
+    os.getenv("NUVION_CALIBRATION_VERSION", "") or ""
+).strip() or None
+INSPECTION_BUNDLE_VERSION = (
+    os.getenv("NUVION_INSPECTION_BUNDLE_VERSION", "") or ""
+).strip() or None
+CAPTURE_PROFILE_VERSION = (
+    os.getenv("NUVION_CAPTURE_PROFILE_VERSION", "capture-v1") or "capture-v1"
+).strip()
+SHADOW_BUNDLE_VERSION = (
+    os.getenv("NUVION_SHADOW_BUNDLE_VERSION", "") or ""
+).strip() or None
+SHADOW_MODEL_DIGEST = (
+    os.getenv("NUVION_SHADOW_MODEL_DIGEST", "") or ""
+).strip() or None
+SHADOW_THRESHOLD_RAW = (os.getenv("NUVION_SHADOW_THRESHOLD", "") or "").strip()
+SHADOW_THRESHOLD = (
+    parse_float(SHADOW_THRESHOLD_RAW, 0.0) if SHADOW_THRESHOLD_RAW else None
+)
 
 ZERO_SHOT_ENABLED = is_truthy(os.getenv("NUVION_ZERO_SHOT_ENABLED", "true"))
 ZERO_SHOT_MODEL = os.getenv("NUVION_ZERO_SHOT_MODEL", "google/siglip2-base-patch16-224")
@@ -2716,6 +2753,71 @@ class DemoSampleContext:
     ground_truth: str
 
 
+def canonical_sha256(value: object) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized.startswith("sha256:"):
+        normalized = normalized[7:]
+    if len(normalized) != 64 or any(character not in string.hexdigits for character in normalized):
+        return None
+    return f"sha256:{normalized}"
+
+
+def build_observation_metadata(
+    *,
+    trigger_reason: str,
+    raw_score: float | None,
+    threshold: float | None,
+    model_digest: object,
+    content_digest: str | None,
+    inference_seconds: float | None,
+) -> dict[str, object] | None:
+    if not DATA_COLLECTION_ENABLED or raw_score is None or threshold is None:
+        return None
+    resolved_model_digest = canonical_sha256(
+        model_digest or os.getenv("NUVION_MODEL_DIGEST")
+    )
+    if resolved_model_digest is None:
+        return None
+    payload: dict[str, object] = {
+        "schemaVersion": 1,
+        "triggerReason": trigger_reason,
+        "productId": PRODUCT_ID,
+        "rawAnomalyScore": float(raw_score),
+        "calibratedScore": None,
+        "threshold": float(threshold),
+        "modelPointer": MODEL_POINTER,
+        "modelVersion": (os.getenv("NUVION_MODEL_VERSION", "") or "").strip() or None,
+        "modelDigest": resolved_model_digest,
+        "referenceBankVersion": REFERENCE_BANK_VERSION,
+        "calibrationVersion": CALIBRATION_VERSION,
+        "bundleVersion": INSPECTION_BUNDLE_VERSION,
+        "agentVersion": build_info.AGENT_VERSION,
+        "cameraProfile": (os.getenv("NUVION_CAMERA_PROFILE", "auto") or "auto").strip(),
+        "captureProfileVersion": CAPTURE_PROFILE_VERSION,
+        "contentDigest": canonical_sha256(content_digest),
+    }
+    shadow_digest = canonical_sha256(SHADOW_MODEL_DIGEST)
+    if (
+        SHADOW_BUNDLE_VERSION
+        and SHADOW_THRESHOLD is not None
+        and (shadow_digest is None or shadow_digest == resolved_model_digest)
+    ):
+        shadow_digest = shadow_digest or resolved_model_digest
+        payload["shadow"] = {
+            "bundleVersion": SHADOW_BUNDLE_VERSION,
+            "modelDigest": shadow_digest,
+            "score": float(raw_score),
+            "threshold": float(SHADOW_THRESHOLD),
+            "result": "DEFECT" if float(raw_score) >= SHADOW_THRESHOLD else "NORMAL",
+            "latencyMs": (
+                max(0.0, float(inference_seconds) * 1000.0)
+                if inference_seconds is not None
+                else None
+            ),
+        }
+    return payload
+
+
 class NuvionEventState:
     def __init__(self, overlay_callback=None, demo_source: MvtecDemoSource | None = None):
         self.pipeline_started_at = time.time()
@@ -2736,6 +2838,8 @@ class NuvionEventState:
         self.last_status = None
         self.last_sent_status = None
         self.last_sent_at = 0.0
+        self.last_normal_sample_at = 0.0
+        self.last_uncertain_sample_at = 0.0
         self.latest_frame = LatestFrameBuffer()
         self.last_frame_monotonic: float | None = None
         self.clip_enabled = CLIP_ENABLED
@@ -3025,6 +3129,24 @@ class NuvionEventState:
             self._triton_client_thread_id = current_thread_id
         return self.triton_client
 
+    def collection_trigger_reason(
+        self,
+        *,
+        status: str,
+        score: float,
+        threshold: float,
+        now: float | None = None,
+    ) -> str | None:
+        if not DATA_COLLECTION_ENABLED or self.demo_mode:
+            return None
+        observed_at = time.time() if now is None else now
+        if abs(score - threshold) <= UNCERTAINTY_MARGIN:
+            if observed_at - getattr(self, "last_uncertain_sample_at", 0.0) >= UNCERTAIN_SAMPLE_INTERVAL_SEC:
+                return "THRESHOLD_NEAR"
+        if status == "NORMAL" and observed_at - getattr(self, "last_normal_sample_at", 0.0) >= NORMAL_SAMPLE_INTERVAL_SEC:
+            return "NORMAL_SAMPLE"
+        return None
+
     def send_status(
         self,
         status: str,
@@ -3035,6 +3157,13 @@ class NuvionEventState:
         clip_object: str | None = None,
         clip_status: str | None = None,
         demo_context: DemoSampleContext | None = None,
+        trigger_reason: str | None = None,
+        force_sample: bool = False,
+        raw_score: float | None = None,
+        threshold: float | None = None,
+        model_digest: object = None,
+        inference_seconds: float | None = None,
+        content_digest: str | None = None,
     ):
         now = time.time()
         inspection_status = INSPECTION_STATUS_DEFECT if status == "DEFECT" else INSPECTION_STATUS_NORMAL
@@ -3043,10 +3172,12 @@ class NuvionEventState:
         status_changed = (prev_sent_status is None) or (status != prev_sent_status)
         self.last_status = status
 
-        if prev_sent_status is None and status == "NORMAL":
+        if not force_sample and prev_sent_status is None and status == "NORMAL":
             return
 
-        if status_changed:
+        if force_sample:
+            pass
+        elif status_changed:
             pass
         elif status == "DEFECT" and now - self.last_sent_at >= ANOMALY_MIN_INTERVAL_SEC:
             pass
@@ -3055,8 +3186,11 @@ class NuvionEventState:
 
         event_id = str(uuid.uuid4())
         occurred_at = utc_now_iso()
-        if status == "DEFECT" and status_changed and snapshot_object is None:
-            snapshot_object = self.capture_snapshot_upload()
+        if (force_sample or (status == "DEFECT" and status_changed)) and snapshot_object is None:
+            snapshot_result = self.capture_snapshot_upload_metadata()
+            if snapshot_result:
+                snapshot_object = snapshot_result.object_name
+                content_digest = snapshot_result.content_digest
 
         if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
             clip_object = self.start_clip_upload(event_id=event_id)
@@ -3064,6 +3198,14 @@ class NuvionEventState:
                 clip_status = "UPLOADING"
 
         tagged_message = self._apply_demo_tag(message)
+        resolved_trigger_reason = trigger_reason
+        if resolved_trigger_reason is None:
+            if self.demo_mode:
+                resolved_trigger_reason = "DEMO_SAMPLE"
+            elif status_changed:
+                resolved_trigger_reason = "STATE_CHANGE"
+            else:
+                resolved_trigger_reason = "DEFECT_REPEAT"
         payload = {
             "anomalyType": anomaly_type,
             "anomalyStatus": status,
@@ -3077,6 +3219,16 @@ class NuvionEventState:
             "executionMode": "DEMO" if self.demo_mode else "PRODUCTION",
             "modeRevision": getattr(self, "demo_mode_revision", 1),
         }
+        observation = build_observation_metadata(
+            trigger_reason=resolved_trigger_reason,
+            raw_score=raw_score,
+            threshold=threshold,
+            model_digest=model_digest,
+            content_digest=content_digest,
+            inference_seconds=inference_seconds,
+        )
+        if observation is not None:
+            payload["observation"] = observation
         if self.demo_mode:
             payload.update(
                 {
@@ -3097,6 +3249,10 @@ class NuvionEventState:
             return
         self.last_sent_status = status
         self.last_sent_at = now
+        if resolved_trigger_reason == "NORMAL_SAMPLE":
+            self.last_normal_sample_at = now
+        if resolved_trigger_reason == "THRESHOLD_NEAR":
+            self.last_uncertain_sample_at = now
         if status_changed:
             log.info("[ZSAD] Sent %s status (change) eventId=%s: %s", status, event_id, tagged_message)
         else:
@@ -3114,12 +3270,16 @@ class NuvionEventState:
         self.last_frame_monotonic = time.monotonic()
 
     def capture_snapshot_upload(self) -> str | None:
+        result = self.capture_snapshot_upload_metadata()
+        return result.object_name if result else None
+
+    def capture_snapshot_upload_metadata(self):
         if not SNAPSHOT_ENABLED:
             return None
 
         frame = self.latest_frame.copy()
         try:
-            return capture_and_upload_snapshot(
+            return capture_and_upload_snapshot_with_metadata(
                 frame,
                 request_upload_url=request_upload_url,
                 upload_bytes_to_url=upload_bytes_to_url,
@@ -3510,11 +3670,38 @@ class NuvionEventState:
                     if self.backend in {"visualad", "visualad_htp"} and os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true":
                         live_overlay = f"EXP / UNCALIBRATED {status} {score:.2f}"
                     self._set_anomaly_overlay(overlay if self.demo_mode else live_overlay)
+                    trigger_reason = self.collection_trigger_reason(
+                        status=status,
+                        score=score,
+                        threshold=float(self.zero_shot.threshold),
+                    )
+                    observation_kwargs = {
+                        "trigger_reason": trigger_reason,
+                        "force_sample": trigger_reason is not None,
+                        "raw_score": score,
+                        "threshold": float(self.zero_shot.threshold),
+                        "model_digest": result.get("model_sha256"),
+                        "inference_seconds": result.get("inference_seconds"),
+                    }
                     try:
                         if status == "DEFECT":
-                            self.send_status("DEFECT", label, f"{provenance}Zero-shot anomaly: {label} ({score:.2f})", "WARNING", demo_context=demo_context)
+                            self.send_status(
+                                "DEFECT",
+                                label,
+                                f"{provenance}Zero-shot anomaly: {label} ({score:.2f})",
+                                "WARNING",
+                                demo_context=demo_context,
+                                **observation_kwargs,
+                            )
                         else:
-                            self.send_status("NORMAL", label, f"{provenance}Recovered to normal: {label} ({score:.2f})", "INFO", demo_context=demo_context)
+                            self.send_status(
+                                "NORMAL",
+                                label,
+                                f"{provenance}Recovered to normal: {label} ({score:.2f})",
+                                "INFO",
+                                demo_context=demo_context,
+                                **observation_kwargs,
+                            )
                     except CriticalEventBackpressureError as exc:
                         log.critical("[SAFETY-STOP] %s", exc)
                         continue
@@ -3559,12 +3746,31 @@ class NuvionEventState:
                     ),
                 )
                 self._set_anomaly_overlay(overlay if self.demo_mode else f"{status} {label} {score:.2f}")
+                trigger_reason = self.collection_trigger_reason(
+                    status=status,
+                    score=score,
+                    threshold=TRITON_THRESHOLD,
+                )
+                observation_kwargs = {
+                    "trigger_reason": trigger_reason,
+                    "force_sample": trigger_reason is not None,
+                    "raw_score": score,
+                    "threshold": TRITON_THRESHOLD,
+                    "model_digest": result.get("model_sha256"),
+                    "inference_seconds": result.get("inference_seconds"),
+                }
 
                 try:
                     if status == "DEFECT":
-                        self.send_status("DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING", demo_context=demo_context)
+                        self.send_status(
+                            "DEFECT", label, f"Triton anomaly score={score:.2f}", "WARNING",
+                            demo_context=demo_context, **observation_kwargs
+                        )
                     else:
-                        self.send_status("NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO", demo_context=demo_context)
+                        self.send_status(
+                            "NORMAL", label, f"Triton recovered: {label} ({score:.2f})", "INFO",
+                            demo_context=demo_context, **observation_kwargs
+                        )
                 except CriticalEventBackpressureError as exc:
                     log.critical("[SAFETY-STOP] %s", exc)
                     continue

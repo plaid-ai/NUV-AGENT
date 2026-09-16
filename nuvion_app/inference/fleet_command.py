@@ -326,7 +326,7 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
         _require_exact_payload_keys(
             payload,
             required={"configVersion", "activation"},
-            optional={"model", "labels", "clip", "video"},
+            optional={"model", "labels", "clip", "video", "collection"},
         )
         _bounded_payload_int(
             payload,
@@ -339,10 +339,13 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
                 "INVALID_PAYLOAD_SCHEMA",
                 "CONFIG_APPLY activation must be IMMEDIATE or RESTART",
             )
-        if not any(key in payload for key in ("model", "labels", "clip", "video")):
+        if not any(
+            key in payload
+            for key in ("model", "labels", "clip", "video", "collection")
+        ):
             raise CommandValidationError(
                 "INVALID_PAYLOAD_SCHEMA",
-                "CONFIG_APPLY requires at least one model/labels/clip/video section",
+                "CONFIG_APPLY requires at least one model/labels/clip/video/collection section",
             )
         if "model" in payload:
             model = _payload_object(payload, "model")
@@ -424,6 +427,118 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
             _bounded_payload_int(video, "height", minimum=120, maximum=4320)
             _bounded_payload_int(video, "fps", minimum=1, maximum=120)
             _bounded_payload_int(video, "bitrateKbps", minimum=100, maximum=20_000)
+        if "collection" in payload:
+            if payload.get("activation") != "RESTART":
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "collection changes require activation=RESTART",
+                )
+            collection = _payload_object(payload, "collection")
+            _require_exact_payload_keys(
+                collection,
+                required={
+                    "enabled",
+                    "normalSampleIntervalSec",
+                    "uncertainSampleIntervalSec",
+                    "uncertaintyMargin",
+                    "productionThreshold",
+                    "captureProfileVersion",
+                },
+                optional={
+                    "productId",
+                    "referenceBankVersion",
+                    "calibrationVersion",
+                    "bundleVersion",
+                    "shadow",
+                },
+            )
+            if not isinstance(collection.get("enabled"), bool):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA", "collection.enabled must be boolean"
+                )
+            _bounded_payload_int(
+                collection,
+                "normalSampleIntervalSec",
+                minimum=1,
+                maximum=86_400,
+            )
+            _bounded_payload_int(
+                collection,
+                "uncertainSampleIntervalSec",
+                minimum=1,
+                maximum=86_400,
+            )
+            _bounded_payload_number(
+                collection,
+                "uncertaintyMargin",
+                minimum=0.0,
+                maximum=1_000_000.0,
+            )
+            _bounded_payload_number(
+                collection,
+                "productionThreshold",
+                minimum=-8.0,
+                maximum=8.0,
+            )
+            for key in (
+                "productId",
+                "referenceBankVersion",
+                "calibrationVersion",
+                "bundleVersion",
+            ):
+                value = collection.get(key)
+                if value is not None and (
+                    not isinstance(value, str)
+                    or not value
+                    or value != value.strip()
+                    or len(value) > 255
+                ):
+                    raise CommandValidationError(
+                        "INVALID_PAYLOAD_SCHEMA",
+                        f"collection.{key} must be a trimmed non-empty string up to 255 characters",
+                    )
+            capture_profile = collection.get("captureProfileVersion")
+            if (
+                not isinstance(capture_profile, str)
+                or not capture_profile
+                or capture_profile != capture_profile.strip()
+                or len(capture_profile) > 100
+            ):
+                raise CommandValidationError(
+                    "INVALID_PAYLOAD_SCHEMA",
+                    "collection.captureProfileVersion must be a trimmed non-empty string up to 100 characters",
+                )
+            if "shadow" in collection:
+                shadow = _payload_object(collection, "shadow")
+                _require_exact_payload_keys(
+                    shadow,
+                    required={"bundleVersion", "modelDigest", "threshold"},
+                )
+                bundle_version = shadow.get("bundleVersion")
+                if (
+                    not isinstance(bundle_version, str)
+                    or not bundle_version
+                    or bundle_version != bundle_version.strip()
+                    or len(bundle_version) > 100
+                ):
+                    raise CommandValidationError(
+                        "INVALID_PAYLOAD_SCHEMA",
+                        "collection.shadow.bundleVersion must be a trimmed non-empty string up to 100 characters",
+                    )
+                shadow_digest = shadow.get("modelDigest")
+                if not isinstance(shadow_digest, str) or not _DIGEST_PATTERN.fullmatch(
+                    shadow_digest
+                ):
+                    raise CommandValidationError(
+                        "INVALID_PAYLOAD_SCHEMA",
+                        "collection.shadow.modelDigest must be sha256:<64 lowercase hex>",
+                    )
+                _bounded_payload_number(
+                    shadow,
+                    "threshold",
+                    minimum=-1_000_000.0,
+                    maximum=1_000_000.0,
+                )
         return
 
     if command_type == "STREAM_POLICY":

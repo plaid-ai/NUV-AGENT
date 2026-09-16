@@ -304,6 +304,45 @@ class SettingsReconcilerTest(unittest.TestCase):
             labels,
         )
 
+    def test_collection_policy_is_encoded_for_restart_overlay(self) -> None:
+        updates = config_env_updates(
+            {
+                "collection": {
+                    "enabled": True,
+                    "productId": "metal-nut",
+                    "normalSampleIntervalSec": 300,
+                    "uncertainSampleIntervalSec": 30,
+                    "uncertaintyMargin": 0.05,
+                    "productionThreshold": 0.5,
+                    "referenceBankVersion": "ref-v1",
+                    "calibrationVersion": "cal-v1",
+                    "bundleVersion": "bundle-v1",
+                    "captureProfileVersion": "capture-v1",
+                    "shadow": {
+                        "bundleVersion": "bundle-v2",
+                        "modelDigest": "sha256:" + "a" * 64,
+                        "threshold": 0.55,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(updates["NUVION_DATA_COLLECTION_ENABLED"], "true")
+        self.assertEqual(updates["NUVION_PRODUCT_ID"], "metal-nut")
+        self.assertEqual(updates["NUVION_NORMAL_SAMPLE_INTERVAL_SEC"], "300")
+        self.assertEqual(updates["NUVION_UNCERTAIN_SAMPLE_INTERVAL_SEC"], "30")
+        self.assertEqual(updates["NUVION_UNCERTAINTY_MARGIN"], "0.05")
+        self.assertEqual(updates["NUVION_ZERO_SHOT_THRESHOLD"], "0.5")
+        self.assertEqual(updates["NUVION_TRITON_THRESHOLD"], "0.5")
+        self.assertEqual(updates["NUVION_VISUALAD_THRESHOLD"], "0.5")
+        self.assertEqual(updates["NUVION_REFERENCE_BANK_VERSION"], "ref-v1")
+        self.assertEqual(updates["NUVION_CALIBRATION_VERSION"], "cal-v1")
+        self.assertEqual(updates["NUVION_INSPECTION_BUNDLE_VERSION"], "bundle-v1")
+        self.assertEqual(updates["NUVION_CAPTURE_PROFILE_VERSION"], "capture-v1")
+        self.assertEqual(updates["NUVION_SHADOW_BUNDLE_VERSION"], "bundle-v2")
+        self.assertEqual(updates["NUVION_SHADOW_MODEL_DIGEST"], "sha256:" + "a" * 64)
+        self.assertEqual(updates["NUVION_SHADOW_THRESHOLD"], "0.55")
+
     def test_unsupported_immediate_effect_restores_runtime_and_lkg(self) -> None:
         command = _command(8)
         runtime = _Runtime()

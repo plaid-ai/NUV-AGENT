@@ -792,6 +792,22 @@ class FleetCommandVerifierTest(unittest.TestCase):
                 "fps": 120,
                 "bitrateKbps": 20_000,
             },
+            "collection": {
+                "enabled": True,
+                "productId": "metal-nut",
+                "normalSampleIntervalSec": 300,
+                "uncertainSampleIntervalSec": 30,
+                "uncertaintyMargin": 0.05,
+                "productionThreshold": 0.5,
+                "referenceBankVersion": "ref-v1",
+                "calibrationVersion": "cal-v1",
+                "captureProfileVersion": "capture-v1",
+                "shadow": {
+                    "bundleVersion": "bundle-candidate-v2",
+                    "modelDigest": "sha256:" + "b" * 64,
+                    "threshold": 0.55,
+                },
+            },
         }
         self.assertEqual(
             self.verifier.verify(
@@ -828,6 +844,15 @@ class FleetCommandVerifierTest(unittest.TestCase):
             lambda value: value["labels"].update(inspection=["x" * 101]),
             lambda value: value["labels"].update(inspection=["normal", "NORMAL"]),
             lambda value: value["labels"].update(anomaly="defect"),
+            lambda value: value["collection"].update(enabled="yes"),
+            lambda value: value["collection"].update(normalSampleIntervalSec=0),
+            lambda value: value["collection"].update(uncertainSampleIntervalSec=86_401),
+            lambda value: value["collection"].update(uncertaintyMargin=-0.01),
+            lambda value: value["collection"].update(productionThreshold=8.01),
+            lambda value: value["collection"].update(captureProfileVersion=""),
+            lambda value: value["collection"]["shadow"].update(modelDigest="bad"),
+            lambda value: value["collection"]["shadow"].update(threshold=True),
+            lambda value: value["collection"]["shadow"].update(unexpected=True),
         ):
             candidate = copy.deepcopy(canonical)
             mutate(candidate)
@@ -839,6 +864,11 @@ class FleetCommandVerifierTest(unittest.TestCase):
                     "configVersion": 1,
                     "activation": "RESTART",
                     "labels": {},
+                },
+                {
+                    "configVersion": 1,
+                    "activation": "IMMEDIATE",
+                    "collection": copy.deepcopy(canonical["collection"]),
                 },
             ]
         )

@@ -1779,6 +1779,92 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertNotIn("sampleId", payload)
         self.assertNotIn("loopIndex", payload)
 
+    def test_forced_normal_sample_contains_structured_observation_lineage(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.last_sent_status = None
+        state.last_status = None
+        state.last_sent_at = 0.0
+        state.demo_mode = False
+        state.demo_tag = "[DEMO]"
+        state.demo_mode_revision = 13
+        coordinator = _Coordinator()
+
+        with (
+            mock.patch.object(pipeline, "get_device_state_coordinator", return_value=coordinator),
+            mock.patch.object(pipeline, "persist_critical_event", return_value=object()) as persist,
+            mock.patch.object(pipeline, "MODEL_POINTER", "edgezsad/prod"),
+            mock.patch.object(pipeline, "PRODUCT_ID", "metal-nut"),
+        ):
+            state.send_status(
+                "NORMAL",
+                "normal",
+                "sampled",
+                "INFO",
+                snapshot_object="anomalies/1/device/snapshot.jpg",
+                content_digest="sha256:" + "b" * 64,
+                trigger_reason="NORMAL_SAMPLE",
+                force_sample=True,
+                raw_score=0.1,
+                threshold=0.5,
+                model_digest="a" * 64,
+                inference_seconds=0.012,
+            )
+
+        observation = persist.call_args.args[2]["observation"]
+        self.assertEqual(observation["schemaVersion"], 1)
+        self.assertEqual(observation["triggerReason"], "NORMAL_SAMPLE")
+        self.assertEqual(observation["productId"], "metal-nut")
+        self.assertEqual(observation["rawAnomalyScore"], 0.1)
+        self.assertEqual(observation["modelDigest"], "sha256:" + "a" * 64)
+        self.assertEqual(observation["contentDigest"], "sha256:" + "b" * 64)
+
+    def test_collection_trigger_prioritizes_uncertainty_and_throttles_samples(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.demo_mode = False
+        state.last_uncertain_sample_at = 90.0
+        state.last_normal_sample_at = 0.0
+        with (
+            mock.patch.object(pipeline, "UNCERTAINTY_MARGIN", 0.05),
+            mock.patch.object(pipeline, "UNCERTAIN_SAMPLE_INTERVAL_SEC", 30.0),
+            mock.patch.object(pipeline, "NORMAL_SAMPLE_INTERVAL_SEC", 300.0),
+        ):
+            self.assertIsNone(state.collection_trigger_reason(status="NORMAL", score=0.48, threshold=0.5, now=100.0))
+            self.assertEqual(
+                state.collection_trigger_reason(status="NORMAL", score=0.48, threshold=0.5, now=121.0),
+                "THRESHOLD_NEAR",
+            )
+            self.assertEqual(
+                state.collection_trigger_reason(status="NORMAL", score=0.1, threshold=0.5, now=301.0),
+                "NORMAL_SAMPLE",
+            )
+
+    def test_shadow_metadata_is_only_reported_for_the_loaded_model(self) -> None:
+        with (
+            mock.patch.object(pipeline, "DATA_COLLECTION_ENABLED", True),
+            mock.patch.object(pipeline, "SHADOW_BUNDLE_VERSION", "candidate-v2"),
+            mock.patch.object(pipeline, "SHADOW_THRESHOLD", 0.6),
+            mock.patch.object(pipeline, "SHADOW_MODEL_DIGEST", "sha256:" + "b" * 64),
+        ):
+            mismatched = pipeline.build_observation_metadata(
+                trigger_reason="THRESHOLD_NEAR",
+                raw_score=0.55,
+                threshold=0.5,
+                model_digest="sha256:" + "a" * 64,
+                content_digest=None,
+                inference_seconds=0.01,
+            )
+            self.assertNotIn("shadow", mismatched)
+
+            matched = pipeline.build_observation_metadata(
+                trigger_reason="THRESHOLD_NEAR",
+                raw_score=0.65,
+                threshold=0.5,
+                model_digest="sha256:" + "b" * 64,
+                content_digest=None,
+                inference_seconds=0.01,
+            )
+            self.assertEqual(matched["shadow"]["result"], "DEFECT")
+
     def test_uncorrelated_terminal_409_stops_replay_instead_of_poison_loop(
         self,
     ) -> None:

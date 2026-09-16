@@ -87,6 +87,46 @@ def config_env_updates(payload: Mapping[str, Any]) -> dict[str, str]:
         updates["NUVION_VIDEO_HEIGHT"] = str(int(video["height"]))
         updates["NUVION_VIDEO_FPS"] = str(int(video["fps"]))
         updates["NUVION_VIDEO_BITRATE_KBPS"] = str(int(video["bitrateKbps"]))
+    collection = payload.get("collection")
+    if isinstance(collection, dict):
+        updates["NUVION_DATA_COLLECTION_ENABLED"] = (
+            "true" if bool(collection["enabled"]) else "false"
+        )
+        updates["NUVION_PRODUCT_ID"] = str(collection.get("productId") or "")
+        updates["NUVION_NORMAL_SAMPLE_INTERVAL_SEC"] = str(
+            int(collection["normalSampleIntervalSec"])
+        )
+        updates["NUVION_UNCERTAIN_SAMPLE_INTERVAL_SEC"] = str(
+            int(collection["uncertainSampleIntervalSec"])
+        )
+        updates["NUVION_UNCERTAINTY_MARGIN"] = str(
+            float(collection["uncertaintyMargin"])
+        )
+        production_threshold = str(float(collection["productionThreshold"]))
+        updates["NUVION_ZERO_SHOT_THRESHOLD"] = production_threshold
+        updates["NUVION_TRITON_THRESHOLD"] = production_threshold
+        updates["NUVION_VISUALAD_THRESHOLD"] = production_threshold
+        updates["NUVION_REFERENCE_BANK_VERSION"] = str(
+            collection.get("referenceBankVersion") or ""
+        )
+        updates["NUVION_CALIBRATION_VERSION"] = str(
+            collection.get("calibrationVersion") or ""
+        )
+        updates["NUVION_INSPECTION_BUNDLE_VERSION"] = str(
+            collection.get("bundleVersion") or ""
+        )
+        updates["NUVION_CAPTURE_PROFILE_VERSION"] = str(
+            collection["captureProfileVersion"]
+        )
+        shadow = collection.get("shadow")
+        if isinstance(shadow, dict):
+            updates["NUVION_SHADOW_BUNDLE_VERSION"] = str(shadow["bundleVersion"])
+            updates["NUVION_SHADOW_MODEL_DIGEST"] = str(shadow["modelDigest"])
+            updates["NUVION_SHADOW_THRESHOLD"] = str(float(shadow["threshold"]))
+        else:
+            updates["NUVION_SHADOW_BUNDLE_VERSION"] = ""
+            updates["NUVION_SHADOW_MODEL_DIGEST"] = ""
+            updates["NUVION_SHADOW_THRESHOLD"] = ""
     return updates
 
 
