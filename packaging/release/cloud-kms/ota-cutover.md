@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v28`, Agent `0.1.123`, release sequence
-`25`, schema `12`, minimum updater `0.2.0`. Sequences 2–24 and publishers v1–v27
+Current publisher: `candidate-publisher-v29`, Agent `0.1.124`, release sequence
+`26`, schema `12`, minimum updater `0.2.0`. Sequences 2–25 and publishers v1–v28
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,8 +12,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v28 \
-     -f tag_message='NUVION IQ9075 candidate publisher v28'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v29 \
+     -f tag_message='NUVION IQ9075 candidate publisher v29'
    ```
 
 2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v28
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
      gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v28 \
-     -f component_sha="$P" -f version=0.1.123 -f release_sequence=25
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v29 \
+     -f component_sha="$P" -f version=0.1.124 -f release_sequence=26
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -57,7 +57,7 @@ production KMS OTA key is not part of this development keyring.
    `iq9075-candidate-sign` and `iq9075-release`. Keep the old public key for
    rollback. Signing keys are never exported from KMS.
 
-This cutover does not mark `0.1.123` READY. Physical automatic rollback and commit
+This cutover does not mark `0.1.124` READY. Physical automatic rollback and commit
 acceptance are separate. Main-branch protection has been restored. The formal
 release settings gate still requires a fresh live settings audit and signed
 evidence. No successful settings/OTA attestation is implied here.
