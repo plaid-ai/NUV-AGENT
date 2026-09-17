@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
-Current publisher: `candidate-publisher-v30`, Agent `0.1.125`, release sequence
-`27`, schema `12`, minimum updater `0.2.0`. Sequences 2–26 and publishers v1–v29
+Current publisher: `candidate-publisher-v31`, Agent `0.1.126`, release sequence
+`28`, schema `12`, minimum updater `0.2.0`. Sequences 2–27 and publishers v1–v30
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
@@ -12,14 +12,14 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
    gh workflow run kms-approve-release.yml --repo plaid-ai/NUV-AGENT --ref main \
-     -f target_sha="$P" -f tag_name=candidate-publisher-v30 \
-     -f tag_message='NUVION IQ9075 candidate publisher v30'
+     -f target_sha="$P" -f tag_name=candidate-publisher-v31 \
+     -f tag_message='NUVION IQ9075 candidate publisher v31'
    ```
 
-2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v29
+2. Verify the annotated tag's object, commit, and KMS OpenPGP signature. Add v31
    to the existing immutable candidate tag ruleset without changing old tags,
    removing update/deletion protections, or adding bypass actors. Update the
-   existing candidate-sign/stage tag policies from v29 to v30 and verify them.
+   existing candidate-sign/stage tag policies from v30 to v31 and verify them.
 
 3. Review then apply the exact-workflow WIF plan:
 
@@ -38,8 +38,8 @@ production KMS OTA key is not part of this development keyring.
 
    ```sh
      gh workflow run iq9075-candidate-trusted-publish.yml \
-     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v30 \
-     -f component_sha="$P" -f version=0.1.125 -f release_sequence=27
+     --repo plaid-ai/NUV-AGENT --ref candidate-publisher-v31 \
+     -f component_sha="$P" -f version=0.1.126 -f release_sequence=28
    ```
 
    Preserve the complete run, canonical BOM, detached signature, artifact
@@ -57,7 +57,7 @@ production KMS OTA key is not part of this development keyring.
    `iq9075-candidate-sign` and `iq9075-release`. Keep the old public key for
    rollback. Signing keys are never exported from KMS.
 
-This cutover does not mark `0.1.125` READY. Physical automatic rollback and commit
+This cutover does not mark `0.1.126` READY. Physical automatic rollback and commit
 acceptance are separate. Main-branch protection has been restored. The formal
 release settings gate still requires a fresh live settings audit and signed
 evidence. No successful settings/OTA attestation is implied here.
