@@ -181,6 +181,7 @@ CANDIDATE_TMPFS_LIMITS = {
     "/dev/shm": {"bytes": 256 * 1024 * 1024, "inodes": 8192},
 }
 CANDIDATE_INACCESSIBLE_PATHS = ("/run/user",)
+CANDIDATE_OAK_RESTORE_TIMEOUT_SECONDS = 30.0
 CANDIDATE_SANDBOX_PROPERTIES = (
     "ProtectSystem=strict",
     "ProtectHome=yes",
@@ -2288,6 +2289,41 @@ class BoardHarness:
             "attached": True,
             "bound": bound,
         }
+
+    def _wait_for_restored_oak(
+        self,
+        expected: Mapping[str, object],
+        *,
+        timeout: float = CANDIDATE_OAK_RESTORE_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
+        """Wait for DepthAI to leave its transient USB2 bootloader identity."""
+
+        port = canonical_oak_port(expected.get("port"))
+        expected_mxid = expected.get("mxidSha256")
+        if (
+            not isinstance(expected_mxid, str)
+            or SHA256_RE.fullmatch(expected_mxid) is None
+        ):
+            raise HarnessError("candidate OAK baseline identity is invalid")
+        deadline = self.monotonic() + timeout
+        last_error: BaseException | None = None
+        while True:
+            try:
+                restored = self.verify_oak(
+                    require_bound=True,
+                    expected_port=port,
+                )
+                if restored.get("mxidSha256") != expected_mxid:
+                    raise HarnessError("restored baseline OAK identity changed")
+                return restored
+            except (HarnessError, OSError) as exc:
+                last_error = exc
+            if self.monotonic() >= deadline:
+                break
+            self.sleeper(0.25)
+        raise HarnessError(
+            "restored baseline OAK did not converge before the deadline"
+        ) from last_error
 
     def _foundation(self) -> dict[str, object]:
         os_payload, _ = read_regular(self.paths.os_release, maximum=16 * 1024)
@@ -6009,8 +6045,6 @@ class BoardHarness:
                         self._save_state(run_id, state)
                         if self._slot_snapshot() != soak["baselineSlots"]:
                             raise HarnessError("signed slot pointers changed during soak")
-                        if self._anti_replay_snapshot() != soak["antiReplay"]:
-                            raise HarnessError("updater anti-replay journal changed during soak")
                         execution_unit = soak.get("executionUnit")
                         if soak.get("runningAt") is not None:
                             expected_unit = self._candidate_unit(run_id)
@@ -6077,6 +6111,13 @@ class BoardHarness:
                                 "candidate modified signed release tree state"
                             )
                         soak["releaseTreesAfter"] = release_trees_after
+                        # Opening SQLite in read-only mode can still refresh
+                        # updater.sqlite3-shm metadata. Prove the candidate did
+                        # not change persistent state before that trusted read.
+                        if self._anti_replay_snapshot() != soak["antiReplay"]:
+                            raise HarnessError(
+                                "updater anti-replay journal changed during soak"
+                            )
                         self._restore_units(soak["unitsBefore"])
                         restored_runtime = self._agent_process_identity(
                             str(soak["baselineSlots"]["current"])
@@ -6097,13 +6138,7 @@ class BoardHarness:
                             or self._anti_replay_snapshot() != soak["antiReplay"]
                         ):
                             raise HarnessError("fresh baseline runtime proof did not converge")
-                        oak_after = self.verify_oak()
-                        if (
-                            oak_after.get("port") != soak["oakBefore"].get("port")
-                            or oak_after.get("mxidSha256")
-                            != soak["oakBefore"].get("mxidSha256")
-                        ):
-                            raise HarnessError("restored baseline OAK identity changed")
+                        oak_after = self._wait_for_restored_oak(soak["oakBefore"])
                         updater_after = self._probe_updater()
                         update_after = updater_after.get("update")
                         if (
@@ -7672,12 +7707,6 @@ class BoardHarness:
                     self._validate_candidate_anti_replay(
                         anti_replay, rollback_terminal
                     )
-                if isinstance(anti_replay, Mapping) and (
-                    self._anti_replay_snapshot() != dict(anti_replay)
-                ):
-                    raise HarnessError(
-                        "candidate soak recovery found changed anti-replay state"
-                    )
                 oak_before = soak.get("oakBefore")
                 if not isinstance(oak_before, Mapping):
                     raise HarnessError("candidate soak recovery OAK baseline is missing")
@@ -7693,6 +7722,14 @@ class BoardHarness:
                             "candidate soak recovery found changed persistent state"
                         )
                     soak["persistentStateAfter"] = persistent_after
+                    # Check the filesystem before the trusted SQLite reader
+                    # refreshes volatile -shm metadata.
+                    if isinstance(anti_replay, Mapping) and (
+                        self._anti_replay_snapshot() != dict(anti_replay)
+                    ):
+                        raise HarnessError(
+                            "candidate soak recovery found changed anti-replay state"
+                        )
                     termination = soak.get("terminationProof")
                     expected_unit = self._candidate_unit(run_id)
                     if (
@@ -7725,7 +7762,11 @@ class BoardHarness:
                 # identity after the candidate process exits.  That transient
                 # state has no stable MXID to compare.  Restore the baseline
                 # Agent first, then require the exact USB3 port and MXID again.
-                oak_after = None if boot_recovery else self.verify_oak()
+                oak_after = (
+                    None
+                    if boot_recovery
+                    else self._wait_for_restored_oak(oak_before)
+                )
                 updater_after = None if boot_recovery else self._probe_updater()
                 update_after = (
                     updater_after.get("update")

@@ -2781,8 +2781,21 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                         "activeSlot": expected,
                     }
                 )
-                fixture.harness._anti_replay_snapshot = (  # type: ignore[method-assign]
-                    lambda: {
+                anti_replay_calls = 0
+
+                def anti_replay_snapshot():
+                    nonlocal anti_replay_calls
+                    anti_replay_calls += 1
+                    # SQLite read-only connections can refresh -shm metadata.
+                    # The candidate persistent-state proof must run before
+                    # subsequent trusted anti-replay reads.
+                    shm = (
+                        fixture.root
+                        / "var/lib/nuvion-updater/updater.sqlite3-shm"
+                    )
+                    shm.parent.mkdir(parents=True, exist_ok=True)
+                    shm.write_text(str(anti_replay_calls), encoding="ascii")
+                    return {
                         "schemaVersion": 4,
                         "semanticSha256": "0" * 64,
                         "maximumCommandSequence": 2,
@@ -2797,7 +2810,8 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                             "healthDeadline": None,
                         },
                     }
-                )
+
+                fixture.harness._anti_replay_snapshot = anti_replay_snapshot  # type: ignore[method-assign]
                 original_run = fixture.runner.run
                 execution_proof = candidate_execution_proof(
                     fixture.run_id,
@@ -3107,6 +3121,29 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
                 fixture.close()
                 for path in (bundle_path, bom_path, harness_path):
                     path.unlink(missing_ok=True)
+
+    def test_candidate_restore_waits_for_oak_runtime_reenumeration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            expected = fixture.harness.verify_oak()
+            attempts = 0
+
+            def delayed_oak(*, require_bound=True, expected_port=None):
+                nonlocal attempts
+                attempts += 1
+                self.assertTrue(require_bound)
+                self.assertEqual(expected_port, expected["port"])
+                if attempts < 4:
+                    raise BOARD.HarnessError(
+                        "USB1 downstream must contain exactly one OAK-D Lite"
+                    )
+                return expected
+
+            fixture.harness.verify_oak = delayed_oak  # type: ignore[method-assign]
+            restored = fixture.harness._wait_for_restored_oak(expected, timeout=2)
+            self.assertEqual(restored, expected)
+            self.assertEqual(attempts, 4)
+            self.assertGreaterEqual(fixture.clock.monotonic(), 0.75)
 
     def test_staging_crash_cleanup_removes_only_journal_bound_incoming_tree(
         self,
