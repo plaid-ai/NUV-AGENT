@@ -4,5 +4,5 @@ The release workflow replaces COMPONENT_SHA before creating the source archive.
 Environment overrides remain available for non-release developer builds.
 """
 
-AGENT_VERSION = "0.1.125"
+AGENT_VERSION = "0.1.126"
 COMPONENT_SHA = "unknown"
