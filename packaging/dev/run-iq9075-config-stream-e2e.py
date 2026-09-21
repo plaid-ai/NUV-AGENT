@@ -29,6 +29,7 @@ SCHEMA_VERSION = 2
 KIND = "nuvion-iq9075-config-stream-e2e-evidence"
 DEFAULT_API_BASE_URL = "https://api.nuvion-dev.plaidlabs.ai"
 MAX_HTTP_BYTES = 2 * 1024 * 1024
+VIEWER_STABILIZATION_SECONDS = 45
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1012,6 +1013,7 @@ def prepare(rid, manifest_sha):
         state["phase"] = "ACTIVE"
         atomic(work / "state.json", canonical(state))
         systemctl("daemon-reload")
+        systemctl("reset-failed", "nuv-agent.service", check=False)
         systemctl("start", "nuv-agent.service")
         if not service_active():
             raise Failure("synthetic Agent service did not become active")
@@ -1504,6 +1506,7 @@ def restore(rid, internal=False, deadman=False):
         if runtime.exists() or runtime.is_symlink() or dropin.exists() or dropin.is_symlink():
             raise Failure("config-stream mutation exists without snapshots")
         if state.get("serviceActiveBefore") is True and not service_active():
+            systemctl("reset-failed", "nuv-agent.service", check=False)
             systemctl("start", "nuv-agent.service")
         if not service_active():
             raise Failure("Agent service did not recover from pre-mutation state")
@@ -1526,6 +1529,7 @@ def restore(rid, internal=False, deadman=False):
         if not verify_restored(records):
             raise Failure("config-stream byte restoration failed")
         if state.get("serviceActiveBefore") is True:
+            systemctl("reset-failed", "nuv-agent.service", check=False)
             systemctl("start", "nuv-agent.service")
         if not service_active():
             raise Failure("Agent service did not recover")
@@ -2300,6 +2304,10 @@ class ConfigStreamOrchestrator:
             )
             validate_queue_drained(prep.get("queue"))
             baseline = validate_baseline(prep.get("baseline"))
+            # Preparing the synthetic runtime restarts the Agent. Keep one
+            # non-reloading viewer connected long enough for its replacement
+            # RTP session to settle before selecting the socket-scoped fault.
+            self.sleeper(VIEWER_STABILIZATION_SECONDS)
             terminal_statuses = {
                 "SUCCEEDED",
                 "FAILED",
@@ -2353,11 +2361,30 @@ class ConfigStreamOrchestrator:
                     }
             if release_command is None:
                 raise ConfigStreamError("commit Fleet command is absent from the journal")
+            qualification_predecessors = [
+                item
+                for sequence, item in sorted(journal_by_sequence.items())
+                if sequence > release_command["sequence"]
+            ]
+            qualification_sequences = [
+                item["sequence"] for item in qualification_predecessors
+            ]
             if any(
-                sequence > release_command["sequence"]
-                for sequence in journal_by_sequence
+                item["type"] not in {"CONFIG_APPLY", "STREAM_POLICY"}
+                or item["status"] not in terminal_statuses
+                for item in qualification_predecessors
+            ) or qualification_sequences != list(
+                range(
+                    release_command["sequence"] + 1,
+                    release_command["sequence"]
+                    + 1
+                    + len(qualification_predecessors),
+                )
             ):
-                raise ConfigStreamError("commit Fleet command is not the journal head")
+                raise ConfigStreamError(
+                    "post-commit qualification journal is not safely terminal"
+                )
+            qualification_head_sequence = max(journal_by_sequence)
             prior_rollback_raw = journal_by_sequence.get(
                 release_command["sequence"] - 1
             )
@@ -2436,8 +2463,10 @@ class ConfigStreamOrchestrator:
                 payload=config_payload,
                 desired_state=config_payload,
             )
-            if issued_config.sequence != release_command["sequence"] + 1:
-                raise ConfigStreamError("fresh Fleet command does not follow the commit")
+            if issued_config.sequence != qualification_head_sequence + 1:
+                raise ConfigStreamError(
+                    "fresh Fleet command does not follow the qualification journal head"
+                )
             config = self._wait_command(
                 issued_config,
                 space_id=space_id,
@@ -2659,6 +2688,13 @@ class ConfigStreamOrchestrator:
                 "releaseCommand": release_command,
                 "priorRollbackCommand": prior_rollback_command,
                 "expiredPredecessors": expired_predecessors,
+                "qualificationContext": {
+                    "startingHeadSequence": qualification_head_sequence,
+                    "resumedAfterTerminalCommands": qualification_predecessors,
+                    "activeViewerRequired": True,
+                    "viewerReloadDuringFault": False,
+                    "viewerStabilizationSeconds": VIEWER_STABILIZATION_SECONDS,
+                },
                 "projectionShape": next(iter(projection_shapes)),
                 "config": {
                     "baseline": baseline,
