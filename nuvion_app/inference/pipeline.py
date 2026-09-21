@@ -162,8 +162,10 @@ import stomper
 import gi
 
 gi.require_version("Gst", "1.0")
-gi.require_version("GLibUnix", "2.0")
-from gi.repository import Gst, GLib, GLibUnix
+from gi.repository import Gst, GLib
+
+from nuvion_app.runtime.glib_compat import load_glib_unix
+GLibUnix = load_glib_unix(gi, GLib)
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
