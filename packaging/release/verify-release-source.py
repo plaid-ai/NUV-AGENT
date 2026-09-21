@@ -260,12 +260,12 @@ def verify_release_source(
         }
         or candidate_publisher
         != {
-            "tag": "candidate-publisher-v37",
-            "tagRef": "refs/tags/candidate-publisher-v37",
-            "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11", "refs/tags/candidate-publisher-v12", "refs/tags/candidate-publisher-v13", "refs/tags/candidate-publisher-v14", "refs/tags/candidate-publisher-v15", "refs/tags/candidate-publisher-v16", "refs/tags/candidate-publisher-v17", "refs/tags/candidate-publisher-v18", "refs/tags/candidate-publisher-v19", "refs/tags/candidate-publisher-v20", "refs/tags/candidate-publisher-v21", "refs/tags/candidate-publisher-v22", "refs/tags/candidate-publisher-v23", "refs/tags/candidate-publisher-v24", "refs/tags/candidate-publisher-v25", "refs/tags/candidate-publisher-v26", "refs/tags/candidate-publisher-v27", "refs/tags/candidate-publisher-v28", "refs/tags/candidate-publisher-v29", "refs/tags/candidate-publisher-v30", "refs/tags/candidate-publisher-v31", "refs/tags/candidate-publisher-v32", "refs/tags/candidate-publisher-v33", "refs/tags/candidate-publisher-v34", "refs/tags/candidate-publisher-v35", "refs/tags/candidate-publisher-v36"],
+            "tag": "candidate-publisher-v38",
+            "tagRef": "refs/tags/candidate-publisher-v38",
+            "retiredTagRefs": ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2", "refs/tags/candidate-publisher-v3", "refs/tags/candidate-publisher-v4", "refs/tags/candidate-publisher-v5", "refs/tags/candidate-publisher-v6", "refs/tags/candidate-publisher-v7", "refs/tags/candidate-publisher-v8", "refs/tags/candidate-publisher-v9", "refs/tags/candidate-publisher-v10", "refs/tags/candidate-publisher-v11", "refs/tags/candidate-publisher-v12", "refs/tags/candidate-publisher-v13", "refs/tags/candidate-publisher-v14", "refs/tags/candidate-publisher-v15", "refs/tags/candidate-publisher-v16", "refs/tags/candidate-publisher-v17", "refs/tags/candidate-publisher-v18", "refs/tags/candidate-publisher-v19", "refs/tags/candidate-publisher-v20", "refs/tags/candidate-publisher-v21", "refs/tags/candidate-publisher-v22", "refs/tags/candidate-publisher-v23", "refs/tags/candidate-publisher-v24", "refs/tags/candidate-publisher-v25", "refs/tags/candidate-publisher-v26", "refs/tags/candidate-publisher-v27", "refs/tags/candidate-publisher-v28", "refs/tags/candidate-publisher-v29", "refs/tags/candidate-publisher-v30", "refs/tags/candidate-publisher-v31", "refs/tags/candidate-publisher-v32", "refs/tags/candidate-publisher-v33", "refs/tags/candidate-publisher-v34", "refs/tags/candidate-publisher-v35", "refs/tags/candidate-publisher-v36", "refs/tags/candidate-publisher-v37"],
             "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
-            "agentVersion": "0.1.132",
-            "releaseSequence": 34,
+            "agentVersion": "0.1.133",
+            "releaseSequence": 35,
             "configSchema": "12",
             "minUpdaterVersion": "0.2.0",
             "rulesetName": "protected-candidate-publisher",
