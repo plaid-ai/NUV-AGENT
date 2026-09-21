@@ -1183,6 +1183,40 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
 
 
 class RtpFaultLifecycleTest(unittest.TestCase):
+    def test_udp_activity_probe_is_recovery_armed_and_exactly_restored(self):
+        ns = _board_namespace()
+        kernel = {"present": False, "timer": False}
+        ns["packet_tables"] = lambda: []
+        ns["packet_probe_counter"] = lambda table, uid, ports, **kwargs: (
+            {"packets": 12, "bytes": 14_400} if kernel["present"] else None
+        )
+
+        def systemctl(*args, **kwargs):
+            if args[0] == "stop":
+                kernel["timer"] = False
+            return SimpleNamespace(
+                stdout="active" if kernel["timer"] else "inactive", returncode=0
+            )
+
+        def run(args, **kwargs):
+            if args[0] == "/usr/bin/systemd-run":
+                kernel["timer"] = True
+            elif args[:3] == ["/usr/sbin/nft", "-f", "-"]:
+                self.assertTrue(kernel["timer"])
+                kernel["present"] = True
+            elif args[:2] == ["/usr/sbin/nft", "delete"]:
+                kernel["present"] = False
+            return SimpleNamespace(returncode=0, stdout="")
+
+        ns["systemctl"] = systemctl
+        ns["subprocess"] = SimpleNamespace(run=run, DEVNULL=-3, PIPE=-1)
+        ns["time"] = SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda seconds: None)
+
+        self.assertTrue(
+            ns["packet_probe_udp_activity"](RUN_ID, 997, [31000, 31001])
+        )
+        self.assertFalse(kernel["present"] or kernel["timer"])
+
     def test_tcp_socket_byte_parser_requires_agent_owned_established_rows(self):
         ns = _board_namespace()
         output = (
@@ -1218,6 +1252,7 @@ class RtpFaultLifecycleTest(unittest.TestCase):
             ]
         )
         ns["packet_socket_inventory"] = lambda rid: dict(next(samples))
+        ns["packet_probe_udp_activity"] = lambda rid, uid, ports: True
         ns["time"] = SimpleNamespace(sleep=lambda seconds: None)
         self.assertEqual(
             ns["packet_binding"](RUN_ID),
@@ -1239,6 +1274,40 @@ class RtpFaultLifecycleTest(unittest.TestCase):
         )
         ns["packet_socket_inventory"] = lambda rid: dict(next(samples))
         self.assertEqual(ns["packet_binding"](RUN_ID)["transportProtocol"], "udp")
+
+    def test_binding_retries_until_udp_flow_is_observed(self):
+        ns = _board_namespace()
+        base = {
+            "servicePid": 101,
+            "processStartTicks": 10000,
+            "uid": 997,
+            "cgroup": "0::/system.slice/nuv-agent.service",
+            "udpSourcePorts": [31000, 31001],
+            "tcpBytesSentBySourcePort": {},
+        }
+        ns["packet_socket_inventory"] = lambda rid: dict(base)
+        observations = iter([False, False, True])
+        ns["packet_probe_udp_activity"] = lambda rid, uid, ports: next(observations)
+        ns["time"] = SimpleNamespace(sleep=lambda seconds: None)
+        result = ns["packet_binding"](RUN_ID)
+        self.assertEqual(result["transportProtocol"], "udp")
+        self.assertEqual(result["sourcePorts"], [31000, 31001])
+
+    def test_binding_rejects_idle_udp_sockets(self):
+        ns = _board_namespace()
+        base = {
+            "servicePid": 101,
+            "processStartTicks": 10000,
+            "uid": 997,
+            "cgroup": "0::/system.slice/nuv-agent.service",
+            "udpSourcePorts": [31000],
+            "tcpBytesSentBySourcePort": {},
+        }
+        ns["packet_socket_inventory"] = lambda rid: dict(base)
+        ns["packet_probe_udp_activity"] = lambda rid, uid, ports: False
+        ns["time"] = SimpleNamespace(sleep=lambda seconds: None)
+        with self.assertRaises(ns["Failure"]):
+            ns["packet_binding"](RUN_ID)
 
     def _fixture(self, work):
         ns = _board_namespace()

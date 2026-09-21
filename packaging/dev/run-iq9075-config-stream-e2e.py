@@ -1035,6 +1035,10 @@ def packet_names(rid):
     run_id(rid)
     return 'nuvion_rtp_' + rid.replace('-', ''), 'nuvion-rtp-' + rid.replace('-', '')
 
+def packet_probe_names(rid):
+    run_id(rid)
+    return 'nuvion_rtp_probe_' + rid.replace('-', ''), 'nuvion-rtp-probe-' + rid.replace('-', '')
+
 def nft_json(*args, absent=False):
     result = subprocess.run(['/usr/sbin/nft', '-j', '-n', *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
     if result.returncode:
@@ -1068,6 +1072,74 @@ def packet_shape(table, uid, protocol, ports):
             {'counter': {'packets': 0, 'bytes': 0}}, {'drop': None},
         ]}},
     ]
+
+def packet_probe_rules(table, uid, ports):
+    if re.fullmatch(r'nuvion_rtp_probe_[0-9a-f]{32}', table) is None or type(uid) is not int or uid < 1 or not isinstance(ports, list) or ports != sorted(set(ports)) or not 1 <= len(ports) <= 16 or any(type(p) is not int or not 1024 < p < 65536 for p in ports):
+        raise Failure('RTP activity probe socket scope is invalid')
+    return ('add table inet ' + table + '\nadd chain inet ' + table + ' output { type filter hook output priority 10; policy accept; }\nadd rule inet ' + table + ' output meta skuid ' + str(uid) + ' udp sport { ' + ', '.join(map(str, ports)) + ' } counter\n')
+
+def packet_probe_shape(table, uid, ports):
+    return [
+        {'table': {'family': 'inet', 'name': table}},
+        {'chain': {'family': 'inet', 'table': table, 'name': 'output', 'type': 'filter', 'hook': 'output', 'prio': 10, 'policy': 'accept'}},
+        {'rule': {'family': 'inet', 'table': table, 'chain': 'output', 'expr': [
+            {'match': {'op': '==', 'left': {'meta': {'key': 'skuid'}}, 'right': uid}},
+            {'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'sport'}}, 'right': ports[0] if len(ports) == 1 else {'set': ports}}},
+            {'counter': {'packets': 0, 'bytes': 0}},
+        ]}},
+    ]
+
+def packet_probe_counter(table, uid, ports, *, absent=False):
+    value = nft_json('list', 'table', 'inet', table, absent=absent)
+    if value is None:
+        return None
+    records = [x for x in value['nftables'] if 'metainfo' not in x]
+    for item in records:
+        for body in item.values():
+            if isinstance(body, dict): body.pop('handle', None)
+    try:
+        counter = dict(records[2]['rule']['expr'][2]['counter'])
+        if set(counter) != {'packets', 'bytes'} or any(type(v) is not int or v < 0 for v in counter.values()):
+            raise Failure('RTP activity probe counter is invalid')
+        records[2]['rule']['expr'][2]['counter'] = {'packets': 0, 'bytes': 0}
+    except (IndexError, KeyError, TypeError) as exc:
+        raise Failure('RTP activity probe rule shape is invalid') from exc
+    if records != packet_probe_shape(table, uid, ports):
+        raise Failure('RTP activity probe rule changed outside its socket scope')
+    return counter
+
+def packet_probe_udp_activity(rid, uid, ports):
+    table, unit = packet_probe_names(rid)
+    before = packet_tables()
+    if any(x['family'] == 'inet' and x['name'] == table for x in before):
+        raise Failure('RTP activity probe table already exists')
+    if any(systemctl('is-active', target, check=False).stdout.strip() in {'active', 'activating', 'deactivating'} for target in (unit + '.timer', unit + '.service')):
+        raise Failure('RTP activity probe recovery unit already exists')
+    rules = packet_probe_rules(table, uid, ports)
+    subprocess.run(['/usr/sbin/nft', '-c', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
+    timer_armed = False
+    try:
+        subprocess.run(['/usr/bin/systemd-run', '--quiet', '--collect', '--unit=' + unit, '--on-active=15s', '--timer-property=AccuracySec=1s', '--property=Type=oneshot', '/usr/sbin/nft', 'delete', 'table', 'inet', table], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True)
+        timer_armed = systemctl('is-active', unit + '.timer', check=False).stdout.strip() == 'active'
+        if not timer_armed:
+            raise Failure('RTP activity probe recovery timer is not active')
+        subprocess.run(['/usr/sbin/nft', '-f', '-'], input=rules, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, text=True, check=True)
+        deadline = time.monotonic() + 4.0
+        while True:
+            counter = packet_probe_counter(table, uid, ports)
+            if counter['packets'] > 0 and counter['bytes'] > 0:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+    finally:
+        current = packet_probe_counter(table, uid, ports, absent=True)
+        if current is not None:
+            subprocess.run(['/usr/sbin/nft', 'delete', 'table', 'inet', table], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15, check=True)
+        systemctl('stop', unit + '.timer', unit + '.service', check=False)
+        systemctl('reset-failed', unit + '.timer', unit + '.service', check=False)
+        if packet_probe_counter(table, uid, ports, absent=True) is not None or packet_tables() != before:
+            raise Failure('RTP activity probe network restoration is incomplete')
 
 def packet_counter(fault, *, absent=False):
     value = nft_json('list', 'table', 'inet', fault['table'], absent=absent)
@@ -1140,19 +1212,28 @@ def packet_socket_inventory(rid):
     return {'servicePid': pid, 'processStartTicks': start_ticks, 'uid': uid, 'cgroup': cgroup, 'udpSourcePorts': udp_ports, 'tcpBytesSentBySourcePort': tcp}
 
 def packet_binding(rid):
-    first = packet_socket_inventory(rid)
-    time.sleep(1.0)
-    second = packet_socket_inventory(rid)
-    identity = ('servicePid', 'processStartTicks', 'uid', 'cgroup', 'udpSourcePorts')
-    if any(first[k] != second[k] for k in identity) or set(first['tcpBytesSentBySourcePort']) != set(second['tcpBytesSentBySourcePort']):
-        raise Failure('Agent socket inventory changed during RTP transport selection')
-    activity = sorted(((max(0, second['tcpBytesSentBySourcePort'][port] - sent), port) for port, sent in first['tcpBytesSentBySourcePort'].items()), reverse=True)
-    if activity and activity[0][0] >= 16384 and (len(activity) == 1 or activity[0][0] >= max(16384, activity[1][0] * 4)):
-        protocol, ports = 'tcp', [activity[0][1]]
-    else:
-        protocol, ports = 'udp', second['udpSourcePorts']
-    packet_rules(packet_names(rid)[0], second['uid'], protocol, ports)
-    return {k: second[k] for k in ('servicePid', 'processStartTicks', 'uid', 'cgroup')} | {'transportProtocol': protocol, 'sourcePorts': ports}
+    identity = ('servicePid', 'processStartTicks', 'uid', 'cgroup')
+    for attempt in range(5):
+        first = packet_socket_inventory(rid)
+        time.sleep(1.0)
+        second = packet_socket_inventory(rid)
+        if any(first[k] != second[k] for k in identity):
+            raise Failure('Agent process changed during RTP transport selection')
+        shared_tcp = sorted(set(first['tcpBytesSentBySourcePort']) & set(second['tcpBytesSentBySourcePort']))
+        activity = sorted(((max(0, second['tcpBytesSentBySourcePort'][port] - first['tcpBytesSentBySourcePort'][port]), port) for port in shared_tcp), reverse=True)
+        if activity and activity[0][0] >= 16384 and (len(activity) == 1 or activity[0][0] >= max(16384, activity[1][0] * 4)):
+            protocol, ports = 'tcp', [activity[0][1]]
+        else:
+            ports = second['udpSourcePorts']
+            protocol = 'udp'
+            if not ports or not packet_probe_udp_activity(rid, second['uid'], ports):
+                if attempt < 4:
+                    time.sleep(1.0)
+                    continue
+                raise Failure('Agent has no observed RTP socket activity')
+        packet_rules(packet_names(rid)[0], second['uid'], protocol, ports)
+        return {k: second[k] for k in identity} | {'transportProtocol': protocol, 'sourcePorts': ports}
+    raise Failure('Agent RTP transport selection exhausted')
 
 def packet_binding_current(rid, expected):
     current = packet_socket_inventory(rid)
