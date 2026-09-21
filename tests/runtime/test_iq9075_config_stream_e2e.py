@@ -320,9 +320,11 @@ class _Api:
         *,
         single_twin: bool = True,
         include_expired_predecessor: bool = True,
+        resumed_commands: list[dict] | None = None,
     ) -> None:
         self.board = board
-        self.next_sequence = 6
+        self.resumed_commands = list(resumed_commands or [])
+        self.next_sequence = 6 + len(self.resumed_commands)
         self.issued: list[MODULE.IssuedCommand] = []
         self.fail_on_issue = fail_on_issue
         self.single_twin = single_twin
@@ -359,6 +361,7 @@ class _Api:
             }
             for command in reversed(self.issued)
         ]
+        commands.extend(reversed(self.resumed_commands))
         if self.include_expired_predecessor:
             commands.append(
                 {
@@ -548,6 +551,16 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(
+            evidence["qualificationContext"],
+            {
+                "startingHeadSequence": 5,
+                "resumedAfterTerminalCommands": [],
+                "activeViewerRequired": True,
+                "viewerReloadDuringFault": False,
+                "viewerStabilizationSeconds": 45,
+            },
+        )
         self.assertEqual(evidence["projectionShape"], "single")
         self.assertEqual(
             evidence["source"]["runtimeIdentity"]["release"],
@@ -612,6 +625,87 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
                 evidence_path, MODULE.FLEET.MAX_OUTPUT_BYTES
             )
             self.assertEqual(persisted, MODULE.canonical_json(evidence))
+
+    def test_terminal_qualification_attempt_can_resume_without_reusing_sequence(self) -> None:
+        resumed = [
+            {
+                "commandId": "00000000-0000-4000-8000-000000000006",
+                "sequence": 6,
+                "type": "CONFIG_APPLY",
+                "status": "SUCCEEDED",
+                "issuedAt": "2026-09-03T00:00:00.000Z",
+                "expiresAt": "2026-09-03T00:02:00.000Z",
+            },
+            {
+                "commandId": "00000000-0000-4000-8000-000000000007",
+                "sequence": 7,
+                "type": "STREAM_POLICY",
+                "status": "FAILED",
+                "issuedAt": "2026-09-03T00:00:01.000Z",
+                "expiresAt": "2026-09-03T00:02:01.000Z",
+            },
+        ]
+        clock = _Clock()
+        board = _Board()
+        api = _Api(board, resumed_commands=resumed)
+        evidence = MODULE.ConfigStreamOrchestrator(
+            api=api,
+            board=board,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+            wall_clock=lambda: datetime(2026, 9, 3, tzinfo=timezone.utc),
+        ).run(
+            run_id=RUN_ID,
+            manifest=_manifest(),
+            manifest_sha256="1" * 64,
+            ota_evidence_sha256="2" * 64,
+            wait_seconds=120,
+        )
+
+        self.assertEqual([item.sequence for item in api.issued], [8, 9, 10, 11])
+        self.assertEqual(
+            evidence["qualificationContext"]["resumedAfterTerminalCommands"],
+            resumed,
+        )
+        self.assertEqual(
+            evidence["qualificationContext"]["startingHeadSequence"], 7
+        )
+
+    def test_nonterminal_qualification_attempt_fails_closed(self) -> None:
+        for sequence, status in ((6, "IN_PROGRESS"), (7, "SUCCEEDED")):
+            with self.subTest(sequence=sequence, status=status):
+                resumed = [
+                    {
+                        "commandId": "00000000-0000-4000-8000-000000000006",
+                        "sequence": sequence,
+                        "type": "CONFIG_APPLY",
+                        "status": status,
+                        "issuedAt": "2026-09-03T00:00:00.000Z",
+                        "expiresAt": "2026-09-03T00:02:00.000Z",
+                    }
+                ]
+                clock = _Clock()
+                board = _Board()
+                with self.assertRaisesRegex(
+                    MODULE.ConfigStreamError,
+                    "qualification journal is not safely terminal",
+                ):
+                    MODULE.ConfigStreamOrchestrator(
+                        api=_Api(board, resumed_commands=resumed),
+                        board=board,
+                        monotonic=clock.monotonic,
+                        sleeper=clock.sleep,
+                        wall_clock=lambda: datetime(
+                            2026, 9, 3, tzinfo=timezone.utc
+                        ),
+                    ).run(
+                        run_id=RUN_ID,
+                        manifest=_manifest(),
+                        manifest_sha256="1" * 64,
+                        ota_evidence_sha256="2" * 64,
+                        wait_seconds=120,
+                    )
+                self.assertEqual(board.restore_calls, 1)
 
     def test_delayed_controller_observations_complete_the_entire_flow(self) -> None:
         class DelayedBoard(_Board):
@@ -1065,6 +1159,16 @@ class ConfigStreamOrchestratorTest(unittest.TestCase):
         self.assertLess(
             prepare_program.index('"dropinSha256": sha(dropin_payload)'),
             prepare_program.index("atomic(dropin, dropin_payload"),
+        )
+        self.assertLess(
+            prepare_program.index(
+                'systemctl("reset-failed", "nuv-agent.service", check=False)'
+            ),
+            prepare_program.index('systemctl("start", "nuv-agent.service")'),
+        )
+        self.assertIn(
+            'systemctl("reset-failed", "nuv-agent.service", check=False)',
+            restore_program,
         )
         restored_index = restore_program.index(
             'state.update({"phase": "RESTORED"'

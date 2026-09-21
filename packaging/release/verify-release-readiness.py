@@ -43,7 +43,7 @@ RUN_ID = re.compile(
 RELEASE_SLOT = re.compile(r"^releases/[0-9a-f]{64}$")
 IDENTITY_TEXT = re.compile(r"^[\x20-\x7e]{1,255}$")
 MAX_EVIDENCE_BYTES = 1024 * 1024
-CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121", "0.1.122", "0.1.123", "0.1.131"})
+CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121", "0.1.122", "0.1.123", "0.1.132"})
 FLEET_RUNTIME_REQUIRED_FROM = (0, 1, 121)
 IQ9075_QUALIFICATION_API_ORIGIN = "https://api.nuvion-dev.plaidlabs.ai"
 IQ9075_FLEET_TRUST_ROOTS = {
@@ -853,6 +853,7 @@ def _validated_config_stream_gate(
                 "releaseCommand",
                 "priorRollbackCommand",
                 "expiredPredecessors",
+                "qualificationContext",
                 "projectionShape",
                 "config",
                 "stream",
@@ -1295,17 +1296,97 @@ def _validated_config_stream_gate(
             adaptive["commandId"],
             disabled["commandId"],
         ]
+        qualification = exact(
+            document.get("qualificationContext"),
+            {
+                "startingHeadSequence",
+                "resumedAfterTerminalCommands",
+                "activeViewerRequired",
+                "viewerReloadDuringFault",
+                "viewerStabilizationSeconds",
+            },
+            "qualification context",
+        )
+        starting_head = qualification.get("startingHeadSequence")
+        resumed = qualification.get("resumedAfterTerminalCommands")
+        resumed_sequences: list[int] = []
+        resumed_ids: list[str] = []
+        if not isinstance(resumed, list):
+            raise ReadinessError("IQ9075 qualification retry journal is invalid")
+        for predecessor in resumed:
+            item = exact(
+                predecessor,
+                {
+                    "commandId",
+                    "sequence",
+                    "type",
+                    "status",
+                    "issuedAt",
+                    "expiresAt",
+                },
+                "qualification retry command",
+            )
+            try:
+                command_id = str(uuid.UUID(str(item.get("commandId") or "")))
+            except ValueError as exc:
+                raise ReadinessError(
+                    "IQ9075 qualification retry identity is invalid"
+                ) from exc
+            issued_at = _api_timestamp(
+                item.get("issuedAt"), label="IQ9075 qualification retry issue time"
+            )
+            if (
+                command_id != item.get("commandId")
+                or type(item.get("sequence")) is not int
+                or item["sequence"] <= release_command["sequence"]
+                or item.get("type") not in {"CONFIG_APPLY", "STREAM_POLICY"}
+                or item.get("status")
+                not in {
+                    "SUCCEEDED",
+                    "FAILED",
+                    "REJECTED",
+                    "ROLLED_BACK",
+                    "EXPIRED",
+                }
+                or issued_at < release_issued
+                or issued_at > config_generated
+            ):
+                raise ReadinessError(
+                    "IQ9075 qualification retry command is invalid"
+                )
+            resumed_sequences.append(item["sequence"])
+            resumed_ids.append(command_id)
+        expected_resumed = list(
+            range(
+                release_command["sequence"] + 1,
+                release_command["sequence"] + 1 + len(resumed),
+            )
+        )
         if (
             type(maximum_sequence) is not int
             or maximum_sequence < 1
+            or type(starting_head) is not int
+            or starting_head < release_command["sequence"]
+            or qualification.get("activeViewerRequired") is not True
+            or qualification.get("viewerReloadDuringFault") is not False
+            or qualification.get("viewerStabilizationSeconds") != 45
+            or resumed_sequences != expected_resumed
+            or len(set(resumed_ids)) != len(resumed_ids)
+            or starting_head
+            != (
+                resumed_sequences[-1]
+                if resumed_sequences
+                else release_command["sequence"]
+            )
             or sequences
             != list(
                 range(
-                    release_command["sequence"] + 1,
-                    release_command["sequence"] + 5,
+                    starting_head + 1,
+                    starting_head + 5,
                 )
             )
             or len(set(command_ids)) != len(command_ids)
+            or set(command_ids) & set(resumed_ids)
             or maximum_sequence != release_command["sequence"]
         ):
             raise ReadinessError(
@@ -1479,6 +1560,7 @@ def _validated_config_stream_gate(
             "source": source,
             "releaseCommand": release_command,
             "priorRollbackCommand": prior_rollback_command,
+            "qualificationContext": qualification,
             "projectionShape": document["projectionShape"],
             "configSequences": [apply["sequence"], restore["sequence"]],
             "streamSequences": [adaptive["sequence"], disabled["sequence"]],
