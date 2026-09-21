@@ -1188,7 +1188,7 @@ class RtpFaultLifecycleTest(unittest.TestCase):
         kernel = {"present": False, "timer": False}
         ns["packet_tables"] = lambda: []
         ns["packet_probe_counter"] = lambda table, uid, ports, **kwargs: (
-            {"packets": 12, "bytes": 14_400} if kernel["present"] else None
+            {"packets": 20, "bytes": 24_000} if kernel["present"] else None
         )
 
         def systemctl(*args, **kwargs):
@@ -1216,6 +1216,19 @@ class RtpFaultLifecycleTest(unittest.TestCase):
             ns["packet_probe_udp_activity"](RUN_ID, 997, [31000, 31001])
         )
         self.assertFalse(kernel["present"] or kernel["timer"])
+
+    def test_udp_activity_probe_rejects_sparse_stun_packets(self):
+        ns = _board_namespace()
+
+        self.assertFalse(
+            ns["packet_probe_has_media"]({"packets": 2, "bytes": 384})
+        )
+        self.assertFalse(
+            ns["packet_probe_has_media"]({"packets": 16, "bytes": 16_383})
+        )
+        self.assertTrue(
+            ns["packet_probe_has_media"]({"packets": 16, "bytes": 16_384})
+        )
 
     def test_tcp_socket_byte_parser_requires_agent_owned_established_rows(self):
         ns = _board_namespace()
