@@ -40,8 +40,8 @@
     "requiredStatusIntegrationId": 15368
   },
   "candidatePublisher": {
-    "tag": "candidate-publisher-v34",
-    "tagRef": "refs/tags/candidate-publisher-v34",
+    "tag": "candidate-publisher-v35",
+    "tagRef": "refs/tags/candidate-publisher-v35",
     "retiredTagRefs": [
       "refs/tags/candidate-publisher-v1",
       "refs/tags/candidate-publisher-v2",
@@ -75,11 +75,12 @@
       "refs/tags/candidate-publisher-v30",
       "refs/tags/candidate-publisher-v31",
       "refs/tags/candidate-publisher-v32",
-      "refs/tags/candidate-publisher-v33"
+      "refs/tags/candidate-publisher-v33",
+      "refs/tags/candidate-publisher-v34"
     ],
     "workflow": ".github/workflows/iq9075-candidate-trusted-publish.yml",
-    "agentVersion": "0.1.129",
-    "releaseSequence": 31,
+    "agentVersion": "0.1.130",
+    "releaseSequence": 32,
     "configSchema": "12",
     "minUpdaterVersion": "0.2.0",
     "rulesetName": "protected-candidate-publisher"
@@ -166,7 +167,7 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v34",
+          "name": "candidate-publisher-v35",
           "type": "tag"
         }
       ],
@@ -186,7 +187,7 @@
       },
       "deploymentBranchPolicies": [
         {
-          "name": "candidate-publisher-v34",
+          "name": "candidate-publisher-v35",
           "type": "tag"
         }
       ],
@@ -269,7 +270,8 @@
       27,
       28,
       29,
-      30
+      30,
+      31
     ],
     "trustDomain": "iq9075-dev",
     "publicKeyringFile": "trusted-release-keyrings/iq9075-dev.json",
@@ -361,6 +363,11 @@
         "agentVersion": "0.1.128",
         "releaseSequence": 30,
         "bomDigest": "sha256:29072bb637c71e0ad3ff2321148dde0ac5e1c823605fc500a37022b796c97487"
+      },
+      {
+        "agentVersion": "0.1.129",
+        "releaseSequence": 31,
+        "bomDigest": "sha256:0ddc05ed28715f11583833265701a84caef58887c0ecfe2a65a2c9b51b6fc71b"
       }
     ]
   }
