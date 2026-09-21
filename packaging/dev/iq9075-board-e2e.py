@@ -1956,7 +1956,15 @@ class BoardHarness:
                 or live["unitFileState"] != unit_file_state
             ):
                 raise HarnessError("unit enablement changed during Fleet E2E")
-            self._systemctl("start" if raw.get("active") is True else "stop", unit)
+            if raw.get("active") is True:
+                # Trust apply/restore can stop and start these units several
+                # times inside systemd's StartLimitIntervalSec.  Clear the
+                # counter immediately before activation so cleanup cannot
+                # strand the production runtime in start-limit-hit.
+                self._systemctl("reset-failed", unit)
+                self._systemctl("start", unit)
+            else:
+                self._systemctl("stop", unit)
         for unit, raw in expected.items():
             if unit not in UNITS or not isinstance(raw, Mapping):
                 raise HarnessError("saved unit state is invalid")
@@ -3423,6 +3431,11 @@ class BoardHarness:
             if unit.endswith(".service")
         }
         for unit in RESTART_ORDER:
+            # A successful stop/start still consumes the unit start-rate
+            # budget.  Fleet qualification deliberately performs multiple
+            # transitions, so every controlled restart owns clearing that
+            # transient budget first.
+            self._systemctl("reset-failed", unit)
             self._systemctl("restart", unit)
             if self._unit_status(unit)["active"] is not True:
                 raise HarnessError("required runtime unit did not become active")

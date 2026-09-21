@@ -1881,6 +1881,48 @@ class Iq9075FleetBoardHarnessTest(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_trust_apply_and_restore_clear_systemd_start_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = HarnessFixture(Path(directory))
+            try:
+                original_run = fixture.runner.run
+                cleared: set[str] = set()
+
+                def enforce_start_limit(argv, *, timeout, input_bytes=None):
+                    call = tuple(argv)
+                    if (
+                        call[:2] == ("/usr/bin/systemctl", "reset-failed")
+                        and call[-1] in BOARD.UNITS
+                    ):
+                        cleared.add(call[-1])
+                    elif (
+                        call[:2]
+                        in {
+                            ("/usr/bin/systemctl", "start"),
+                            ("/usr/bin/systemctl", "restart"),
+                        }
+                        and call[-1] in BOARD.UNITS
+                    ):
+                        if call[-1] not in cleared:
+                            fixture.runner.calls.append(call)
+                            return BOARD.CommandResult(
+                                1, "", "Start request repeated too quickly"
+                            )
+                        cleared.remove(call[-1])
+                    return original_run(
+                        argv, timeout=timeout, input_bytes=input_bytes
+                    )
+
+                fixture.runner.run = enforce_start_limit
+                fixture.provision()
+                cleanup = fixture.harness.cleanup(fixture.run_id)
+
+                self.assertTrue(cleanup["complete"])
+                self.assertTrue(fixture.runner.units["nuv-agent.service"]["active"])
+                self.assertFalse(cleared)
+            finally:
+                fixture.close()
+
     def test_trust_waits_for_camera_after_backup_without_mutating_early(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = HarnessFixture(Path(directory))
