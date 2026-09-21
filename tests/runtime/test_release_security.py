@@ -5962,7 +5962,7 @@ class DistributionSourcePlanRecoveryTest(unittest.TestCase):
             result = SOURCE_PLAN_RECOVERY.resolve(
                 registry_path=self._registry(root, source=source),
                 repository=repository,
-                tag="v0.1.133",
+                tag="v0.1.134",
                 current_publisher_sha=current,
             )
             self.assertEqual(
@@ -6038,7 +6038,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
-            artifact = root / "nuv-agent_0.1.133_iq9075-aarch64.agent-bundle.tar.gz"
+            artifact = root / "nuv-agent_0.1.134_iq9075-aarch64.agent-bundle.tar.gz"
             artifact.write_bytes(b"new release")
             keyring = (
                 ROOT / "packaging/release/trusted-release-keyrings/iq9075-dev.json"
@@ -6055,26 +6055,26 @@ class SequenceAndPromotionTest(unittest.TestCase):
                     policy_path=ROOT / "packaging/release/release-security-policy.json",
                     keyring_path=keyring,
                     artifact_path=artifact,
-                    version="0.1.133",
+                    version="0.1.134",
                     component_sha="a" * 40,
-                    requested_sequence=35,
+                    requested_sequence=36,
                     config_schema="12",
                     min_updater_version="0.2.0",
                     built_at="2026-09-02T00:00:00+00:00",
                 )
-                self.assertEqual(reservation["releaseSequence"], 35)
+                self.assertEqual(reservation["releaseSequence"], 36)
                 self.assertEqual(output["latest_sequence"], "1")
                 self.assertEqual(
-                    output["reservation_object"], "releases/reservations/iq9075/35.json"
+                    output["reservation_object"], "releases/reservations/iq9075/36.json"
                 )
-                for rejected in (*range(1, 35), 36):
+                for rejected in (*range(1, 36), 37):
                     with self.assertRaises(PLAN_OTA.SequencePlanError):
                         PLAN_OTA.plan_sequence(
                             policy_path=ROOT
                             / "packaging/release/release-security-policy.json",
                             keyring_path=keyring,
                             artifact_path=artifact,
-                            version="0.1.133",
+                            version="0.1.134",
                             component_sha="a" * 40,
                             requested_sequence=rejected,
                             config_schema="12",
@@ -6551,7 +6551,7 @@ esac
                     )
 
 
-def candidate_publisher_tag_response(version: int = 38) -> dict[str, object]:
+def candidate_publisher_tag_response(version: int = 39) -> dict[str, object]:
     # Preserve the real v2 API shape and use an adapted v6 payload for metadata
     # tests. This reused signature is opaque here; local crypto is tested separately.
     signature = (
@@ -6595,7 +6595,7 @@ def candidate_publisher_tag_response(version: int = 38) -> dict[str, object]:
 
 
 class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
-    TAG = "candidate-publisher-v38"
+    TAG = "candidate-publisher-v39"
     TAG_OBJECT_SHA = candidate_publisher_tag_response()["sha"]
     PUBLISHER_SHA = "f8211ffaf2c127d66a540c00e6516c407b6beec8"
 
@@ -6619,7 +6619,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         self.assertEqual(self._rehashed(tag_object), self.TAG_OBJECT_SHA)
         self.assertEqual(
             tag_object["message"],
-            "NUVION IQ9075 candidate publisher v38\n"
+            "NUVION IQ9075 candidate publisher v39\n"
             + tag_object["verification"]["signature"],
         )
         self.assertEqual(self._verify(tag_object), self.PUBLISHER_SHA)
@@ -6658,7 +6658,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 tag_object["verification"]["signature"] = malformed
                 object_sha = self.TAG_OBJECT_SHA
                 if isinstance(malformed, str):
-                    tag_object["message"] = "NUVION IQ9075 candidate publisher v38\n" + malformed
+                    tag_object["message"] = "NUVION IQ9075 candidate publisher v39\n" + malformed
                     object_sha = self._rehashed(tag_object)
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object, object_sha=object_sha)
@@ -6678,7 +6678,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
                 verification[field] = verification[field].replace(before, after)
                 if field == "signature":
                     tag_object["message"] = (
-                        "NUVION IQ9075 candidate publisher v38\n" + verification[field]
+                        "NUVION IQ9075 candidate publisher v39\n" + verification[field]
                     )
                 with self.assertRaises(SETTINGS.SettingsError):
                     self._verify(tag_object)
@@ -6687,7 +6687,7 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         cases = (
             ("object " + self.PUBLISHER_SHA, "object " + "1" * 40),
             ("type commit", "type tag"),
-            ("tag candidate-publisher-v38", "tag candidate-publisher-v1"),
+            ("tag candidate-publisher-v39", "tag candidate-publisher-v1"),
             ("tagger Plaid Platform Admin", "committer Plaid Platform Admin"),
             ("\n\nNUVION", "\nencoding UTF-8\n\nNUVION"),
         )
@@ -6703,11 +6703,11 @@ class CandidatePublisherTagEnvelopeTest(unittest.TestCase):
         tag_object = candidate_publisher_tag_response()
         verification = tag_object["verification"]
         verification["payload"] = verification["payload"].replace(
-            "NUVION IQ9075 candidate publisher v38\n",
-            "NUVION IQ9075 candidate publisher v38\nextra\n",
+            "NUVION IQ9075 candidate publisher v39\n",
+            "NUVION IQ9075 candidate publisher v39\nextra\n",
         )
         tag_object["message"] = (
-            "NUVION IQ9075 candidate publisher v38\nextra\n"
+            "NUVION IQ9075 candidate publisher v39\nextra\n"
             + verification["signature"]
         )
         with self.assertRaises(SETTINGS.SettingsError):
@@ -6793,7 +6793,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertEqual(
                 environment["deploymentBranchPolicies"],
                 (
-                    [{"name": "candidate-publisher-v38", "type": "tag"}]
+                    [{"name": "candidate-publisher-v39", "type": "tag"}]
                     if name
                     in {
                         "iq9075-candidate-sign",
@@ -6945,6 +6945,7 @@ class SettingsPolicyTest(unittest.TestCase):
                         "refs/tags/candidate-publisher-v36",
                         "refs/tags/candidate-publisher-v37",
                         "refs/tags/candidate-publisher-v38",
+                        "refs/tags/candidate-publisher-v39",
                     ],
                     "exclude": [],
                 }
@@ -7024,8 +7025,8 @@ class SettingsPolicyTest(unittest.TestCase):
             "/repos/plaid-ai/NUV-AGENT/rulesets/1": branch_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/2": tag_ruleset,
             "/repos/plaid-ai/NUV-AGENT/rulesets/3": candidate_tag_ruleset,
-            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v38": {
-                "ref": "refs/tags/candidate-publisher-v38",
+            "/repos/plaid-ai/NUV-AGENT/git/ref/tags/candidate-publisher-v39": {
+                "ref": "refs/tags/candidate-publisher-v39",
                 "object": {"type": "tag", "sha": candidate_tag_object_sha},
             },
             "/repos/plaid-ai/NUV-AGENT/git/tags/" + candidate_tag_object_sha: candidate_tag_object,
@@ -7048,7 +7049,7 @@ class SettingsPolicyTest(unittest.TestCase):
             "face-artifacts-release",
         ):
             expected_deployment_policy = (
-                {"id": 1, "name": "candidate-publisher-v38", "type": "tag"}
+                {"id": 1, "name": "candidate-publisher-v39", "type": "tag"}
                 if name in {"iq9075-candidate-sign", "iq9075-candidate-stage"}
                 else {"id": 1, "name": "main", "type": "branch"}
             )
@@ -7114,8 +7115,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 SETTINGS,
                 "_verify_local_candidate_publisher",
                 return_value={
-                    "candidate_publisher_tag": "candidate-publisher-v38",
-                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v38",
+                    "candidate_publisher_tag": "candidate-publisher-v39",
+                    "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v39",
                     "candidate_publisher_tag_object_sha": candidate_tag_object_sha,
                     "candidate_publisher_sha": candidate_publisher_sha,
                     "component_sha": "b" * 40,
@@ -7167,7 +7168,7 @@ class SettingsPolicyTest(unittest.TestCase):
             self.assertTrue(result["secretScopesChecked"])
             candidate_ruleset_path = "/repos/plaid-ai/NUV-AGENT/rulesets/3"
             for tag_refs in (
-                ["refs/tags/candidate-publisher-v38"],
+                ["refs/tags/candidate-publisher-v39"],
                 ["refs/tags/candidate-publisher-v4"],
                 ["refs/tags/candidate-publisher-v1"],
                 ["refs/tags/candidate-publisher-v1", "refs/tags/candidate-publisher-v2"],
@@ -7199,7 +7200,7 @@ class SettingsPolicyTest(unittest.TestCase):
                     "refs/tags/candidate-publisher-v1",
                     "refs/tags/candidate-publisher-v2",
                     "refs/tags/candidate-publisher-v3",
-                    "refs/tags/candidate-publisher-v38",
+                    "refs/tags/candidate-publisher-v39",
                 ],
             ):
                 invalid_ruleset = copy.deepcopy(candidate_tag_ruleset)
@@ -7946,8 +7947,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-03T00:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v38",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v38",
+                        "candidate_publisher_tag": "candidate-publisher-v39",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v39",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
@@ -8131,8 +8132,8 @@ class SettingsPolicyTest(unittest.TestCase):
                 "expiresAt": "2026-09-02T12:00:00Z",
                 "settings": {
                     "candidatePublisher": {
-                        "candidate_publisher_tag": "candidate-publisher-v38",
-                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v38",
+                        "candidate_publisher_tag": "candidate-publisher-v39",
+                        "candidate_publisher_tag_ref": "refs/tags/candidate-publisher-v39",
                         "candidate_publisher_tag_object_sha": "d" * 40,
                         "candidate_publisher_sha": "9" * 40,
                         "audited_main_sha": "e" * 40,
