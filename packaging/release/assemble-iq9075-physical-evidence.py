@@ -35,7 +35,7 @@ SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 MAX_JSON_BYTES = 1024 * 1024
-CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121", "0.1.122", "0.1.123", "0.1.127"})
+CANDIDATE_SOAK_REQUIRED_VERSIONS = frozenset({"0.1.121", "0.1.122", "0.1.123", "0.1.128"})
 
 
 class AssemblyError(RuntimeError):
