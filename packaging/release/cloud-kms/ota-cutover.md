@@ -1,7 +1,7 @@
 # IQ9075 development OTA cutover to Cloud KMS
 
 Current publisher: `candidate-publisher-v35`, Agent `0.1.130`, release sequence
-`31`, schema `12`, minimum updater `0.2.0`. Sequences 2–30 and publishers v1–v33
+`32`, schema `12`, minimum updater `0.2.0`. Sequences 2–31 and publishers v1–v34
 remain retired, immutable evidence. The development device trusts the new
 `release-iq9075-dev-kms-2026-09-v1` key and the previous verification key. The
 production KMS OTA key is not part of this development keyring.
