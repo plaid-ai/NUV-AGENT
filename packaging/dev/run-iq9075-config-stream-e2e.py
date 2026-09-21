@@ -1039,6 +1039,9 @@ def packet_probe_names(rid):
     run_id(rid)
     return 'nuvion_rtp_probe_' + rid.replace('-', ''), 'nuvion-rtp-probe-' + rid.replace('-', '')
 
+UDP_MEDIA_MIN_PACKETS = 16
+UDP_MEDIA_MIN_BYTES = 16 * 1024
+
 def nft_json(*args, absent=False):
     result = subprocess.run(['/usr/sbin/nft', '-j', '-n', *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
     if result.returncode:
@@ -1108,6 +1111,16 @@ def packet_probe_counter(table, uid, ports, *, absent=False):
         raise Failure('RTP activity probe rule changed outside its socket scope')
     return counter
 
+def packet_probe_has_media(counter):
+    return (
+        isinstance(counter, dict)
+        and set(counter) == {'packets', 'bytes'}
+        and type(counter['packets']) is int
+        and type(counter['bytes']) is int
+        and counter['packets'] >= UDP_MEDIA_MIN_PACKETS
+        and counter['bytes'] >= UDP_MEDIA_MIN_BYTES
+    )
+
 def packet_probe_udp_activity(rid, uid, ports):
     table, unit = packet_probe_names(rid)
     before = packet_tables()
@@ -1127,7 +1140,7 @@ def packet_probe_udp_activity(rid, uid, ports):
         deadline = time.monotonic() + 4.0
         while True:
             counter = packet_probe_counter(table, uid, ports)
-            if counter['packets'] > 0 and counter['bytes'] > 0:
+            if packet_probe_has_media(counter):
                 return True
             if time.monotonic() >= deadline:
                 return False
