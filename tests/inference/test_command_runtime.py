@@ -1016,7 +1016,13 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
         # command; the live registry-backed verifier is the admission boundary.
         self.assertEqual(
             set(runtime.processor.handlers),
-            {"STREAM_POLICY", "CONFIG_APPLY", "AGENT_UPDATE", "DEVICE_MODE_SET"},
+            {
+                "STREAM_POLICY",
+                "CONFIG_APPLY",
+                "AGENT_UPDATE",
+                "DEVICE_MODE_SET",
+                "CAMERA_POSITION_SET",
+            },
         )
         self.assertIn("command.stream.policy", runtime.processor.verifier.capabilities)
         self.assertNotIn(
