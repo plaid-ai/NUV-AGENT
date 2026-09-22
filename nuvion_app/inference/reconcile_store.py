@@ -71,6 +71,8 @@ def effect_domains(command: VerifiedFleetCommand) -> tuple[str, ...]:
             domains.add("inference_model")
     elif command.command_type == "DEVICE_MODE_SET":
         domains.update({"settings", "video_source", "inference_model"})
+    elif command.command_type == "CAMERA_POSITION_SET":
+        domains.add("camera_position")
     else:
         domains.add(command.command_type.lower())
     return tuple(sorted(domains))

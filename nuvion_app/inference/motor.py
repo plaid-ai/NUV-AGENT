@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -9,7 +10,7 @@ import time
 import tty
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +109,10 @@ class BaseMotorBackend:
     def close(self) -> None:
         return None
 
+    @property
+    def protocol(self) -> str:
+        return "legacy"
+
 
 class NoOpMotorBackend(BaseMotorBackend):
     def __init__(self, reason: str = "") -> None:
@@ -140,6 +145,79 @@ class UartMotorBackend(BaseMotorBackend):
             pass
 
 
+class Nuv1UartMotorBackend(BaseMotorBackend):
+    """Acknowledged OpenRB NUV1 bridge used by the Nuvion Ultra pan/tilt head."""
+
+    _COMMANDS = {
+        MotorCommand.LEFT: "JOG 1 -1",
+        MotorCommand.RIGHT: "JOG 1 1",
+        MotorCommand.UP: "JOG 2 1",
+        MotorCommand.DOWN: "JOG 2 -1",
+    }
+
+    def __init__(self, port: str, baud: int, timeout_sec: float) -> None:
+        super().__init__()
+        if serial is None:
+            raise RuntimeError(f"pyserial unavailable: {_SERIAL_IMPORT_ERROR}")
+        self.port = port
+        self.baud = baud
+        self.timeout_sec = timeout_sec
+        self._serial = serial.Serial(
+            self.port,
+            self.baud,
+            timeout=min(self.timeout_sec, 0.1),
+            write_timeout=min(self.timeout_sec, 0.5),
+            exclusive=True,
+        )
+        self._sequence = 0
+        self.last_response: dict[str, Any] | None = None
+
+    @property
+    def protocol(self) -> str:
+        return "nuv1"
+
+    def _request(self, command: str) -> dict[str, Any]:
+        self._sequence += 1
+        sequence = self._sequence
+        self._serial.reset_input_buffer()
+        self._serial.write(f"NUV1 {sequence} {command}\n".encode("ascii"))
+        self._serial.flush()
+        deadline = time.monotonic() + max(0.2, self.timeout_sec)
+        while time.monotonic() < deadline:
+            raw = self._serial.readline(2048)
+            if not raw:
+                continue
+            try:
+                response = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(response, dict):
+                continue
+            if response.get("protocol") != "NUV1" or response.get("seq") != sequence:
+                continue
+            self.last_response = dict(response)
+            if response.get("ok") is not True:
+                reason = str(response.get("error") or "OpenRB command rejected")
+                raise RuntimeError(reason)
+            return dict(response)
+        raise TimeoutError("OpenRB NUV1 response timed out; command was not retried")
+
+    def send_command(self, command: MotorCommand) -> None:
+        encoded = self._COMMANDS.get(command)
+        if encoded is None:
+            raise ValueError(f"NUV1 does not support {command.name}")
+        status = self._request("STATUS")
+        if status.get("armed") is not True:
+            self._request("ARM")
+        self._request(encoded)
+
+    def close(self) -> None:
+        try:
+            self._serial.close()
+        except Exception:
+            pass
+
+
 class PwmMotorBackend(NoOpMotorBackend):
     def __init__(self) -> None:
         super().__init__("PWM backend is not implemented yet.")
@@ -152,6 +230,15 @@ def build_motor_backend(config: MotorConfig) -> BaseMotorBackend:
 
     if backend == "none":
         return NoOpMotorBackend("Motor backend is disabled.")
+
+    if backend == "nuv1":
+        try:
+            return Nuv1UartMotorBackend(
+                config.uart_port, config.uart_baud, config.uart_timeout_sec
+            )
+        except Exception as exc:
+            log.warning("[MOTOR] NUV1 UART backend unavailable: %s", exc)
+            return NoOpMotorBackend(str(exc))
 
     if backend in {"auto", "uart"}:
         try:
@@ -182,6 +269,10 @@ class MotorController:
     @property
     def reason(self) -> str:
         return getattr(self.backend, "reason", "")
+
+    @property
+    def protocol(self) -> str:
+        return self.backend.protocol
 
     def send(self, command: MotorCommand, *, force: bool = False, lane: str = "generic") -> bool:
         if not self.config.enabled:
@@ -223,6 +314,21 @@ class MotorController:
 
     def center(self) -> bool:
         return self.send(MotorCommand.CENTER)
+
+    def move_position(self, command: MotorCommand) -> Mapping[str, Any]:
+        if self.protocol != "nuv1":
+            raise RuntimeError("camera position control requires the NUV1 motor backend")
+        mapped = command
+        if self.config.pan_invert and command in {MotorCommand.LEFT, MotorCommand.RIGHT}:
+            mapped = MotorCommand.RIGHT if command == MotorCommand.LEFT else MotorCommand.LEFT
+        if self.config.tilt_invert and command in {MotorCommand.UP, MotorCommand.DOWN}:
+            mapped = MotorCommand.DOWN if command == MotorCommand.UP else MotorCommand.UP
+        if not self.send(mapped, force=True, lane="camera_position"):
+            raise RuntimeError(self.reason or "motor command was not sent")
+        response = getattr(self.backend, "last_response", None)
+        if not isinstance(response, dict):
+            raise RuntimeError("OpenRB did not provide acknowledged motor telemetry")
+        return dict(response)
 
     def close(self) -> None:
         self.backend.close()
