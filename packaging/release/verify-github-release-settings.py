@@ -319,6 +319,61 @@ def _candidate_tag_publisher_sha(
     return tag_target["sha"]
 
 
+def _verify_candidate_policy_compatibility(
+    candidate_policy_path: Path, final_policy_path: Path
+) -> None:
+    """Allow only catalog reconciliation after an immutable candidate was signed.
+
+    A promoted sequence may be removed from the retired set after candidate
+    qualification when the final policy also records its exact rollback
+    baseline. Every other policy field remains byte-for-byte equivalent after
+    JSON normalization.
+    """
+    try:
+        candidate = _strict_json(candidate_policy_path.read_bytes(), label="candidate policy")
+        final = _strict_json(final_policy_path.read_bytes(), label="final policy")
+    except OSError as exc:
+        raise SettingsError("candidate or final publisher policy is unavailable") from exc
+    if not isinstance(candidate, dict) or not isinstance(final, dict):
+        raise SettingsError("candidate or final publisher policy is invalid")
+
+    candidate_copy = json.loads(json.dumps(candidate))
+    final_copy = json.loads(json.dumps(final))
+    try:
+        candidate_retired = candidate_copy["iq9075"].pop("retiredCandidateSequences")
+        final_retired = final_copy["iq9075"].pop("retiredCandidateSequences")
+        current_sequence = final["candidatePublisher"]["releaseSequence"]
+        rollback_baselines = final["iq9075"]["additionalPhysicalRollbackBaselines"]
+    except (KeyError, TypeError) as exc:
+        raise SettingsError("candidate or final publisher policy is invalid") from exc
+    if candidate_copy != final_copy:
+        raise SettingsError("candidate and final publisher policies differ")
+    if (
+        not isinstance(candidate_retired, list)
+        or not isinstance(final_retired, list)
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in candidate_retired)
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in final_retired)
+        or len(candidate_retired) != len(set(candidate_retired))
+        or len(final_retired) != len(set(final_retired))
+        or not isinstance(current_sequence, int)
+        or isinstance(current_sequence, bool)
+        or not isinstance(rollback_baselines, list)
+    ):
+        raise SettingsError("candidate or final publisher policy is invalid")
+    removed = set(candidate_retired) - set(final_retired)
+    if set(final_retired) - set(candidate_retired):
+        raise SettingsError("candidate and final publisher policies differ")
+    baseline_sequences = {
+        value.get("releaseSequence")
+        for value in rollback_baselines
+        if isinstance(value, dict)
+        and isinstance(value.get("agentVersion"), str)
+        and isinstance(value.get("bomDigest"), str)
+    }
+    if any(value >= current_sequence or value not in baseline_sequences for value in removed):
+        raise SettingsError("candidate and final publisher policies differ")
+
+
 def _ruleset_covers(
     rulesets: list[Any],
     *,
@@ -750,8 +805,9 @@ def verify_settings(
         candidate_publisher_root.resolve()
         / "packaging/release/release-security-policy.json"
     )
-    if candidate_policy_path.read_bytes() != policy_path.resolve().read_bytes():
-        raise SettingsError("candidate and final publisher policies differ")
+    _verify_candidate_policy_compatibility(
+        candidate_policy_path, policy_path.resolve()
+    )
     local_candidate_verification = _verify_local_candidate_publisher(
         candidate_publisher_root=candidate_publisher_root.resolve(),
         publisher_sha=candidate_publisher_sha,

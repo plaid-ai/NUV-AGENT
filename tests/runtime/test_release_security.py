@@ -8272,6 +8272,43 @@ class SettingsPolicyTest(unittest.TestCase):
         self.assertFalse(SETTINGS._ruleset_covers(rulesets, **arguments))
 
 
+    def test_settings_audit_allows_only_promoted_catalog_reconciliation(self) -> None:
+        policy = json.loads(
+            (ROOT / "packaging/release/release-security-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        candidate = copy.deepcopy(policy)
+        candidate["iq9075"]["retiredCandidateSequences"].append(24)
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            candidate_path = root / "candidate.json"
+            final_path = root / "final.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            final_path.write_text(json.dumps(policy), encoding="utf-8")
+            SETTINGS._verify_candidate_policy_compatibility(candidate_path, final_path)
+
+            unsafe = copy.deepcopy(policy)
+            unsafe["requiredStatusContext"] = "unreviewed"
+            final_path.write_text(json.dumps(unsafe), encoding="utf-8")
+            with self.assertRaisesRegex(
+                SETTINGS.SettingsError, "candidate and final publisher policies differ"
+            ):
+                SETTINGS._verify_candidate_policy_compatibility(candidate_path, final_path)
+
+            missing_baseline = copy.deepcopy(policy)
+            missing_baseline["iq9075"]["additionalPhysicalRollbackBaselines"] = [
+                value
+                for value in missing_baseline["iq9075"]["additionalPhysicalRollbackBaselines"]
+                if value["releaseSequence"] != 24
+            ]
+            final_path.write_text(json.dumps(missing_baseline), encoding="utf-8")
+            with self.assertRaisesRegex(
+                SETTINGS.SettingsError, "candidate and final publisher policies differ"
+            ):
+                SETTINGS._verify_candidate_policy_compatibility(candidate_path, final_path)
+
+
 class FaceArtifactManifestTest(unittest.TestCase):
     @staticmethod
     def _artifacts(root: Path) -> Path:
