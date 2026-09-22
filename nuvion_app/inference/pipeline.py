@@ -110,6 +110,7 @@ from nuvion_app.inference.face_tracking import build_overlay_snapshot
 from nuvion_app.inference.face_tracking import draw_tracking_overlay
 from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
+from nuvion_app.inference.camera_position import CameraPositionReconciler
 from nuvion_app.inference.snapshot import LatestFrameBuffer
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
 from nuvion_app.inference.stream_policy import (
@@ -182,6 +183,7 @@ from nuvion_app.runtime.model_guard import resolve_effective_profile, resolve_mo
 from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
+    NUVION_ULTRA,
     resolve_platform_identity,
 )
 from nuvion_app.runtime.fleet_capabilities import (
@@ -4509,6 +4511,23 @@ class GStreamerInferenceApp:
                 log.error("[DEVICE-MODE] capability disabled: %s", exc)
         else:
             fleet_effect_registry.unregister("DEVICE_MODE_SET")
+
+        try:
+            identity = resolve_platform_identity()
+            if (
+                identity.product_model == NUVION_ULTRA
+                and self.user_data.motor_controller.available
+                and self.user_data.motor_controller.protocol == "nuv1"
+            ):
+                fleet_effect_registry.register(
+                    CameraPositionReconciler(self.user_data.motor_controller)
+                )
+                log.info("[CAMERA-POSITION] NUV1 reconciler registered")
+            else:
+                fleet_effect_registry.unregister("CAMERA_POSITION_SET")
+        except (OSError, RuntimeError, ValueError) as exc:
+            fleet_effect_registry.unregister("CAMERA_POSITION_SET")
+            log.error("[CAMERA-POSITION] capability disabled: %s", exc)
 
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None

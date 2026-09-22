@@ -105,6 +105,31 @@ class FleetCommandVerifierTest(unittest.TestCase):
         signature = (private_key or self.private_key).sign(signing_input)
         return f"{protected_segment}.{claims_segment}.{_b64url(signature)}"
 
+    def test_camera_position_requires_capability_and_strict_direction(self) -> None:
+        payload = _json_bytes({"direction": "LEFT"})
+        claims = self._claims(
+            type="CAMERA_POSITION_SET",
+            payloadBase64=_b64url(payload),
+            payloadHash=hashlib.sha256(payload).hexdigest(),
+        )
+        verifier = self._verifier(
+            Ed25519Keyring({KID: self.raw_public_key}),
+            capabilities=frozenset({"command.camera.position.set"}),
+        )
+        self.assertEqual(
+            verifier.verify(self._sign(claims)).payload,
+            {"direction": "LEFT"},
+        )
+
+        invalid_payload = _json_bytes({"direction": "CENTER"})
+        invalid_claims = self._claims(
+            type="CAMERA_POSITION_SET",
+            payloadBase64=_b64url(invalid_payload),
+            payloadHash=hashlib.sha256(invalid_payload).hexdigest(),
+        )
+        with self.assertRaisesRegex(CommandValidationError, "direction"):
+            verifier.verify(self._sign(invalid_claims))
+
     def _claims_with_payload(
         self,
         payload: object,

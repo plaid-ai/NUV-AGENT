@@ -36,6 +36,7 @@ COMMAND_CAPABILITY_BY_TYPE = {
     "STREAM_POLICY": "command.stream.policy",
     "AGENT_UPDATE": "command.agent.update",
     "DEVICE_MODE_SET": "command.device.mode.set",
+    "CAMERA_POSITION_SET": "command.camera.position.set",
 }
 
 AUTHENTICATED_REJECTION_CODES = frozenset(
@@ -678,6 +679,15 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
                     "INVALID_PAYLOAD_SCHEMA",
                     "DEVICE_MODE_SET reason must be canonical text up to 1000 characters",
                 )
+        return
+
+    if command_type == "CAMERA_POSITION_SET":
+        _require_exact_payload_keys(payload, required={"direction"})
+        if payload.get("direction") not in {"LEFT", "RIGHT", "UP", "DOWN"}:
+            raise CommandValidationError(
+                "INVALID_PAYLOAD_SCHEMA",
+                "CAMERA_POSITION_SET direction must be LEFT, RIGHT, UP or DOWN",
+            )
         return
 
     raise CommandValidationError("UNSUPPORTED_COMMAND", "command type is not supported")

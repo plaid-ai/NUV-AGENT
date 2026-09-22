@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from unittest import mock
 
 from nuvion_app.inference import motor as motor_module
@@ -16,6 +17,72 @@ class FakeBackend(motor_module.BaseMotorBackend):
 
 
 class MotorTest(unittest.TestCase):
+    def test_nuv1_backend_arms_then_sends_one_acknowledged_jog(self) -> None:
+        class FakeSerial:
+            def __init__(self) -> None:
+                self.sent: list[bytes] = []
+                self.responses: list[bytes] = []
+
+            def reset_input_buffer(self) -> None:
+                self.responses.clear()
+
+            def write(self, data: bytes) -> int:
+                self.sent.append(data)
+                sequence = int(data.split()[1])
+                command = data.decode().strip().split(" ", 2)[2]
+                response = {
+                    "protocol": "NUV1",
+                    "seq": sequence,
+                    "ok": True,
+                    "armed": command != "STATUS",
+                    "motors": [
+                        {"id": 1, "position": 2000},
+                        {"id": 2, "position": 2100},
+                    ],
+                }
+                self.responses.append(json.dumps(response).encode())
+                return len(data)
+
+            def flush(self) -> None:
+                return None
+
+            def readline(self, _limit: int) -> bytes:
+                return self.responses.pop(0) if self.responses else b""
+
+            def close(self) -> None:
+                return None
+
+        fake = FakeSerial()
+        serial_module = mock.Mock()
+        serial_module.Serial.return_value = fake
+        with mock.patch.object(motor_module, "serial", serial_module):
+            backend = motor_module.Nuv1UartMotorBackend("/dev/test", 115200, 0.2)
+        controller = motor_module.MotorController(
+            motor_module.MotorConfig(enabled=True, backend="nuv1"), backend=backend
+        )
+
+        result = controller.move_position(motor_module.MotorCommand.LEFT)
+
+        self.assertEqual(
+            fake.sent,
+            [b"NUV1 1 STATUS\n", b"NUV1 2 ARM\n", b"NUV1 3 JOG 1 -1\n"],
+        )
+        self.assertEqual(result["motors"][0]["position"], 2000)
+
+    def test_nuv1_position_move_respects_mount_inversion(self) -> None:
+        backend = mock.Mock(spec=motor_module.BaseMotorBackend)
+        backend.available = True
+        backend.protocol = "nuv1"
+        backend.last_response = {"protocol": "NUV1", "motors": [{"id": 1, "position": 2000}]}
+        controller = motor_module.MotorController(
+            motor_module.MotorConfig(enabled=True, backend="nuv1", pan_invert=True),
+            backend=backend,
+        )
+
+        controller.move_position(motor_module.MotorCommand.LEFT)
+
+        backend.send_command.assert_called_once_with(motor_module.MotorCommand.RIGHT)
+
     def test_motor_controller_throttles_commands_but_allows_repeat_after_interval(self) -> None:
         backend = FakeBackend()
         config = motor_module.MotorConfig(enabled=True, command_interval_sec=0.5)
