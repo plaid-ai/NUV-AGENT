@@ -6036,6 +6036,25 @@ class SequenceAndPromotionTest(unittest.TestCase):
             artifact_size_bytes=10,
             built_at="2026-09-01T12:00:00+00:00",
         )
+        published_122 = VerifiedReleaseBom(
+            schema_version=2,
+            bom_id="nuv-agent-0.1.122-iq9075-aarch64-seq24",
+            bom_digest="ba4f097ecf5546c87c5ae69681166112d53e3e6da7bb9f633201a838bc570540",
+            agent_version="0.1.122",
+            component_sha="7608536e65acdfbaf1944293de8722ec78a65dcf",
+            config_schema="12",
+            updater_version=None,
+            release_sequence=24,
+            min_updater_version="0.2.0",
+            targets=(target,),
+            publisher_key_id="release-test",
+            platform_profiles=(),
+            artifact_name="nuv-agent_0.1.122_iq9075-aarch64.agent-bundle.tar.gz",
+            artifact_kind="agent-bundle",
+            artifact_sha256="2" * 64,
+            artifact_size_bytes=10,
+            built_at="2026-09-15T03:35:45+00:00",
+        )
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             artifact = root / "nuv-agent_0.1.134_iq9075-aarch64.agent-bundle.tar.gz"
@@ -6045,10 +6064,21 @@ class SequenceAndPromotionTest(unittest.TestCase):
             )
             with (
                 mock.patch.object(
-                    PLAN_OTA, "list_version_boms", return_value={"0.1.120": "1"}
+                    PLAN_OTA,
+                    "list_version_boms",
+                    return_value={"0.1.120": "1", "0.1.122": "2"},
                 ),
                 mock.patch.object(
-                    PLAN_OTA, "_load_remote_signed_bom", return_value=published
+                    PLAN_OTA,
+                    "_load_remote_signed_bom",
+                    side_effect=lambda **kwargs: (
+                        published_122 if kwargs["version"] == "0.1.122" else published
+                    ),
+                ),
+                mock.patch.object(
+                    PLAN_OTA,
+                    "_promotion_is_complete",
+                    return_value=True,
                 ),
             ):
                 reservation, output = PLAN_OTA.plan_sequence(
@@ -6063,7 +6093,7 @@ class SequenceAndPromotionTest(unittest.TestCase):
                     built_at="2026-09-02T00:00:00+00:00",
                 )
                 self.assertEqual(reservation["releaseSequence"], 36)
-                self.assertEqual(output["latest_sequence"], "1")
+                self.assertEqual(output["latest_sequence"], "24")
                 self.assertEqual(
                     output["reservation_object"], "releases/reservations/iq9075/36.json"
                 )
