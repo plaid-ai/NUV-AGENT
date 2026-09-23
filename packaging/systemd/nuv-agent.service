@@ -10,6 +10,7 @@ After=nuvion-fleet-e2e-reconcile.service
 [Service]
 Type=simple
 Environment=NUV_AGENT_CONFIG=/etc/nuv-agent/agent.env
+Environment=HOME=/var/lib/nuv-agent
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONNOUSERSITE=1
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

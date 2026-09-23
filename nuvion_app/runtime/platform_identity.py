@@ -147,7 +147,11 @@ def _run_version(command: str, *args: str) -> str:
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-    output = (result.stdout or result.stderr or "").strip()
+    output = "\n".join(
+        stream.strip()
+        for stream in (result.stdout or "", result.stderr or "")
+        if stream.strip()
+    )
     if not output:
         return "unknown"
     version_lines = [line for line in output.splitlines() if "version" in line.lower()]
@@ -217,6 +221,8 @@ def collect_platform_probe(environ: Mapping[str, str] | None = None) -> Platform
             accelerator_runtime = _read_text(Path("/etc/nv_tegra_release"))[:100]
         elif "deepx" in lowered or "dx-m1" in lowered:
             accelerator_runtime = _run_version("dxrt-cli", "--version")
+        elif _is_ventuno_q_evidence(lowered):
+            accelerator_runtime = _run_version("qnn-net-run", "--version")
         elif system.lower() == "darwin":
             accelerator_runtime = "MPS"
     if not accelerator_runtime:
@@ -243,7 +249,7 @@ def detect_platform_profile(probe: PlatformProbe) -> str:
     evidence = probe.hardware_text.lower()
     if any(marker in evidence for marker in ("qcs9075", "iq-9075", "iq 9075")):
         return PROFILE_IQ9075_DEV
-    if "ventuno q" in evidence or "ventuno_q" in evidence:
+    if _is_ventuno_q_evidence(evidence):
         return PROFILE_VENTUNO_Q
     if "orin nano" in evidence:
         return PROFILE_JETSON_ORIN_NANO_DEV
@@ -263,6 +269,10 @@ def _accelerator_name(profile_name: str, hardware_text: str) -> str:
             else "DEEPX unconfirmed"
         )
     if profile_name == PROFILE_VENTUNO_Q:
+        if "arduino,monza" in evidence or (
+            "monaco monza" in evidence and "qcom,qcs8300" in evidence
+        ):
+            return "VENTUNO Q prototype (QCS8300)"
         return "VENTUNO Q"
     if profile_name == PROFILE_JETSON_ORIN_NX:
         return "NVIDIA Jetson Orin NX"
@@ -275,6 +285,17 @@ def _accelerator_name(profile_name: str, hardware_text: str) -> str:
     return "unknown"
 
 
+def _is_ventuno_q_evidence(evidence: str) -> bool:
+    # Pre-release Ventuno Q boards expose their Arduino Monza/QCS8300
+    # platform identity instead of the eventual product name.
+    return (
+        "ventuno q" in evidence
+        or "ventuno_q" in evidence
+        or "arduino,monza" in evidence
+        or ("monaco monza" in evidence and "qcom,qcs8300" in evidence)
+    )
+
+
 def _profile_hardware_confirmed(profile_name: str, probe: PlatformProbe) -> bool:
     evidence = probe.hardware_text.lower()
     if profile_name == PROFILE_RPI5_DEEPX:
@@ -282,7 +303,7 @@ def _profile_hardware_confirmed(profile_name: str, probe: PlatformProbe) -> bool
         has_deepx = "deepx" in evidence or "dx-m1" in evidence or "dxrt" in evidence
         return has_rpi5 and has_deepx
     if profile_name == PROFILE_VENTUNO_Q:
-        return "ventuno q" in evidence or "ventuno_q" in evidence
+        return _is_ventuno_q_evidence(evidence)
     if profile_name == PROFILE_JETSON_ORIN_NX:
         return "orin nx" in evidence
     if profile_name == PROFILE_JETSON_ORIN_NANO_DEV:

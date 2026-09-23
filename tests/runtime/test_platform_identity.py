@@ -27,11 +27,38 @@ from nuvion_app.runtime.platform_identity import (
     PROFILE_VENTUNO_Q,
     PlatformProbe,
     _run_version,
+    collect_platform_probe,
     resolve_platform_identity,
 )
 
 
 class PlatformIdentityTest(unittest.TestCase):
+    def test_ventuno_probe_reports_qnn_sdk_version(self) -> None:
+        def version(command: str, *_args: str) -> str:
+            return "2.46.0.260424121129" if command == "qnn-net-run" else "1.24.2"
+
+        with (
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.platform.system",
+                return_value="Linux",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._read_text",
+                return_value="arduino,monza qcom,qcs8300",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._run_hardware_probe",
+                return_value="",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._run_version",
+                side_effect=version,
+            ),
+        ):
+            probe = collect_platform_probe({})
+
+        self.assertEqual(probe.accelerator_runtime, "2.46.0.260424121129")
+
     def test_version_probe_does_not_confuse_executable_suffix_with_runtime(
         self,
     ) -> None:
@@ -50,6 +77,26 @@ class PlatformIdentityTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(_run_version("gst-launch-1.0", "--version"), "1.28.2")
+
+    def test_version_probe_combines_stdout_and_stderr(self) -> None:
+        completed = SimpleNamespace(
+            stdout="qnn-net-run pid:104361\n",
+            stderr="QNN SDK v2.46.0.260424121129\n",
+        )
+        with (
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.shutil.which",
+                return_value="/usr/bin/qnn-net-run",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.subprocess.run",
+                return_value=completed,
+            ),
+        ):
+            self.assertEqual(
+                _run_version("qnn-net-run", "--version"),
+                "2.46.0.260424121129",
+            )
 
     def _resolve_declared(
         self,
@@ -143,6 +190,21 @@ class PlatformIdentityTest(unittest.TestCase):
                             for capability in identity.capabilities
                         )
                     )
+
+    def test_ventuno_q_prototype_device_tree_is_verified(self) -> None:
+        identity = self._resolve_declared(
+            product_model=NUVION_PRO,
+            platform_profile=PROFILE_VENTUNO_Q,
+            hardware_text=(
+                "Qualcomm Technologies, Inc. Monaco Monza addons\n"
+                "arduino,monza qcom,monaco-monza qcom,qcs8300"
+            ),
+        )
+
+        self.assertEqual(identity.identity_status, IDENTITY_STATUS_VERIFIED)
+        self.assertEqual(identity.observed_platform_profile, PROFILE_VENTUNO_Q)
+        self.assertEqual(identity.accelerator, "VENTUNO Q prototype (QCS8300)")
+        self.assertIn("accelerator.ventuno_q", identity.capabilities)
 
     def test_nano_prototype_is_dev_and_never_verified_as_nx(self) -> None:
         identity = self._resolve_declared(
