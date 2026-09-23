@@ -527,6 +527,26 @@ class ConfigGuardTest(unittest.TestCase):
             self.assertTrue(report.ok)
             self.assertEqual(report.values["NUVION_MOTOR_BACKEND"], "auto")
 
+    def test_guard_preserves_nuv1_motor_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "agent.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "NUVION_SERVER_BASE_URL=https://api.example.com",
+                        "NUVION_DEVICE_USERNAME=device-1",
+                        "NUVION_DEVICE_PASSWORD=secret",
+                        "NUVION_MOTOR_BACKEND=nuv1",
+                        "",
+                    ]
+                )
+            )
+
+            report = guard_config(config_path=config_path, apply_fixes=True)
+
+            self.assertTrue(report.ok)
+            self.assertEqual(report.values["NUVION_MOTOR_BACKEND"], "nuv1")
+
     def test_guard_normalizes_invalid_face_tracking_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "agent.env"

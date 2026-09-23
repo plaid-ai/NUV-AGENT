@@ -222,7 +222,7 @@ Device found:
             "NUVION_FACE_TRACKING_ENABLED": "true",
             "NUVION_FACE_TRACKING_SHOW_BBOX": "true",
             "NUVION_MOTOR_ENABLED": "true",
-            "NUVION_MOTOR_BACKEND": "uart",
+            "NUVION_MOTOR_BACKEND": "nuv1",
             "NUVION_DEMO_MODE": "false",
             "NUVION_WEBRTC_FORCE_RELAY": "false",
             "NUVION_CLIP_ENABLED": "true",
@@ -247,6 +247,7 @@ Device found:
         self.assertIn('name="NUVION_VIDEO_ROTATION"', html)
         self.assertIn('value="90" selected', html)
         self.assertIn('name="NUVION_MOTOR_BACKEND"', html)
+        self.assertIn('<option value="nuv1" selected>nuv1</option>', html)
         self.assertIn("Motor Test", html)
         self.assertIn("Live sessions can be overridden by the backend", html)
         self.assertIn('<option value="true" selected>On</option>', html)

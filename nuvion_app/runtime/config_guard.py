@@ -40,7 +40,7 @@ _VALID_MODEL_SOURCES = {"server"}
 _VALID_MODEL_PROFILES = {"runtime", "light", "full"}
 _VALID_TRITON_INPUT_FORMATS = {"NCHW", "NHWC"}
 _VALID_VIDEO_ROTATIONS = {"0", "90", "180", "270"}
-_VALID_MOTOR_BACKENDS = {"auto", "uart", "pwm", "none"}
+_VALID_MOTOR_BACKENDS = {"auto", "nuv1", "uart", "pwm", "none"}
 _VALID_FACE_TRACKING_BACKENDS = {"auto", "triton", "opencv"}
 _VALID_CAMERA_PREFERENCES = {"auto", "csi", "usb"}
 _VALID_CAMERA_WB_MODES = {
@@ -581,7 +581,7 @@ def _validate_values(values: Dict[str, str]) -> tuple[List[ConfigIssue], List[Co
             )
 
     if (values.get("NUVION_MOTOR_BACKEND", "auto") or "auto").strip().lower() not in _VALID_MOTOR_BACKENDS:
-        errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, uart, pwm, none 중 하나여야 합니다."))
+        errors.append(ConfigIssue(key="NUVION_MOTOR_BACKEND", message="motor backend는 auto, nuv1, uart, pwm, none 중 하나여야 합니다."))
 
     if (values.get("NUVION_FACE_TRACKING_BACKEND", "auto") or "auto").strip().lower() not in _VALID_FACE_TRACKING_BACKENDS:
         errors.append(ConfigIssue(key="NUVION_FACE_TRACKING_BACKEND", message="face tracking backend는 auto, triton, opencv 중 하나여야 합니다."))
