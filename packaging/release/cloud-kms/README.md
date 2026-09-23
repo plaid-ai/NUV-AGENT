@@ -48,8 +48,8 @@ artifacts and unauthorized approval requests. The production OpenPGP public key
 is added alongside the old company key so existing signed evidence remains valid.
 The development approval key is deliberately absent from production tag trust.
 
-This change does **not** mark `0.1.134` READY or resume an IQ9075 OTA test.
-`candidate-publisher-v39` signs sequence 35 with the development OTA KMS key.
+This change does **not** mark `0.1.135` READY or resume an IQ9075 OTA test.
+`candidate-publisher-v40` signs sequence 37 with the development OTA KMS key.
 The IQ9075 development board must not trust the production OTA key. The active
 IQ9075 keyring contains the new development key and the previous public key so
 existing releases remain verifiable for rollback. Readiness still requires the
@@ -58,7 +58,7 @@ new candidate to be signed by the policy's active publisher key.
 GitHub OIDC smoke verification passed for development (run 34311921321) and
 production (run 34311923274), including BOM, detached evidence and signed Git tags.
 The candidate and final IQ9075 OTA publishers use dedicated WIF providers pinned
-to the exact approved workflow commit. Provision v38 only after merging and
+to the exact approved workflow commit. Provision v40 only after merging and
 creating the new signed immutable publisher tag. The final publisher keeps its
 GCS credentials separate from KMS credentials; KMS never uses a stored private key.
 
