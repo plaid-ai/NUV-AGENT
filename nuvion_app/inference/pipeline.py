@@ -162,8 +162,10 @@ import stomper
 import gi
 
 gi.require_version("Gst", "1.0")
-gi.require_version("GLibUnix", "2.0")
-from gi.repository import Gst, GLib, GLibUnix
+from gi.repository import Gst, GLib
+
+from nuvion_app.runtime.glib_compat import load_glib_unix
+GLibUnix = load_glib_unix(gi, GLib)
 
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
@@ -184,6 +186,7 @@ from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
     NUVION_ULTRA,
+    NUVION_ULTRA_DEV,
     resolve_platform_identity,
 )
 from nuvion_app.runtime.fleet_capabilities import (
@@ -4515,7 +4518,7 @@ class GStreamerInferenceApp:
         try:
             identity = resolve_platform_identity()
             if (
-                identity.product_model == NUVION_ULTRA
+                identity.product_model in {NUVION_ULTRA, NUVION_ULTRA_DEV}
                 and self.user_data.motor_controller.available
                 and self.user_data.motor_controller.protocol == "nuv1"
             ):

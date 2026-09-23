@@ -62,6 +62,7 @@ from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
     PROFILE_IQ9075_DEV,
+    PROFILE_JETSON_ORIN_NANO_DEV,
     PROFILE_MACOS_DEV,
     PlatformIdentity,
     resolve_platform_identity,
@@ -642,6 +643,9 @@ def build_fleet_command_runtime(
         require_root_owner = False
     elif platform_identity.platform_profile == PROFILE_IQ9075_DEV:
         trust_domain = "iq9075-dev"
+        require_root_owner = True
+    elif platform_identity.platform_profile == PROFILE_JETSON_ORIN_NANO_DEV:
+        trust_domain = "ultra-dev"
         require_root_owner = True
     else:
         raise FleetCommandRuntimeError(

@@ -382,7 +382,7 @@ def _field_note(key: str) -> str:
         "NUVION_FACE_TRACKING_MAX_DETECTIONS": "Maximum face boxes kept per frame before primary target selection.",
         "NUVION_TRACKING_HYSTERESIS_PCT": "Additional margin before motion starts again near the center. Increase this to reduce twitching.",
         "NUVION_MOTOR_ENABLED": "Enable motor control if the device has a supported motor backend.",
-        "NUVION_MOTOR_BACKEND": "Allowed values: auto, uart, pwm, none.",
+        "NUVION_MOTOR_BACKEND": "Allowed values: auto, nuv1, uart, pwm, none.",
         "NUVION_MOTOR_UART_PORT": "UART serial device for the external motor controller.",
         "NUVION_MOTOR_UART_BAUD": "Serial baud rate for UART motor control.",
         "NUVION_MOTOR_PAN_INVERT": "Invert left/right commands when motor wiring is reversed.",
@@ -565,7 +565,7 @@ def _prompt_tracking_motor_setup(fields: List[Dict[str, str]], existing: Dict[st
         field_map["NUVION_MOTOR_BACKEND"]["comment"] or "Motor backend",
         "NUVION_MOTOR_BACKEND",
         values.get("NUVION_MOTOR_BACKEND", field_map["NUVION_MOTOR_BACKEND"]["default"]),
-        ("auto", "uart", "pwm", "none"),
+        ("auto", "nuv1", "uart", "pwm", "none"),
     )
 
     for key in (
@@ -581,7 +581,7 @@ def _prompt_tracking_motor_setup(fields: List[Dict[str, str]], existing: Dict[st
             values[key] = _prompt_boolean_setting(field["comment"] or key, key, default)
             continue
         if _is_motor_backend_field(key):
-            values[key] = _prompt_choice_setting(field["comment"] or key, key, default, ("auto", "uart", "pwm", "none"))
+            values[key] = _prompt_choice_setting(field["comment"] or key, key, default, ("auto", "nuv1", "uart", "pwm", "none"))
             continue
         prompt = f"{field['comment'] or key} ({key})"
         if default:
@@ -1486,7 +1486,7 @@ def _render_form(
             )
             continue
         if _is_motor_backend_field(key):
-            backend_options = ("auto", "uart", "pwm", "none")
+            backend_options = ("auto", "nuv1", "uart", "pwm", "none")
             target_rows.append(
                 """
                 <div class="field field-row group-{group}" data-group="{group}">

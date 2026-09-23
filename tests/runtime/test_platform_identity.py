@@ -18,8 +18,10 @@ from nuvion_app.runtime.platform_identity import (
     NUVION,
     NUVION_PRO,
     NUVION_ULTRA,
+    NUVION_ULTRA_DEV,
     PROFILE_IQ9075_DEV,
     PROFILE_JETSON_ORIN_NX,
+    PROFILE_JETSON_ORIN_NANO_DEV,
     PROFILE_MACOS_DEV,
     PROFILE_RPI5_DEEPX,
     PROFILE_VENTUNO_Q,
@@ -141,6 +143,31 @@ class PlatformIdentityTest(unittest.TestCase):
                             for capability in identity.capabilities
                         )
                     )
+
+    def test_nano_prototype_is_dev_and_never_verified_as_nx(self) -> None:
+        identity = self._resolve_declared(
+            product_model=NUVION_ULTRA_DEV,
+            platform_profile=PROFILE_JETSON_ORIN_NANO_DEV,
+            hardware_text="NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super",
+        )
+
+        self.assertEqual(identity.identity_status, IDENTITY_STATUS_DEV)
+        self.assertIn("dev.hardware", identity.capabilities)
+        self.assertEqual(identity.accelerator, "NVIDIA Jetson Orin Nano")
+
+        mismatch = self._resolve_declared(
+            product_model=NUVION_ULTRA,
+            platform_profile=PROFILE_JETSON_ORIN_NX,
+            hardware_text="NVIDIA Jetson Orin Nano",
+        )
+        self.assertEqual(mismatch.identity_status, IDENTITY_STATUS_MISMATCH)
+
+        generic = self._resolve_declared(
+            product_model=NUVION_ULTRA,
+            platform_profile=PROFILE_JETSON_ORIN_NX,
+            hardware_text="NVIDIA Jetson Orin",
+        )
+        self.assertNotEqual(generic.identity_status, IDENTITY_STATUS_VERIFIED)
 
     def test_unprovisioned_iq9075_is_detected_but_has_no_capabilities(self) -> None:
         identity = resolve_platform_identity(
