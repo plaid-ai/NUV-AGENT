@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import json
+import math
 import os
 import stat
 from collections.abc import Callable, Mapping
@@ -624,6 +625,7 @@ def build_fleet_command_runtime(
     process_instance_id: str | None = None,
     restart_requester: Callable[[], bool] | None = None,
     platform_admin_enabled: bool = True,
+    http_timeout_seconds: float = 15.0,
 ) -> FleetCommandRuntime:
     if not isinstance(platform_admin_enabled, bool):
         raise FleetCommandRuntimeError("platform_admin_enabled must be a boolean")
@@ -729,6 +731,7 @@ def build_fleet_command_runtime(
         http_client=FleetCommandHttpClient(
             base_url=base_url,
             access_token_provider=access_token_provider,
+            timeout_seconds=http_timeout_seconds,
         ),
         ack_sender=ack_sender,
         reconcile_store=reconcile_store,
@@ -774,6 +777,18 @@ def build_fleet_command_runtime_from_env(
         ) from exc
     if space_id < 1:
         raise FleetCommandRuntimeError("NUVION_SPACE_ID must be a positive integer")
+    try:
+        http_timeout_seconds = float(
+            str(values.get("NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC") or "15")
+        )
+    except ValueError as exc:
+        raise FleetCommandRuntimeError(
+            "NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC must be a number between 1 and 120"
+        ) from exc
+    if not math.isfinite(http_timeout_seconds) or not 1 <= http_timeout_seconds <= 120:
+        raise FleetCommandRuntimeError(
+            "NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC must be between 1 and 120"
+        )
     keyring_path = str(values.get("NUVION_FLEET_COMMAND_KEYRING_PATH") or "").strip()
     if not keyring_path:
         raise FleetCommandRuntimeError("NUVION_FLEET_COMMAND_KEYRING_PATH is required")
@@ -791,4 +806,5 @@ def build_fleet_command_runtime_from_env(
         process_instance_id=process_instance_id,
         restart_requester=restart_requester,
         platform_admin_enabled=platform_admin in {"1", "true", "yes", "on"},
+        http_timeout_seconds=http_timeout_seconds,
     )

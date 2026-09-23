@@ -239,6 +239,7 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         runtime = self._from_env(self._platform_admin_env())
+        self.assertEqual(runtime.http_client.timeout_seconds, 15.0)
         self.assertEqual(
             runtime.authorization_capabilities, {"fleet.auth.platform_admin.v1"}
         )
@@ -255,6 +256,23 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
             {"SPACE_ADMIN"}
         )
         self.assertEqual(runtime.authorization_capabilities, frozenset())
+
+    def test_command_http_timeout_is_configurable_for_high_latency_links(self) -> None:
+        values = self._platform_admin_env()
+        values["NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC"] = "45"
+        runtime = self._from_env(values)
+        self.assertEqual(runtime.http_client.timeout_seconds, 45.0)
+
+    def test_command_http_timeout_rejects_invalid_values(self) -> None:
+        for value in ("zero", "0", "121", "nan", "inf"):
+            with self.subTest(value=value):
+                values = self._platform_admin_env()
+                values["NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC"] = value
+                with self.assertRaisesRegex(
+                    FleetCommandRuntimeError,
+                    "NUVION_FLEET_COMMAND_HTTP_TIMEOUT_SEC",
+                ):
+                    self._from_env(values)
 
     def test_platform_admin_capability_withdraws_if_verifier_or_keyring_changes(
         self,
