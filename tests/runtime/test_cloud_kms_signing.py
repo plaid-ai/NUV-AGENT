@@ -187,13 +187,13 @@ class ApprovalAuthorizationTest(unittest.TestCase):
     def env(self):
         return dict(GITHUB_REPOSITORY="plaid-ai/NUV-AGENT", GITHUB_REF="refs/heads/main",
                     GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_RUN_ATTEMPT="1", ACTOR_ID="57535980",
-                    TARGET_SHA="a" * 40, TAG_NAME="v0.1.134", TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
+                    TARGET_SHA="a" * 40, TAG_NAME="v0.1.135", TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
 
     def test_valid_request_must_match_current_main(self):
         with patch.dict("os.environ", self.env(), clear=True), patch.object(
             self.module, "run", side_effect=[json.dumps({"object": {"sha": "a" * 40}}), "a" * 40, ""]
         ):
-            self.assertEqual(self.module.authorize()[:2], ("a" * 40, "v0.1.134"))
+            self.assertEqual(self.module.authorize()[:2], ("a" * 40, "v0.1.135"))
 
     def test_rejects_unauthorized_events_identities_and_tag_values(self):
         for field, value in (("GITHUB_REF", "refs/heads/feature"), ("GITHUB_REPOSITORY", "other/repo"),
