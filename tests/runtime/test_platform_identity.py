@@ -27,11 +27,38 @@ from nuvion_app.runtime.platform_identity import (
     PROFILE_VENTUNO_Q,
     PlatformProbe,
     _run_version,
+    collect_platform_probe,
     resolve_platform_identity,
 )
 
 
 class PlatformIdentityTest(unittest.TestCase):
+    def test_ventuno_probe_reports_qnn_sdk_version(self) -> None:
+        def version(command: str, *_args: str) -> str:
+            return "2.46.0.260424121129" if command == "qnn-net-run" else "1.24.2"
+
+        with (
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.platform.system",
+                return_value="Linux",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._read_text",
+                return_value="arduino,monza qcom,qcs8300",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._run_hardware_probe",
+                return_value="",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity._run_version",
+                side_effect=version,
+            ),
+        ):
+            probe = collect_platform_probe({})
+
+        self.assertEqual(probe.accelerator_runtime, "2.46.0.260424121129")
+
     def test_version_probe_does_not_confuse_executable_suffix_with_runtime(
         self,
     ) -> None:

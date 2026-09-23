@@ -217,6 +217,8 @@ def collect_platform_probe(environ: Mapping[str, str] | None = None) -> Platform
             accelerator_runtime = _read_text(Path("/etc/nv_tegra_release"))[:100]
         elif "deepx" in lowered or "dx-m1" in lowered:
             accelerator_runtime = _run_version("dxrt-cli", "--version")
+        elif _is_ventuno_q_evidence(lowered):
+            accelerator_runtime = _run_version("qnn-net-run", "--version")
         elif system.lower() == "darwin":
             accelerator_runtime = "MPS"
     if not accelerator_runtime:
