@@ -153,6 +153,22 @@ class DurableCommandInboxTest(unittest.TestCase):
 
         self.assertEqual(restarted.last_sequence(), 0)
 
+    def test_ultra_dev_identity_scope_is_supported_and_stable(self) -> None:
+        self.inbox.bind_identity(
+            device_id="sp-34-nuvion-ultra-dev",
+            space_id=34,
+            trust_domain="ultra-dev",
+        )
+
+        restarted = DurableCommandInbox(self.path)
+        restarted.bind_identity(
+            device_id="sp-34-nuvion-ultra-dev",
+            space_id=34,
+            trust_domain="ultra-dev",
+        )
+
+        self.assertEqual(restarted.last_sequence(), 0)
+
     def test_legacy_rows_without_identity_scope_require_explicit_migration(
         self,
     ) -> None:

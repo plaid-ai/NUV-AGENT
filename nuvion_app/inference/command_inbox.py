@@ -24,7 +24,9 @@ COMMAND_STATUS_FAILED = "FAILED"
 COMMAND_STATUS_REJECTED = "REJECTED"
 COMMAND_STATUS_ROLLED_BACK = "ROLLED_BACK"
 MAX_REPORTED_STATE_BYTES = 64 * 1024
-COMMAND_TRUST_DOMAINS = frozenset({"production", "macos-dev", "iq9075-dev"})
+COMMAND_TRUST_DOMAINS = frozenset(
+    {"production", "macos-dev", "iq9075-dev", "ultra-dev"}
+)
 
 COMMAND_STATUSES = frozenset(
     {
@@ -509,7 +511,7 @@ class DurableCommandInbox:
             raise ValueError("space_id must be a positive integer")
         if normalized_domain not in COMMAND_TRUST_DOMAINS:
             raise ValueError(
-                "trust_domain must be production, macos-dev, or iq9075-dev"
+                "trust_domain must be production, macos-dev, iq9075-dev, or ultra-dev"
             )
 
         with self._lock, self._transaction(immediate=True) as connection:
