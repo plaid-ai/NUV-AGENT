@@ -147,7 +147,11 @@ def _run_version(command: str, *args: str) -> str:
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
-    output = (result.stdout or result.stderr or "").strip()
+    output = "\n".join(
+        stream.strip()
+        for stream in (result.stdout or "", result.stderr or "")
+        if stream.strip()
+    )
     if not output:
         return "unknown"
     version_lines = [line for line in output.splitlines() if "version" in line.lower()]

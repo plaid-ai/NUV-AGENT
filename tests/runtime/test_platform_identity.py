@@ -78,6 +78,26 @@ class PlatformIdentityTest(unittest.TestCase):
         ):
             self.assertEqual(_run_version("gst-launch-1.0", "--version"), "1.28.2")
 
+    def test_version_probe_combines_stdout_and_stderr(self) -> None:
+        completed = SimpleNamespace(
+            stdout="qnn-net-run pid:104361\n",
+            stderr="QNN SDK v2.46.0.260424121129\n",
+        )
+        with (
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.shutil.which",
+                return_value="/usr/bin/qnn-net-run",
+            ),
+            mock.patch(
+                "nuvion_app.runtime.platform_identity.subprocess.run",
+                return_value=completed,
+            ),
+        ):
+            self.assertEqual(
+                _run_version("qnn-net-run", "--version"),
+                "2.46.0.260424121129",
+            )
+
     def _resolve_declared(
         self,
         *,
