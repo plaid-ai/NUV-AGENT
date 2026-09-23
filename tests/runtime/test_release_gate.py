@@ -398,6 +398,7 @@ class ReleaseGateTest(unittest.TestCase):
 
         self.assertIn("User=nuvion", unit)
         self.assertIn("StateDirectory=nuv-agent", unit)
+        self.assertIn("Environment=HOME=/var/lib/nuv-agent", unit)
         self.assertIn(
             "Environment=NUVION_EVENT_OUTBOX_PATH=/var/lib/nuv-agent/events.sqlite3",
             unit,
