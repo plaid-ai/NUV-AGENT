@@ -958,6 +958,41 @@ class FleetCommandRuntimeTest(unittest.IsolatedAsyncioTestCase):
             trust_domain="iq9075-dev",
         )
 
+    def test_orin_nano_dev_uses_dedicated_root_owned_trust_domain(self) -> None:
+        identity = SimpleNamespace(
+            identity_status="DEV",
+            platform_profile="jetson_orin_nano_dev",
+            capabilities=frozenset({"command.camera.position.set"}),
+        )
+        with (
+            mock.patch(
+                "nuvion_app.inference.command_runtime.load_fleet_command_keyring",
+                return_value=object(),
+            ) as load_keyring,
+            mock.patch.object(DurableCommandInbox, "bind_identity") as bind_identity,
+        ):
+            build_fleet_command_runtime(
+                base_url="https://api.example.test",
+                access_token_provider=lambda: "token",
+                ack_sender=lambda _destination, _payload: True,
+                device_id="sp-34-nuvion-ultra-dev",
+                space_id=34,
+                keyring_path=self.root / "ultra-keyring.json",
+                inbox_path=self.root / "ultra.sqlite3",
+                platform_identity=identity,
+            )
+
+        load_keyring.assert_called_once_with(
+            self.root / "ultra-keyring.json",
+            expected_trust_domain="ultra-dev",
+            require_root_owner=True,
+        )
+        bind_identity.assert_called_once_with(
+            device_id="sp-34-nuvion-ultra-dev",
+            space_id=34,
+            trust_domain="ultra-dev",
+        )
+
     def test_unknown_dev_profile_is_not_mapped_to_production(self) -> None:
         identity = SimpleNamespace(
             identity_status="DEV",
