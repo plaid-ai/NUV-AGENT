@@ -144,6 +144,21 @@ class PlatformIdentityTest(unittest.TestCase):
                         )
                     )
 
+    def test_ventuno_q_prototype_device_tree_is_verified(self) -> None:
+        identity = self._resolve_declared(
+            product_model=NUVION_PRO,
+            platform_profile=PROFILE_VENTUNO_Q,
+            hardware_text=(
+                "Qualcomm Technologies, Inc. Monaco Monza addons\n"
+                "arduino,monza qcom,monaco-monza qcom,qcs8300"
+            ),
+        )
+
+        self.assertEqual(identity.identity_status, IDENTITY_STATUS_VERIFIED)
+        self.assertEqual(identity.observed_platform_profile, PROFILE_VENTUNO_Q)
+        self.assertEqual(identity.accelerator, "VENTUNO Q prototype (QCS8300)")
+        self.assertIn("accelerator.ventuno_q", identity.capabilities)
+
     def test_nano_prototype_is_dev_and_never_verified_as_nx(self) -> None:
         identity = self._resolve_declared(
             product_model=NUVION_ULTRA_DEV,
