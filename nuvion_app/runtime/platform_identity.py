@@ -14,6 +14,7 @@ from typing import Any
 NUVION = "NUVION"
 NUVION_PRO = "NUVION_PRO"
 NUVION_ULTRA = "NUVION_ULTRA"
+NUVION_ULTRA_DEV = "NUVION_ULTRA_DEV"
 IQ9075_DEV = "IQ9075_DEV"
 MACOS_DEV = "MACOS_DEV"
 UNKNOWN_PRODUCT = "UNKNOWN"
@@ -21,6 +22,7 @@ UNKNOWN_PRODUCT = "UNKNOWN"
 PROFILE_RPI5_DEEPX = "rpi5_deepx_dx_m1"
 PROFILE_VENTUNO_Q = "ventuno_q"
 PROFILE_JETSON_ORIN_NX = "jetson_orin_nx"
+PROFILE_JETSON_ORIN_NANO_DEV = "jetson_orin_nano_dev"
 PROFILE_IQ9075_DEV = "iq9075_dev"
 PROFILE_MACOS_DEV = "macos_dev"
 PROFILE_UNKNOWN = "unknown"
@@ -38,6 +40,7 @@ PRODUCT_PROFILE = {
     NUVION: PROFILE_RPI5_DEEPX,
     NUVION_PRO: PROFILE_VENTUNO_Q,
     NUVION_ULTRA: PROFILE_JETSON_ORIN_NX,
+    NUVION_ULTRA_DEV: PROFILE_JETSON_ORIN_NANO_DEV,
     IQ9075_DEV: PROFILE_IQ9075_DEV,
     MACOS_DEV: PROFILE_MACOS_DEV,
 }
@@ -55,6 +58,8 @@ PROFILE_CAPABILITIES = {
     PROFILE_VENTUNO_Q: _COMMON_COMMAND_CAPABILITIES | {"accelerator.ventuno_q"},
     PROFILE_JETSON_ORIN_NX: _COMMON_COMMAND_CAPABILITIES
     | {"accelerator.cuda", "accelerator.tensorrt"},
+    PROFILE_JETSON_ORIN_NANO_DEV: _COMMON_COMMAND_CAPABILITIES
+    | {"accelerator.cuda", "accelerator.tensorrt", "dev.hardware"},
     PROFILE_IQ9075_DEV: _COMMON_COMMAND_CAPABILITIES
     | {"dev.hardware", "camera.usb", "camera.depthai"},
     PROFILE_MACOS_DEV: _COMMON_COMMAND_CAPABILITIES
@@ -240,7 +245,9 @@ def detect_platform_profile(probe: PlatformProbe) -> str:
         return PROFILE_IQ9075_DEV
     if "ventuno q" in evidence or "ventuno_q" in evidence:
         return PROFILE_VENTUNO_Q
-    if "orin nx" in evidence or "jetson orin" in evidence:
+    if "orin nano" in evidence:
+        return PROFILE_JETSON_ORIN_NANO_DEV
+    if "orin nx" in evidence:
         return PROFILE_JETSON_ORIN_NX
     if "raspberry pi 5" in evidence or "raspberrypi,5" in evidence:
         return PROFILE_RPI5_DEEPX
@@ -259,6 +266,8 @@ def _accelerator_name(profile_name: str, hardware_text: str) -> str:
         return "VENTUNO Q"
     if profile_name == PROFILE_JETSON_ORIN_NX:
         return "NVIDIA Jetson Orin NX"
+    if profile_name == PROFILE_JETSON_ORIN_NANO_DEV:
+        return "NVIDIA Jetson Orin Nano"
     if profile_name == PROFILE_IQ9075_DEV:
         return "Qualcomm IQ-9075"
     if profile_name == PROFILE_MACOS_DEV:
@@ -275,7 +284,9 @@ def _profile_hardware_confirmed(profile_name: str, probe: PlatformProbe) -> bool
     if profile_name == PROFILE_VENTUNO_Q:
         return "ventuno q" in evidence or "ventuno_q" in evidence
     if profile_name == PROFILE_JETSON_ORIN_NX:
-        return "orin nx" in evidence or "jetson orin" in evidence
+        return "orin nx" in evidence
+    if profile_name == PROFILE_JETSON_ORIN_NANO_DEV:
+        return "orin nano" in evidence and probe.system.lower() == "linux"
     if profile_name == PROFILE_IQ9075_DEV:
         architecture = probe.architecture.strip().lower()
         return (
@@ -396,9 +407,9 @@ def resolve_platform_identity(
         platform_profile = declared.platform_profile
         source = declared.source
         expected_profile = PRODUCT_PROFILE.get(product_model)
-        if product_model == IQ9075_DEV and declared.source == "environment":
+        if product_model in {IQ9075_DEV, NUVION_ULTRA_DEV} and declared.source == "environment":
             declaration_error = (
-                "IQ9075_DEV identity must be declared by a secure identity file"
+                f"{product_model} identity must be declared by a secure identity file"
             )
             product_model = UNKNOWN_PRODUCT
             hardware_revision = "unknown"
@@ -412,7 +423,7 @@ def resolve_platform_identity(
             status = IDENTITY_STATUS_MISMATCH
         elif not _profile_hardware_confirmed(platform_profile, observed):
             status = IDENTITY_STATUS_UNVERIFIED
-        elif product_model in {MACOS_DEV, IQ9075_DEV}:
+        elif product_model in {MACOS_DEV, IQ9075_DEV, NUVION_ULTRA_DEV}:
             status = IDENTITY_STATUS_DEV
         else:
             status = IDENTITY_STATUS_VERIFIED
