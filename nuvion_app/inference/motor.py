@@ -194,6 +194,7 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
         )
         self._sequence = 0
         self.last_response: dict[str, Any] | None = None
+        self._run_command: MotorCommand | None = None
 
     @property
     def protocol(self) -> str:
@@ -225,15 +226,22 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
             return dict(response)
         raise TimeoutError("OpenRB NUV1 response timed out; command was not retried")
 
-    def send_command(self, command: MotorCommand, *, expires_at: float | None = None, max_lead: int | None = None) -> None:
+    def send_command(self, command: MotorCommand, *, expires_at: float | None = None,
+                     max_lead: int | None = None, status: dict | None = None,
+                     is_active: Callable[[], bool] = lambda: True) -> dict[str, Any]:
         encoded = self._COMMANDS.get(command)
         if encoded is None:
             raise ValueError(f"NUV1 does not support {command.name}")
-        status = self._request("STATUS")
+        provided_status = status is not None
+        status = status if provided_status else self._request("STATUS")
         if status.get("armed") is not True:
+            if not is_active():
+                raise ValueError("camera movement input cancelled")
             self._request("ARM")
+            provided_status = False
         # STATUS may precede ARM: always check the goal that the firmware will use.
-        status = self._request("STATUS")
+        if not provided_status:
+            status = self._request("STATUS")
         axis = "pan" if command in {MotorCommand.LEFT, MotorCommand.RIGHT} else "tilt"
         identifier = 1 if axis == "pan" else 2
         step = -11 if command in {MotorCommand.LEFT, MotorCommand.DOWN} else 11
@@ -247,23 +255,79 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
         low, high = self.limits[axis + "Min"], self.limits[axis + "Max"]
         if not low <= position <= high or not low <= goal + step <= high:
             raise MotorLimitReached("configured camera movement limit reached")
-        if expires_at is not None and time.time() >= expires_at:
+        if not is_active() or (expires_at is not None and time.time() >= expires_at):
             raise ValueError("camera movement command has expired")
         # Do not build a queue of goals ahead of the physical servo. A held key
         # streams intent; slow servos simply catch up before another small step.
         if max_lead is not None and abs(goal + step - position) > max_lead:
-            return
-        self._request(encoded)
+            return status
+        return self._request(encoded)
 
     def read_position(self) -> dict[str, Any]:
         return self._request("STATUS")
 
+    def realtime_step(self, command: MotorCommand, *, expires_at: float,
+                      is_active: Callable[[], bool] = lambda: True) -> dict[str, Any]:
+        """Use smooth-v3's hardware deadman; never rewrite a running goal.
+
+        RUN targets the firmware's position limits. Keep bounded JOG for custom
+        software ranges until firmware can accept those bounds atomically.
+        """
+        def check_input():
+            if time.time() >= expires_at or not is_active():
+                raise ValueError("camera movement input expired or cancelled")
+
+        check_input()
+        active = getattr(self, "_run_command", None)
+        if active is not None and active != command:
+            self.stop_position()
+        if getattr(self, "_run_command", None) == command:
+            state = self.last_response or {}
+            identifier = 1 if command in {MotorCommand.LEFT, MotorCommand.RIGHT} else 2
+            if state.get("moving_id") != identifier or state.get("armed") is not True:
+                raise RuntimeError("continuous camera movement stopped; release and press again")
+            check_input()
+            response = self._request("KEEP")
+            if response.get("moving_id") != identifier or response.get("armed") is not True:
+                raise RuntimeError("continuous camera movement stopped; release and press again")
+            return response
+
+        state = self.read_position()
+        axis = "pan" if command in {MotorCommand.LEFT, MotorCommand.RIGHT} else "tilt"
+        identifier = 1 if axis == "pan" else 2
+        motor = next((m for m in state.get("motors", []) if m.get("id") == identifier), {})
+        continuous = (state.get("firmware") == "NUV1-smooth-v3"
+                      and motor.get("mode") == 3
+                      and self.limits[axis + "Min"] == 0 and self.limits[axis + "Max"] == 4095)
+        if not continuous:
+            check_input()
+            return self.send_command(command, expires_at=expires_at, max_lead=22,
+                                     status=state, is_active=is_active)
+        if state.get("armed") is not True:
+            check_input()
+            state = self._request("ARM")
+        motor = next((m for m in state.get("motors", []) if m.get("id") == identifier), {})
+        if (motor.get("present") is not True or motor.get("torque") != 1
+                or motor.get("hardware_error") != 0 or state.get("moving_id") != 0):
+            raise RuntimeError("motor is not ready for continuous camera movement")
+        check_input()
+        direction = -1 if command in {MotorCommand.LEFT, MotorCommand.DOWN} else 1
+        # 4 * 0.229 rpm ~= 5.5 deg/s, firmware KEEP deadman remains 400ms.
+        response = self._request(f"RUN {identifier} {direction} 4")
+        if response.get("moving_id") != identifier:
+            raise RuntimeError("continuous camera movement did not start")
+        self._run_command = command
+        return response
+
     def stop_position(self) -> dict[str, Any]:
-        return self._request("STOP")
+        try:
+            return self._request("STOP")
+        finally:
+            self._run_command = None
 
     def set_limits(self, limits: Mapping[str, Any]) -> dict[str, Any]:
         validated = validate_motor_limits(limits)
-        status = self._request("STOP")
+        status = self.stop_position()
         status = self._request("STATUS")
         for identifier, axis in ((1, "pan"), (2, "tilt")):
             motor = next((m for m in status.get("motors", []) if isinstance(m, dict) and m.get("id") == identifier), {})
@@ -434,8 +498,9 @@ class MotorController:
                 raise RuntimeError("OpenRB did not provide acknowledged motor telemetry")
             return dict(response)
 
-    def realtime_step(self, command: MotorCommand, *, expires_at: float) -> Mapping[str, Any]:
-        """Accept a bounded jog and return measured state, without a settle deadline."""
+    def realtime_step(self, command: MotorCommand, *, expires_at: float,
+                      is_active: Callable[[], bool] = lambda: True) -> Mapping[str, Any]:
+        """Renew continuous movement, with a bounded-jog compatibility path."""
         if not self.config.enabled or not self.available or self.protocol != "nuv1":
             raise RuntimeError("camera position control requires the NUV1 motor backend")
         mapped = command
@@ -444,10 +509,9 @@ class MotorController:
         if self.config.tilt_invert and command in {MotorCommand.UP, MotorCommand.DOWN}:
             mapped = MotorCommand.DOWN if command == MotorCommand.UP else MotorCommand.UP
         with self._lock:
-            if time.time() >= expires_at:
-                return self.backend.stop_position()
-            self.backend.send_command(mapped, expires_at=expires_at, max_lead=22)
-            return self.backend.read_position()
+            if time.time() >= expires_at or not is_active():
+                raise ValueError("camera movement input expired or cancelled")
+            return self.backend.realtime_step(mapped, expires_at=expires_at, is_active=is_active)
 
     def position_action(self, action: str, limits: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         if not self.config.enabled or not self.available or self.protocol != "nuv1":
