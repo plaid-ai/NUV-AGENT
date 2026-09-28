@@ -336,3 +336,18 @@ class ContinuousCameraTest(unittest.TestCase):
         self.assertIsNone(b._run_command)
         b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
         self.assertEqual(sum(c.args[0].startswith('RUN') for c in b._request.call_args_list), 2)
+
+    def test_arm_reply_torque_snapshot_is_refreshed_before_run(self):
+        b, s = self.make_backend()
+        s['armed'] = False
+        s['motors'][0]['torque'] = 0
+        base = b._request.side_effect
+        def request(command, **kwargs):
+            if command == 'ARM':
+                s['armed'] = True
+            elif command == 'STATUS' and s['armed']:
+                s['motors'][0]['torque'] = 1
+            return base(command, **kwargs)
+        b._request.side_effect = request
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS', 'ARM', 'STATUS', 'RUN 1 1 4'])

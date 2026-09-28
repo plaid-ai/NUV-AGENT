@@ -305,7 +305,10 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
                                      status=state, is_active=is_active)
         if state.get("armed") is not True:
             check_input()
-            state = self._request("ARM")
+            self._request("ARM")
+            # ARM replies contain the pre-enable torque snapshot in smooth-v3.
+            # Refresh once after arming, not on every KEEP.
+            state = self.read_position()
         motor = next((m for m in state.get("motors", []) if m.get("id") == identifier), {})
         if (motor.get("present") is not True or motor.get("torque") != 1
                 or motor.get("hardware_error") != 0 or state.get("moving_id") != 0):
