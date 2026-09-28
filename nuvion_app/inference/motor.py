@@ -267,14 +267,17 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
         return self._request("STATUS")
 
     def realtime_step(self, command: MotorCommand, *, expires_at: float,
-                      is_active: Callable[[], bool] = lambda: True) -> dict[str, Any]:
+                      is_active: Callable[[], bool] | None = None) -> dict[str, Any]:
         """Use smooth-v3's hardware deadman; never rewrite a running goal.
 
         RUN targets the firmware's position limits. Keep bounded JOG for custom
         software ranges until firmware can accept those bounds atomically.
         """
         def check_input():
-            if time.time() >= expires_at or not is_active():
+            # The worker predicate includes the latest authenticated renewal's
+            # deadline; arming must not discard renewals received during UART I/O.
+            valid = is_active() if is_active is not None else time.time() < expires_at
+            if not valid:
                 raise ValueError("camera movement input expired or cancelled")
 
         check_input()
@@ -301,8 +304,8 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
                       and self.limits[axis + "Min"] == 0 and self.limits[axis + "Max"] == 4095)
         if not continuous:
             check_input()
-            return self.send_command(command, expires_at=expires_at, max_lead=22,
-                                     status=state, is_active=is_active)
+            return self.send_command(command, expires_at=None if is_active else expires_at,
+                                     max_lead=22, status=state, is_active=is_active or (lambda: True))
         if state.get("armed") is not True:
             check_input()
             self._request("ARM")
@@ -502,7 +505,7 @@ class MotorController:
             return dict(response)
 
     def realtime_step(self, command: MotorCommand, *, expires_at: float,
-                      is_active: Callable[[], bool] = lambda: True) -> Mapping[str, Any]:
+                      is_active: Callable[[], bool] | None = None) -> Mapping[str, Any]:
         """Renew continuous movement, with a bounded-jog compatibility path."""
         if not self.config.enabled or not self.available or self.protocol != "nuv1":
             raise RuntimeError("camera position control requires the NUV1 motor backend")
@@ -512,7 +515,8 @@ class MotorController:
         if self.config.tilt_invert and command in {MotorCommand.UP, MotorCommand.DOWN}:
             mapped = MotorCommand.DOWN if command == MotorCommand.UP else MotorCommand.UP
         with self._lock:
-            if time.time() >= expires_at or not is_active():
+            valid = is_active() if is_active is not None else time.time() < expires_at
+            if not valid:
                 raise ValueError("camera movement input expired or cancelled")
             return self.backend.realtime_step(mapped, expires_at=expires_at, is_active=is_active)
 

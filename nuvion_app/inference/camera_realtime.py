@@ -104,7 +104,8 @@ class CameraRealtimeControl:
                     with self._lock:
                         return (self._intent is not None and not self._stop_requested
                                 and self._intent["sessionId"] == frame["sessionId"]
-                                and self._intent["action"] == action)
+                                and self._intent["action"] == action
+                                and self._intent["expiresAtMs"] > time.time() * 1000)
                 response = self.controller.realtime_step(
                     _DIRECTION_COMMANDS[action], expires_at=frame["expiresAtMs"] / 1000,
                     is_active=is_active)
