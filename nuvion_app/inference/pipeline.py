@@ -2609,6 +2609,8 @@ def publish_camera_telemetry(payload: dict) -> None:
 
 async def _signaling_transport_main(command_runtime):
     global websocket
+    from nuvion_app.runtime.system_health import SystemHealthCollector, system_health_sender
+    health_collector = SystemHealthCollector(resolve_platform_identity().platform_profile)
 
     while True:
         token = await login()
@@ -2665,6 +2667,11 @@ async def _signaling_transport_main(command_runtime):
                 event_replay_task = asyncio.create_task(durable_event_replay_sender())
                 stomp_heartbeat_task = asyncio.create_task(stomp_heartbeat_sender(ws, send_interval_ms))
                 heartbeat_task = asyncio.create_task(device_state_heartbeat_sender())
+                health_task = None
+                if is_truthy(os.getenv("NUVION_SYSTEM_HEALTH_ENABLED", "false")):
+                    async def send_health(payload, active_ws=ws):
+                        await active_ws.send(json.dumps([build_send_frame('/app/device/health', payload)]))
+                    health_task = asyncio.create_task(system_health_sender(health_collector, send_health))
                 connectivity_task = None
                 fleet_command_poll_task = None
                 webrtc_stats_task = None
@@ -2767,6 +2774,8 @@ async def _signaling_transport_main(command_runtime):
                 stomp_heartbeat_task.cancel()
             if "heartbeat_task" in locals():
                 heartbeat_task.cancel()
+            if "health_task" in locals() and health_task is not None:
+                health_task.cancel()
             if "connectivity_task" in locals() and connectivity_task is not None:
                 connectivity_task.cancel()
             if "fleet_command_poll_task" in locals() and fleet_command_poll_task is not None:
