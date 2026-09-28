@@ -189,6 +189,25 @@ class CameraLimitsTest(unittest.TestCase):
         backend._request = mock.Mock(return_value=status)
         return backend, status
 
+    def test_realtime_goal_cannot_accumulate_ahead_of_slow_servo(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, status = self.backend(directory)
+            status['motors'][0].update(position=2000, goal=2020)
+            backend.send_command(motor_module.MotorCommand.RIGHT, max_lead=22)
+            self.assertFalse(any('JOG' in call.args[0] for call in backend._request.call_args_list))
+
+    def test_realtime_reports_moving_axis_without_settle_timeout(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, status = self.backend(directory)
+            status['motors'][1].update(position=2100, goal=2150)
+            controller = motor_module.MotorController(motor_module.MotorConfig(enabled=True), backend=backend)
+            observed = controller.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+            self.assertEqual(observed['motors'][0]['position'], 2000)
+            self.assertEqual(backend._request.call_count, 4)
+            self.assertIn(mock.call('JOG 1 1'), backend._request.call_args_list)
+
     def test_jog_cannot_cross_saved_limit(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

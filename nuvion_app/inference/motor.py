@@ -225,7 +225,7 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
             return dict(response)
         raise TimeoutError("OpenRB NUV1 response timed out; command was not retried")
 
-    def send_command(self, command: MotorCommand, *, expires_at: float | None = None) -> None:
+    def send_command(self, command: MotorCommand, *, expires_at: float | None = None, max_lead: int | None = None) -> None:
         encoded = self._COMMANDS.get(command)
         if encoded is None:
             raise ValueError(f"NUV1 does not support {command.name}")
@@ -249,6 +249,10 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
             raise MotorLimitReached("configured camera movement limit reached")
         if expires_at is not None and time.time() >= expires_at:
             raise ValueError("camera movement command has expired")
+        # Do not build a queue of goals ahead of the physical servo. A held key
+        # streams intent; slow servos simply catch up before another small step.
+        if max_lead is not None and abs(goal + step - position) > max_lead:
+            return
         self._request(encoded)
 
     def read_position(self) -> dict[str, Any]:
@@ -352,6 +356,8 @@ class MotorController:
 
         now = time.time()
         with self._lock:
+            if now < getattr(self, "manual_control_until", 0.0):
+                return False
             last_sent_at = self._last_sent_at.get(lane, 0.0)
             if not force and now - last_sent_at < self.config.command_interval_sec:
                 return False
@@ -399,6 +405,8 @@ class MotorController:
         if not self.config.enabled or not self.available:
             raise RuntimeError(self.reason or "motor unavailable")
         with self._lock:
+            if time.time() < getattr(self, "manual_control_until", 0.0):
+                raise RuntimeError("manual WebSocket camera control is active")
             if expires_at is not None and time.time() >= expires_at:
                 raise ValueError("camera movement command has expired")
             if isinstance(self.backend, Nuv1UartMotorBackend):
@@ -425,6 +433,21 @@ class MotorController:
             if not isinstance(response, dict):
                 raise RuntimeError("OpenRB did not provide acknowledged motor telemetry")
             return dict(response)
+
+    def realtime_step(self, command: MotorCommand, *, expires_at: float) -> Mapping[str, Any]:
+        """Accept a bounded jog and return measured state, without a settle deadline."""
+        if not self.config.enabled or not self.available or self.protocol != "nuv1":
+            raise RuntimeError("camera position control requires the NUV1 motor backend")
+        mapped = command
+        if self.config.pan_invert and command in {MotorCommand.LEFT, MotorCommand.RIGHT}:
+            mapped = MotorCommand.RIGHT if command == MotorCommand.LEFT else MotorCommand.LEFT
+        if self.config.tilt_invert and command in {MotorCommand.UP, MotorCommand.DOWN}:
+            mapped = MotorCommand.DOWN if command == MotorCommand.UP else MotorCommand.UP
+        with self._lock:
+            if time.time() >= expires_at:
+                return self.backend.stop_position()
+            self.backend.send_command(mapped, expires_at=expires_at, max_lead=22)
+            return self.backend.read_position()
 
     def position_action(self, action: str, limits: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         if not self.config.enabled or not self.available or self.protocol != "nuv1":

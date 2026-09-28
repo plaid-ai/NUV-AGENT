@@ -111,6 +111,7 @@ from nuvion_app.inference.face_tracking import draw_tracking_overlay
 from nuvion_app.inference.motor import MotorController
 from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.camera_position import CameraPositionReconciler
+from nuvion_app.inference.camera_realtime import CameraRealtimeControl, CAMERA_CONTROL_QUEUE, CAMERA_TELEMETRY_DESTINATION
 from nuvion_app.inference.snapshot import LatestFrameBuffer
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
 from nuvion_app.inference.stream_policy import (
@@ -604,6 +605,8 @@ critical_event_outbox_lock = threading.Lock()
 critical_event_safety_gate = CriticalEventSafetyGate()
 device_state_coordinator: DeviceStateCoordinator | None = None
 device_state_coordinator_lock = threading.Lock()
+camera_realtime_control: CameraRealtimeControl | None = None
+camera_telemetry_pending = None
 fleet_command_runtime: FleetCommandRuntime | None = None
 fleet_command_runtime_init_attempted = False
 fleet_command_runtime_lock = threading.Lock()
@@ -1879,6 +1882,8 @@ def build_dynamic_runtime_telemetry(
     merged["agentUpdate"] = updater_telemetry["agentUpdate"]
     merged["updaterVersion"] = updater_telemetry["updaterVersion"]
     camera_capabilities: set[str] = set()
+    if camera_realtime_control is not None and fleet_command_runtime is not None and camera_realtime_control.ready:
+        camera_capabilities.add("camera.control.realtime.v1")
     camera_controller = getattr(g_app, "camera_controller", None)
     if camera_controller is not None:
         try:
@@ -2579,6 +2584,25 @@ async def signaling_client_main():
         await asyncio.gather(*local_tasks, return_exceptions=True)
 
 
+def publish_camera_telemetry(payload: dict) -> None:
+    global camera_telemetry_pending
+    loop, ws = signaling_loop, websocket
+    if loop is None or ws is None or loop.is_closed():
+        return
+    if camera_telemetry_pending is not None:
+        previous_ws, previous_send = camera_telemetry_pending
+        if previous_ws is ws and not previous_send.done():
+            return  # telemetry is lossy; never accumulate a reconnect backlog
+    async def send():
+        try:
+            if websocket is ws:
+                await ws.send(json.dumps([build_send_frame(CAMERA_TELEMETRY_DESTINATION, payload)]))
+        except Exception:
+            if websocket is ws and camera_realtime_control is not None:
+                camera_realtime_control.disconnect()
+    camera_telemetry_pending = (ws, asyncio.run_coroutine_threadsafe(send(), loop))
+
+
 async def _signaling_transport_main(command_runtime):
     global websocket
 
@@ -2700,7 +2724,16 @@ async def _signaling_transport_main(command_runtime):
                         destination = frame["headers"].get("destination")
                         body = frame["body"]
 
-                        if destination and COMMAND_OBSERVED_ACK_QUEUE_DEST in destination:
+                        if destination and CAMERA_CONTROL_QUEUE in destination:
+                            if camera_realtime_control is not None:
+                                try:
+                                    intent = json.loads(body)
+                                    if isinstance(intent, dict) and (intent.get("action") == "STOP" or
+                                            (fleet_command_runtime is not None and critical_event_safety_gate.replay_allowed())):
+                                        camera_realtime_control.accept(intent)
+                                except (ValueError, TypeError):
+                                    log.warning("[CAMERA-CONTROL] invalid frame")
+                        elif destination and COMMAND_OBSERVED_ACK_QUEUE_DEST in destination:
                             await handle_command_observation_ack(body)
                         elif destination and FLEET_COMMAND_QUEUE_DEST in destination:
                             await handle_fleet_command_wakeup(body)
@@ -2714,6 +2747,8 @@ async def _signaling_transport_main(command_runtime):
         except Exception as exc:
             log.error("[SIGNALING] WebSocket error: %s", exc)
         finally:
+            if camera_realtime_control is not None:
+                camera_realtime_control.disconnect()
             _set_update_commit_signaling_ready(False)
             # A transport reconnect is an exact WebRTC generation boundary.
             # Invalidate the media branch and every volatile signaling envelope,
@@ -4522,10 +4557,13 @@ class GStreamerInferenceApp:
                 and self.user_data.motor_controller.available
                 and self.user_data.motor_controller.protocol == "nuv1"
             ):
+                global camera_realtime_control
+                if camera_realtime_control is None:
+                    camera_realtime_control = CameraRealtimeControl(self.user_data.motor_controller, publish_camera_telemetry)
                 fleet_effect_registry.register(
-                    CameraPositionReconciler(self.user_data.motor_controller)
+                    CameraPositionReconciler(self.user_data.motor_controller, stop_realtime=camera_realtime_control.disconnect)
                 )
-                log.info("[CAMERA-POSITION] NUV1 reconciler registered")
+                log.info("[CAMERA-POSITION] NUV1 reconciler and realtime control registered")
             else:
                 fleet_effect_registry.unregister("CAMERA_POSITION_SET")
         except (OSError, RuntimeError, ValueError) as exc:
@@ -4801,6 +4839,8 @@ class GStreamerInferenceApp:
         if self.loop and self.loop.is_running():
             self.loop.quit()
         self.user_data.wait_for_workers()
+        if camera_realtime_control is not None:
+            camera_realtime_control.close()
         self.user_data.motor_controller.close()
 
 

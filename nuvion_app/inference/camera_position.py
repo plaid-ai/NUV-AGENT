@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 from datetime import datetime, timezone
 
@@ -28,8 +28,9 @@ class CameraPositionReconciler:
     command_type = CAMERA_POSITION_COMMAND_TYPE
     capability = CAMERA_POSITION_CAPABILITY
 
-    def __init__(self, controller: MotorController) -> None:
+    def __init__(self, controller: MotorController, *, stop_realtime: Callable[[], None] | None = None) -> None:
         self.controller = controller
+        self.stop_realtime = stop_realtime
 
     @property
     def ready(self) -> bool:
@@ -45,6 +46,8 @@ class CameraPositionReconciler:
                 message="unsupported camera control action",
             )
         try:
+            if direction in {"STOP", "LIMITS"} and self.stop_realtime is not None:
+                self.stop_realtime()
             if motor_command is not None:
                 expiry = datetime.fromisoformat(command.expires_at.replace("Z", "+00:00"))
                 if expiry <= datetime.now(timezone.utc):

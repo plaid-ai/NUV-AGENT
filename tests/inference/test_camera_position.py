@@ -61,6 +61,18 @@ class CameraPositionReconcilerTest(unittest.TestCase):
 
 
 class CameraActionSafetyTest(unittest.TestCase):
+    def test_durable_stop_also_cancels_realtime_intent(self):
+        from unittest.mock import Mock
+        controller = Mock()
+        controller.position_limits = dict(panMin=0, panMax=4095, tiltMin=0, tiltMax=4095)
+        controller.position_action.return_value = FakeNuv1Backend().last_response
+        stop = Mock()
+        effect = CameraPositionReconciler(controller, stop_realtime=stop)
+        effect.reconcile(command('STATUS'))
+        stop.assert_not_called()
+        effect.reconcile(command('STOP'))
+        stop.assert_called_once()
+
     def test_expired_jog_is_not_executed(self):
         from dataclasses import replace
         from unittest.mock import Mock
