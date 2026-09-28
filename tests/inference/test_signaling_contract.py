@@ -25,6 +25,7 @@ class SignalingContractTest(unittest.TestCase):
         self.assertEqual(
             REQUIRED_AGENT_SUBSCRIPTIONS,
             (
+                "/user/queue/camera.control",
                 AGENT_COMMAND_QUEUE_DEST,
                 AGENT_ERROR_QUEUE_DEST,
                 EVENT_ACK_QUEUE_DEST,

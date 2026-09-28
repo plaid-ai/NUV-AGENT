@@ -1,3 +1,5 @@
+> 후속 변경: 수동 이동·STATUS·STOP은 [실시간 제어 계약](camera-realtime-control.md)의 WebSocket 경로로 대체되었습니다. 아래는 기존 Fleet 단일 명령 및 제한 저장 계약입니다.
+
 # Ultra camera control
 
 `CAMERA_POSITION_SET` schema 1 keeps LEFT/RIGHT/UP/DOWN as one acknowledged 11-tick (~0.97°) JOG. It additionally supports STATUS (read), STOP (hold), and LIMITS (persist operator bounds). Existing single-step clients remain compatible. The bridge firmware is unchanged; this interface does not issue RUN.
