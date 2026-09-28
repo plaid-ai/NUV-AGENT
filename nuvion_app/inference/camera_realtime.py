@@ -22,6 +22,9 @@ class CameraRealtimeControl:
         self.publish = publish
         self._lock = threading.Lock()
         self._intent: dict[str, Any] | None = None
+        # One pending query per viewer, in arrival order. Queries must not
+        # overwrite another viewer or the current motion lease.
+        self._status_requests: dict[str, dict[str, Any]] = {}
         self._generation = 0
         self._seen: dict[str, tuple[int, float]] = {}
         self._moving = False
@@ -54,14 +57,21 @@ class CameraRealtimeControl:
             if len(self._seen) >= 128 and session not in self._seen:
                 return False
             self._seen[session] = (sequence, now)
+            self._status_requests = {
+                k: v for k, v in self._status_requests.items() if v['expiresAtMs'] > now * 1000
+            }
             if (self._intent and self._intent["sessionId"] != session
                     and self._intent["expiresAtMs"] > now * 1000
                     and self._intent["action"] in _DIRECTION_COMMANDS and action != "STOP"):
                 self.publish({"requestId": frame["requestId"], "sequence": sequence,
                               "status": "BUSY", "message": "다른 사용자가 카메라를 조작 중입니다."})
                 return False
+            if action == "STATUS":
+                self._status_requests[session] = dict(frame)
+                return True
             if session in self._blocked_sessions and action in _DIRECTION_COMMANDS:
                 return False
+            self._status_requests.pop(session, None)
             if action == "STOP":
                 if self._intent and self._intent["sessionId"] != session:
                     self._blocked_sessions.add(self._intent["sessionId"])
@@ -80,15 +90,28 @@ class CameraRealtimeControl:
             if self._intent:
                 self._blocked_sessions.add(self._intent["sessionId"])
             self._intent = None
+            self._status_requests.clear()
             self._generation += 1
             self._stop_requested = True
 
     def tick(self) -> None:
         with self._lock:
+            now_ms = time.time() * 1000
+            self._status_requests = {
+                k: v for k, v in self._status_requests.items() if v['expiresAtMs'] > now_ms
+            }
+            if (self._intent and self._intent['expiresAtMs'] <= now_ms
+                    and not self._moving and not self._stop_requested):
+                self._intent = None
             frame = dict(self._intent) if self._intent else None
             generation = self._generation
             stop = self._stop_requested
             self._stop_requested = False
+            # Serve at most one query per tick: movement/STOP always wins,
+            # and telemetry sends must not burst into the lossy WS publisher.
+            if frame is None and not self._moving and not stop and self._status_requests:
+                session = next(iter(self._status_requests))
+                frame = self._status_requests.pop(session)
         expired = frame is None or frame["expiresAtMs"] <= time.time() * 1000
         if expired and not self._moving and not stop:
             return

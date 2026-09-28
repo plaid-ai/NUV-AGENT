@@ -23,6 +23,70 @@ import unittest
 
 
 class CameraRealtimeTest(unittest.TestCase):
+    def test_idle_viewers_each_receive_their_own_status_response(self):
+        control, motor, publish = setup()
+        for viewer in ('first', 'second'):
+            assert control.accept(dict(frame('STATUS', session=viewer), requestId=viewer))
+        control.tick(); control.tick()
+        assert [call.args[0]['requestId'] for call in publish.call_args_list] == ['first', 'second']
+        assert motor.position_action.call_count == 2
+
+    def test_owner_status_does_not_replace_or_extend_held_motion(self):
+        control, motor, _ = setup()
+        request = frame()
+        control.accept(request); control.tick()
+        control.accept(dict(frame('STATUS', 2), expiresAtMs=request['expiresAtMs'] + 100))
+        control.tick()
+        assert motor.realtime_step.call_count == 2
+        with patch('nuvion_app.inference.camera_realtime.time.time', return_value=request['expiresAtMs']/1000 + .01):
+            control.tick()
+        motor.position_action.assert_called_with('STOP')
+
+    def test_stop_precedes_queued_status_and_disconnect_discards_queries(self):
+        control, motor, publish = setup()
+        control.accept(frame('STATUS', session='viewer'))
+        control.accept(frame('STOP')); control.tick()
+        motor.position_action.assert_called_with('STOP')
+        control.disconnect(); control.tick(); control.tick()
+        assert all(call.args[0]['status'] != 'IDLE' for call in publish.call_args_list)
+
+    def test_status_queue_coalesces_per_viewer_without_starving_other_viewers(self):
+        control, _, publish = setup()
+        control.accept(dict(frame('STATUS', session='first'), requestId='first-old'))
+        control.accept(dict(frame('STATUS', session='second'), requestId='second'))
+        control.accept(dict(frame('STATUS', 2, 'first'), requestId='first-new'))
+        control.tick(); control.tick(); control.tick()
+        assert [call.args[0]['requestId'] for call in publish.call_args_list] == ['first-new', 'second']
+
+    def test_expired_status_is_not_replayed(self):
+        control, motor, publish = setup()
+        request = frame('STATUS')
+        control.accept(request)
+        with patch('nuvion_app.inference.camera_realtime.time.time', return_value=request['expiresAtMs']/1000 + .01):
+            control.tick()
+        motor.position_action.assert_not_called()
+        publish.assert_not_called()
+
+    def test_status_queue_is_bounded_and_recovers_after_expiry(self):
+        control, _, _ = setup()
+        for index in range(128):
+            assert control.accept(frame('STATUS', session=str(index)))
+        assert not control.accept(frame('STATUS', session='overflow'))
+        assert len(control._status_requests) == 128
+        with patch('nuvion_app.inference.camera_realtime.time.time', return_value=time.time() + 31):
+            assert control.accept(frame('STATUS', session='fresh'))
+            assert list(control._status_requests) == ['fresh']
+
+    def test_new_move_supersedes_its_pending_query_but_preserves_other_viewer(self):
+        control, motor, publish = setup()
+        control.accept(frame('STATUS'))
+        control.accept(dict(frame('STATUS', session='viewer'), requestId='viewer'))
+        control.accept(frame(sequence=2)); control.tick()
+        motor.realtime_step.assert_called_once()
+        control.accept(frame('STOP', 3)); control.tick(); control.tick(); control.tick()
+        assert [call.args[0]['status'] for call in publish.call_args_list] == ['MOVING', 'STOPPED', 'IDLE']
+        assert publish.call_args.args[0]['requestId'] == 'viewer'
+
     def test_move_reports_measured_angle_without_waiting_for_settle(self):
         control, motor, publish = setup()
         assert control.accept(frame())
