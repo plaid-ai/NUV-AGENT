@@ -2122,7 +2122,10 @@ async def device_connectivity_sender(reporter: ConnectivityReporter):
     interval = max(1.0, CONNECTIVITY_INTERVAL_SEC)
     coordinator = get_device_state_coordinator()
     while True:
-        sample = reporter.collect_sample_payload()
+        # iw/ping are blocking subprocesses (three pings normally take ~2s).
+        # Keep them off the signaling loop so camera leases and telemetry can
+        # be processed while network quality is being measured.
+        sample = await asyncio.to_thread(reporter.collect_sample_payload)
         runtime = fleet_command_runtime
         if sample and runtime is not None:
             try:
@@ -2133,7 +2136,8 @@ async def device_connectivity_sender(reporter: ConnectivityReporter):
                     type(exc).__name__,
                     str(exc)[:500],
                 )
-        payload = reporter.build_transition_payload(sample)
+        # None would make build_transition_payload collect again synchronously.
+        payload = reporter.build_transition_payload(sample) if sample is not None else None
         if payload:
             coordinator.set_connectivity_status(str(payload.get("quality") or CONNECTIVITY_QUALITY_GOOD))
         if payload and persist_connectivity_event(payload):
