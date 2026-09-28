@@ -205,7 +205,7 @@ class CameraLimitsTest(unittest.TestCase):
             controller = motor_module.MotorController(motor_module.MotorConfig(enabled=True), backend=backend)
             observed = controller.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
             self.assertEqual(observed['motors'][0]['position'], 2000)
-            self.assertEqual(backend._request.call_count, 4)
+            self.assertEqual(backend._request.call_count, 2)
             self.assertIn(mock.call('JOG 1 1'), backend._request.call_args_list)
 
     def test_jog_cannot_cross_saved_limit(self):
@@ -264,3 +264,90 @@ class CameraLimitsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ContinuousCameraTest(unittest.TestCase):
+    def make_backend(self):
+        backend = motor_module.Nuv1UartMotorBackend.__new__(motor_module.Nuv1UartMotorBackend)
+        motor_module.BaseMotorBackend.__init__(backend)
+        backend.limits = dict(panMin=0, panMax=4095, tiltMin=0, tiltMax=4095)
+        backend._run_command = None
+        status = dict(protocol='NUV1', firmware='NUV1-smooth-v3', armed=True, moving_id=0,
+                      motors=[dict(id=1, present=True, position=2000, goal=2000, mode=3, torque=1, hardware_error=0),
+                              dict(id=2, present=True, position=1200, goal=1200, mode=3, torque=1, hardware_error=0)])
+        def request(command, **kwargs):
+            if command.startswith('RUN'): status['moving_id'] = int(command.split()[1])
+            if command == 'STOP': status['moving_id'] = 0
+            backend.last_response = status
+            return status
+        backend._request = mock.Mock(side_effect=request)
+        return backend, status
+
+    def test_hold_writes_one_run_then_keep_without_goal_rewrites(self):
+        b, _ = self.make_backend()
+        for _ in range(4): b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS', 'RUN 1 1 4', 'KEEP', 'KEEP', 'KEEP'])
+
+    def test_direction_change_stops_before_new_run(self):
+        b, _ = self.make_backend()
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        b.realtime_step(motor_module.MotorCommand.UP, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS', 'RUN 1 1 4', 'STOP', 'STATUS', 'RUN 2 1 4'])
+
+    def test_narrow_software_limits_do_not_run_toward_hardware_limit(self):
+        b, _ = self.make_backend()
+        b.limits['panMax'] = 2100
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        commands = [c.args[0] for c in b._request.call_args_list]
+        self.assertFalse(any(c.startswith('RUN') for c in commands))
+        self.assertIn('JOG 1 1', commands)
+
+    def test_firmware_deadman_stop_cannot_be_silently_restarted(self):
+        b, s = self.make_backend()
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        s['moving_id'] = 0
+        with self.assertRaisesRegex(RuntimeError, 'stopped'):
+            b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual(sum(c.args[0].startswith('RUN') for c in b._request.call_args_list), 1)
+
+    def test_stop_arriving_during_status_prevents_run(self):
+        b, _ = self.make_backend()
+        with self.assertRaisesRegex(ValueError, 'cancelled'):
+            b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999, is_active=lambda: False)
+        self.assertFalse(any(c.args[0].startswith('RUN') for c in b._request.call_args_list))
+
+    def test_old_firmware_uses_bounded_jog(self):
+        b, s = self.make_backend()
+        s['firmware'] = 'NUV1-old'
+        b.realtime_step(motor_module.MotorCommand.LEFT, expires_at=9999999999)
+        self.assertFalse(any(c.args[0].startswith('RUN') for c in b._request.call_args_list))
+        self.assertIn(mock.call('JOG 1 -1'), b._request.call_args_list)
+
+    def test_expired_input_cannot_renew_keep(self):
+        b, _ = self.make_backend()
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        with self.assertRaises(ValueError):
+            b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=1)
+        self.assertNotIn(mock.call('KEEP'), b._request.call_args_list)
+
+    def test_release_clears_run_and_new_press_arms_at_current_position(self):
+        b, _ = self.make_backend()
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        b.stop_position()
+        self.assertIsNone(b._run_command)
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual(sum(c.args[0].startswith('RUN') for c in b._request.call_args_list), 2)
+
+    def test_arm_reply_torque_snapshot_is_refreshed_before_run(self):
+        b, s = self.make_backend()
+        s['armed'] = False
+        s['motors'][0]['torque'] = 0
+        base = b._request.side_effect
+        def request(command, **kwargs):
+            if command == 'ARM':
+                s['armed'] = True
+            elif command == 'STATUS' and s['armed']:
+                s['motors'][0]['torque'] = 1
+            return base(command, **kwargs)
+        b._request.side_effect = request
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS', 'ARM', 'STATUS', 'RUN 1 1 4'])

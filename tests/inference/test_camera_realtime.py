@@ -118,3 +118,18 @@ class CameraRealtimeTest(unittest.TestCase):
         assert motor.realtime_step.call_count == 1
         assert control.accept(frame('STOP', 3))
         assert control.accept(frame(sequence=4))
+
+    def test_fresh_renewal_during_uart_setup_is_used_but_not_invented(self):
+        control, motor, _ = setup()
+        first = frame()
+        control.accept(first)
+        control.tick()
+        valid = motor.realtime_step.call_args.kwargs['is_active']
+        future = first['expiresAtMs'] / 1000 + .01
+        with patch('nuvion_app.inference.camera_realtime.time.time', return_value=future):
+            assert not valid()
+            renewed = dict(first, sequence=2, expiresAtMs=int(future * 1000) + 600)
+            assert control.accept(renewed)
+            assert valid()
+            assert control.accept(dict(renewed, action='STOP', sequence=3))
+            assert not valid()

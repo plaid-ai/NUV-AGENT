@@ -20,7 +20,10 @@ Ultra 현장 command inbox에서 LEFT가 움직인 뒤 `motor did not reach the 
 - FE는 누르는 동안 150ms마다 방향을 갱신한다. release/blur/hidden/unmount는 이전 ACK를 기다리지 않고 STOP한다. 피드백이 900ms 넘게 없으면 입력을 중단한다. reconnect는 STATUS만 보내며 이전 방향을 복원하지 않는다.
 - Agent는 하나의 최신 intent만 보관하고 독립 thread에서 실행한다. lease 만료/transport disconnect는 STOP한다. 입력 만료 기준은 650ms이며 실제 STOP 완료에는 진행 중인 bounded UART 요청 시간과 worker 주기가 추가된다. 하드웨어 비상정지 보증이 아니다.
 - 명령 순서·중복을 검사하고 다른 session의 active press는 BUSY로 거절한다. 권한 있는 STOP은 항상 우선한다. 오류/만료 후 같은 press의 갱신은 STOP을 받기 전까지 재개하지 않는다.
-- 펌웨어 변경 없이 NUV1 JOG 약 0.97°를 사용한다. 목표가 측정 위치보다 22 ticks 이상 앞서 쌓이지 않게 한다. 목표각 도달을 1초 안에 강제하지 않으며 `MOVING`과 측정 각도를 함께 보낸다. 이 응답은 기계적 목표 도착 완료를 뜻하지 않는다.
+- `NUV1-smooth-v3`의 position mode(3), 해당 축의 기본 범위(0..4095)에서는 `RUN` 한 번으로 연속 이동을 시작하고 이후 `KEEP`만 보낸다. 목표각을 매 주기 다시 쓰지 않는다. profile velocity 4(약 5.5°/s), 펌웨어 400ms KEEP watchdog을 유지한다. 방향 전환은 STOP 후 새 RUN이다. 펌웨어가 정지하면 KEEP로 재시작하지 않는다.
+- RUN은 펌웨어 한계까지의 목표를 설정하므로, 사용자 지정 소프트웨어 범위 또는 미지원 펌웨어/모드에서는 기존 0.97° bounded JOG를 유지한다. 좁은 범위에도 연속 이동을 제공하려면 범위를 원자적으로 전달하는 펌웨어 계약이 필요하다. 범위를 무시하고 RUN하지 않는다. 이 경로도 중복 STATUS를 제거하여 armed 상태에서 STATUS+JOG 두 번으로 처리한다.
+- `MOVING` 응답은 실측 각도를 포함하며 기계적 목표 도착 완료를 뜻하지 않는다. STOP/만료가 UART 조회 도중 도착하면 다음 이동 쓰기 전에 다시 검사한다.
+- 속도 단위 근거: https://emanual.robotis.com/docs/en/dxl/x/xl330-m288/#profile-velocity112
 - 저장된 위치 제한은 매 JOG에서 적용한다. 한계 도달 시 STOP 후 실제 각도를 유지하여 표시한다. 수동 lease 중에는 자동 tracking 입력을 억제하고 STATUS 조회는 자동 제어를 점유하지 않는다.
 
 ## 배포 및 검증
