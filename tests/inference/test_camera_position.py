@@ -13,8 +13,8 @@ class FakeNuv1Backend(BaseMotorBackend):
         self.last_response = {
             "protocol": "NUV1",
             "motors": [
-                {"id": 1, "position": 2011},
-                {"id": 2, "position": 2048},
+                {"id": 1, "position": 2011, "present": True},
+                {"id": 2, "position": 2048, "present": True},
             ],
         }
 
@@ -34,7 +34,7 @@ def command(direction: str) -> VerifiedFleetCommand:
         command_type="CAMERA_POSITION_SET",
         schema_version=1,
         issued_at="2026-09-22T00:00:00Z",
-        expires_at="2026-09-22T00:00:30Z",
+        expires_at="2099-09-22T00:00:30Z",
         sequence=1,
         payload_base64="e30",
         payload_hash="0" * 64,
@@ -57,6 +57,36 @@ class CameraPositionReconcilerTest(unittest.TestCase):
         self.assertEqual(result.status, "SUCCEEDED")
         self.assertEqual(result.reported_state["positions"], {"pan": 2011, "tilt": 2048})
         self.assertEqual(result.reported_state["protocol"], "NUV1")
+
+
+
+class CameraActionSafetyTest(unittest.TestCase):
+    def test_expired_jog_is_not_executed(self):
+        from dataclasses import replace
+        from unittest.mock import Mock
+        controller = Mock()
+        result = CameraPositionReconciler(controller).reconcile(replace(command('RIGHT'), expires_at='2020-01-01T00:00:00Z'))
+        self.assertEqual(result.status, 'FAILED')
+        controller.move_position.assert_not_called()
+
+    def test_missing_motor_does_not_report_healthy(self):
+        backend = FakeNuv1Backend()
+        backend.last_response['motors'][1]['present'] = False
+        controller = MotorController(MotorConfig(enabled=True, backend='nuv1'), backend=backend)
+        self.assertEqual(CameraPositionReconciler(controller).reconcile(command('RIGHT')).status, 'FAILED')
+
+    def test_status_stop_and_limits_are_not_jogs(self):
+        from dataclasses import replace
+        from unittest.mock import Mock
+        controller = Mock()
+        controller.position_limits = dict(panMin=0, panMax=4095, tiltMin=0, tiltMax=4095)
+        controller.position_action.return_value = FakeNuv1Backend().last_response
+        for action in ('STATUS', 'STOP', 'LIMITS'):
+            result = CameraPositionReconciler(controller).reconcile(replace(command(action), payload={'direction': action, **({'limits': controller.position_limits} if action == 'LIMITS' else {})}))
+            self.assertEqual(result.status, 'SUCCEEDED')
+            self.assertEqual(result.reported_state['limits'], controller.position_limits)
+            self.assertEqual(result.reported_state['controlVersion'], 2)
+        controller.move_position.assert_not_called()
 
 
 if __name__ == "__main__":

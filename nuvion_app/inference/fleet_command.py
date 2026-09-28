@@ -682,12 +682,16 @@ def _validate_command_payload(command_type: str, payload: Mapping[str, Any]) -> 
         return
 
     if command_type == "CAMERA_POSITION_SET":
-        _require_exact_payload_keys(payload, required={"direction"})
-        if payload.get("direction") not in {"LEFT", "RIGHT", "UP", "DOWN"}:
-            raise CommandValidationError(
-                "INVALID_PAYLOAD_SCHEMA",
-                "CAMERA_POSITION_SET direction must be LEFT, RIGHT, UP or DOWN",
-            )
+        limits_action = payload.get("direction") == "LIMITS"
+        _require_exact_payload_keys(payload, required={"direction", "limits"} if limits_action else {"direction"})
+        if payload.get("direction") not in {"LEFT", "RIGHT", "UP", "DOWN", "STATUS", "STOP", "LIMITS"}:
+            raise CommandValidationError("INVALID_PAYLOAD_SCHEMA", "unsupported camera direction")
+        if limits_action:
+            from nuvion_app.inference.motor import validate_motor_limits
+            try:
+                validate_motor_limits(payload["limits"])
+            except (TypeError, ValueError) as exc:
+                raise CommandValidationError("INVALID_PAYLOAD_SCHEMA", str(exc)) from exc
         return
 
     raise CommandValidationError("UNSUPPORTED_COMMAND", "command type is not supported")

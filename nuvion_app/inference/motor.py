@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+import tempfile
 import os
 import sys
 import termios
@@ -145,6 +147,21 @@ class UartMotorBackend(BaseMotorBackend):
             pass
 
 
+class MotorLimitReached(RuntimeError):
+    """A bounded tracking step was blocked by operator limits."""
+
+
+def validate_motor_limits(value: Mapping[str, Any]) -> dict[str, int]:
+    keys = {"panMin", "panMax", "tiltMin", "tiltMax"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError("limits require panMin, panMax, tiltMin and tiltMax")
+    if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 4095 for v in value.values()):
+        raise ValueError("motor limits must be encoder integers from 0 to 4095")
+    if value["panMin"] >= value["panMax"] or value["tiltMin"] >= value["tiltMax"]:
+        raise ValueError("motor minimum must be less than maximum")
+    return dict(value)
+
+
 class Nuv1UartMotorBackend(BaseMotorBackend):
     """Acknowledged OpenRB NUV1 bridge used by the Nuvion Ultra pan/tilt head."""
 
@@ -162,6 +179,12 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
         self.port = port
         self.baud = baud
         self.timeout_sec = timeout_sec
+        from nuvion_app.runtime.settings_overlay import resolve_settings_state_dir
+        self.limits_path = Path(resolve_settings_state_dir(os.environ)) / "camera-limits.json"
+        self.limits = {"panMin": 0, "panMax": 4095, "tiltMin": 0, "tiltMax": 4095}
+        if self.limits_path.exists():
+            self.limits = validate_motor_limits(json.loads(self.limits_path.read_text()))
+
         self._serial = serial.Serial(
             self.port,
             self.baud,
@@ -202,14 +225,61 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
             return dict(response)
         raise TimeoutError("OpenRB NUV1 response timed out; command was not retried")
 
-    def send_command(self, command: MotorCommand) -> None:
+    def send_command(self, command: MotorCommand, *, expires_at: float | None = None) -> None:
         encoded = self._COMMANDS.get(command)
         if encoded is None:
             raise ValueError(f"NUV1 does not support {command.name}")
         status = self._request("STATUS")
         if status.get("armed") is not True:
             self._request("ARM")
+        # STATUS may precede ARM: always check the goal that the firmware will use.
+        status = self._request("STATUS")
+        axis = "pan" if command in {MotorCommand.LEFT, MotorCommand.RIGHT} else "tilt"
+        identifier = 1 if axis == "pan" else 2
+        step = -11 if command in {MotorCommand.LEFT, MotorCommand.DOWN} else 11
+        motor = next((m for m in status.get("motors", []) if isinstance(m, dict) and m.get("id") == identifier), None)
+        if motor is None or motor.get("present") is not True:
+            raise RuntimeError("motor position unavailable")
+        goal = motor.get("goal")
+        position = motor.get("position")
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in (goal, position)):
+            raise RuntimeError("motor position unavailable")
+        low, high = self.limits[axis + "Min"], self.limits[axis + "Max"]
+        if not low <= position <= high or not low <= goal + step <= high:
+            raise MotorLimitReached("configured camera movement limit reached")
+        if expires_at is not None and time.time() >= expires_at:
+            raise ValueError("camera movement command has expired")
         self._request(encoded)
+
+    def read_position(self) -> dict[str, Any]:
+        return self._request("STATUS")
+
+    def stop_position(self) -> dict[str, Any]:
+        return self._request("STOP")
+
+    def set_limits(self, limits: Mapping[str, Any]) -> dict[str, Any]:
+        validated = validate_motor_limits(limits)
+        status = self._request("STOP")
+        status = self._request("STATUS")
+        for identifier, axis in ((1, "pan"), (2, "tilt")):
+            motor = next((m for m in status.get("motors", []) if isinstance(m, dict) and m.get("id") == identifier), {})
+            position = motor.get("position")
+            if (motor.get("present") is not True or isinstance(position, bool)
+                    or not isinstance(position, int)
+                    or not validated[axis + "Min"] <= position <= validated[axis + "Max"]):
+                raise ValueError("movement limits must contain the current motor positions")
+        self.limits_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=self.limits_path.parent, prefix=".camera-limits-")
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(validated, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.limits_path)
+            self.limits = validated
+        finally:
+            Path(name).unlink(missing_ok=True)
+        return status
 
     def close(self) -> None:
         try:
@@ -286,7 +356,10 @@ class MotorController:
             if not force and now - last_sent_at < self.config.command_interval_sec:
                 return False
 
-            self.backend.send_command(command)
+            try:
+                self.backend.send_command(command)
+            except MotorLimitReached:
+                return False
             self._last_sent_at[lane] = now
             return True
 
@@ -315,7 +388,7 @@ class MotorController:
     def center(self) -> bool:
         return self.send(MotorCommand.CENTER)
 
-    def move_position(self, command: MotorCommand) -> Mapping[str, Any]:
+    def move_position(self, command: MotorCommand, *, expires_at: float | None = None) -> Mapping[str, Any]:
         if self.protocol != "nuv1":
             raise RuntimeError("camera position control requires the NUV1 motor backend")
         mapped = command
@@ -323,12 +396,51 @@ class MotorController:
             mapped = MotorCommand.RIGHT if command == MotorCommand.LEFT else MotorCommand.LEFT
         if self.config.tilt_invert and command in {MotorCommand.UP, MotorCommand.DOWN}:
             mapped = MotorCommand.DOWN if command == MotorCommand.UP else MotorCommand.UP
-        if not self.send(mapped, force=True, lane="camera_position"):
-            raise RuntimeError(self.reason or "motor command was not sent")
-        response = getattr(self.backend, "last_response", None)
-        if not isinstance(response, dict):
-            raise RuntimeError("OpenRB did not provide acknowledged motor telemetry")
-        return dict(response)
+        if not self.config.enabled or not self.available:
+            raise RuntimeError(self.reason or "motor unavailable")
+        with self._lock:
+            if expires_at is not None and time.time() >= expires_at:
+                raise ValueError("camera movement command has expired")
+            if isinstance(self.backend, Nuv1UartMotorBackend):
+                self.backend.send_command(mapped, expires_at=expires_at)
+            else:
+                self.backend.send_command(mapped)
+            reader = getattr(self.backend, "read_position", None)
+            response = getattr(self.backend, "last_response", None)
+            if callable(reader):
+                deadline = time.monotonic() + 1.0
+                while True:
+                    response = reader()
+                    motors = response.get("motors", [])
+                    if len(motors) == 2 and all(
+                        isinstance(m, dict) and m.get("present") is True
+                        and isinstance(m.get("position"), int) and isinstance(m.get("goal"), int)
+                        and abs(m["position"] - m["goal"]) <= 2 for m in motors
+                    ):
+                        break
+                    if time.monotonic() >= deadline:
+                        self.backend.stop_position()
+                        raise TimeoutError("motor did not reach the requested position")
+                    time.sleep(0.025)
+            if not isinstance(response, dict):
+                raise RuntimeError("OpenRB did not provide acknowledged motor telemetry")
+            return dict(response)
+
+    def position_action(self, action: str, limits: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        if not self.config.enabled or not self.available or self.protocol != "nuv1":
+            raise RuntimeError("camera position control requires the NUV1 motor backend")
+        with self._lock:
+            if action == "STATUS":
+                return self.backend.read_position()
+            if action == "STOP":
+                return self.backend.stop_position()
+            if action == "LIMITS":
+                return self.backend.set_limits(limits or {})
+            raise ValueError("unknown camera action")
+
+    @property
+    def position_limits(self) -> Mapping[str, int]:
+        return dict(getattr(self.backend, "limits", {}))
 
     def close(self) -> None:
         self.backend.close()

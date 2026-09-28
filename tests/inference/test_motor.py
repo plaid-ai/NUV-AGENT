@@ -36,8 +36,8 @@ class MotorTest(unittest.TestCase):
                     "ok": True,
                     "armed": command != "STATUS",
                     "motors": [
-                        {"id": 1, "position": 2000},
-                        {"id": 2, "position": 2100},
+                        {"id": 1, "position": 2000, "goal": 2000, "present": True},
+                        {"id": 2, "position": 2100, "goal": 2100, "present": True},
                     ],
                 }
                 self.responses.append(json.dumps(response).encode())
@@ -65,7 +65,7 @@ class MotorTest(unittest.TestCase):
 
         self.assertEqual(
             fake.sent,
-            [b"NUV1 1 STATUS\n", b"NUV1 2 ARM\n", b"NUV1 3 JOG 1 -1\n"],
+            [b"NUV1 1 STATUS\n", b"NUV1 2 ARM\n", b"NUV1 3 STATUS\n", b"NUV1 4 JOG 1 -1\n", b"NUV1 5 STATUS\n"],
         )
         self.assertEqual(result["motors"][0]["position"], 2000)
 
@@ -172,6 +172,75 @@ class MotorTest(unittest.TestCase):
             backend.commands,
             [motor_module.MotorCommand.LEFT, motor_module.MotorCommand.CENTER],
         )
+
+
+
+class CameraLimitsTest(unittest.TestCase):
+    def backend(self, directory):
+        from pathlib import Path
+        backend = motor_module.Nuv1UartMotorBackend.__new__(motor_module.Nuv1UartMotorBackend)
+        motor_module.BaseMotorBackend.__init__(backend)
+        backend.limits_path = Path(directory) / 'camera-limits.json'
+        backend.limits = dict(panMin=1900, panMax=2100, tiltMin=2000, tiltMax=2200)
+        status = {'armed': True, 'motors': [
+            {'id': 1, 'present': True, 'position': 2000, 'goal': 2000},
+            {'id': 2, 'present': True, 'position': 2100, 'goal': 2100},
+        ]}
+        backend._request = mock.Mock(return_value=status)
+        return backend, status
+
+    def test_jog_cannot_cross_saved_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, status = self.backend(directory)
+            status['motors'][0].update(position=2095, goal=2095)
+            with self.assertRaisesRegex(RuntimeError, 'limit reached'):
+                backend.send_command(motor_module.MotorCommand.RIGHT)
+            self.assertTrue(all(call.args[0] == 'STATUS' for call in backend._request.call_args_list))
+
+    def test_limits_require_current_position_and_persist_without_jog(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, _ = self.backend(directory)
+            old = dict(backend.limits)
+            with self.assertRaisesRegex(ValueError, 'current motor positions'):
+                backend.set_limits(dict(panMin=0, panMax=100, tiltMin=0, tiltMax=3000))
+            self.assertEqual(backend.limits, old)
+            self.assertFalse(backend.limits_path.exists())
+            limits = dict(panMin=1950, panMax=2050, tiltMin=2050, tiltMax=2150)
+            backend.set_limits(limits)
+            self.assertEqual(json.loads(backend.limits_path.read_text()), limits)
+            self.assertFalse(any('JOG' in call.args[0] for call in backend._request.call_args_list))
+            serial_module = mock.Mock()
+            with mock.patch.object(motor_module, 'serial', serial_module), mock.patch.dict('os.environ', {'NUVION_SETTINGS_STATE_DIR': directory}):
+                restarted = motor_module.Nuv1UartMotorBackend('/dev/test', 115200, 0.2)
+            self.assertEqual(restarted.limits, limits)
+
+    def test_corrupt_limits_fail_before_opening_uart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, _ = self.backend(directory)
+            backend.limits_path.write_text('{"panMin": 0}')
+            serial_module = mock.Mock()
+            with mock.patch.object(motor_module, 'serial', serial_module), mock.patch.dict('os.environ', {'NUVION_SETTINGS_STATE_DIR': directory}):
+                with self.assertRaises(ValueError):
+                    motor_module.Nuv1UartMotorBackend('/dev/test', 115200, 0.2)
+            serial_module.Serial.assert_not_called()
+
+    def test_invalid_ranges_are_rejected(self):
+        for bad in [dict(panMin=True, panMax=4095, tiltMin=0, tiltMax=4095),
+                    dict(panMin=100, panMax=100, tiltMin=0, tiltMax=4095),
+                    dict(panMin=0, panMax=4096, tiltMin=0, tiltMax=4095)]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                motor_module.validate_motor_limits(bad)
+
+    def test_tracking_limit_does_not_kill_tracking_worker(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            backend, status = self.backend(directory)
+            status['motors'][0].update(position=2095, goal=2095)
+            controller = motor_module.MotorController(motor_module.MotorConfig(enabled=True), backend=backend)
+            self.assertFalse(controller.send_pan(motor_module.MotorCommand.RIGHT))
 
 
 if __name__ == "__main__":
