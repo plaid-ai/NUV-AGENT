@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+from datetime import datetime, timezone
 
 from nuvion_app.inference.command_inbox import (
     COMMAND_STATUS_FAILED,
@@ -22,7 +23,7 @@ _DIRECTION_COMMANDS = {
 
 
 class CameraPositionReconciler:
-    """Executes one bounded, acknowledged NUV1 pan/tilt step per Fleet command."""
+    """Acknowledged NUV1 steps, status, hold and persistent operator limits."""
 
     command_type = CAMERA_POSITION_COMMAND_TYPE
     capability = CAMERA_POSITION_CAPABILITY
@@ -37,17 +38,25 @@ class CameraPositionReconciler:
     def reconcile(self, command: VerifiedFleetCommand) -> CommandEffectOutcome:
         direction = str(command.payload.get("direction") or "")
         motor_command = _DIRECTION_COMMANDS.get(direction)
-        if motor_command is None:
+        if motor_command is None and direction not in {"STATUS", "STOP", "LIMITS"}:
             return CommandEffectOutcome(
                 status=COMMAND_STATUS_FAILED,
                 code="CAMERA_POSITION_INVALID_DIRECTION",
-                message="direction must be LEFT, RIGHT, UP or DOWN",
+                message="unsupported camera control action",
             )
         try:
-            response = self.controller.move_position(motor_command)
-            return CommandEffectOutcome.succeeded(
-                self._reported_state(direction, response)
-            )
+            if motor_command is not None:
+                expiry = datetime.fromisoformat(command.expires_at.replace("Z", "+00:00"))
+                if expiry <= datetime.now(timezone.utc):
+                    raise ValueError("camera movement command has expired")
+                response = self.controller.move_position(motor_command, expires_at=expiry.timestamp())
+            else:
+                response = self.controller.position_action(direction, command.payload.get("limits"))
+            state = self._reported_state(direction, response)
+            state["controlVersion"] = 2
+            state["limits"] = dict(self.controller.position_limits)
+            state["observedAt"] = datetime.now(timezone.utc).isoformat()
+            return CommandEffectOutcome.succeeded(state)
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             return CommandEffectOutcome(
                 status=COMMAND_STATUS_FAILED,
@@ -74,8 +83,12 @@ class CameraPositionReconciler:
                     and isinstance(position, int)
                     and not isinstance(position, bool)
                     and identifier in {1, 2}
+                    and motor.get("present") is True
+                    and 0 <= position <= 4095
                 ):
                     positions["pan" if identifier == 1 else "tilt"] = position
+        if set(positions) != {"pan", "tilt"}:
+            raise RuntimeError("both motor positions must be available")
         return {
             "direction": direction,
             "health": "FUNCTIONAL_HEALTHY",
