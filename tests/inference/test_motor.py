@@ -266,6 +266,21 @@ if __name__ == "__main__":
     unittest.main()
 
 class ContinuousCameraTest(unittest.TestCase):
+    def test_unreferenced_axis_never_arms_or_moves(self):
+        b, state = self.make_backend()
+        state['armed'] = False
+        state['motors'][1]['position'] = 4395
+        with self.assertRaisesRegex(RuntimeError, '위치 기준'):
+            b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS'])
+
+    def test_v4_reference_firmware_keeps_continuous_motion(self):
+        b, state = self.make_backend()
+        state['firmware'] = 'NUV1-smooth-v4'
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        b.realtime_step(motor_module.MotorCommand.RIGHT, expires_at=9999999999)
+        self.assertEqual([c.args[0] for c in b._request.call_args_list], ['STATUS', 'RUN 1 1 4', 'KEEP'])
+
     def make_backend(self):
         backend = motor_module.Nuv1UartMotorBackend.__new__(motor_module.Nuv1UartMotorBackend)
         motor_module.BaseMotorBackend.__init__(backend)

@@ -33,3 +33,16 @@ Ultra 현장 command inbox에서 LEFT가 움직인 뒤 `motor did not reach the 
 자동 검증: FE 인증/receipt/요청 상관관계, no-REST movement, hold/release, stale response, feedback loss, reconnect, 영구 LIMITS; BE owner/bound-device/expiry/rate/telemetry identity; Agent deadman/sequence/conflict/fault/기존 motor limits.
 
 실기 수용 기준: 양 축 짧은 이동과 release 정지, 브라우저 연결 차단 후 bounded 정지, 한계 도달 시 각도 유지, reconnect 이동 미재개, 제한값 저장 및 재시작 유지. 아직 이 변경의 실기 수용 검증을 완료하지 않았다.
+
+## Encoder reference and transport liveness
+
+`positions` carries signed 32-bit measured encoder ticks, not necessarily a valid
+single-turn movement goal. `positionReferenceRequired=true` blocks movement and
+limit changes while leaving STATUS/STOP and numeric display available. The Agent
+also blocks motion before ARM for out-of-range/invalid references, independent
+of the UI. smooth-v4 OpenRB firmware safely provides a single-turn reference when
+torque is off in mode 3 with zero homing offset; see `firmware/openrb/README.md`.
+
+FE tracks received replies separately from fresh valid motion feedback. An ERROR
+reply proves response liveness but never renews a movement watchdog. Thus an
+ongoing device error is not replaced by an incorrect response-timeout message.

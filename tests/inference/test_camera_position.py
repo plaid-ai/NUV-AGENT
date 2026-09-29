@@ -61,6 +61,21 @@ class CameraPositionReconcilerTest(unittest.TestCase):
 
 
 class CameraActionSafetyTest(unittest.TestCase):
+    def test_continuous_encoder_position_is_measured_but_not_movement_ready(self):
+        for position in (4395, -1, -(2**31), 2**31 - 1):
+            response = FakeNuv1Backend().last_response
+            response['motors'][1]['position'] = position
+            state = CameraPositionReconciler._reported_state('STATUS', response)
+            self.assertEqual(state['positions']['tilt'], position)
+            self.assertTrue(state['positionReferenceRequired'])
+
+    def test_malformed_encoder_position_is_rejected(self):
+        for position in (True, 1.5, None, 2**31, -(2**31)-1):
+            response = FakeNuv1Backend().last_response
+            response['motors'][1]['position'] = position
+            with self.assertRaises(RuntimeError):
+                CameraPositionReconciler._reported_state('STATUS', response)
+
     def test_durable_stop_also_cancels_realtime_intent(self):
         from unittest.mock import Mock
         controller = Mock()
