@@ -234,6 +234,7 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
             raise ValueError(f"NUV1 does not support {command.name}")
         provided_status = status is not None
         status = status if provided_status else self._request("STATUS")
+        self._check_position_references(status)
         if status.get("armed") is not True:
             if not is_active():
                 raise ValueError("camera movement input cancelled")
@@ -266,6 +267,16 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
     def read_position(self) -> dict[str, Any]:
         return self._request("STATUS")
 
+    @staticmethod
+    def _check_position_references(status: Mapping[str, Any]) -> None:
+        for motor in status.get("motors", []):
+            if not isinstance(motor, dict):
+                continue
+            position = motor.get("position")
+            if (motor.get("reference_valid") is False
+                    or (type(position) is int and not 0 <= position <= 4095)):
+                raise RuntimeError("모터 위치 기준을 복구해야 합니다. OpenRB 펌웨어와 설치 기준을 확인해주세요.")
+
     def realtime_step(self, command: MotorCommand, *, expires_at: float,
                       is_active: Callable[[], bool] | None = None) -> dict[str, Any]:
         """Use smooth-v3's hardware deadman; never rewrite a running goal.
@@ -291,15 +302,17 @@ class Nuv1UartMotorBackend(BaseMotorBackend):
                 raise RuntimeError("continuous camera movement stopped; release and press again")
             check_input()
             response = self._request("KEEP")
+            self._check_position_references(response)
             if response.get("moving_id") != identifier or response.get("armed") is not True:
                 raise RuntimeError("continuous camera movement stopped; release and press again")
             return response
 
         state = self.read_position()
+        self._check_position_references(state)
         axis = "pan" if command in {MotorCommand.LEFT, MotorCommand.RIGHT} else "tilt"
         identifier = 1 if axis == "pan" else 2
         motor = next((m for m in state.get("motors", []) if m.get("id") == identifier), {})
-        continuous = (state.get("firmware") == "NUV1-smooth-v3"
+        continuous = (state.get("firmware") in {"NUV1-smooth-v3", "NUV1-smooth-v4"}
                       and motor.get("mode") == 3
                       and self.limits[axis + "Min"] == 0 and self.limits[axis + "Max"] == 4095)
         if not continuous:

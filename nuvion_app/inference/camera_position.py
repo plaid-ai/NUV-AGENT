@@ -73,6 +73,7 @@ class CameraPositionReconciler:
         direction: str, response: Mapping[str, Any]
     ) -> dict[str, Any]:
         positions: dict[str, int] = {}
+        reference_required = False
         motors = response.get("motors")
         if isinstance(motors, list):
             for motor in motors:
@@ -87,14 +88,18 @@ class CameraPositionReconciler:
                     and not isinstance(position, bool)
                     and identifier in {1, 2}
                     and motor.get("present") is True
-                    and 0 <= position <= 4095
+                    # XL330 Present Position is signed continuous encoder data
+                    # with torque off. Reporting it is not permission to move.
+                    and -(2**31) <= position < 2**31
                 ):
                     positions["pan" if identifier == 1 else "tilt"] = position
+                    reference_required |= motor.get("reference_valid") is False
         if set(positions) != {"pan", "tilt"}:
-            raise RuntimeError("both motor positions must be available")
+            raise RuntimeError("Pan·Tilt 모터의 위치를 모두 읽지 못했습니다. 모터 연결을 확인해주세요.")
         return {
             "direction": direction,
             "health": "FUNCTIONAL_HEALTHY",
             "protocol": "NUV1",
             "positions": positions,
+            "positionReferenceRequired": reference_required or any(not 0 <= p <= 4095 for p in positions.values()),
         }
