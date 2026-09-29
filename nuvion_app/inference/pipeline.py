@@ -186,6 +186,7 @@ from nuvion_app.runtime.model_guard import resolve_effective_profile, resolve_mo
 from nuvion_app.runtime.platform_identity import (
     IDENTITY_STATUS_DEV,
     IDENTITY_STATUS_VERIFIED,
+    NUVION_PRO,
     NUVION_ULTRA,
     NUVION_ULTRA_DEV,
     resolve_platform_identity,
@@ -4566,7 +4567,7 @@ class GStreamerInferenceApp:
         try:
             identity = resolve_platform_identity()
             if (
-                identity.product_model in {NUVION_ULTRA, NUVION_ULTRA_DEV}
+                identity.product_model in {NUVION_PRO, NUVION_ULTRA, NUVION_ULTRA_DEV}
                 and self.user_data.motor_controller.available
                 and self.user_data.motor_controller.protocol == "nuv1"
             ):
