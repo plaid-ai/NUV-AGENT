@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from datetime import datetime, timezone
 
 from nuvion_app.inference.command_inbox import CommandEffectOutcome, DurableCommandInbox
 from nuvion_app.inference.command_observation import (
@@ -516,6 +517,9 @@ class CommandObservationOutboxTest(unittest.TestCase):
         outbox = DurableCommandObservationOutbox(
             self.inbox,
             dlq_max_rows=1,
+            # Capacity test: do not age September fixture ACKs against wall time.
+            clock=lambda: "2026-09-01T00:00:03Z",
+            retry_clock=lambda: datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp(),
         )
         first_observation = outbox.enqueue(
             command_id=self.command.command_id,
