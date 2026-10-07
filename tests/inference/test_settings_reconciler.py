@@ -568,6 +568,20 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(outcome.reported_state["health"], "ROLLBACK_RESTART_REQUIRED")
         self.assertEqual(restarted.store.marker()["phase"], "ROLLBACK_STAGED")
 
+    def test_download_pending_retries_without_staging_or_restart(self):
+        runtime = _Runtime()
+        runtime.preflight_model = mock.Mock(return_value=False)
+        command = _command(32, activation="RESTART", sections={"model": {
+            "pointer": "anomalyvfm/ventuno-q-v16", "digest": "sha256:" + "a" * 64}})
+        reconciler = self._reconciler(runtime, "before")
+        result = reconciler.reconcile(command)
+        self.assertIsInstance(result, ReconcileDeferred)
+        self.assertEqual(result.reported_state["health"], "MODEL_DOWNLOADING")
+        self.assertEqual(result.checkpoint["nextAction"], "RETRY_EFFECT")
+        self.assertFalse(result.checkpoint["restartRequired"])
+        self.assertIsNone(reconciler.store.marker())
+        self.assertFalse(reconciler.store.active_path.exists())
+
     def test_model_preflight_failure_preserves_active_overlay_and_marker(self) -> None:
         runtime = _Runtime()
         runtime.preflight_model = mock.Mock(

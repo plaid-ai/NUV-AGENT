@@ -648,7 +648,11 @@ class SettingsReconciler:
             if callable(preflight):
                 self._ensure_fence()
                 try:
-                    preflight(command.payload["model"])
+                    if preflight(command.payload["model"]) is False:
+                        return self._deferred(
+                            command, digest, health="MODEL_DOWNLOADING", marker={},
+                            retry_without_restart=True,
+                        )
                 except (OSError, RuntimeError, ValueError) as exc:
                     return CommandEffectOutcome(
                         status=COMMAND_STATUS_FAILED,
