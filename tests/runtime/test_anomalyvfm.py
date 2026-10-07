@@ -91,6 +91,10 @@ class AnomalyVFMTests(unittest.TestCase):
             self.assertFalse(detector.preflight_model(desired))
             with self.assertRaises(ValueError): detector._preflight_future.result(timeout=2)
             with self.assertRaises(ValueError): detector.preflight_model(desired)
+            self.assertIsNone(detector._preflight_future)
+            with mock.patch.object(model, "ensure_package", return_value=self.selection):
+                self.assertFalse(detector.preflight_model(desired))
+                detector._preflight_future.result(timeout=2)
         model.read_manifest(self.selection)
         self.assertFalse((self.root / ("a" * 64)).exists())
 

@@ -348,7 +348,15 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
                 if not self._preflight_future.done():
                     return False
                 if self._preflight_target == target:
-                    self._preflight_future.result()
+                    completed = self._preflight_future
+                    try:
+                        completed.result()
+                    except Exception:
+                        # Fail this command, but permit a later signed command to retry
+                        # a transient download failure without restarting the agent.
+                        self._preflight_future = self._preflight_target = None
+                        raise
+                    read_manifest(candidate)
                     return True
             future = Future()
             self._preflight_future, self._preflight_target = future, target
