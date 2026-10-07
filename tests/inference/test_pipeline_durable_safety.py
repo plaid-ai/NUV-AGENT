@@ -548,6 +548,17 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertEqual(context.ground_truth, "defect")
         self.assertEqual(context.sample_id, "metal_nut/test/scratch/001.png")
 
+        # Real Ventuno Q videorate capture changes slides at 1.033, 3.033,
+        # 5.033... seconds; an exact midpoint still contains the previous slide.
+        with mock.patch.object(pipeline.Gst, "SECOND", 1_000_000_000, create=True):
+            for pts, index, loop in ((0, 0, 0), (1_000_000_000, 0, 0),
+                    (1_033_333_333, 1, 0), (3_000_000_000, 1, 0),
+                    (3_033_333_333, 0, 1), (47_000_000_000, 1, 11),
+                    (47_033_333_333, 0, 12)):
+                with self.subTest(pts=pts):
+                    actual = state.resolve_demo_sample(pts)
+                    self.assertEqual((actual.sample_index, actual.loop_index), (index, loop))
+
     def test_continuous_htp_worker_unwraps_frame_and_reports_arrival_age(self):
         pixels = object()
         with mock.patch.object(pipeline.time, "monotonic", return_value=100.0):

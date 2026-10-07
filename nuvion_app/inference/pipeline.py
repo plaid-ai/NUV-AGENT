@@ -3100,10 +3100,14 @@ class NuvionEventState:
             and self.demo_image_duration_sec > 0
         ):
             duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
-            index = int(pts_ns // duration_ns)
+            # videorate duplicates the nearest source frame, retaining the old
+            # frame on an exact midpoint tie. With 2-second slides at 30 fps,
+            # frame 1 starts at 1.033s, not 2s. Bind ground truth to that frame.
+            index = max(0, int((pts_ns + duration_ns // 2 - 1) // duration_ns))
         elif self.demo_image_duration_sec > 0:
             elapsed = max(0.0, time.time() - self.demo_started_at)
-            index = int(elapsed / self.demo_image_duration_sec)
+            duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
+            index = max(0, int((int(elapsed * Gst.SECOND) + duration_ns // 2 - 1) // duration_ns))
 
         if index is None:
             return None
@@ -4376,33 +4380,33 @@ class GStreamerInferenceApp:
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_status_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_STATUS_XPAD} "
+                "xpad=20 ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_label_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 14\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_LABEL_XPAD} "
+                "xpad=20 ypad=82 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_score_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_SCORE_XPAD} "
+                f"xpad={self.video_width // 3 + 10} ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_gt_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_GT_XPAD} "
+                f"xpad={self.video_width * 2 // 3} ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
@@ -4774,10 +4778,12 @@ class GStreamerInferenceApp:
                 match_color = OVERLAY_COLOR_RED
 
             self.overlay.set_property("text", "")
-            self._set_overlay_field(self.status_overlay, text.status, match_color)
-            self._set_overlay_field(self.label_overlay, text.label)
-            self._set_overlay_field(self.score_overlay, text.score_text)
-            self._set_overlay_field(self.gt_overlay, text.ground_truth or "", match_color)
+            prediction_color = OVERLAY_COLOR_RED if text.status == "DEFECT" else OVERLAY_COLOR_GREEN
+            self._set_overlay_field(self.status_overlay, f"AI RESULT\n{text.status}", prediction_color)
+            comparison = "MATCH" if match is True else "MISMATCH" if match is False else "GT UNAVAILABLE"
+            self._set_overlay_field(self.label_overlay, comparison, match_color)
+            self._set_overlay_field(self.score_overlay, f"ANOMALY\nSCORE {text.score_text}")
+            self._set_overlay_field(self.gt_overlay, f"DATASET GT\n{(text.ground_truth or 'UNKNOWN').upper()}")
             return True
 
         resolved_text = text if isinstance(text, str) else f"{text.status} {text.label} {text.score_text}"
