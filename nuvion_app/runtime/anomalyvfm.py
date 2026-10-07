@@ -243,10 +243,15 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
     def __init__(self, environ=None):
         self.environ = dict(os.environ if environ is None else environ)
         self.selection = selection_from_env(self.environ)
+        demo = str(self.environ.get("NUVION_DEMO_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
+        override = self.environ.get("NUVION_ANOMALYVFM_DEMO_THRESHOLD")
+        self.demo_threshold_applied = demo and override is not None
+        threshold = override if self.demo_threshold_applied else self.environ.get("NUVION_ZERO_SHOT_THRESHOLD", "0.7")
         super().__init__(True, str(self.selection.manifest_path),
                          self.selection.digest.removeprefix("sha256:"),
                          self.environ.get("NUVION_ANOMALYVFM_STATE_DIR", "/var/lib/nuv-agent/anomalyvfm"),
-                         float(self.environ.get("NUVION_ZERO_SHOT_THRESHOLD", "0.7")))
+                         float(threshold))
+        self._validate_threshold()
         self.model_name = "AnomalyVFM/RADIO/MinMax-W8A16/V-range"
         self.source_commit = self.ln_post_policy = None
         self._loaded_fingerprint = self._result_at = None

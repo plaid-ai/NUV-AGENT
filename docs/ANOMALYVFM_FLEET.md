@@ -8,6 +8,13 @@ IQ9075 compatibility. CSI capture remains outside this validation; use the
 existing demo/video input. Scores are not probabilities and the initial 0.7
 threshold is uncalibrated. Validate a factory threshold before production use.
 
+For a labeled MVTec showcase, `NUVION_ANOMALYVFM_DEMO_THRESHOLD` can set an
+explicit demo-only decision threshold. It is ignored outside DEMO mode; production
+continues to use `NUVION_ZERO_SHOT_THRESHOLD`. A video banner identifies the demo
+and its threshold. A threshold selected from showcase images is not a held-out
+accuracy result or factory calibration. Use square video geometry (768×768) for
+the square MVTec input and retain the unmodified deterministic 24-image playlist.
+
 ## Package and identity
 
 `tools/package_anomalyvfm.py DIRECTORY` verifies the two evaluated source hashes

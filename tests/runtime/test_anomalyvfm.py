@@ -105,3 +105,16 @@ class AnomalyVFMTests(unittest.TestCase):
 
     def test_factory_requires_boot_guard(self):
         with self.assertRaises(RuntimeError): model.build_anomalyvfm_detector(self.env)
+
+    def test_demo_threshold_never_changes_production_threshold(self):
+        env = {**self.env, "NUVION_ZERO_SHOT_THRESHOLD": "0.7", "NUVION_ANOMALYVFM_DEMO_THRESHOLD": "0.35"}
+        for mode in ("false", "UNKNOWN", ""):
+            detector = model.AnomalyVFMDetector({**env, "NUVION_DEMO_MODE": mode})
+            self.assertEqual(detector.threshold, .7)
+            self.assertFalse(detector.demo_threshold_applied)
+        detector = model.AnomalyVFMDetector({**env, "NUVION_DEMO_MODE": "true"})
+        self.assertEqual(detector.threshold, .35)
+        self.assertTrue(detector.demo_threshold_applied)
+        for invalid in ("nan", "inf", "-0.1", "1.1"):
+            with self.subTest(value=invalid), self.assertRaises(ValueError):
+                model.AnomalyVFMDetector({**env, "NUVION_DEMO_MODE": "true", "NUVION_ANOMALYVFM_DEMO_THRESHOLD": invalid})

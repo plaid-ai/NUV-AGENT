@@ -4355,9 +4355,19 @@ class GStreamerInferenceApp:
             )
 
         if self.demo_mode:
+            demo_banner = ""
+            detector = getattr(self.user_data, "zero_shot", None)
+            if isinstance(detector, AnomalyVFMDetector):
+                scope = "DEMO-ONLY" if detector.demo_threshold_applied else "UNCALIBRATED"
+                demo_banner = (
+                    'textoverlay name=anomalyvfm_demo_banner font-desc="Sans 15" '
+                    'halignment=center valignment=bottom shaded-background=true '
+                    f'text="MVTec DEMO | NPU | {scope} threshold {detector.threshold:.3f}" ! '
+                )
             overlay_pipeline = (
                 f"{tracking_overlay_pipeline}"
                 "videoconvert ! "
+                f"{demo_banner}"
                 "textoverlay name=zsad_overlay "
                 "font-desc=\"Sans 24\" "
                 "halignment=left valignment=top "
