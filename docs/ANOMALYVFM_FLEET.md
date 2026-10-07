@@ -53,6 +53,11 @@ the catalog to platform admins. A fresh running device advertises this capabilit
 only after a QNN-only profiled result. Choose eligible devices and a greater
 configVersion; start Canary, verify loaded digest, then advance waves.
 
+In DEMO mode this adapter permits only a model-only CONFIG_APPLY with
+activation=RESTART. The demo input/profile stays unchanged. Mixed video, labels,
+clip or collection changes remain rejected, as do unsupported/unknown modes.
+The same fresh inference and exact digest checks gate commit after restart.
+
 The preflight worker downloads to a temporary directory, checks sizes/SHA-256,
 and atomically publishes a content-addressed directory. Pending downloads return
 MODEL_DOWNLOADING / RETRY_EFFECT without changing active.env or restarting.

@@ -4105,6 +4105,17 @@ class PipelineSettingsRuntimeAdapter:
             raise RuntimeError("active VisualAD Fleet source/pointer differs from settings runtime")
         return detector
 
+    def allows_demo_model_restart(self) -> bool:
+        # Model replacement preserves the demo input. Do not require fresh
+        # inference here: the restarted candidate must reach the health gate.
+        try:
+            return (
+                self.app.user_data.backend == "anomalyvfm_qnn"
+                and isinstance(self._fleet_visualad_detector(), AnomalyVFMDetector)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return False
+
     def startup_pending(self) -> bool:
         detector = getattr(self.app.user_data, "zero_shot", None)
         return (

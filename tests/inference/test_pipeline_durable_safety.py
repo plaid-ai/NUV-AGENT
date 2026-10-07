@@ -396,6 +396,16 @@ class PipelineDurableSafetyTest(unittest.TestCase):
                 model_pointer=proof["pointer"],
                 model_dir=model_dir,
             )
+            self.assertTrue(adapter.allows_demo_model_restart())
+            detector.loaded_model_proof.return_value = None
+            self.assertTrue(adapter.allows_demo_model_restart())
+            detector.loaded_model_proof.return_value = proof
+            with mock.patch.object(app.user_data, "backend", "visualad_htp"):
+                self.assertFalse(adapter.allows_demo_model_restart())
+            with mock.patch.object(app.user_data, "zero_shot", object()):
+                self.assertFalse(adapter.allows_demo_model_restart())
+            with mock.patch.object(adapter, "model_dir", root):
+                self.assertFalse(adapter.allows_demo_model_restart())
             registry = pipeline.ReconcilerRegistry()
             registry.register(
                 pipeline.SettingsReconciler(store=object(), runtime=adapter)

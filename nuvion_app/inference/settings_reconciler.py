@@ -521,11 +521,22 @@ class SettingsReconciler:
                 operation_mode = str(self._operation_mode_provider() or "").upper()
             except Exception:
                 operation_mode = "UNKNOWN"
-            if operation_mode != "PRODUCTION":
+            demo_model_restart = False
+            if (
+                operation_mode == "DEMO"
+                and set(command.payload) == {"configVersion", "activation", "model"}
+                and command.payload.get("activation") == "RESTART"
+            ):
+                allow_demo = getattr(self.runtime, "allows_demo_model_restart", None)
+                try:
+                    demo_model_restart = callable(allow_demo) and allow_demo() is True
+                except Exception:  # noqa: BLE001 - unavailable capability fails closed.
+                    pass
+            if operation_mode != "PRODUCTION" and not demo_model_restart:
                 return CommandEffectOutcome(
                     status=COMMAND_STATUS_FAILED,
                     code="DEVICE_MODE_CONFLICT",
-                    message="CONFIG_APPLY is allowed only in PRODUCTION mode",
+                    message="CONFIG_APPLY requires PRODUCTION or supported model-only DEMO restart",
                     reported_state=self._reported(
                         command, digest, health="NOT_APPLIED"
                     ),
