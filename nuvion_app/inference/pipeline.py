@@ -171,6 +171,7 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
+from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
 from nuvion_app.inference.video_source import resolve_depthai_device_id
@@ -195,6 +196,7 @@ from nuvion_app.runtime.fleet_capabilities import (
     RUNTIME_ONLY_FLEET_CAPABILITIES,
     SIGLIP_MODEL_CONFIG_CAPABILITY,
     VISUALAD_HTP_MODEL_CONFIG_CAPABILITY,
+    ANOMALYVFM_MODEL_CONFIG_CAPABILITY,
 )
 from nuvion_app.runtime.visualad_fleet import (
     FleetVisualADHTPAnomalyDetector,
@@ -1838,7 +1840,9 @@ def build_model_config_capabilities() -> frozenset[str]:
             and adapter.can_verify_model()
         ):
             capability = (
-                VISUALAD_HTP_MODEL_CONFIG_CAPABILITY
+                ANOMALYVFM_MODEL_CONFIG_CAPABILITY
+                if adapter.app.user_data.backend == "anomalyvfm_qnn"
+                else VISUALAD_HTP_MODEL_CONFIG_CAPABILITY
                 if adapter.app.user_data.backend == "visualad_htp"
                 else SIGLIP_MODEL_CONFIG_CAPABILITY
             )
@@ -1909,9 +1913,9 @@ def build_dynamic_runtime_telemetry(
         | camera_capabilities
     )
     user_data = getattr(g_app, "user_data", None)
-    if getattr(user_data, "backend", None) in {"visualad", "visualad_htp"}:
+    if getattr(user_data, "backend", None) in {"visualad", "visualad_htp", "anomalyvfm_qnn"}:
         detector = getattr(user_data, "zero_shot", None)
-        if isinstance(detector, FleetVisualADHTPAnomalyDetector):
+        if isinstance(detector, (FleetVisualADHTPAnomalyDetector, AnomalyVFMDetector)):
             proof = detector.loaded_model_proof()
             if getattr(user_data, "inference_failed", False) or not getattr(user_data, "running", False):
                 proof = None
@@ -1936,10 +1940,11 @@ def build_dynamic_runtime_telemetry(
             "ready": ready,
             "failed": failed,
             "source": "demo" if getattr(user_data, "demo_mode", False) else VIDEO_SOURCE_ENV,
-            "scoreKind": "raw_top_1_percent_mean",
-            "experimental": os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true",
+            "scoreKind": "sigmoid_image_logit" if user_data.backend == "anomalyvfm_qnn" else "raw_top_1_percent_mean",
+            "modelName": getattr(detector, "model_name", None),
+            "experimental": user_data.backend == "anomalyvfm_qnn" or os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true",
             "validationStatus": os.getenv("NUVION_VISUALAD_VALIDATION_STATUS", "UNVERIFIED"),
-            "thresholdStatus": os.getenv("NUVION_VISUALAD_THRESHOLD_STATUS", "UNCALIBRATED"),
+            "thresholdStatus": "UNCALIBRATED" if user_data.backend == "anomalyvfm_qnn" else os.getenv("NUVION_VISUALAD_THRESHOLD_STATUS", "UNCALIBRATED"),
             "threshold": getattr(detector, "threshold", None),
             "modelSha256": getattr(user_data, "last_inference_model_sha256", None),
             "backboneSha256": getattr(detector, "backbone_sha256", None),
@@ -1951,7 +1956,7 @@ def build_dynamic_runtime_telemetry(
             "inferenceSeconds": getattr(detector, "last_inference_seconds", None),
             "inferenceCount": getattr(detector, "inference_count", 0),
             "contextCacheHit": getattr(detector, "context_cache_hit", False),
-            "processingMode": "continuous_latest" if user_data.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0 else "sampled",
+            "processingMode": "continuous_latest" if user_data.backend in {"visualad_htp", "anomalyvfm_qnn"} and ZERO_SHOT_SAMPLE_SEC <= 0 else "sampled",
             "configuredSampleSeconds": ZERO_SHOT_SAMPLE_SEC,
             "frameArrivalAgeSeconds": round(frame_age, 3) if frame_age is not None else None,
             "anomalyScore": getattr(user_data, "last_inference_score", None),
@@ -2947,7 +2952,12 @@ class NuvionEventState:
         self.last_inference_score: float | None = None
         self.last_inference_model_sha256: str | None = None
 
-        if self.backend == "visualad_htp":
+        if self.backend == "anomalyvfm_qnn":
+            if not ZERO_SHOT_ENABLED:
+                raise ValueError("AnomalyVFM requires enabled NPU inference")
+            self.zero_shot = build_anomalyvfm_detector(os.environ)
+            get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_STARTING)
+        elif self.backend == "visualad_htp":
             if os.getenv(VISUALAD_FLEET_STORE_ENV):
                 if not ZERO_SHOT_ENABLED:
                     raise ValueError("VisualAD Fleet requires enabled HTP inference")
@@ -2995,7 +3005,7 @@ class NuvionEventState:
         else:
             self.backend = "none"
 
-        if self.backend != "visualad_htp":
+        if self.backend not in {"visualad_htp", "anomalyvfm_qnn"}:
             self._htp_initialization_allowed.set()
 
         if self.face_tracking_enabled:
@@ -3090,10 +3100,14 @@ class NuvionEventState:
             and self.demo_image_duration_sec > 0
         ):
             duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
-            index = int(pts_ns // duration_ns)
+            # videorate duplicates the nearest source frame, retaining the old
+            # frame on an exact midpoint tie. With 2-second slides at 30 fps,
+            # frame 1 starts at 1.033s, not 2s. Bind ground truth to that frame.
+            index = max(0, int((pts_ns + duration_ns // 2 - 1) // duration_ns))
         elif self.demo_image_duration_sec > 0:
             elapsed = max(0.0, time.time() - self.demo_started_at)
-            index = int(elapsed / self.demo_image_duration_sec)
+            duration_ns = max(1, int(self.demo_image_duration_sec * Gst.SECOND))
+            index = max(0, int((int(elapsed * Gst.SECOND) + duration_ns // 2 - 1) // duration_ns))
 
         if index is None:
             return None
@@ -3563,7 +3577,7 @@ class NuvionEventState:
     ):
         now = time.time()
         if self.backend != "none":
-            if self.backend == "visualad_htp" and ZERO_SHOT_SAMPLE_SEC <= 0:
+            if self.backend in {"visualad_htp", "anomalyvfm_qnn"} and ZERO_SHOT_SAMPLE_SEC <= 0:
                 # One appsink producer and one inference worker: keep at most
                 # one pending frame, replacing stale work without blocking video.
                 latest = TimedInferenceFrame(
@@ -3603,7 +3617,7 @@ class NuvionEventState:
                         pass
 
     def _zsad_worker(self):
-        if self.running and self.backend == "visualad_htp" and self.zero_shot and self.zero_shot.enabled:
+        if self.running and self.backend in {"visualad_htp", "anomalyvfm_qnn"} and self.zero_shot and self.zero_shot.enabled:
             initialization_gate = getattr(self, "_htp_initialization_allowed", None)
             if initialization_gate is not None and not initialization_gate.wait(timeout=15.0):
                 log.warning(
@@ -3648,7 +3662,7 @@ class NuvionEventState:
                 demo_context = frame.demo_context
                 frame = frame.pixels
 
-            if self.backend in {"siglip", "visualad", "visualad_htp"} and self.zero_shot and self.zero_shot.enabled:
+            if self.backend in {"siglip", "visualad", "visualad_htp", "anomalyvfm_qnn"} and self.zero_shot and self.zero_shot.enabled:
                 processing_started = time.monotonic()
                 try:
                     is_anomaly, result = self.zero_shot.is_anomaly(frame)
@@ -3672,7 +3686,7 @@ class NuvionEventState:
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
-                    if self.inference_failed or self.backend == "visualad_htp":
+                    if self.inference_failed or self.backend in {"visualad_htp", "anomalyvfm_qnn"}:
                         self.inference_failed = False
                         camera_controller = getattr(self, "camera_controller", None)
                         if camera_controller is None or not camera_controller.blocks_runtime_health():
@@ -3682,14 +3696,14 @@ class NuvionEventState:
                     self.last_inference_score = score
                     self.last_inference_model_sha256 = result.get("model_sha256")
                     provenance = ""
-                    if self.backend in {"visualad", "visualad_htp"}:
+                    if self.backend in {"visualad", "visualad_htp", "anomalyvfm_qnn"}:
                         provenance = (
-                            f"VisualAD source={'demo' if self.demo_mode else VIDEO_SOURCE_ENV} "
+                            f"{'AnomalyVFM' if self.backend == 'anomalyvfm_qnn' else 'VisualAD'} source={'demo' if self.demo_mode else VIDEO_SOURCE_ENV} "
                             f"model={result.get('model_sha256', 'unknown')} "
                             f"rawAnomalyScore={score:.4f} "
                             f"threshold={self.zero_shot.threshold:.4f} "
                         )
-                        if self.backend == "visualad_htp":
+                        if self.backend in {"visualad_htp", "anomalyvfm_qnn"}:
                             provenance += (
                                 f"provider=QNN/HTP graph={result.get('graph_sha256', 'unknown')} "
                                 f"contextCache={'hit' if result.get('context_cache_hit') else 'miss'} "
@@ -3708,7 +3722,9 @@ class NuvionEventState:
                                 f"validation={os.getenv('NUVION_VISUALAD_VALIDATION_STATUS', 'UNVERIFIED')} "
                                 f"thresholdStatus={os.getenv('NUVION_VISUALAD_THRESHOLD_STATUS', 'UNCALIBRATED')} "
                             )
-                        log.info("[VISUALAD] %s status=%s", provenance, status)
+                        if self.backend == "anomalyvfm_qnn":
+                            provenance += "experimental=true thresholdStatus=UNCALIBRATED "
+                        log.info("[MODEL] %s status=%s", provenance, status)
                     overlay = OverlayPayload(
                         status=status,
                         label=label,
@@ -3720,7 +3736,7 @@ class NuvionEventState:
                         ),
                     )
                     live_overlay = f"{status} {label} {score:.2f}"
-                    if self.backend in {"visualad", "visualad_htp"} and os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true":
+                    if self.backend == "anomalyvfm_qnn" or (self.backend in {"visualad", "visualad_htp"} and os.getenv("NUVION_VISUALAD_EXPERIMENTAL", "false").lower() == "true"):
                         live_overlay = f"EXP / UNCALIBRATED {status} {score:.2f}"
                     self._set_anomaly_overlay(overlay if self.demo_mode else live_overlay)
                     trigger_reason = self.collection_trigger_reason(
@@ -4032,7 +4048,7 @@ class PipelineSettingsRuntimeAdapter:
                 return False
             if not 100 <= self.encoder.read_bitrate_kbps() <= 20_000:
                 return False
-            if isinstance(getattr(self.app.user_data, "zero_shot", None), FleetVisualADHTPAnomalyDetector):
+            if isinstance(getattr(self.app.user_data, "zero_shot", None), (FleetVisualADHTPAnomalyDetector, AnomalyVFMDetector)):
                 return self.can_verify_model()
             return True
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -4071,7 +4087,7 @@ class PipelineSettingsRuntimeAdapter:
         if self.app.pipeline is None or not self.app.user_data.running:
             return False
         try:
-            if self.app.user_data.backend == "visualad_htp":
+            if self.app.user_data.backend in {"visualad_htp", "anomalyvfm_qnn"}:
                 detector = self._fleet_visualad_detector()
                 return (
                     detector.loaded_model_proof() is not None
@@ -4082,9 +4098,9 @@ class PipelineSettingsRuntimeAdapter:
             return False
         return True
 
-    def _fleet_visualad_detector(self) -> FleetVisualADHTPAnomalyDetector:
+    def _fleet_visualad_detector(self) -> FleetVisualADHTPAnomalyDetector | AnomalyVFMDetector:
         detector = getattr(self.app.user_data, "zero_shot", None)
-        if self.app.user_data.backend != "visualad_htp" or not isinstance(detector, FleetVisualADHTPAnomalyDetector):
+        if self.app.user_data.backend not in {"visualad_htp", "anomalyvfm_qnn"} or not isinstance(detector, (FleetVisualADHTPAnomalyDetector, AnomalyVFMDetector)):
             raise UnsupportedSettingsEffect("active backend has no VisualAD Fleet model adapter")
         if (
             Path(self.model_dir).resolve(strict=True) != detector.selection.directory
@@ -4093,19 +4109,32 @@ class PipelineSettingsRuntimeAdapter:
             raise RuntimeError("active VisualAD Fleet source/pointer differs from settings runtime")
         return detector
 
+    def allows_demo_model_restart(self) -> bool:
+        # Model replacement preserves the demo input. Do not require fresh
+        # inference here: the restarted candidate must reach the health gate.
+        try:
+            return (
+                self.app.user_data.backend == "anomalyvfm_qnn"
+                and isinstance(self._fleet_visualad_detector(), AnomalyVFMDetector)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return False
+
     def startup_pending(self) -> bool:
         detector = getattr(self.app.user_data, "zero_shot", None)
         return (
-            self.app.user_data.backend == "visualad_htp"
+            self.app.user_data.backend in {"visualad_htp", "anomalyvfm_qnn"}
             and self.app.user_data.running
-            and isinstance(detector, FleetVisualADHTPAnomalyDetector)
+            and isinstance(detector, (FleetVisualADHTPAnomalyDetector, AnomalyVFMDetector))
             and detector.startup_pending()
         )
 
-    def preflight_model(self, desired) -> None:
+    def preflight_model(self, desired) -> bool | None:
         if self.app.user_data.backend == "siglip":
             return
         detector = self._fleet_visualad_detector()
+        if isinstance(detector, AnomalyVFMDetector):
+            return detector.preflight_model(desired)
         select_visualad_fleet_model(
             detector.selection.store,
             str(desired.get("pointer") or ""),
@@ -4114,7 +4143,7 @@ class PipelineSettingsRuntimeAdapter:
         )
 
     def verify_model(self, desired) -> dict[str, str]:
-        if self.app.user_data.backend == "visualad_htp":
+        if self.app.user_data.backend in {"visualad_htp", "anomalyvfm_qnn"}:
             if not self.can_verify_model():
                 raise RuntimeError("VisualAD Fleet inference is not freshly healthy")
             return self._fleet_visualad_detector().verify_model(desired)
@@ -4330,9 +4359,19 @@ class GStreamerInferenceApp:
             )
 
         if self.demo_mode:
+            demo_banner = ""
+            detector = getattr(self.user_data, "zero_shot", None)
+            if isinstance(detector, AnomalyVFMDetector):
+                scope = "DEMO-ONLY" if detector.demo_threshold_applied else "UNCALIBRATED"
+                demo_banner = (
+                    'textoverlay name=anomalyvfm_demo_banner font-desc="Sans 15" '
+                    'halignment=center valignment=bottom shaded-background=true '
+                    f'text="MVTec DEMO | NPU | {scope} threshold {detector.threshold:.3f}" ! '
+                )
             overlay_pipeline = (
                 f"{tracking_overlay_pipeline}"
                 "videoconvert ! "
+                f"{demo_banner}"
                 "textoverlay name=zsad_overlay "
                 "font-desc=\"Sans 24\" "
                 "halignment=left valignment=top "
@@ -4341,33 +4380,33 @@ class GStreamerInferenceApp:
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_status_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_STATUS_XPAD} "
+                "xpad=20 ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_label_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 14\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_LABEL_XPAD} "
+                "xpad=20 ypad=82 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_score_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_SCORE_XPAD} "
+                f"xpad={self.video_width // 3 + 10} ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
                 "! "
                 "textoverlay name=zsad_gt_overlay "
-                "font-desc=\"Monospace 24\" "
+                "font-desc=\"Monospace 20\" "
                 "halignment=left valignment=top "
-                f"xpad={DEMO_OVERLAY_GT_XPAD} "
+                f"xpad={self.video_width * 2 // 3} ypad=15 "
                 "shaded-background=true "
                 "color=4294967295 "
                 "text=\"\" "
@@ -4515,7 +4554,7 @@ class GStreamerInferenceApp:
                     model_pointer=MODEL_POINTER,
                     model_dir=(
                         self.user_data.zero_shot.selection.directory
-                        if isinstance(self.user_data.zero_shot, FleetVisualADHTPAnomalyDetector)
+                        if isinstance(self.user_data.zero_shot, (FleetVisualADHTPAnomalyDetector, AnomalyVFMDetector))
                         else resolve_model_dir(resolve_effective_profile())
                     ),
                 )
@@ -4739,10 +4778,12 @@ class GStreamerInferenceApp:
                 match_color = OVERLAY_COLOR_RED
 
             self.overlay.set_property("text", "")
-            self._set_overlay_field(self.status_overlay, text.status, match_color)
-            self._set_overlay_field(self.label_overlay, text.label)
-            self._set_overlay_field(self.score_overlay, text.score_text)
-            self._set_overlay_field(self.gt_overlay, text.ground_truth or "", match_color)
+            prediction_color = OVERLAY_COLOR_RED if text.status == "DEFECT" else OVERLAY_COLOR_GREEN
+            self._set_overlay_field(self.status_overlay, f"AI RESULT\n{text.status}", prediction_color)
+            comparison = "MATCH" if match is True else "MISMATCH" if match is False else "GT UNAVAILABLE"
+            self._set_overlay_field(self.label_overlay, comparison, match_color)
+            self._set_overlay_field(self.score_overlay, f"ANOMALY\nSCORE {text.score_text}")
+            self._set_overlay_field(self.gt_overlay, f"DATASET GT\n{(text.ground_truth or 'UNKNOWN').upper()}")
             return True
 
         resolved_text = text if isinstance(text, str) else f"{text.status} {text.label} {text.score_text}"
@@ -4766,6 +4807,8 @@ class GStreamerInferenceApp:
             return f"{prefix}ZSAD ON | WEBRTC{tracking_suffix}"
         if backend == "visualad":
             return f"{prefix}VisualAD preparing | WEBRTC{tracking_suffix}"
+        if backend == "anomalyvfm_qnn":
+            return f"{prefix}AnomalyVFM NPU preparing | WEBRTC{tracking_suffix}"
         if backend == "visualad_htp":
             return f"{prefix}VisualAD HTP preparing | WEBRTC{tracking_suffix}"
         return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
@@ -4800,7 +4843,7 @@ class GStreamerInferenceApp:
                 get_device_state_coordinator().set_runtime_status(
                     RUNTIME_STATUS_STARTING
                     if getattr(getattr(self, "user_data", None), "backend", None)
-                    == "visualad_htp"
+                    in {"visualad_htp", "anomalyvfm_qnn"}
                     else RUNTIME_STATUS_RUNNING
                 )
                 camera_controller = getattr(self, "camera_controller", None)

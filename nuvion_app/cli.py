@@ -37,7 +37,7 @@ from nuvion_app.runtime.config_guard import (
 )
 from nuvion_app.runtime.inference_mode import normalize_backend, normalize_siglip_device
 
-_BACKEND_CHOICES = ("triton", "siglip", "visualad", "visualad_htp", "mps", "none")
+_BACKEND_CHOICES = ("triton", "siglip", "visualad", "visualad_htp", "anomalyvfm_qnn", "mps", "none")
 _SIGLIP_DEVICE_CHOICES = ("auto", "mps", "cuda", "cpu")
 
 

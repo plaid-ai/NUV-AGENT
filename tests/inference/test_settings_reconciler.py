@@ -287,6 +287,48 @@ class SettingsReconcilerTest(unittest.TestCase):
         self.assertEqual(after.st_mode & 0o777, 0o640)
         self.assertEqual(self.config_path.read_bytes(), self.original)
 
+    def test_demo_model_restart_waits_for_actual_inference_before_commit(self):
+        desired = {"pointer": "anomalyvfm/ventuno-q-v16", "digest": "sha256:" + "b" * 64}
+        command = _command(9, activation="RESTART", sections={"model": desired})
+        runtime = _Runtime()
+        runtime.allows_demo_model_restart = lambda: True
+        reconciler = self._reconciler(runtime, "before")
+        reconciler._operation_mode_provider = lambda: "DEMO"
+        self.assertEqual(reconciler.reconcile(command).reported_state["health"], "RESTART_REQUIRED")
+        restarted = self._reconciler(runtime, "after")
+        restarted._operation_mode_provider = lambda: "DEMO"
+        runtime.startup_pending = lambda: True
+        self.assertEqual(restarted.reconcile(command).reported_state["health"], "MODEL_STARTUP_PENDING")
+        runtime.startup_pending = lambda: False
+        runtime.state["model"] = desired
+        self.assertEqual(restarted.reconcile(command).status, "SUCCEEDED")
+        self.assertEqual(restarted.store.marker()["phase"], "COMMITTED")
+        self.assertEqual(self.config_path.read_bytes(), self.original)
+
+    def test_demo_exception_cannot_allow_other_settings_or_unknown_mode(self):
+        desired = {"pointer": "anomalyvfm/ventuno-q-v16", "digest": "sha256:" + "b" * 64}
+        runtime = _Runtime()
+        runtime.allows_demo_model_restart = mock.Mock(return_value=True)
+        reconciler = self._reconciler(runtime, "before")
+        for mode, activation, extra in [
+            ("UNKNOWN", "RESTART", {}),
+            ("DEMO", "IMMEDIATE", {}),
+            *[("DEMO", "RESTART", {section: {}}) for section in ("video", "labels", "clip", "collection")],
+        ]:
+            with self.subTest(mode=mode, activation=activation, extra=extra):
+                reconciler._operation_mode_provider = lambda: mode
+                command = _command(9, activation=activation, sections={"model": desired, **extra})
+                self.assertEqual(reconciler.reconcile(command).code, "DEVICE_MODE_CONFLICT")
+        runtime.allows_demo_model_restart.assert_not_called()
+        reconciler._operation_mode_provider = lambda: "DEMO"
+        command = _command(9, activation="RESTART", sections={"model": desired})
+        for result in (False, None, "true"):
+            runtime.allows_demo_model_restart.return_value = result
+            self.assertEqual(reconciler.reconcile(command).code, "DEVICE_MODE_CONFLICT")
+        runtime.allows_demo_model_restart.side_effect = RuntimeError("unavailable")
+        self.assertEqual(reconciler.reconcile(command).code, "DEVICE_MODE_CONFLICT")
+        self.assertFalse((self.root / "state" / "active.env").exists())
+
     def test_label_arrays_are_encoded_losslessly_for_env_storage(self) -> None:
         labels = ["scratch,edge", "한글 label", "line\\nbreak"]
         encoded = config_env_updates(
@@ -567,6 +609,20 @@ class SettingsReconcilerTest(unittest.TestCase):
         outcome = restarted.reconcile(command)
         self.assertEqual(outcome.reported_state["health"], "ROLLBACK_RESTART_REQUIRED")
         self.assertEqual(restarted.store.marker()["phase"], "ROLLBACK_STAGED")
+
+    def test_download_pending_retries_without_staging_or_restart(self):
+        runtime = _Runtime()
+        runtime.preflight_model = mock.Mock(return_value=False)
+        command = _command(32, activation="RESTART", sections={"model": {
+            "pointer": "anomalyvfm/ventuno-q-v16", "digest": "sha256:" + "a" * 64}})
+        reconciler = self._reconciler(runtime, "before")
+        result = reconciler.reconcile(command)
+        self.assertIsInstance(result, ReconcileDeferred)
+        self.assertEqual(result.reported_state["health"], "MODEL_DOWNLOADING")
+        self.assertEqual(result.checkpoint["nextAction"], "RETRY_EFFECT")
+        self.assertFalse(result.checkpoint["restartRequired"])
+        self.assertIsNone(reconciler.store.marker())
+        self.assertFalse(reconciler.store.active_path.exists())
 
     def test_model_preflight_failure_preserves_active_overlay_and_marker(self) -> None:
         runtime = _Runtime()
