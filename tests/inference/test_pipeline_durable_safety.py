@@ -71,6 +71,29 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_anomalyvfm_demo_samples_each_slide_immediately_without_backlog(self):
+        import queue
+        state = object.__new__(pipeline.NuvionEventState)
+        state.backend = "anomalyvfm_qnn"
+        state.demo_mode = True
+        state.face_tracking_enabled = False
+        state._last_demo_inference_key = None
+        state.zero_shot_queue = queue.Queue(maxsize=1)
+        first = pipeline.DemoSampleContext("a", 0, 0, "normal")
+        second = pipeline.DemoSampleContext("b", 1, 0, "defect")
+        with mock.patch.object(pipeline, "ZERO_SHOT_SAMPLE_SEC", 60):
+            state.maybe_enqueue_frame("first", first)
+            state.maybe_enqueue_frame("duplicate", first)
+            self.assertEqual(state.zero_shot_queue.get_nowait().pixels, "first")
+            state.maybe_enqueue_frame("still duplicate", first)
+            self.assertTrue(state.zero_shot_queue.empty())
+            state.maybe_enqueue_frame("second", second)
+            third = pipeline.DemoSampleContext("a", 0, 1, "normal")
+            state.maybe_enqueue_frame("new loop", third)
+            item = state.zero_shot_queue.get_nowait()
+            self.assertEqual(item.pixels, "new loop")
+            self.assertEqual(item.demo_context, third)
+
     def _trusted_runtime(self, root: Path, registry=None):
         public_key = (
             Ed25519PrivateKey.generate()

@@ -171,7 +171,7 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
-from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions
+from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions, sample_key
 from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
@@ -2910,6 +2910,7 @@ class NuvionEventState:
         self.demo_image_duration_sec = float(demo_source.image_duration_sec) if demo_source else 0.0
         self.demo_started_at = time.time()
         self.defect_region_state = DefectRegionState()
+        self._last_demo_inference_key = None
         self.current_demo_ground_truth = self.demo_ground_truth_labels[0] if self.demo_ground_truth_labels else None
         self.demo_profile_id = (
             demo_source.profile_id if demo_source else os.getenv("NUVION_DEMO_PROFILE_ID")
@@ -3087,6 +3088,7 @@ class NuvionEventState:
 
     def reset_demo_timing(self) -> None:
         self.defect_region_state.clear()
+        self._last_demo_inference_key = None
         self.demo_started_at = time.time()
         if self.demo_ground_truth_labels:
             self.current_demo_ground_truth = self.demo_ground_truth_labels[0]
@@ -3580,7 +3582,22 @@ class NuvionEventState:
     ):
         now = time.time()
         if self.backend != "none":
-            if self.backend in {"visualad_htp", "anomalyvfm_qnn"} and ZERO_SHOT_SAMPLE_SEC <= 0:
+            if self.backend == "anomalyvfm_qnn" and self.demo_mode and demo_context is not None:
+                # Submit the first frame of each slide, not a free-running timer
+                # that can drift to the end of a slide and return too late to draw.
+                key = sample_key(demo_context)
+                if key != self._last_demo_inference_key:
+                    latest = TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context)
+                    try:
+                        self.zero_shot_queue.put_nowait(latest)
+                    except queue.Full:
+                        try:
+                            self.zero_shot_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.zero_shot_queue.put_nowait(latest)
+                    self._last_demo_inference_key = key
+            elif self.backend in {"visualad_htp", "anomalyvfm_qnn"} and ZERO_SHOT_SAMPLE_SEC <= 0:
                 # One appsink producer and one inference worker: keep at most
                 # one pending frame, replacing stale work without blocking video.
                 latest = TimedInferenceFrame(
