@@ -24,6 +24,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from nuvion_app.inference.defect_regions import extract_defect_regions
 from nuvion_app.runtime.settings_overlay import SHA256_PATTERN
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector, _require_qnn_only_profile
 
@@ -245,6 +246,7 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
         self.selection = selection_from_env(self.environ)
         demo = str(self.environ.get("NUVION_DEMO_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
         override = self.environ.get("NUVION_ANOMALYVFM_DEMO_THRESHOLD")
+        self.demo_mode_enabled = demo
         self.demo_threshold_applied = demo and override is not None
         threshold = override if self.demo_threshold_applied else self.environ.get("NUVION_ZERO_SHOT_THRESHOLD", "0.7")
         super().__init__(True, str(self.selection.manifest_path),
@@ -410,6 +412,7 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
                 self.inference_count += 1
                 self._result_at = time.monotonic()
                 return {"label": "defect" if score >= self.threshold else "normal", "score": score,
+                        "defect_regions": extract_defect_regions(self.last_anomaly_map, is_defect=score >= self.threshold) if self.demo_mode_enabled else (),
                         "raw_score": score, "backend": BACKEND, "labels": ["anomaly_score"], "scores": [score],
                         "model_sha256": self.model_sha256, "graph_sha256": self.graph_sha256,
                         "manifest_sha256": self.loaded_manifest_sha256, "image_size": 768,

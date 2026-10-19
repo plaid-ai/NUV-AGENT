@@ -171,6 +171,7 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
+from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions
 from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
@@ -2908,6 +2909,7 @@ class NuvionEventState:
         self.demo_sample_ids = tuple(demo_source.sample_ids) if demo_source else ()
         self.demo_image_duration_sec = float(demo_source.image_duration_sec) if demo_source else 0.0
         self.demo_started_at = time.time()
+        self.defect_region_state = DefectRegionState()
         self.current_demo_ground_truth = self.demo_ground_truth_labels[0] if self.demo_ground_truth_labels else None
         self.demo_profile_id = (
             demo_source.profile_id if demo_source else os.getenv("NUVION_DEMO_PROFILE_ID")
@@ -3084,6 +3086,7 @@ class NuvionEventState:
             close_detector()
 
     def reset_demo_timing(self) -> None:
+        self.defect_region_state.clear()
         self.demo_started_at = time.time()
         if self.demo_ground_truth_labels:
             self.current_demo_ground_truth = self.demo_ground_truth_labels[0]
@@ -3636,6 +3639,7 @@ class NuvionEventState:
                     except queue.Empty:
                         pass
                 else:
+                    self.defect_region_state.clear()
                     self.inference_failed = True
                     get_device_state_coordinator().set_runtime_status(
                         RUNTIME_STATUS_ERROR
@@ -3678,11 +3682,15 @@ class NuvionEventState:
                 if result is None:
                     # Missing/failed inference is not a normal inspection and
                     # must not kill the worker or create a false recovery event.
+                    self.defect_region_state.clear()
                     self.inference_failed = True
                     get_device_state_coordinator().set_runtime_status(RUNTIME_STATUS_ERROR)
                     self._set_anomaly_overlay(f"{self.backend.upper()} inference unavailable")
                     continue
                 if result:
+                    self.defect_region_state.update(
+                        demo_context, result.get("defect_regions", ()) if is_anomaly else ()
+                    )
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
@@ -4358,6 +4366,16 @@ class GStreamerInferenceApp:
                 "videoconvert ! "
             )
 
+        defect_overlay_pipeline = ""
+        if self.demo_mode and self.user_data.backend == "anomalyvfm_qnn":
+            gi.require_foreign("cairo")
+            if Gst.ElementFactory.find("cairooverlay") is None:
+                raise RuntimeError("AnomalyVFM demo localization requires cairooverlay")
+            defect_overlay_pipeline = (
+                "videoconvert ! video/x-raw,format=BGRx ! "
+                "cairooverlay name=defect_overlay ! videoconvert ! "
+            )
+
         if self.demo_mode:
             demo_banner = ""
             detector = getattr(self.user_data, "zero_shot", None)
@@ -4369,7 +4387,7 @@ class GStreamerInferenceApp:
                     f'text="MVTec DEMO | NPU | {scope} threshold {detector.threshold:.3f}" ! '
                 )
             overlay_pipeline = (
-                f"{tracking_overlay_pipeline}"
+                f"{tracking_overlay_pipeline}{defect_overlay_pipeline}"
                 "videoconvert ! "
                 f"{demo_banner}"
                 "textoverlay name=zsad_overlay "
@@ -4414,7 +4432,7 @@ class GStreamerInferenceApp:
             )
         else:
             overlay_pipeline = (
-                f"{tracking_overlay_pipeline}"
+                f"{tracking_overlay_pipeline}{defect_overlay_pipeline}"
                 "videoconvert ! "
                 "textoverlay name=zsad_overlay "
                 "font-desc=\"Sans 24\" "
@@ -4517,6 +4535,9 @@ class GStreamerInferenceApp:
             self._queue_overlay_text(self._default_overlay_text())
             self._flush_pending_overlay_text()
             GLib.timeout_add(100, self._flush_pending_overlay_text)
+        defect_overlay = self.pipeline.get_by_name("defect_overlay")
+        if defect_overlay:
+            defect_overlay.connect("draw", self._draw_defect_overlay)
         self.tracking_overlay = self.pipeline.get_by_name("tracking_overlay")
         if self.tracking_overlay:
             self.tracking_overlay.connect("draw", self._draw_tracking_overlay)
@@ -4743,6 +4764,11 @@ class GStreamerInferenceApp:
             remember=remember,
             signaling_token=signaling_token,
         )
+
+    def _draw_defect_overlay(self, _overlay, context, timestamp, _duration) -> None:
+        sample = self.user_data.resolve_demo_sample(timestamp)
+        regions = self.user_data.defect_region_state.visible(sample)
+        draw_defect_regions(context, regions, self.video_width, self.video_height)
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()
