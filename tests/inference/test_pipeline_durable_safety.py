@@ -71,6 +71,29 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_anomalyvfm_demo_samples_each_slide_immediately_without_backlog(self):
+        import queue
+        state = object.__new__(pipeline.NuvionEventState)
+        state.backend = "anomalyvfm_qnn"
+        state.demo_mode = True
+        state.face_tracking_enabled = False
+        state._last_demo_inference_key = None
+        state.zero_shot_queue = queue.Queue(maxsize=1)
+        first = pipeline.DemoSampleContext("a", 0, 0, "normal")
+        second = pipeline.DemoSampleContext("b", 1, 0, "defect")
+        with mock.patch.object(pipeline, "ZERO_SHOT_SAMPLE_SEC", 60):
+            state.maybe_enqueue_frame("first", first)
+            state.maybe_enqueue_frame("duplicate", first)
+            self.assertEqual(state.zero_shot_queue.get_nowait().pixels, "first")
+            state.maybe_enqueue_frame("still duplicate", first)
+            self.assertTrue(state.zero_shot_queue.empty())
+            state.maybe_enqueue_frame("second", second)
+            third = pipeline.DemoSampleContext("a", 0, 1, "normal")
+            state.maybe_enqueue_frame("new loop", third)
+            item = state.zero_shot_queue.get_nowait()
+            self.assertEqual(item.pixels, "new loop")
+            self.assertEqual(item.demo_context, third)
+
     def _trusted_runtime(self, root: Path, registry=None):
         public_key = (
             Ed25519PrivateKey.generate()
@@ -461,6 +484,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         safety_stop_during_inference=False,
     ):
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.running = True
         state.backend = backend
         state.inference_failed = False
@@ -515,6 +539,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_continuous_htp_keeps_only_latest_frame_without_sample_delay(self):
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.backend = "visualad_htp"
         state.zero_shot_last_sample = 100.0
         state.zero_shot_queue = pipeline.queue.Queue(maxsize=1)
@@ -534,6 +559,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_demo_sample_context_is_bound_to_pts_and_loop_before_inference(self):
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.demo_mode = True
         state.demo_ground_truth_labels = ("normal", "defect")
         state.demo_sample_ids = ("metal_nut/test/good/000.png", "metal_nut/test/scratch/001.png")
@@ -585,6 +611,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
     def test_sampled_backends_keep_existing_sampling_contract(self):
         for backend in ("visualad_htp", "visualad", "siglip", "triton"):
             state = object.__new__(pipeline.NuvionEventState)
+            state.defect_region_state = pipeline.DefectRegionState()
             state.backend = backend
             state.zero_shot_last_sample = 100.0
             state.zero_shot_queue = pipeline.queue.Queue(maxsize=1)
@@ -718,6 +745,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_htp_compiles_then_discards_startup_frame_before_fresh_inference(self):
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.running = True
         state.backend = "visualad_htp"
         state.send_status = mock.Mock()
@@ -763,6 +791,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_htp_worker_waits_for_control_plane_gate_before_preparing(self):
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.running = True
         state.backend = "visualad_htp"
         state.inference_failed = False
@@ -1635,6 +1664,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
     def test_worker_wait_joins_before_releasing_native_detector(self) -> None:
         calls: list[str] = []
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state._shutdown_lock = threading.Lock()
         state._workers_stopped = False
         state.worker_thread = mock.Mock(
@@ -1769,6 +1799,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_send_status_never_returns_before_critical_safety_boundary(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.last_sent_status = None
         state.last_status = None
         state.last_sent_at = 0.0
@@ -1811,6 +1842,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_demo_anomaly_event_contains_structured_origin_and_sample_identity(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.last_sent_status = None
         state.last_status = None
         state.last_sent_at = 0.0
@@ -1850,6 +1882,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_production_anomaly_event_contains_mode_revision_without_demo_context(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.last_sent_status = "DEFECT"
         state.last_status = None
         state.last_sent_at = 0.0
@@ -1880,6 +1913,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_forced_normal_sample_contains_structured_observation_lineage(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.last_sent_status = None
         state.last_status = None
         state.last_sent_at = 0.0
@@ -1919,6 +1953,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
 
     def test_collection_trigger_prioritizes_uncertainty_and_throttles_samples(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
+        state.defect_region_state = pipeline.DefectRegionState()
         state.demo_mode = False
         state.last_uncertain_sample_at = 90.0
         state.last_normal_sample_at = 0.0

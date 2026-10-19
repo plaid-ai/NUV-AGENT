@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PKG_NAME="nuv-agent"
-VERSION="${VERSION:-0.1.135}"
+VERSION="${VERSION:-0.1.136}"
 ARCH="${ARCH:-arm64}"
 BUILD_ROOT="${BUILD_ROOT:-}"
 SOURCE_EPOCH="${SOURCE_DATE_EPOCH:-}"
@@ -98,7 +98,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Nuvion <ops@nuvion.ai>
-Depends: python3 (>= 3.12), python3 (<< 3.13), python3-cryptography, python3-gi, curl | wget, ffmpeg, psmisc, util-linux, udev, libusb-1.0-0, v4l-utils, gstreamer1.0-tools, gstreamer1.0-nice, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gst-plugins-bad-1.0
+Depends: python3 (>= 3.12), python3 (<< 3.13), python3-cryptography, python3-gi, python3-gi-cairo, curl | wget, ffmpeg, psmisc, util-linux, udev, libusb-1.0-0, v4l-utils, gstreamer1.0-tools, gstreamer1.0-nice, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gst-plugins-bad-1.0
 Description: Nuvion on-device agent
 CONTROL
 
