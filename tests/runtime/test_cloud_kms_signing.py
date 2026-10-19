@@ -183,17 +183,18 @@ class ApprovalAuthorizationTest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("kms_authorize", ROOT / "packaging/release/authorize-kms-tag.py")
         cls.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.module)
+        cls.release_tag = "v" + cls.module.tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
 
     def env(self):
         return dict(GITHUB_REPOSITORY="plaid-ai/NUV-AGENT", GITHUB_REF="refs/heads/main",
                     GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_RUN_ATTEMPT="1", ACTOR_ID="57535980",
-                    TARGET_SHA="a" * 40, TAG_NAME="v0.1.135", TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
+                    TARGET_SHA="a" * 40, TAG_NAME=self.release_tag, TAG_MESSAGE="Reviewed evidence", GH_TOKEN="test-token")
 
     def test_valid_request_must_match_current_main(self):
         with patch.dict("os.environ", self.env(), clear=True), patch.object(
             self.module, "run", side_effect=[json.dumps({"object": {"sha": "a" * 40}}), "a" * 40, ""]
         ):
-            self.assertEqual(self.module.authorize()[:2], ("a" * 40, "v0.1.135"))
+            self.assertEqual(self.module.authorize()[:2], ("a" * 40, self.release_tag))
 
     def test_rejects_unauthorized_events_identities_and_tag_values(self):
         for field, value in (("GITHUB_REF", "refs/heads/feature"), ("GITHUB_REPOSITORY", "other/repo"),
