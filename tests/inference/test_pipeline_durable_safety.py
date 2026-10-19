@@ -71,6 +71,26 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_demo_cairo_uses_outgoing_pts_and_async_text_cannot_overwrite_it(self):
+        app = object.__new__(pipeline.GStreamerInferenceApp)
+        app.demo_mode = True
+        app.video_width = app.video_height = 768
+        app._overlay_update_lock = threading.Lock()
+        app._pending_overlay_text = pipeline.OverlayPayload("DEFECT", "defect", .9, "defect")
+        sample = pipeline.DemoSampleContext("new", 1, 0, "normal")
+        state = pipeline.DefectRegionState()
+        state.update(pipeline.DemoSampleContext("old", 0, 0, "defect"), ((.1, .2, .3, .4),), status="DEFECT", score=.9)
+        app.user_data = types.SimpleNamespace(backend="anomalyvfm_qnn", inference_failed=False,
+            resolve_demo_sample=mock.Mock(return_value=sample), defect_region_state=state)
+        app.overlay = mock.Mock()
+        self.assertTrue(app._flush_pending_overlay_text())
+        app.overlay.set_property.assert_not_called()
+        self.assertIsNone(app._pending_overlay_text)
+        with mock.patch.object(pipeline, "draw_demo_result") as draw:
+            app._draw_defect_overlay(None, "context", 123456, 0)
+            app.user_data.resolve_demo_sample.assert_called_once_with(123456)
+            draw.assert_called_once_with("context", sample, None, 768, 768, failed=False)
+
     def test_anomalyvfm_demo_samples_each_slide_immediately_without_backlog(self):
         import queue
         state = object.__new__(pipeline.NuvionEventState)
