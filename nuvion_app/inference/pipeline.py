@@ -171,7 +171,7 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
-from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions, sample_key
+from nuvion_app.inference.defect_regions import DefectRegionState, draw_demo_result, sample_key
 from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
@@ -436,7 +436,8 @@ LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
 TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
 ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
 
-CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
+# Demo inference must not record segments or request server clip storage.
+CLIP_ENABLED = not DEMO_MODE and is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
 CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 2.0)
@@ -3362,7 +3363,7 @@ class NuvionEventState:
             return None
 
     def start_clip_upload(self, event_id: str | None = None) -> str | None:
-        if not self.clip_enabled or not CLIP_ENABLED:
+        if self.demo_mode or not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
         if now - self.pipeline_started_at < CLIP_WARMUP_SEC:
@@ -3706,7 +3707,9 @@ class NuvionEventState:
                     continue
                 if result:
                     self.defect_region_state.update(
-                        demo_context, result.get("defect_regions", ()) if is_anomaly else ()
+                        demo_context, result.get("defect_regions", ()) if is_anomaly else (),
+                        status="DEFECT" if is_anomaly else "NORMAL",
+                        score=float(result.get("score", 0.0)),
                     )
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
@@ -4784,8 +4787,9 @@ class GStreamerInferenceApp:
 
     def _draw_defect_overlay(self, _overlay, context, timestamp, _duration) -> None:
         sample = self.user_data.resolve_demo_sample(timestamp)
-        regions = self.user_data.defect_region_state.visible(sample)
-        draw_defect_regions(context, regions, self.video_width, self.video_height)
+        result = self.user_data.defect_region_state.snapshot(sample)
+        draw_demo_result(context, sample, result, self.video_width, self.video_height,
+                         failed=self.user_data.inference_failed)
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()
@@ -4802,6 +4806,12 @@ class GStreamerInferenceApp:
             self._pending_overlay_text = text
 
     def _flush_pending_overlay_text(self) -> bool:
+        if self.demo_mode and self.user_data.backend == "anomalyvfm_qnn":
+            # This demo renders the complete result in the frame's Cairo draw
+            # callback. Async textoverlay properties would show the prior slide.
+            with self._overlay_update_lock:
+                self._pending_overlay_text = None
+            return True
         if not self.overlay:
             return True
 

@@ -7,6 +7,7 @@ original frame because AnomalyVFM resizes the entire RGB image without cropping.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import threading
 import time
 
@@ -70,30 +71,86 @@ class RegionSnapshot:
     key: tuple | None = None
     regions: tuple = ()
     at: float = 0.0
+    status: str = ""
+    score: float | None = None
 
 
 class DefectRegionState:
     """Hand off immutable inference results; never draw on a different slide."""
     def __init__(self):
         self._lock = threading.Lock()
-        self._snapshot = RegionSnapshot()
+        self._snapshots = OrderedDict()
 
     def clear(self):
         with self._lock:
-            self._snapshot = RegionSnapshot()
+            self._snapshots.clear()
 
-    def update(self, sample, regions, *, now=None):
+    def update(self, sample, regions, *, now=None, status="", score=None):
+        key = sample_key(sample)
+        if key is None:
+            return
         with self._lock:
-            self._snapshot = RegionSnapshot(sample_key(sample), tuple(regions),
-                                           time.monotonic() if now is None else now)
+            self._snapshots[key] = RegionSnapshot(
+                key, tuple(regions), time.monotonic() if now is None else now,
+                status, score,
+            )
+            self._snapshots.move_to_end(key)
+            # Inference and the encoded preview have independent queues. Keep a
+            # bounded history so a newer result cannot erase a visible slide.
+            while len(self._snapshots) > 8:
+                self._snapshots.popitem(last=False)
+
+    def snapshot(self, sample, *, now=None):
+        with self._lock:
+            result = self._snapshots.get(sample_key(sample))
+        if result is None:
+            return None
+        age = (time.monotonic() if now is None else now) - result.at
+        return result if 0 <= age <= 3 else None
 
     def visible(self, sample, *, now=None):
-        with self._lock:
-            result = self._snapshot
-        age = (time.monotonic() if now is None else now) - result.at
-        if result.key is None or result.key != sample_key(sample) or not 0 <= age <= 3:
-            return ()
-        return result.regions
+        result = self.snapshot(sample, now=now)
+        return result.regions if result else ()
+
+
+def draw_demo_result(context, sample, result, width, height, *, failed=False):
+    """Draw labels and regions atomically on the outgoing slide, never old text."""
+    status = result.status if result else ("UNAVAILABLE" if failed else "ANALYZING")
+    ground_truth = getattr(sample, "ground_truth", "unknown").upper()
+    score = f"{result.score:.2f}" if result and result.score is not None else "--"
+    comparison = ""
+    color = (1, 1, 1)
+    if result:
+        color = (1, .15, .1) if status == "DEFECT" else (.35, 1, .35)
+        comparison = "MATCH" if ground_truth == status else "MISMATCH"
+        if ground_truth not in {"NORMAL", "DEFECT"}:
+            comparison = "GT UNAVAILABLE"
+        if status == "DEFECT":
+            if not result.regions:
+                comparison = "LOCATION UNAVAILABLE"
+    scale = max(.5, width / 768)
+    context.save()
+    context.set_source_rgba(0, 0, 0, .78)
+    context.rectangle(0, 0, width, 100 * scale)
+    context.fill()
+    context.set_font_size(20 * scale)
+    for x, title, value, rgb in (
+        (20, "AI RESULT", status, color),
+        (width / scale / 3 + 10, "ANOMALY SCORE", score, (1, 1, 1)),
+        (width / scale * 2 / 3, "DATASET GT", ground_truth, (1, 1, 1)),
+    ):
+        context.set_source_rgb(*rgb)
+        context.move_to(x * scale, 25 * scale)
+        context.show_text(title)
+        context.move_to(x * scale, 52 * scale)
+        context.show_text(value)
+    context.set_font_size(14 * scale)
+    context.set_source_rgb(1, 1, 1)
+    context.move_to(20 * scale, 80 * scale)
+    context.show_text(comparison)
+    context.restore()
+    if result and status == "DEFECT":
+        draw_defect_regions(context, result.regions, width, height)
 
 
 def draw_defect_regions(context, regions, width, height):
