@@ -71,6 +71,14 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_demo_cannot_request_clip_storage_even_if_clip_flag_is_enabled(self):
+        state = object.__new__(pipeline.NuvionEventState)
+        state.demo_mode = True
+        state.clip_enabled = True
+        with mock.patch.object(pipeline, "CLIP_ENABLED", True):
+            self.assertIsNone(state.start_clip_upload("demo-event"))
+
+
     def test_demo_cairo_uses_outgoing_pts_and_async_text_cannot_overwrite_it(self):
         app = object.__new__(pipeline.GStreamerInferenceApp)
         app.demo_mode = True

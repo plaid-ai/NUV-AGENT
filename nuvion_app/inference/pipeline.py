@@ -436,7 +436,8 @@ LOCAL_DISPLAY = is_truthy(os.getenv("NUVION_LOCAL_DISPLAY", "false"))
 TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
 ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
 
-CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
+# Demo inference must not record segments or request server clip storage.
+CLIP_ENABLED = not DEMO_MODE and is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
 CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 2.0)
@@ -3362,7 +3363,7 @@ class NuvionEventState:
             return None
 
     def start_clip_upload(self, event_id: str | None = None) -> str | None:
-        if not self.clip_enabled or not CLIP_ENABLED:
+        if self.demo_mode or not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
         if now - self.pipeline_started_at < CLIP_WARMUP_SEC:
