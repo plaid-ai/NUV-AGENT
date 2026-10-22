@@ -3347,6 +3347,9 @@ class NuvionEventState:
         return result.object_name if result else None
 
     def capture_snapshot_upload_metadata(self):
+        # Local playback must not wait for synchronous cloud media uploads.
+        if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
+            return None
         if not SNAPSHOT_ENABLED:
             return None
 
@@ -3363,6 +3366,8 @@ class NuvionEventState:
             return None
 
     def start_clip_upload(self, event_id: str | None = None) -> str | None:
+        if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
+            return None
         if not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
