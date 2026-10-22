@@ -4320,6 +4320,7 @@ class GStreamerInferenceApp:
         self._supervisor_restart_requested = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
+        self.local_demo: LocalDemoServer | None = None
 
         self.create_pipeline()
 
@@ -4460,7 +4461,6 @@ class GStreamerInferenceApp:
                 "! "
             )
 
-        self.local_demo = None
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             assets = os.getenv("NUVION_LOCAL_DEMO_ASSETS", "/opt/nuv-agent/share/local-demo")
             self.local_demo = LocalDemoServer(assets)
@@ -4894,8 +4894,9 @@ class GStreamerInferenceApp:
                 sigterm_source.destroy()
                 raise RuntimeError("GLib SIGTERM source could not be attached")
             try:
-                if self.local_demo is not None:
-                    self.local_demo.start()
+                local_demo = getattr(self, "local_demo", None)
+                if local_demo is not None:
+                    local_demo.start()
                     log.info("[LOCAL-DEMO] http://localhost:8080 ready")
                 state_result = self.pipeline.set_state(Gst.State.PLAYING)
                 if state_result == Gst.StateChangeReturn.FAILURE:
