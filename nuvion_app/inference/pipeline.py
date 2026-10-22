@@ -31,6 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
+from nuvion_app.inference.local_demo import LocalDemoServer, preview_branch
 from nuvion_app import build_info
 from nuvion_app.config import load_env, resolve_config_path
 import aiohttp
@@ -3346,6 +3347,9 @@ class NuvionEventState:
         return result.object_name if result else None
 
     def capture_snapshot_upload_metadata(self):
+        # Local playback must not wait for synchronous cloud media uploads.
+        if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
+            return None
         if not SNAPSHOT_ENABLED:
             return None
 
@@ -3362,6 +3366,8 @@ class NuvionEventState:
             return None
 
     def start_clip_upload(self, event_id: str | None = None) -> str | None:
+        if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
+            return None
         if not self.clip_enabled or not CLIP_ENABLED:
             return None
         now = time.time()
@@ -4319,6 +4325,7 @@ class GStreamerInferenceApp:
         self._supervisor_restart_requested = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
+        self.local_demo: LocalDemoServer | None = None
 
         self.create_pipeline()
 
@@ -4459,6 +4466,11 @@ class GStreamerInferenceApp:
                 "! "
             )
 
+        if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
+            assets = os.getenv("NUVION_LOCAL_DEMO_ASSETS", "/opt/nuv-agent/share/local-demo")
+            self.local_demo = LocalDemoServer(assets)
+            overlay_pipeline += preview_branch()
+
         uplink_pipeline = build_uplink_pipeline(
             rtp_ssrc=self.rtp_ssrc,
             clip_enabled=CLIP_ENABLED,
@@ -4534,6 +4546,10 @@ class GStreamerInferenceApp:
                 on_failure=self._on_depthai_failure,
                 logger=log,
             )
+
+        if self.local_demo is not None:
+            local_sink = self.pipeline.get_by_name("local_demo_sink")
+            local_sink.connect("new-sample", self._publish_local_demo_frame)
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -4856,6 +4872,13 @@ class GStreamerInferenceApp:
             return f"{prefix}VisualAD HTP preparing | WEBRTC{tracking_suffix}"
         return f"{prefix}ZSAD OFF | WEBRTC{tracking_suffix}"
 
+    def _publish_local_demo_frame(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is not None and self.local_demo is not None:
+            buffer = sample.get_buffer()
+            self.local_demo.publish(buffer.extract_dup(0, buffer.get_size()))
+        return Gst.FlowReturn.OK
+
     def run(self):
         def _start():
             log.info("Starting GStreamer main loop...")
@@ -4876,6 +4899,10 @@ class GStreamerInferenceApp:
                 sigterm_source.destroy()
                 raise RuntimeError("GLib SIGTERM source could not be attached")
             try:
+                local_demo = getattr(self, "local_demo", None)
+                if local_demo is not None:
+                    local_demo.start()
+                    log.info("[LOCAL-DEMO] http://localhost:8080 ready")
                 state_result = self.pipeline.set_state(Gst.State.PLAYING)
                 if state_result == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError("GStreamer pipeline failed to enter PLAYING")
@@ -4926,6 +4953,9 @@ class GStreamerInferenceApp:
             if self._shutdown_complete:
                 return
             self._shutdown_complete = True
+        local_demo = getattr(self, "local_demo", None)
+        if local_demo is not None:
+            local_demo.close()
         self.user_data.request_stop()
         camera_controller = getattr(self, "camera_controller", None)
         if camera_controller is not None:

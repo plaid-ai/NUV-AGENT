@@ -1797,6 +1797,43 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         self.assertFalse(gate.health_overlay()["durableSafetyRetained"])
         self.assertEqual(coordinator.runtime_statuses, [pipeline.RUNTIME_STATUS_ERROR])
 
+    def test_snapshot_upload_remains_enabled_outside_local_demo(self) -> None:
+        for demo_mode, enabled in ((False, "1"), (True, "0")):
+            with self.subTest(demo_mode=demo_mode, enabled=enabled):
+                state = object.__new__(pipeline.NuvionEventState)
+                state.demo_mode = demo_mode
+                state.latest_frame = mock.Mock()
+                with (
+                    mock.patch.dict(pipeline.os.environ, {"NUVION_LOCAL_DEMO_ENABLED": enabled}),
+                    mock.patch.object(pipeline, "SNAPSHOT_ENABLED", True),
+                    mock.patch.object(pipeline, "capture_and_upload_snapshot_with_metadata", return_value="uploaded") as upload,
+                ):
+                    self.assertEqual(state.capture_snapshot_upload_metadata(), "uploaded")
+                upload.assert_called_once()
+
+    def test_local_demo_skips_cloud_media_but_preserves_anomaly_event(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.last_sent_status = None
+        state.last_status = None
+        state.last_sent_at = 0.0
+        state.demo_mode = True
+        state.demo_tag = "[DEMO]"
+        state.demo_session_id = "local-demo"
+        state.demo_profile_id = "test"
+        with (
+            mock.patch.dict(pipeline.os.environ, {"NUVION_LOCAL_DEMO_ENABLED": "1"}),
+            mock.patch.object(pipeline, "SNAPSHOT_ENABLED", True),
+            mock.patch.object(pipeline, "get_device_state_coordinator", return_value=_Coordinator()),
+            mock.patch.object(pipeline, "request_upload_url", side_effect=AssertionError("network on inference thread")) as upload,
+            mock.patch.object(pipeline, "persist_critical_event", return_value=object()) as persist,
+        ):
+            state.send_status("DEFECT", "scratch", "detected", "WARNING")
+        upload.assert_not_called()
+        payload = persist.call_args.args[2]
+        self.assertIsNone(payload["snapshotObject"])
+        self.assertIsNone(payload["clipObject"])
+        self.assertEqual(payload["anomalyStatus"], "DEFECT")
+
     def test_send_status_never_returns_before_critical_safety_boundary(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
         state.defect_region_state = pipeline.DefectRegionState()
