@@ -474,12 +474,11 @@ def build_video_source_pipeline(
     current_platform = platform_name or sys.platform
 
     if demo_mode and demo_video:
-        uri = Path(demo_video).resolve().as_uri()
-        return (f'uridecodebin uri="{uri}" caps="video/x-raw" ! '
-                'videoconvert ! videoscale add-borders=true ! videorate ! '
-                f'video/x-raw,width={width},height={height},pixel-aspect-ratio=1/1,framerate={fps}/1 ! '
-                'videoconvert ! video/x-raw,format=RGB ! '
-                'identity name=demo_realtime_clock sync=true')
+        return (
+            'appsrc name=demo_video_source is-live=true format=time do-timestamp=true '
+            'block=false max-buffers=2 max-bytes=0 max-time=0 leaky-type=downstream '
+            f'caps="video/x-raw,format=RGB,width={width},height={height},pixel-aspect-ratio=1/1,framerate={fps}/1"'
+        )
 
     if demo_mode:
         mvtec_source = demo_source or prepare_mvtec_demo_source(
