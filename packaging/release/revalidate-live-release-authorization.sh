@@ -32,6 +32,7 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \
   "$script_dir/verify-release-readiness.py" \
   --policy "$script_dir/release-readiness.json" \
   --version "$RELEASE_AUTH_VERSION" \
+  --target "${RELEASE_AUTH_TARGET:-iq9075}" \
   --component-sha "$RELEASE_AUTH_COMPONENT_SHA" \
   --gate-run-id "$RELEASE_AUTH_GATE_RUN_ID" \
   --gate-check-id "$RELEASE_AUTH_GATE_CHECK_ID" \

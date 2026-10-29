@@ -3824,6 +3824,7 @@ def _validate_ready_evidence(
 ) -> dict[str, str]:
     common_fields = {"componentSha", "agentReleaseGate"}
     runtime_fields = common_fields | {"iq9075FleetRuntime"}
+    pro_fields = common_fields | {"proDemoRuntime"}
     legacy_fields = common_fields | {"iq9075Physical"}
     try:
         version_tuple = tuple(int(part) for part in version.split("."))
@@ -3832,14 +3833,14 @@ def _validate_ready_evidence(
     if (
         not isinstance(decision, dict)
         or frozenset(decision)
-        not in {frozenset(runtime_fields), frozenset(legacy_fields)}
+        not in {frozenset(runtime_fields), frozenset(legacy_fields), frozenset(pro_fields)}
         or component_sha is None
         or not SHA.fullmatch(component_sha)
         or decision.get("componentSha") != component_sha
         or gate_evidence is None
         or (
             version_tuple >= FLEET_RUNTIME_REQUIRED_FROM
-            and frozenset(decision) != frozenset(runtime_fields)
+            and frozenset(decision) not in {frozenset(runtime_fields), frozenset(pro_fields)}
         )
     ):
         raise ReadinessError("READY release lacks exact component evidence")
@@ -3864,9 +3865,11 @@ def _validate_ready_evidence(
         )
 
     evidence_key = (
+        "proDemoRuntime" if "proDemoRuntime" in decision else
         "iq9075FleetRuntime" if "iq9075FleetRuntime" in decision else "iq9075Physical"
     )
     evidence_kind = (
+        "Pro demo" if evidence_key == "proDemoRuntime" else
         "Fleet Runtime" if evidence_key == "iq9075FleetRuntime" else "physical"
     )
     signed_evidence = decision.get(evidence_key)
@@ -3951,6 +3954,8 @@ def _validate_ready_evidence(
         raise ReadinessError(f"{evidence_kind} evidence signer differs from readiness")
 
     document = _strict_object(evidence_raw, label=f"IQ9075 {evidence_kind} evidence")
+    if evidence_key == "proDemoRuntime":
+        return _validate_pro_demo_document(document, version, component_sha)
     if evidence_key == "iq9075FleetRuntime":
         assert candidate_fleet_runner is not None
         assert candidate_config_stream_runner is not None
@@ -3980,10 +3985,81 @@ def _validate_ready_evidence(
     )
 
 
+def _validate_pro_demo_document(document: dict, version: str, component_sha: str) -> dict[str, str]:
+    """Qualify the recorded Pro demo stack only; never grants IQ9075 OTA authority."""
+    required = {"schemaVersion", "target", "version", "componentSha", "qualifiedCapabilities",
+                "excludedCapabilities", "device", "package", "bundleSha256", "runnerSha256",
+                "runtimeFiles", "observations", "restart", "recordedAt"}
+    if not isinstance(document, dict) or set(document) != required or type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1:
+        raise ReadinessError("invalid Pro evidence schema")
+    if (document.get("target") != "pro-demo" or document.get("version") != version
+            or document.get("componentSha") != component_sha):
+        raise ReadinessError("Pro evidence identity mismatch")
+    if document["qualifiedCapabilities"] != ["package-install", "local-demo", "qnn-htp-inference", "video-loop", "service-restart"]:
+        raise ReadinessError("invalid Pro qualification scope")
+    if document["excludedCapabilities"] != ["iq9075-ota", "camera-csi", "openrb-motor", "production-accuracy"]:
+        raise ReadinessError("Pro exclusions must remain explicit")
+    try:
+        recorded = dt.datetime.fromisoformat(document["recordedAt"])
+        if recorded.tzinfo is None:
+            raise ValueError("timezone required")
+    except (TypeError, ValueError) as exc:
+        raise ReadinessError("invalid Pro evidence timestamp") from exc
+    device = document["device"]
+    if not isinstance(device, dict) or device.get("architecture") != "aarch64" or device.get("profile") != "ventuno-q-prototype":
+        raise ReadinessError("invalid Pro device identity")
+    package = document["package"]
+    if (not isinstance(package, dict) or package.get("name") != f"nuv-agent_{version}_arm64.deb"
+            or package.get("installedVersion") != version
+            or package.get("installedComponentSha") != component_sha
+            or type(package.get("size")) is not int or package["size"] <= 0):
+        raise ReadinessError("Pro installed package mismatch")
+    for value in (package.get("sha256"), document["bundleSha256"], document["runnerSha256"]):
+        if not isinstance(value, str) or not SHA256.fullmatch(value):
+            raise ReadinessError("invalid Pro artifact digest")
+    runner = Path(__file__).with_name("qualify-pro-demo.py")
+    if hashlib.sha256(_regular_bytes(runner)).hexdigest() != document["runnerSha256"]:
+        raise ReadinessError("Pro qualification runner differs from trusted publisher")
+    runtime_files = document["runtimeFiles"]
+    if not isinstance(runtime_files, dict) or not runtime_files:
+        raise ReadinessError("Pro runtime stack manifest is missing")
+    for name, digest in runtime_files.items():
+        if not isinstance(name, str) or not name.startswith("/opt/nuv-agent/") or not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            raise ReadinessError("invalid Pro runtime stack manifest")
+    observations = document["observations"]
+    if not isinstance(observations, list) or any(not isinstance(item, dict) for item in observations) or {item.get("profile") for item in observations} != {"mvtec", "video-1", "video-2"} or len(observations) != 3:
+        raise ReadinessError("all Pro demo profiles must be qualified")
+    for item in observations:
+        duration = item.get("durationSeconds")
+        if not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration < 35:
+            raise ReadinessError("Pro profile observation is too short")
+        frames = item.get("frames")
+        if not isinstance(frames, list) or len(frames) < 15 or any(not isinstance(f, dict) or f.get("httpStatus") != 200 or not isinstance(f.get("sha256"), str) or not SHA256.fullmatch(f["sha256"]) for f in frames):
+            raise ReadinessError("Pro preview frames are unavailable")
+        sequences = [f.get("sequence") for f in frames]
+        if any(type(n) is not int for n in sequences) or any(b <= a for a, b in zip(sequences, sequences[1:])) or len({f["sha256"] for f in frames}) < 5:
+            raise ReadinessError("Pro preview is stale")
+        samples = item.get("inferenceSeconds")
+        if (item.get("provider") != "QNN/HTP" or not isinstance(samples, list) or len(samples) < 20
+                or any(type(v) not in (int, float) or not math.isfinite(v) or not 0 < v <= 1.7 for v in samples)):
+            raise ReadinessError("Pro NPU inference is missing or slower than demo cadence")
+        if item.get("processStable") is not True or item.get("runtimeErrors") != []:
+            raise ReadinessError("Pro runtime failed during qualification")
+        if item["profile"] != "mvtec" and (type(item.get("loops")) is not int or item["loops"] < 3):
+            raise ReadinessError("Pro video did not repeat continuously")
+    restart = document["restart"]
+    if not isinstance(restart, dict) or restart.get("pidChanged") is not True or restart.get("httpStatus") != 200 or restart.get("selectedProfile") != "video-1" or restart.get("inferenceResumed") is not True:
+        raise ReadinessError("Pro restart recovery failed")
+    return {"qualification_target": "pro-demo", "physical_artifact_sha256": document["bundleSha256"],
+            "physical_bom_sha256": "", "tested_deb_name": package["name"],
+            "tested_deb_sha256": package["sha256"], "tested_deb_size": str(package["size"])}
+
+
 def verify_readiness(
     path: Path,
     *,
     version: str,
+    target: str = "iq9075",
     component_sha: str | None = None,
     gate_evidence: dict[str, object] | None = None,
     security_policy: Path | None = None,
@@ -3995,6 +4071,8 @@ def verify_readiness(
     candidate_installer: Path | None = None,
     candidate_rollout_control: Path | None = None,
 ) -> dict[str, str]:
+    if target not in {"iq9075", "pro-demo"}:
+        raise ReadinessError("unknown qualification target")
     if not SEMVER.fullmatch(version):
         raise ReadinessError("release readiness version must be exact SemVer")
     payload = _load(path)
@@ -4035,6 +4113,9 @@ def verify_readiness(
         raise ReadinessError(
             f"release {version} is blocked by: {', '.join(sorted(blocker_ids))}"
         )
+    is_pro = isinstance(release.get("evidence"), dict) and "proDemoRuntime" in release["evidence"]
+    if is_pro != (target == "pro-demo"):
+        raise ReadinessError("release evidence does not qualify the requested target")
     return _validate_ready_evidence(
         policy_path=path,
         version=version,
@@ -4062,6 +4143,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--target", choices=("iq9075", "pro-demo"), default="iq9075")
     parser.add_argument("--component-sha")
     parser.add_argument("--gate-run-id", type=int)
     parser.add_argument("--gate-check-id", type=int)
@@ -4081,6 +4163,7 @@ def main() -> int:
         result = verify_readiness(
             arguments.policy,
             version=arguments.version,
+            target=arguments.target,
             component_sha=arguments.component_sha,
             gate_evidence={
                 "componentSha": arguments.component_sha,
