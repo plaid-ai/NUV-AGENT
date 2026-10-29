@@ -11,6 +11,11 @@ on:
       tag:
         description: "Existing signed tag to release (for example v0.1.134)"
         required: true
+      qualification_target:
+        description: "Hardware qualification scope (Pro demo never authorizes IQ9075 OTA)"
+        type: choice
+        options: [iq9075, pro-demo]
+        default: iq9075
       publish_iq9075_ota:
         description: "Publish and promote the signed IQ9075_DEV OTA bundle"
         required: false
@@ -44,6 +49,7 @@ jobs:
       checks: read
       contents: read
     outputs:
+      qualification_target: ${{ steps.request.outputs.qualification_target }}
       release_tag: ${{ steps.identity.outputs.tag }}
       tag_object_sha: ${{ steps.identity.outputs.tag_object_sha }}
       release_version: ${{ steps.identity.outputs.version }}
@@ -68,6 +74,7 @@ jobs:
       - name: Resolve request without credentials
         id: request
         env:
+          QUALIFICATION_TARGET: ${{ inputs.qualification_target || 'iq9075' }}
           REQUESTED_TAG: ${{ inputs.tag }}
           REQUEST_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
           REQUEST_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -94,6 +101,10 @@ jobs:
             || { echo "RELEASE_TRUSTED_PUBLISHER_SHA is not configured" >&2; exit 1; }
           [ "$SECURITY_POLICY_VERSION" = "1" ] \
             || { echo "RELEASE_SECURITY_POLICY_VERSION must be 1" >&2; exit 1; }
+          case "$QUALIFICATION_TARGET" in iq9075|pro-demo) ;; *) exit 1 ;; esac
+          if [ "$QUALIFICATION_TARGET" = "pro-demo" ] && [ "$PUBLISH_OTA" = "true" ]; then
+            echo "Pro demo evidence cannot authorize IQ9075 OTA" >&2; exit 1
+          fi
           if [ "$PUBLISH_OTA" = "true" ]; then
             [[ "${REQUESTED_SEQUENCE:-}" =~ ^[1-9][0-9]*$ ]] \
               || { echo "OTA release_sequence must be a positive integer" >&2; exit 1; }
@@ -102,6 +113,7 @@ jobs:
             exit 1
           fi
           {
+            echo "qualification_target=$QUALIFICATION_TARGET"
             echo "tag=$TAG"
             echo "trusted_publisher_sha=$TRUSTED_PUBLISHER_SHA"
             echo "requested_sequence=${REQUESTED_SEQUENCE:-}"
@@ -235,6 +247,7 @@ jobs:
       - name: Enforce audited dependency release readiness
         id: readiness
         env:
+          QUALIFICATION_TARGET: ${{ steps.request.outputs.qualification_target }}
           VERSION: ${{ steps.identity.outputs.version }}
           COMPONENT_SHA: ${{ steps.identity.outputs.component_sha }}
           GATE_RUN_ID: ${{ steps.release-gate.outputs.gate_run_id }}
@@ -245,6 +258,7 @@ jobs:
           set -euo pipefail
           env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -I -B \
             publisher/packaging/release/verify-release-readiness.py \
+            --target "$QUALIFICATION_TARGET" \
             --policy publisher/packaging/release/release-readiness.json \
             --version "$VERSION" \
             --component-sha "$COMPONENT_SHA" \
@@ -512,6 +526,7 @@ jobs:
       contents: write
     environment: homebrew-release
     env:
+      RELEASE_AUTH_TARGET: ${{ needs.release-preflight.outputs.qualification_target }}
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
       RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
       RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
@@ -747,6 +762,7 @@ jobs:
     env:
       TAP_REPO: plaid-ai/homebrew-NUV-AGENT-HOMEBREW
       FORMULA_PATH: Formula/nuv-agent.rb
+      RELEASE_AUTH_TARGET: ${{ needs.release-preflight.outputs.qualification_target }}
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
       RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
       RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
@@ -884,6 +900,7 @@ jobs:
       GPG_KEY_ID: E5230C3090A66BC5
       BUCKET: apt.plaidai.io
       APT_RUNTIME_ROOT: ${{ github.workspace }}/apt-runtime
+      RELEASE_AUTH_TARGET: ${{ needs.release-preflight.outputs.qualification_target }}
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
       RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
       RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
@@ -1215,6 +1232,7 @@ jobs:
       id-token: write
     env:
       APT_RUNTIME_ROOT: ${{ github.workspace }}/nuv-ota-publish-runtime
+      RELEASE_AUTH_TARGET: ${{ needs.release-preflight.outputs.qualification_target }}
       RELEASE_AUTH_VERSION: ${{ needs.release-preflight.outputs.release_version }}
       RELEASE_AUTH_COMPONENT_SHA: ${{ needs.release-preflight.outputs.component_sha }}
       RELEASE_AUTH_GATE_RUN_ID: ${{ needs.release-preflight.outputs.gate_run_id }}
