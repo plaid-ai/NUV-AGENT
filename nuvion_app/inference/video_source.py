@@ -462,6 +462,7 @@ def build_video_source_pipeline(
     demo_mode: bool = False,
     platform_name: str | None = None,
     demo_source: MvtecDemoSource | None = None,
+    demo_video: str | None = None,
 ) -> str:
     if demo_mode and gst_source_override and gst_source_override.strip():
         raise ValueError(
@@ -471,6 +472,14 @@ def build_video_source_pipeline(
         return _append_video_transforms(gst_source_override.strip())
 
     current_platform = platform_name or sys.platform
+
+    if demo_mode and demo_video:
+        uri = Path(demo_video).resolve().as_uri()
+        return (f'uridecodebin uri="{uri}" caps="video/x-raw" ! '
+                'videoconvert ! videoscale add-borders=true ! videorate ! '
+                f'video/x-raw,width={width},height={height},pixel-aspect-ratio=1/1,framerate={fps}/1 ! '
+                'videoconvert ! video/x-raw,format=RGB ! '
+                'identity name=demo_realtime_clock sync=true')
 
     if demo_mode:
         mvtec_source = demo_source or prepare_mvtec_demo_source(

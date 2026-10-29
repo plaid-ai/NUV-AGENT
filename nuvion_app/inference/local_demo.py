@@ -1,6 +1,7 @@
-"""Read-only, loopback-only display for demo frames. No cloud/auth dependencies."""
+"""Loopback-only demo display and allowlisted input selection. No cloud/auth dependencies."""
 from __future__ import annotations
 
+import json
 import mimetypes
 import threading
 import time
@@ -22,7 +23,9 @@ def preview_branch() -> str:
 
 
 class LocalDemoServer:
-    def __init__(self, assets: str | Path, port: int = 8080):
+    def __init__(self, assets: str | Path, port: int = 8080, profiles=None, restart=None):
+        self.profiles = profiles
+        self.restart = restart
         self.assets = Path(assets).resolve()
         self._lock = threading.Lock()
         self._jpeg = b''
@@ -72,6 +75,30 @@ class LocalDemoServer:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_POST(self):
+                allowed = {f'localhost:{owner.port}', f'127.0.0.1:{owner.port}'}
+                if (self.headers.get('Host') not in allowed
+                    or self.headers.get('Origin') not in {f'http://{host}' for host in allowed}
+                    or self.headers.get('Content-Type') != 'application/json'):
+                    self.send_bytes(403, b'Local control only')
+                    return
+                if self.path != '/api/profile' or owner.profiles is None or owner.restart is None:
+                    self.send_bytes(404, b'Not found')
+                    return
+                try:
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < size <= 1024:
+                        raise ValueError('Invalid request size')
+                    body = json.loads(self.rfile.read(size))
+                    result = owner.profiles.select(body['id'], owner.restart)
+                    self.send_bytes(202, json.dumps(result).encode(), 'application/json')
+                except (ValueError, KeyError, TypeError):
+                    self.send_bytes(400, b'Invalid demo profile')
+                except RuntimeError:
+                    self.send_bytes(409, b'Demo switch unavailable')
+                except OSError:
+                    self.send_bytes(503, b'Demo selection storage unavailable')
+
             def do_GET(self):
                 # Reject DNS rebinding and non-local origins even though we bind loopback.
                 allowed = {f'localhost:{owner.port}', f'127.0.0.1:{owner.port}'}
@@ -83,6 +110,9 @@ class LocalDemoServer:
                     self.send_bytes(403, b'Local display only')
                     return
                 path = unquote(urlsplit(self.path).path)
+                if path == '/api/profiles' and owner.profiles is not None:
+                    self.send_bytes(200, json.dumps(owner.profiles.snapshot()).encode(), 'application/json')
+                    return
                 if path == '/api/frame.jpg':
                     jpeg, sequence, _age = owner.snapshot()
                     if jpeg is None:

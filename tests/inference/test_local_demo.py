@@ -70,6 +70,30 @@ class LocalDemoHandlerTest(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read(), dict(exc.headers)
 
+    def test_profile_control_requires_origin_and_valid_profile(self):
+        import urllib.request
+        import urllib.error
+        from nuvion_app.inference.demo_profiles import DemoProfiles
+        root = Path(self._tmp.name)
+        (root / "video.mp4").write_bytes(b"video")
+        (root / "profiles.json").write_text('[{"id":"video","name":"Video","file":"video.mp4"}]')
+        self.server.profiles = DemoProfiles(root)
+        self.server.restart = lambda: True
+        def post(body, origin=None):
+            headers = {"Content-Type": "application/json"}
+            if origin: headers["Origin"] = origin
+            request = urllib.request.Request(self.base + "/api/profile", data=body, headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    return response.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+        self.assertEqual(post(b'{"id":"video"}'), 403)
+        self.assertEqual(post(b'{"id":"video"}', 'https://evil.example'), 403)
+        self.assertEqual(post(b'{"id":"missing"}', self.base), 400)
+        self.assertEqual(post(b'{"id":"video"}', self.base), 202)
+        self.assertEqual(self.server.profiles.pending_id, 'video')
+
     def test_serves_index_and_assets(self) -> None:
         status, body, headers = self._get("/")
         self.assertEqual(status, 200)

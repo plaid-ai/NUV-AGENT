@@ -87,11 +87,11 @@ class DefectRegionState:
             self._snapshot = RegionSnapshot(sample_key(sample), tuple(regions),
                                            time.monotonic() if now is None else now)
 
-    def visible(self, sample, *, now=None):
+    def visible(self, sample, *, now=None, max_age=3):
         with self._lock:
             result = self._snapshot
         age = (time.monotonic() if now is None else now) - result.at
-        if result.key is None or result.key != sample_key(sample) or not 0 <= age <= 3:
+        if result.key is None or result.key != sample_key(sample) or not 0 <= age <= max_age:
             return ()
         return result.regions
 

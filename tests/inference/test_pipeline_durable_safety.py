@@ -71,6 +71,27 @@ class _Coordinator:
 
 
 class PipelineDurableSafetyTest(unittest.TestCase):
+    def test_video_demo_keeps_latest_frame_even_with_slide_sampling_interval(self):
+        import queue
+        state = object.__new__(pipeline.NuvionEventState)
+        state.backend = "anomalyvfm_qnn"
+        state.demo_mode = True
+        state.demo_video_id = "video-1"
+        state.face_tracking_enabled = False
+        state.zero_shot_queue = queue.Queue(maxsize=1)
+        context = pipeline.DemoSampleContext("video-1", 0, 2, "unknown")
+        with mock.patch.object(pipeline, "ZERO_SHOT_SAMPLE_SEC", 60):
+            state.maybe_enqueue_frame("first", context)
+            state.maybe_enqueue_frame("latest", context)
+        self.assertEqual(state.zero_shot_queue.get_nowait().pixels, "latest")
+
+    def test_local_video_does_not_emit_invalid_dataset_events(self):
+        state = object.__new__(pipeline.NuvionEventState)
+        state.demo_video_id = "video-1"
+        with mock.patch.object(pipeline, "get_device_state_coordinator") as coordinator:
+            state.send_status("DEFECT", "visual", "local video", "WARNING")
+        coordinator.assert_not_called()
+
     def test_anomalyvfm_demo_samples_each_slide_immediately_without_backlog(self):
         import queue
         state = object.__new__(pipeline.NuvionEventState)

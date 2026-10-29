@@ -57,6 +57,7 @@ from nuvion_app.inference.fleet_command import (
 )
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
+from nuvion_app.inference.demo_profiles import DemoProfiles
 from nuvion_app.inference.device_mode import (
     DeviceModeReconciler,
     DeviceModeStore,
@@ -3088,6 +3089,7 @@ class NuvionEventState:
             close_detector()
 
     def reset_demo_timing(self) -> None:
+        self.demo_video_generation = getattr(self, "demo_video_generation", 0) + 1
         self.defect_region_state.clear()
         self._last_demo_inference_key = None
         self.demo_started_at = time.time()
@@ -3095,6 +3097,8 @@ class NuvionEventState:
             self.current_demo_ground_truth = self.demo_ground_truth_labels[0]
 
     def resolve_demo_sample(self, pts_ns: int | None) -> DemoSampleContext | None:
+        if getattr(self, "demo_video_id", None):
+            return DemoSampleContext(self.demo_video_id, 0, self.demo_video_generation, "unknown")
         if not self.demo_mode or not self.demo_ground_truth_labels:
             return None
 
@@ -3238,6 +3242,8 @@ class NuvionEventState:
         inference_seconds: float | None = None,
         content_digest: str | None = None,
     ):
+        if getattr(self, "demo_video_id", None):
+            return  # Local video profiles have no central dataset/GT contract.
         now = time.time()
         inspection_status = INSPECTION_STATUS_DEFECT if status == "DEFECT" else INSPECTION_STATUS_NORMAL
         get_device_state_coordinator().set_inspection_status(inspection_status)
@@ -3588,7 +3594,7 @@ class NuvionEventState:
     ):
         now = time.time()
         if self.backend != "none":
-            if self.backend == "anomalyvfm_qnn" and self.demo_mode and demo_context is not None:
+            if self.backend == "anomalyvfm_qnn" and self.demo_mode and demo_context is not None and not getattr(self, "demo_video_id", None):
                 # Submit the first frame of each slide, not a free-running timer
                 # that can drift to the end of a slide and return too late to draw.
                 key = sample_key(demo_context)
@@ -3603,7 +3609,7 @@ class NuvionEventState:
                             pass
                         self.zero_shot_queue.put_nowait(latest)
                     self._last_demo_inference_key = key
-            elif self.backend in {"visualad_htp", "anomalyvfm_qnn"} and ZERO_SHOT_SAMPLE_SEC <= 0:
+            elif self.backend in {"visualad_htp", "anomalyvfm_qnn"} and (ZERO_SHOT_SAMPLE_SEC <= 0 or getattr(self, "demo_video_id", None)):
                 # One appsink producer and one inference worker: keep at most
                 # one pending frame, replacing stale work without blocking video.
                 latest = TimedInferenceFrame(
@@ -3702,6 +3708,9 @@ class NuvionEventState:
                     break
                 if critical_event_safety_gate.is_stopped():
                     continue
+                if (getattr(self, "demo_video_id", None) and demo_context is not None
+                        and demo_context.loop_index != self.demo_video_generation):
+                    continue  # Discard inference from the preceding video loop.
                 if result is None:
                     # Missing/failed inference is not a normal inspection and
                     # must not kill the worker or create a false recovery event.
@@ -4275,8 +4284,12 @@ class GStreamerInferenceApp:
         self.video_source = video_source
         self.demo_mode = DEMO_MODE
         self.demo_loop = DEMO_LOOP
+        self.demo_profiles = (DemoProfiles(os.getenv("NUVION_LOCAL_DEMO_PROFILES", "/var/lib/nuv-agent/demo/profiles"))
+                              if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED") == "1" else None)
+        selected = self.demo_profiles.validate(self.demo_profiles.active_id) if self.demo_profiles else {}
+        self.demo_video = str(selected["path"]) if selected.get("kind") == "video" else None
         try:
-            self.demo_source = self._prepare_demo_source() if self.demo_mode else None
+            self.demo_source = self._prepare_demo_source() if self.demo_mode and not self.demo_video else None
         except (OSError, RuntimeError, ValueError):
             if systemd_restart_enabled(os.environ):
                 rollback_failed_mode_startup(
@@ -4296,6 +4309,8 @@ class GStreamerInferenceApp:
         self._overlay_update_lock = threading.Lock()
         self._pending_overlay_text: str | OverlayPayload | None = None
         self.user_data = NuvionEventState(self.update_overlay_text, demo_source=self.demo_source)
+        self.user_data.demo_video_id = self.demo_profiles.active_id if self.demo_video else None
+        self.user_data.demo_video_generation = 0
         self.webrtc_uplink = WebRTCUplinkController(
             send_message=self.send_webrtc_signal,
             default_force_relay=WEBRTC_FORCE_RELAY,
@@ -4375,6 +4390,7 @@ class GStreamerInferenceApp:
             gst_source_override=GST_SOURCE_OVERRIDE,
             demo_mode=self.demo_mode,
             demo_source=self.demo_source,
+            demo_video=self.demo_video,
         )
 
         tracking_overlay_pipeline = ""
@@ -4408,7 +4424,7 @@ class GStreamerInferenceApp:
                 demo_banner = (
                     'textoverlay name=anomalyvfm_demo_banner font-desc="Sans 15" '
                     'halignment=center valignment=bottom shaded-background=true '
-                    f'text="MVTec DEMO | NPU | {scope} threshold {detector.threshold:.3f}" ! '
+                    f'text="{"VIDEO DEMO" if self.demo_video else "MVTec DEMO"} | NPU | {scope} threshold {detector.threshold:.3f}" ! '
                 )
             overlay_pipeline = (
                 f"{tracking_overlay_pipeline}{defect_overlay_pipeline}"
@@ -4468,12 +4484,12 @@ class GStreamerInferenceApp:
 
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             assets = os.getenv("NUVION_LOCAL_DEMO_ASSETS", "/opt/nuv-agent/share/local-demo")
-            self.local_demo = LocalDemoServer(assets)
+            self.local_demo = LocalDemoServer(assets, profiles=self.demo_profiles, restart=self._schedule_demo_profile_restart)
             overlay_pipeline += preview_branch()
 
         uplink_pipeline = build_uplink_pipeline(
             rtp_ssrc=self.rtp_ssrc,
-            clip_enabled=CLIP_ENABLED,
+            clip_enabled=CLIP_ENABLED and not (self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED") == "1"),
             clip_segment_sec=CLIP_SEGMENT_SEC,
             clip_max_segments=CLIP_MAX_SEGMENTS,
             clip_segments_dir=CLIP_SEGMENTS_DIR,
@@ -4558,6 +4574,8 @@ class GStreamerInferenceApp:
         appsink = self.pipeline.get_by_name("zsad_sink")
         if appsink:
             appsink.connect("new-sample", on_new_sample, self.user_data)
+            if self.demo_video and self.demo_loop:
+                appsink.connect("eos", lambda _sink: GLib.idle_add(self._replay_local_video))
         else:
             log.warning("[PIPELINE] zsad_sink not found.")
 
@@ -4680,6 +4698,20 @@ class GStreamerInferenceApp:
         if self.webrtc_uplink and self.pipeline and not self.webrtc_uplink.attach_pipeline(self.pipeline):
             self.webrtc_uplink = None
 
+    def _schedule_demo_profile_restart(self) -> bool:
+        # Reply to the browser before leaving the process. Supervisor reloads selection.
+        if not systemd_restart_enabled(os.environ):
+            return False
+        return bool(GLib.timeout_add(500, lambda: (self.loop.quit(), False)[1]))
+
+    def _replay_local_video(self):
+        self.user_data.reset_demo_timing()
+        if not self.pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0):
+            log.error("[DEMO] local video rewind failed")
+        else:
+            log.info("[DEMO] Local video rewound")
+        return False  # GLib idle callback runs once.
+
     def _restart_demo_pipeline(self, reason: str) -> bool:
         if not self.pipeline:
             return False
@@ -4800,7 +4832,7 @@ class GStreamerInferenceApp:
 
     def _draw_defect_overlay(self, _overlay, context, timestamp, _duration) -> None:
         sample = self.user_data.resolve_demo_sample(timestamp)
-        regions = self.user_data.defect_region_state.visible(sample)
+        regions = self.user_data.defect_region_state.visible(sample, max_age=0.75 if self.demo_video else 3)
         draw_defect_regions(context, regions, self.video_width, self.video_height)
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
