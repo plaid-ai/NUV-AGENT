@@ -58,6 +58,7 @@ from nuvion_app.inference.fleet_command import (
 from nuvion_app.inference.demo_mvtec import MvtecDemoSource
 from nuvion_app.inference.demo_mvtec import prepare_mvtec_demo_source
 from nuvion_app.inference.demo_profiles import DemoProfiles
+from nuvion_app.inference.demo_video import DemoVideoBridge
 from nuvion_app.inference.device_mode import (
     DeviceModeReconciler,
     DeviceModeStore,
@@ -4325,6 +4326,7 @@ class GStreamerInferenceApp:
         self.loop = None
         self.encoder_adapter: X264EncoderAdapter | None = None
         self.depthai_bridge: DepthAIGStreamerBridge | None = None
+        self.demo_video_bridge = None
         camera_environment = dict(os.environ)
         if self.demo_mode or (GST_SOURCE_OVERRIDE and GST_SOURCE_OVERRIDE.strip()):
             camera_environment["NUVION_CAMERA_PROFILE"] = "generic"
@@ -4524,6 +4526,12 @@ class GStreamerInferenceApp:
         log.info("[PIPELINE] %s", pipeline_string)
         self.pipeline = Gst.parse_launch(pipeline_string)
         self.loop = GLib.MainLoop()
+        if self.demo_video:
+            self.demo_video_bridge = DemoVideoBridge(
+                self.demo_video, self.pipeline.get_by_name("demo_video_source"), Gst,
+                self.video_width, self.video_height, self.frame_rate,
+                on_loop=self.user_data.reset_demo_timing,
+            )
         self.camera_controller.configure(
             self.pipeline.get_by_name(CAMERA_SOURCE_ELEMENT_NAME)
         )
@@ -4574,8 +4582,7 @@ class GStreamerInferenceApp:
         appsink = self.pipeline.get_by_name("zsad_sink")
         if appsink:
             appsink.connect("new-sample", on_new_sample, self.user_data)
-            if self.demo_video and self.demo_loop:
-                appsink.connect("eos", lambda _sink: GLib.idle_add(self._replay_local_video))
+
         else:
             log.warning("[PIPELINE] zsad_sink not found.")
 
@@ -4703,14 +4710,6 @@ class GStreamerInferenceApp:
         if not systemd_restart_enabled(os.environ):
             return False
         return bool(GLib.timeout_add(500, lambda: (self.loop.quit(), False)[1]))
-
-    def _replay_local_video(self):
-        self.user_data.reset_demo_timing()
-        if not self.pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0):
-            log.error("[DEMO] local video rewind failed")
-        else:
-            log.info("[DEMO] Local video rewound")
-        return False  # GLib idle callback runs once.
 
     def _restart_demo_pipeline(self, reason: str) -> bool:
         if not self.pipeline:
@@ -4938,6 +4937,8 @@ class GStreamerInferenceApp:
                 state_result = self.pipeline.set_state(Gst.State.PLAYING)
                 if state_result == Gst.StateChangeReturn.FAILURE:
                     raise RuntimeError("GStreamer pipeline failed to enter PLAYING")
+                if self.demo_video_bridge is not None:
+                    self.demo_video_bridge.start()
                 if self.depthai_bridge is not None:
                     self.depthai_bridge.start()
                     log.info("[DEPTHAI] RGB source started")
@@ -4992,6 +4993,8 @@ class GStreamerInferenceApp:
         camera_controller = getattr(self, "camera_controller", None)
         if camera_controller is not None:
             camera_controller.close()
+        if getattr(self, "demo_video_bridge", None) is not None:
+            self.demo_video_bridge.close()
         if self.depthai_bridge is not None:
             self.depthai_bridge.close()
         if self.webrtc_uplink:

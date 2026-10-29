@@ -1752,6 +1752,7 @@ class PipelineDurableSafetyTest(unittest.TestCase):
         app = object.__new__(pipeline.GStreamerInferenceApp)
         app.pipeline = types.SimpleNamespace(set_state=lambda _state: success)
         app.depthai_bridge = None
+        app.demo_video_bridge = None
         app.loop = loop
         app.shutdown = mock.Mock()
 
