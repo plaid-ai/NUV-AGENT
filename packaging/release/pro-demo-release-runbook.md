@@ -35,3 +35,15 @@ requirements. A Pro release cannot request IQ9075 OTA publication.
 
 Do not copy IQ9075 evidence to authorize Pro or mark an untested capability as
 passed. The OpenRB UART timeout is a separate hardware/firmware investigation.
+
+### Optional live event clip tracking
+
+On the Ventuno Q live camera path, set
+`NUVION_CLIP_DEFECT_TRACKING_ENABLED=1` once the backend and console support
+`clipTrack`. The runtime needs OpenCV's Python bindings with NumPy ABI
+compatibility, plus `ffmpeg` and `ffprobe`. The Pro QNN Python 3.12 runtime
+with NumPy 2.2.6 was tested with `opencv-python-headless==4.12.0.88` installed
+in a separate runtime directory without reinstalling NumPy. Leave the flag
+unset on other devices until qualified. The optional tracker runs after
+recording, independently of live inference. If it cannot match or track the
+inference frame, playback still works and the captured image remains available.

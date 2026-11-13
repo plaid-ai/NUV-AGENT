@@ -447,6 +447,7 @@ TRITON_THRESHOLD = parse_float(os.getenv("NUVION_TRITON_THRESHOLD"), 0.7)
 ZSAD_BACKEND = normalize_backend(os.getenv("NUVION_ZSAD_BACKEND", "triton"), default="triton")
 
 CLIP_ENABLED = is_truthy(os.getenv("NUVION_CLIP_ENABLED", "true"))
+CLIP_DEFECT_TRACKING = is_truthy(os.getenv("NUVION_CLIP_DEFECT_TRACKING_ENABLED", "false"))
 CLIP_PRE_SEC = parse_float(os.getenv("NUVION_CLIP_PRE_SEC"), 5.0)
 CLIP_POST_SEC = parse_float(os.getenv("NUVION_CLIP_POST_SEC"), 5.0)
 CLIP_SEGMENT_SEC = parse_float(os.getenv("NUVION_CLIP_SEGMENT_SEC"), 2.0)
@@ -853,11 +854,7 @@ def build_uplink_pipeline(
             "tee name=webrtc_uplink_tee allow-not-linked=true"
         )
 
-    segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
-    segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
-    clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
     live_queue = build_bounded_live_queue(element_name="uplink_live_queue")
-    clip_queue = build_bounded_live_queue(element_name="clip_live_queue")
     return (
         "tee name=stream_split "
         f"stream_split. ! {live_queue} ! "
@@ -866,7 +863,17 @@ def build_uplink_pipeline(
         f"rtph264pay name=webrtc_pay config-interval=1 pt=96 mtu=1200 ssrc={int(rtp_ssrc)} ! "
         "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000 ! "
         "tee name=webrtc_uplink_tee allow-not-linked=true "
-        f"stream_split. ! {clip_queue} ! "
+        f"stream_split. ! {build_clip_recording_pipeline(clip_segment_sec, clip_max_segments, clip_segments_dir)}"
+    )
+
+
+def build_clip_recording_pipeline(clip_segment_sec: float, clip_max_segments: int, clip_segments_dir: str) -> str:
+    segment_ns = int(float(clip_segment_sec) * 1_000_000_000)
+    segment_location = os.path.join(clip_segments_dir, "segment_%05d.mp4")
+    clip_encoder_pipeline = build_x264_encoder_pipeline("clip_encoder")
+    clip_queue = build_bounded_live_queue(element_name="clip_live_queue")
+    return (
+        f"{clip_queue} ! "
         f"{clip_encoder_pipeline}"
         "h264parse config-interval=1 ! "
         f"splitmuxsink name=clip_sink muxer=mp4mux max-size-time={segment_ns} "
@@ -956,17 +963,26 @@ def request_upload_url(media_type: str = "CLIP", content_type: str | None = None
     return response.get("data")
 
 
-def update_clip_status(object_name: str, status: str, event_offset_ms: int | None = None) -> bool:
+def update_clip_status(
+    object_name: str, status: str, event_offset_ms: int | None = None, clip_track: dict | None = None,
+) -> bool:
     payload = {"objectName": object_name, "status": status}
     if status == "READY" and event_offset_ms is not None:
         payload["eventOffsetMs"] = event_offset_ms
+    if status == "READY" and clip_track is not None:
+        payload["clipTrack"] = clip_track
     return api_request("PATCH", "/devices/media/clip-status", payload) is not None
 
 
-def update_clip_status_with_retry(object_name: str, status: str, event_offset_ms: int | None = None) -> bool:
+def update_clip_status_with_retry(
+    object_name: str, status: str, event_offset_ms: int | None = None, clip_track: dict | None = None,
+) -> bool:
     attempts = max(1, CLIP_STATUS_MAX_RETRIES)
     for attempt in range(1, attempts + 1):
-        if update_clip_status(object_name, status, event_offset_ms):
+        args = (object_name, status, event_offset_ms)
+        if clip_track is not None:
+            args += (clip_track,)
+        if update_clip_status(*args):
             return True
         if attempt < attempts:
             delay = max(0.1, CLIP_STATUS_RETRY_BASE_SEC) * (2 ** (attempt - 1))
@@ -3291,8 +3307,11 @@ class NuvionEventState:
                 content_digest = snapshot_result.content_digest
 
         if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
+            tracking_input = {}
+            if CLIP_DEFECT_TRACKING and not self.demo_mode and snapshot_frame is not None and snapshot_regions:
+                tracking_input = {"frame_rgb": snapshot_frame.copy(), "regions": tuple(snapshot_regions)}
             clip_object = self.start_clip_upload(
-                event_id=event_id, event_running_time_ns=clip_event_running_time_ns,
+                event_id=event_id, event_running_time_ns=clip_event_running_time_ns, **tracking_input,
             )
             if clip_object:
                 clip_status = "UPLOADING"
@@ -3408,6 +3427,7 @@ class NuvionEventState:
 
     def start_clip_upload(
         self, event_id: str | None = None, *, event_running_time_ns: int | None = None,
+        frame_rgb: np.ndarray | None = None, regions: tuple = (),
     ) -> str | None:
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             return None
@@ -3444,6 +3464,7 @@ class NuvionEventState:
         threading.Thread(
             target=self._capture_and_upload_clip,
             args=(object_name, upload_url, now, event_id, event_running_time_ns),
+            kwargs={"frame_rgb": frame_rgb, "regions": regions} if frame_rgb is not None else {},
             daemon=True,
         ).start()
         return object_name
@@ -3455,8 +3476,10 @@ class NuvionEventState:
         detected_at: float,
         event_id: str | None,
         event_running_time_ns: int | None = None,
+        *, frame_rgb: np.ndarray | None = None, regions: tuple = (),
     ):
         clip_path = None
+        clip_track = None
         event_offset_ms = None
         final_status = "FAILED"
         try:
@@ -3464,6 +3487,24 @@ class NuvionEventState:
             if clip_path:
                 ok = upload_file_to_url(upload_url, clip_path, CLIP_CONTENT_TYPE)
                 final_status = "READY" if ok else "FAILED"
+                if ok and event_offset_ms is not None and frame_rgb is not None and regions:
+                    try:
+                        from nuvion_app.inference.clip_tracking import build_clip_track
+
+                        ffmpeg, ffprobe = resolve_ffmpeg_path(), resolve_ffprobe_path()
+                        if ffmpeg and ffprobe:
+                            clip_track = build_clip_track(
+                                clip_path, ffmpeg=ffmpeg, ffprobe=ffprobe, event_ms=event_offset_ms,
+                                frame_rgb=frame_rgb, regions=regions,
+                            )
+                        if clip_track:
+                            event_offset_ms = clip_track["eventTimeMs"]
+                            log.info("[CLIP] tracked %d frames eventOffsetMs=%d object=%s",
+                                     len(clip_track["frames"]), event_offset_ms, object_name)
+                        else:
+                            log.info("[CLIP] no reliable tracking frames object=%s", object_name)
+                    except Exception as exc:
+                        log.warning("[CLIP] tracking unavailable object=%s: %s", object_name, exc)
         except Exception as exc:
             log.warning("[CLIP] capture/upload failed object=%s: %s", object_name, exc)
         finally:
@@ -3474,11 +3515,16 @@ class NuvionEventState:
                     pass
             with self.clip_lock:
                 self.clip_in_progress = False
-        self._finalize_clip_status(object_name, final_status, event_id, event_offset_ms)
+        args = (object_name, final_status, event_id, event_offset_ms)
+        if clip_track is None:
+            self._finalize_clip_status(*args)
+        else:
+            self._finalize_clip_status(*args, clip_track)
 
     @staticmethod
     def _finalize_clip_status(
         object_name: str, status: str, event_id: str | None, event_offset_ms: int | None = None,
+        clip_track: dict | None = None,
     ) -> None:
         if event_id and critical_event_delivery is not None:
             acknowledged = critical_event_delivery.wait_for_ack(event_id, CLIP_EVENT_ACK_WAIT_SEC)
@@ -3488,7 +3534,11 @@ class NuvionEventState:
                     event_id,
                     object_name,
                 )
-        update_clip_status_with_retry(object_name, status, event_offset_ms)
+        args = (object_name, status, event_offset_ms)
+        if clip_track is None:
+            update_clip_status_with_retry(*args)
+        else:
+            update_clip_status_with_retry(*args, clip_track)
 
     def _list_segments(self) -> list[str]:
         now = time.time()
@@ -4595,9 +4645,17 @@ class GStreamerInferenceApp:
             self.local_demo = LocalDemoServer(assets, profiles=self.demo_profiles, restart=self._schedule_demo_profile_restart)
             overlay_pipeline += preview_branch()
 
+        recording_enabled = CLIP_ENABLED and not (
+            self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED") == "1"
+        )
+        raw_recording = recording_enabled and CLIP_DEFECT_TRACKING and not self.demo_mode
+        clip_branch = (
+            f"t. ! {build_clip_recording_pipeline(CLIP_SEGMENT_SEC, CLIP_MAX_SEGMENTS, CLIP_SEGMENTS_DIR)} "
+            if raw_recording else ""
+        )
         uplink_pipeline = build_uplink_pipeline(
             rtp_ssrc=self.rtp_ssrc,
-            clip_enabled=CLIP_ENABLED and not (self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED") == "1"),
+            clip_enabled=recording_enabled and not raw_recording,
             clip_segment_sec=CLIP_SEGMENT_SEC,
             clip_max_segments=CLIP_MAX_SEGMENTS,
             clip_segments_dir=CLIP_SEGMENTS_DIR,
@@ -4609,6 +4667,7 @@ class GStreamerInferenceApp:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
+                f"{clip_branch}"
                 f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
                 f"t. ! {live_queue} ! "
@@ -4622,6 +4681,7 @@ class GStreamerInferenceApp:
             pipeline_string = (
                 f"{source_pipeline} ! "
                 "tee name=t "
+                f"{clip_branch}"
                 f"t. ! {live_queue} ! "
                 "appsink name=zsad_sink emit-signals=true max-buffers=1 drop=true sync=false "
                 f"t. ! {live_queue} ! "
