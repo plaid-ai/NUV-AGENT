@@ -75,3 +75,22 @@ def collect_stable_segments(
         segments = [segment for segment in segments if os.path.getmtime(segment) >= after]
         return segments[:count]
     return segments[-count:]
+
+
+def clip_event_offset_ms(
+    bounds: tuple[tuple[int, int | None] | None, ...], event_ns: int,
+) -> int | None:
+    """Map the camera running time into a complete, contiguous clip."""
+    first = previous_end = None
+    contains_event = False
+    for fragment in bounds:
+        if fragment is None:
+            return None
+        start, end = fragment
+        if end is None or end <= start or (previous_end is not None and start != previous_end):
+            return None
+        if first is None:
+            first = start
+        previous_end = end
+        contains_event |= start <= event_ns < end
+    return (event_ns - first) // 1_000_000 if first is not None and contains_event else None
