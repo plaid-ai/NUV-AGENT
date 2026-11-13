@@ -73,3 +73,14 @@ class ClipSegmentsTest(unittest.TestCase):
             )
 
             self.assertEqual(result, [good])
+
+
+def test_event_offset_uses_inference_frame_and_actual_fragment_boundaries():
+    from nuvion_app.inference.clip_segments import clip_event_offset_ms
+
+    fragments = ((9_000_000_000, 10_100_000_000), (10_100_000_000, 11_250_000_000))
+    assert clip_event_offset_ms(fragments, 10_400_000_000) == 1400
+    assert clip_event_offset_ms(fragments, 10_100_000_000) == 1100
+    assert clip_event_offset_ms(fragments, 11_250_000_000) is None
+    assert clip_event_offset_ms((fragments[0], (10_200_000_000, 11_000_000_000)), 10_400_000_000) is None
+    assert clip_event_offset_ms((None, fragments[1]), 10_400_000_000) is None

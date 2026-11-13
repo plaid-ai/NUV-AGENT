@@ -38,7 +38,7 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
-from nuvion_app.inference.clip_segments import list_stable_segments
+from nuvion_app.inference.clip_segments import clip_event_offset_ms, list_stable_segments
 from nuvion_app.inference.camera_control import (
     CAMERA_SOURCE_ELEMENT_NAME,
     build_camera_controller,
@@ -116,7 +116,10 @@ from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.camera_position import CameraPositionReconciler
 from nuvion_app.inference.camera_realtime import CameraRealtimeControl, CAMERA_CONTROL_QUEUE, CAMERA_TELEMETRY_DESTINATION
 from nuvion_app.inference.snapshot import LatestFrameBuffer
-from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
+from nuvion_app.inference.snapshot import (
+    capture_and_upload_snapshot_with_metadata,
+    render_snapshot_regions,
+)
 from nuvion_app.inference.stream_policy import (
     GlibMainContextDispatcher,
     StreamPolicyReconciler,
@@ -174,7 +177,9 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
-from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions, sample_key
+from nuvion_app.inference.defect_regions import (
+    DefectRegionState, draw_defect_regions, draw_inspection_roi, sample_key,
+)
 from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
@@ -949,15 +954,17 @@ def request_upload_url(media_type: str = "CLIP", content_type: str | None = None
     return response.get("data")
 
 
-def update_clip_status(object_name: str, status: str) -> bool:
+def update_clip_status(object_name: str, status: str, event_offset_ms: int | None = None) -> bool:
     payload = {"objectName": object_name, "status": status}
+    if status == "READY" and event_offset_ms is not None:
+        payload["eventOffsetMs"] = event_offset_ms
     return api_request("PATCH", "/devices/media/clip-status", payload) is not None
 
 
-def update_clip_status_with_retry(object_name: str, status: str) -> bool:
+def update_clip_status_with_retry(object_name: str, status: str, event_offset_ms: int | None = None) -> bool:
     attempts = max(1, CLIP_STATUS_MAX_RETRIES)
     for attempt in range(1, attempts + 1):
-        if update_clip_status(object_name, status):
+        if update_clip_status(object_name, status, event_offset_ms):
             return True
         if attempt < attempts:
             delay = max(0.1, CLIP_STATUS_RETRY_BASE_SEC) * (2 ** (attempt - 1))
@@ -2806,6 +2813,7 @@ class TimedInferenceFrame:
     pixels: np.ndarray
     arrived_at_monotonic: float
     demo_context: "DemoSampleContext | None" = None
+    running_time_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2933,6 +2941,7 @@ class NuvionEventState:
         self.clip_in_progress = False
         self.clip_last_started = 0.0
         self.clip_lock = threading.Lock()
+        self.clip_fragment_bounds: dict[str, tuple[int, int | None]] = {}
         self.face_tracking_enabled = FACE_TRACKING_ENABLED
         self.face_tracking_show_bbox = FACE_TRACKING_SHOW_BBOX
         self.tracking_overlay_state = TrackingOverlayState()
@@ -3242,6 +3251,9 @@ class NuvionEventState:
         model_digest: object = None,
         inference_seconds: float | None = None,
         content_digest: str | None = None,
+        snapshot_frame: np.ndarray | None = None,
+        snapshot_regions: tuple = (),
+        clip_event_running_time_ns: int | None = None,
     ):
         if getattr(self, "demo_video_id", None):
             return  # Local video profiles have no central dataset/GT contract.
@@ -3267,13 +3279,19 @@ class NuvionEventState:
         event_id = str(uuid.uuid4())
         occurred_at = utc_now_iso()
         if (force_sample or (status == "DEFECT" and status_changed)) and snapshot_object is None:
-            snapshot_result = self.capture_snapshot_upload_metadata()
+            snapshot_result = (
+                self.capture_snapshot_upload_metadata(snapshot_frame, snapshot_regions)
+                if snapshot_frame is not None
+                else self.capture_snapshot_upload_metadata()
+            )
             if snapshot_result:
                 snapshot_object = snapshot_result.object_name
                 content_digest = snapshot_result.content_digest
 
         if status == "DEFECT" and status_changed and clip_object is None and clip_status is None:
-            clip_object = self.start_clip_upload(event_id=event_id)
+            clip_object = self.start_clip_upload(
+                event_id=event_id, event_running_time_ns=clip_event_running_time_ns,
+            )
             if clip_object:
                 clip_status = "UPLOADING"
 
@@ -3353,15 +3371,20 @@ class NuvionEventState:
         result = self.capture_snapshot_upload_metadata()
         return result.object_name if result else None
 
-    def capture_snapshot_upload_metadata(self):
+    def capture_snapshot_upload_metadata(
+        self, frame: np.ndarray | None = None, regions: tuple = (),
+    ):
         # Local playback must not wait for synchronous cloud media uploads.
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             return None
         if not SNAPSHOT_ENABLED:
             return None
 
-        frame = self.latest_frame.copy()
+        if frame is None:
+            frame = self.latest_frame.copy()
         try:
+            if frame is not None and regions:
+                frame = render_snapshot_regions(frame, regions)
             return capture_and_upload_snapshot_with_metadata(
                 frame,
                 request_upload_url=request_upload_url,
@@ -3372,7 +3395,18 @@ class NuvionEventState:
             log.warning("[SNAPSHOT] Failed to upload snapshot: %s", exc)
             return None
 
-    def start_clip_upload(self, event_id: str | None = None) -> str | None:
+    def record_clip_fragment(self, path: str, running_time_ns: int, *, opened: bool) -> None:
+        with self.clip_lock:
+            if opened:
+                self.clip_fragment_bounds[path] = (running_time_ns, None)
+            elif path in self.clip_fragment_bounds:
+                start, _ = self.clip_fragment_bounds[path]
+                if running_time_ns > start:
+                    self.clip_fragment_bounds[path] = (start, running_time_ns)
+
+    def start_clip_upload(
+        self, event_id: str | None = None, *, event_running_time_ns: int | None = None,
+    ) -> str | None:
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             return None
         if not self.clip_enabled or not CLIP_ENABLED:
@@ -3407,7 +3441,7 @@ class NuvionEventState:
 
         threading.Thread(
             target=self._capture_and_upload_clip,
-            args=(object_name, upload_url, now, event_id),
+            args=(object_name, upload_url, now, event_id, event_running_time_ns),
             daemon=True,
         ).start()
         return object_name
@@ -3418,11 +3452,13 @@ class NuvionEventState:
         upload_url: str,
         detected_at: float,
         event_id: str | None,
+        event_running_time_ns: int | None = None,
     ):
         clip_path = None
+        event_offset_ms = None
         final_status = "FAILED"
         try:
-            clip_path = self._build_clip_from_segments(detected_at)
+            clip_path, event_offset_ms = self._build_clip_from_segments(detected_at, event_running_time_ns)
             if clip_path:
                 ok = upload_file_to_url(upload_url, clip_path, CLIP_CONTENT_TYPE)
                 final_status = "READY" if ok else "FAILED"
@@ -3436,10 +3472,12 @@ class NuvionEventState:
                     pass
             with self.clip_lock:
                 self.clip_in_progress = False
-        self._finalize_clip_status(object_name, final_status, event_id)
+        self._finalize_clip_status(object_name, final_status, event_id, event_offset_ms)
 
     @staticmethod
-    def _finalize_clip_status(object_name: str, status: str, event_id: str | None) -> None:
+    def _finalize_clip_status(
+        object_name: str, status: str, event_id: str | None, event_offset_ms: int | None = None,
+    ) -> None:
         if event_id and critical_event_delivery is not None:
             acknowledged = critical_event_delivery.wait_for_ack(event_id, CLIP_EVENT_ACK_WAIT_SEC)
             if not acknowledged:
@@ -3448,7 +3486,7 @@ class NuvionEventState:
                     event_id,
                     object_name,
                 )
-        update_clip_status_with_retry(object_name, status)
+        update_clip_status_with_retry(object_name, status, event_offset_ms)
 
     def _list_segments(self) -> list[str]:
         now = time.time()
@@ -3507,11 +3545,13 @@ class NuvionEventState:
             return segments[:count]
         return segments[-count:]
 
-    def _build_clip_from_segments(self, detected_at: float) -> str | None:
+    def _build_clip_from_segments(
+        self, detected_at: float, event_running_time_ns: int | None = None,
+    ) -> tuple[str | None, int | None]:
         ffmpeg_path = resolve_ffmpeg_path()
         if not ffmpeg_path:
             log.warning("[CLIP] ffmpeg not found. Skip clip creation.")
-            return None
+            return None, None
 
         pre_count = max(1, int(math.ceil(CLIP_PRE_SEC / CLIP_SEGMENT_SEC)))
         post_count = max(1, int(math.ceil(CLIP_POST_SEC / CLIP_SEGMENT_SEC)))
@@ -3521,6 +3561,11 @@ class NuvionEventState:
         post_segments = self._collect_segments(after=detected_at, count=post_count)
 
         segments = pre_segments + [s for s in post_segments if s not in pre_segments]
+        event_offset_ms = None
+        if event_running_time_ns is not None:
+            with self.clip_lock:
+                bounds = tuple(self.clip_fragment_bounds.get(path) for path in segments)
+            event_offset_ms = clip_event_offset_ms(bounds, event_running_time_ns)
         minimum_segments = max(2, pre_count)
         if len(segments) < minimum_segments:
             log.warning(
@@ -3528,7 +3573,7 @@ class NuvionEventState:
                 minimum_segments,
                 len(segments),
             )
-            return None
+            return None, None
 
         ts = int(detected_at)
         list_file = os.path.join(CLIP_CLIPS_DIR, f"concat_{ts}.txt")
@@ -3555,14 +3600,14 @@ class NuvionEventState:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 log.warning("[CLIP] ffmpeg failed: %s", result.stderr.strip())
-                return None
+                return None, None
         finally:
             try:
                 os.remove(list_file)
             except OSError:
                 pass
 
-        return output_path
+        return output_path, event_offset_ms
 
     def report_production(self, count: int) -> bool:
         event_id = str(uuid.uuid4())
@@ -3592,6 +3637,7 @@ class NuvionEventState:
         self,
         frame_rgb,
         demo_context: DemoSampleContext | None = None,
+        *, running_time_ns: int | None = None,
     ):
         now = time.time()
         if self.backend != "none":
@@ -3600,7 +3646,7 @@ class NuvionEventState:
                 # that can drift to the end of a slide and return too late to draw.
                 key = sample_key(demo_context)
                 if key != self._last_demo_inference_key:
-                    latest = TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context)
+                    latest = TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context, running_time_ns)
                     try:
                         self.zero_shot_queue.put_nowait(latest)
                     except queue.Full:
@@ -3614,7 +3660,7 @@ class NuvionEventState:
                 # One appsink producer and one inference worker: keep at most
                 # one pending frame, replacing stale work without blocking video.
                 latest = TimedInferenceFrame(
-                    frame_rgb, time.monotonic(), demo_context
+                    frame_rgb, time.monotonic(), demo_context, running_time_ns
                 )
                 try:
                     self.zero_shot_queue.put_nowait(latest)
@@ -3632,8 +3678,11 @@ class NuvionEventState:
                 if not self.zero_shot_queue.full():
                     try:
                         queued_frame = (
-                            TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context)
-                            if getattr(self, "demo_mode", False)
+                            TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context, running_time_ns)
+                            if getattr(self, "demo_mode", False) or (
+                                self.backend == "anomalyvfm_qnn"
+                                and getattr(self.zero_shot, "live_boxes_enabled", False)
+                            )
                             else frame_rgb
                         )
                         self.zero_shot_queue.put_nowait(queued_frame)
@@ -3690,9 +3739,11 @@ class NuvionEventState:
                 continue
 
             frame_arrived_at = None
+            frame_running_time_ns = None
             demo_context = None
             if isinstance(frame, TimedInferenceFrame):
                 frame_arrived_at = frame.arrived_at_monotonic
+                frame_running_time_ns = frame.running_time_ns
                 demo_context = frame.demo_context
                 frame = frame.pixels
 
@@ -3721,9 +3772,12 @@ class NuvionEventState:
                     self._set_anomaly_overlay(f"{self.backend.upper()} inference unavailable")
                     continue
                 if result:
-                    self.defect_region_state.update(
-                        demo_context, result.get("defect_regions", ()) if is_anomaly else ()
-                    )
+                    regions = result.get("defect_regions", ()) if is_anomaly else ()
+                    if (self.backend == "anomalyvfm_qnn" and not self.demo_mode
+                            and frame_arrived_at is not None):
+                        self.defect_region_state.update_live(regions, captured_at=frame_arrived_at)
+                    else:
+                        self.defect_region_state.update(demo_context, regions)
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
@@ -3753,7 +3807,7 @@ class NuvionEventState:
                             )
                             if frame_arrived_at is not None:
                                 provenance += (
-                                    "mode=continuous_latest "
+                                    f"mode={'sampled' if not self.demo_mode and ZERO_SHOT_SAMPLE_SEC > 0 else 'continuous_latest'} "
                                     f"queueWaitSeconds={max(0.0, processing_started - frame_arrived_at):.3f} "
                                     f"frameToResultSeconds={max(0.0, self.last_inference_at - frame_arrived_at):.3f} "
                                 )
@@ -3765,6 +3819,8 @@ class NuvionEventState:
                             )
                         if self.backend == "anomalyvfm_qnn":
                             provenance += "experimental=true thresholdStatus=UNCALIBRATED "
+                            if not self.demo_mode and getattr(self.zero_shot, "live_boxes_enabled", False):
+                                provenance += f"liveRegions={len(regions)} "
                         log.info("[MODEL] %s status=%s", provenance, status)
                     overlay = OverlayPayload(
                         status=status,
@@ -3793,6 +3849,11 @@ class NuvionEventState:
                         "model_digest": result.get("model_sha256"),
                         "inference_seconds": result.get("inference_seconds"),
                     }
+                    if status == "DEFECT" and not self.demo_mode and self.backend == "anomalyvfm_qnn":
+                        observation_kwargs.update(
+                            snapshot_frame=frame, snapshot_regions=regions,
+                            clip_event_running_time_ns=frame_running_time_ns,
+                        )
                     try:
                         if status == "DEFECT":
                             self.send_status(
@@ -3987,7 +4048,12 @@ def on_new_sample(appsink, user_data: NuvionEventState):
         int(buffer.pts) if buffer.pts != Gst.CLOCK_TIME_NONE else None
     )
     user_data.remember_latest_frame(frame)
-    user_data.maybe_enqueue_frame(frame, demo_context)
+    running_time_ns = None
+    if buffer.pts != Gst.CLOCK_TIME_NONE and (segment := sample.get_segment()) is not None:
+        running_time = segment.to_running_time(Gst.Format.TIME, buffer.pts)
+        if running_time != Gst.CLOCK_TIME_NONE:
+            running_time_ns = int(running_time)
+    user_data.maybe_enqueue_frame(frame, demo_context, running_time_ns=running_time_ns)
     return Gst.FlowReturn.OK
 
 
@@ -4409,10 +4475,22 @@ class GStreamerInferenceApp:
             )
 
         defect_overlay_pipeline = ""
-        if self.demo_mode and self.user_data.backend == "anomalyvfm_qnn":
+        detector = getattr(self.user_data, "zero_shot", None)
+        self.live_inspection_roi = None
+        self.live_inspection_boxes = False
+        self._live_roi_drawn = False
+        self._live_boxes_drawn = False
+        if self.user_data.backend == "anomalyvfm_qnn" and not self.demo_mode:
+            self.live_inspection_roi = detector.live_roi
+            self.live_inspection_boxes = detector.live_boxes_enabled
+            if self.live_inspection_roi:
+                self.live_inspection_roi.validate_frame(self.video_width, self.video_height)
+        if self.user_data.backend == "anomalyvfm_qnn" and (
+            self.demo_mode or self.live_inspection_roi or self.live_inspection_boxes
+        ):
             gi.require_foreign("cairo")
             if Gst.ElementFactory.find("cairooverlay") is None:
-                raise RuntimeError("AnomalyVFM demo localization requires cairooverlay")
+                raise RuntimeError("AnomalyVFM localization requires cairooverlay")
             defect_overlay_pipeline = (
                 "videoconvert ! video/x-raw,format=BGRx ! "
                 "cairooverlay name=defect_overlay ! videoconvert ! "
@@ -4420,7 +4498,6 @@ class GStreamerInferenceApp:
 
         if self.demo_mode:
             demo_banner = ""
-            detector = getattr(self.user_data, "zero_shot", None)
             if isinstance(detector, AnomalyVFMDetector):
                 scope = "DEMO-ONLY" if detector.demo_threshold_applied else "UNCALIBRATED"
                 demo_banner = (
@@ -4793,7 +4870,18 @@ class GStreamerInferenceApp:
 
     def bus_call(self, bus, message, loop):
         msg_type = message.type
-        if msg_type == Gst.MessageType.EOS:
+        if msg_type == Gst.MessageType.ELEMENT:
+            structure = message.get_structure()
+            if structure and message.src.get_name() == "clip_sink":
+                name = structure.get_name()
+                if name in ("splitmuxsink-fragment-opened", "splitmuxsink-fragment-closed"):
+                    path = structure.get_string("location")
+                    running_time = structure.get_value("running-time")
+                    if path and isinstance(running_time, int) and 0 <= running_time < Gst.CLOCK_TIME_NONE:
+                        self.user_data.record_clip_fragment(
+                            path, running_time, opened=name.endswith("-opened"),
+                        )
+        elif msg_type == Gst.MessageType.EOS:
             if self.demo_mode and self.demo_loop and self.pipeline:
                 if self._restart_demo_pipeline("eos"):
                     return True
@@ -4830,9 +4918,23 @@ class GStreamerInferenceApp:
         )
 
     def _draw_defect_overlay(self, _overlay, context, timestamp, _duration) -> None:
-        sample = self.user_data.resolve_demo_sample(timestamp)
-        regions = self.user_data.defect_region_state.visible(sample, max_age=0.75 if self.demo_video else 3)
+        if self.demo_mode:
+            sample = self.user_data.resolve_demo_sample(timestamp)
+            regions = self.user_data.defect_region_state.visible(sample, max_age=0.75 if self.demo_video else 3)
+        else:
+            if self.live_inspection_roi:
+                draw_inspection_roi(context, self.live_inspection_roi)
+                if not self._live_roi_drawn:
+                    self._live_roi_drawn = True
+                    log.info("[INSPECTION] live ROI rendered %s stream=%sx%s model=768x768",
+                             self.live_inspection_roi, self.video_width, self.video_height)
+            if not self.live_inspection_boxes or critical_event_safety_gate.is_stopped():
+                return
+            regions = self.user_data.defect_region_state.visible_live()
         draw_defect_regions(context, regions, self.video_width, self.video_height)
+        if regions and not self.demo_mode and not self._live_boxes_drawn:
+            self._live_boxes_drawn = True
+            log.info("[INSPECTION] live defect regions rendered count=%s", len(regions))
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()

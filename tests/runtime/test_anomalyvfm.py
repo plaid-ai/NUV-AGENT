@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 import numpy as np
 from nuvion_app.runtime import anomalyvfm as model
+from nuvion_app.inference.defect_regions import InspectionROI, extract_defect_regions
 
 
 class AnomalyVFMTests(unittest.TestCase):
@@ -60,6 +61,44 @@ class AnomalyVFMTests(unittest.TestCase):
     def test_unsupported_platform_never_downloads_or_loads(self):
         with mock.patch.object(model.platform, "system", return_value="Darwin"), self.assertRaises(ValueError):
             model.ensure_package(self.selection, self.env)
+
+    def test_live_classify_uses_only_roi_and_maps_actual_hotspots_to_full_frame(self):
+        env = {**self.env, "NUVION_ANOMALYVFM_LIVE_ROI": "36,11,56,56",
+               "NUVION_ANOMALYVFM_LIVE_BOXES": "true"}
+        detector = model.AnomalyVFMDetector(env)
+        detector._loaded_fingerprint = self.selection.fingerprint()
+        detector._profile_verified = True
+        detector._verified_graph_sha256 = "verified"
+        detector._session = mock.Mock()
+        logits = np.full((1, 1, 96, 96), -5, np.float32)
+        logits[0, 0, 24:36, 48:64] = 5
+        defect = np.full((1, 1), 3, np.float32)
+        detector._session.run.side_effect = [(defect, logits), (np.zeros_like(defect), logits)]
+        frame = np.zeros((72, 128, 3), np.uint8)
+        frame[11:67, 36:92] = (255, 128, 0)
+        with mock.patch.object(detector, "prepare", return_value=True):
+            result = detector.classify(frame)
+            batch = detector._session.run.call_args.args[1]["rgb"]
+            self.assertEqual(batch.shape, (1, 3, 768, 768))
+            np.testing.assert_allclose(batch[0, 0], 1.)
+            np.testing.assert_allclose(batch[0, 1], np.float32(128 / 255))
+            np.testing.assert_allclose(batch[0, 2], 0.)
+            self.assertEqual(result["label"], "defect")
+            regions = extract_defect_regions(detector.last_anomaly_map, is_defect=True)
+            self.assertEqual(len(regions), 1)
+            x, y, w, h = regions[0]
+            np.testing.assert_allclose(result["defect_regions"], [
+                ((36 + x * 56) / 128, (11 + y * 56) / 72, w * 56 / 128, h * 56 / 72),
+            ])
+            self.assertEqual(detector.classify(frame)["defect_regions"], ())
+        self.assertIsNone(model.AnomalyVFMDetector({**env, "NUVION_DEMO_MODE": "true"}).live_roi)
+
+    def test_live_roi_rejects_bad_config_or_frame(self):
+        for value in ("-1,0,12,12", "0,0,0,0", "0,0,8,12", "0,0,8", "0,0,a,a"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                InspectionROI.from_setting(value)
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            InspectionROI.from_setting("36,11,56,56").crop(np.zeros((66, 128, 3), np.uint8))
 
     def test_download_or_session_load_is_not_live_proof_and_mutations_withdraw_it(self):
         detector = model.AnomalyVFMDetector(self.env)

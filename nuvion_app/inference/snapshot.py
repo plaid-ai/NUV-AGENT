@@ -35,6 +35,26 @@ class LatestFrameBuffer:
             return self._frame.copy()
 
 
+def render_snapshot_regions(frame_rgb: np.ndarray, regions: tuple) -> np.ndarray:
+    """Mark model regions on a copy of the exact inference frame."""
+    annotated = frame_rgb.copy()
+    height, width = annotated.shape[:2]
+    thickness = max(2, round(min(width, height) / 240))
+    for x, y, w, h in regions:
+        left = max(0, round(x * width))
+        top = max(0, round(y * height))
+        right = min(width, round((x + w) * width))
+        bottom = min(height, round((y + h) * height))
+        if right <= left or bottom <= top:
+            continue
+        red = (255, 38, 25)
+        annotated[top:min(top + thickness, bottom), left:right] = red
+        annotated[max(top, bottom - thickness):bottom, left:right] = red
+        annotated[top:bottom, left:min(left + thickness, right)] = red
+        annotated[top:bottom, max(left, right - thickness):right] = red
+    return annotated
+
+
 def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
     checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
     return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", checksum)

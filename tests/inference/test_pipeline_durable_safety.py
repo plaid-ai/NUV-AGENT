@@ -1833,6 +1833,29 @@ class PipelineDurableSafetyTest(unittest.TestCase):
                     self.assertEqual(state.capture_snapshot_upload_metadata(), "uploaded")
                 upload.assert_called_once()
 
+    def test_live_event_upload_uses_detection_frame_and_model_regions(self) -> None:
+        state = object.__new__(pipeline.NuvionEventState)
+        state.demo_mode = False
+        state.last_sent_status = "NORMAL"
+        state.last_sent_at = 0.0
+        state.latest_frame = mock.Mock()
+        frame = pipeline.np.zeros((100, 200, 3), dtype=pipeline.np.uint8)
+        with (
+            mock.patch.object(pipeline, "SNAPSHOT_ENABLED", True),
+            mock.patch.object(pipeline, "get_device_state_coordinator", return_value=_Coordinator()),
+            mock.patch.object(pipeline, "capture_and_upload_snapshot_with_metadata",
+                              return_value=types.SimpleNamespace(object_name="snapshot.jpg", content_digest="digest")) as upload,
+            mock.patch.object(state, "start_clip_upload", return_value=None),
+            mock.patch.object(pipeline, "persist_critical_event", return_value=object()) as persist,
+        ):
+            state.send_status(
+                "DEFECT", "scratch", "detected", "WARNING",
+                snapshot_frame=frame, snapshot_regions=((0.25, 0.30, 0.20, 0.40),),
+            )
+        state.latest_frame.copy.assert_not_called()
+        self.assertEqual(tuple(upload.call_args.args[0][30, 50]), (255, 38, 25))
+        self.assertEqual(persist.call_args.args[2]["snapshotObject"], "snapshot.jpg")
+
     def test_local_demo_skips_cloud_media_but_preserves_anomaly_event(self) -> None:
         state = object.__new__(pipeline.NuvionEventState)
         state.last_sent_status = None
