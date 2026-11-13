@@ -11,6 +11,7 @@ from nuvion_app.inference.snapshot import PNG_SIGNATURE
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot
 from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
 from nuvion_app.inference.snapshot import encode_snapshot
+from nuvion_app.inference.snapshot import render_snapshot_regions
 
 
 class SnapshotTest(unittest.TestCase):
@@ -19,6 +20,15 @@ class SnapshotTest(unittest.TestCase):
         self.frame[..., 0] = 12
         self.frame[..., 1] = 34
         self.frame[..., 2] = 56
+
+    def test_red_box_projects_into_the_inference_frame_without_altering_input(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        result = render_snapshot_regions(frame, ((0.25, 0.30, 0.20, 0.40), (0.9, 0.9, 0.2, 0.2)))
+        np.testing.assert_array_equal(result[30, 50], (255, 38, 25))
+        np.testing.assert_array_equal(result[69, 89], (255, 38, 25))
+        np.testing.assert_array_equal(result[99, 199], (255, 38, 25))
+        self.assertFalse(result[50, 70].any())
+        self.assertFalse(frame.any())
 
     def test_latest_frame_buffer_returns_copy(self) -> None:
         buffer = LatestFrameBuffer()

@@ -116,7 +116,10 @@ from nuvion_app.inference.motor import motor_config_from_env
 from nuvion_app.inference.camera_position import CameraPositionReconciler
 from nuvion_app.inference.camera_realtime import CameraRealtimeControl, CAMERA_CONTROL_QUEUE, CAMERA_TELEMETRY_DESTINATION
 from nuvion_app.inference.snapshot import LatestFrameBuffer
-from nuvion_app.inference.snapshot import capture_and_upload_snapshot_with_metadata
+from nuvion_app.inference.snapshot import (
+    capture_and_upload_snapshot_with_metadata,
+    render_snapshot_regions,
+)
 from nuvion_app.inference.stream_policy import (
     GlibMainContextDispatcher,
     StreamPolicyReconciler,
@@ -3244,6 +3247,8 @@ class NuvionEventState:
         model_digest: object = None,
         inference_seconds: float | None = None,
         content_digest: str | None = None,
+        snapshot_frame: np.ndarray | None = None,
+        snapshot_regions: tuple = (),
     ):
         if getattr(self, "demo_video_id", None):
             return  # Local video profiles have no central dataset/GT contract.
@@ -3269,7 +3274,11 @@ class NuvionEventState:
         event_id = str(uuid.uuid4())
         occurred_at = utc_now_iso()
         if (force_sample or (status == "DEFECT" and status_changed)) and snapshot_object is None:
-            snapshot_result = self.capture_snapshot_upload_metadata()
+            snapshot_result = (
+                self.capture_snapshot_upload_metadata(snapshot_frame, snapshot_regions)
+                if snapshot_frame is not None
+                else self.capture_snapshot_upload_metadata()
+            )
             if snapshot_result:
                 snapshot_object = snapshot_result.object_name
                 content_digest = snapshot_result.content_digest
@@ -3355,15 +3364,20 @@ class NuvionEventState:
         result = self.capture_snapshot_upload_metadata()
         return result.object_name if result else None
 
-    def capture_snapshot_upload_metadata(self):
+    def capture_snapshot_upload_metadata(
+        self, frame: np.ndarray | None = None, regions: tuple = (),
+    ):
         # Local playback must not wait for synchronous cloud media uploads.
         if self.demo_mode and os.getenv("NUVION_LOCAL_DEMO_ENABLED", "0") == "1":
             return None
         if not SNAPSHOT_ENABLED:
             return None
 
-        frame = self.latest_frame.copy()
+        if frame is None:
+            frame = self.latest_frame.copy()
         try:
+            if frame is not None and regions:
+                frame = render_snapshot_regions(frame, regions)
             return capture_and_upload_snapshot_with_metadata(
                 frame,
                 request_upload_url=request_upload_url,
@@ -3803,6 +3817,8 @@ class NuvionEventState:
                         "model_digest": result.get("model_sha256"),
                         "inference_seconds": result.get("inference_seconds"),
                     }
+                    if status == "DEFECT" and not self.demo_mode and self.backend == "anomalyvfm_qnn":
+                        observation_kwargs.update(snapshot_frame=frame, snapshot_regions=regions)
                     try:
                         if status == "DEFECT":
                             self.send_status(
