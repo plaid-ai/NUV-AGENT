@@ -9,7 +9,7 @@ from bisect import bisect_left, bisect_right
 import numpy as np
 
 log = logging.getLogger(__name__)
-TRACK_WINDOW_MS = 1200
+TRACK_WINDOW_MS = 1500
 MAX_FRAMES = 180
 
 
@@ -84,7 +84,11 @@ def _follow(cv, frames, times, anchor, box, step, output):
         target_i = np.rint(new[:, 0]).astype(int)
         origin_values = reference[origin_i[:, 1], origin_i[:, 0]].astype(float)
         target_values = frames[current][target_i[:, 1], target_i[:, 0]].astype(float)
-        if np.median(np.abs(target_values - origin_values)) > 24:
+        brightness_delta = target_values - origin_values
+        shift = np.median(brightness_delta)
+        # The same steel surface can brighten as it moves under ambient light.
+        # Permit a shared brightness shift while still rejecting a changed pattern.
+        if abs(shift) > 60 or np.median(np.abs(brightness_delta - shift)) > 35:
             break
         transformed = corners @ affine[:, :2].T + affine[:, 2]
         a, b = transformed.min(axis=0), transformed.max(axis=0)
@@ -164,5 +168,8 @@ def build_clip_track(path: str, *, ffmpeg: str, ffprobe: str, event_ms: int,
             _follow(cv, frames, times, anchor,
                     (x1 * width, y1 * height, (x2 - x1) * width, (y2 - y1) * height),
                     step, output)
-    track_frames = [{"timeMs": time, "boxes": boxes} for time, boxes in zip(times, output) if boxes]
+    track_frames = [
+        {"timeMs": time, "boxes": boxes} for time, boxes in zip(times, output)
+        if boxes and abs(time - times[anchor]) <= TRACK_WINDOW_MS
+    ]
     return {"eventTimeMs": times[anchor], "frames": track_frames} if track_frames else None
