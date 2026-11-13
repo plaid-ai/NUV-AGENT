@@ -58,6 +58,16 @@ class DefectRegionsTest(unittest.TestCase):
         state.clear()
         self.assertEqual(state.visible(sample, now=11), ())
 
+    def test_live_snapshot_expires_from_frame_capture_and_never_leaks_to_demo(self):
+        state = DefectRegionState()
+        boxes = ((.1, .2, .3, .4),)
+        state.update_live(boxes, captured_at=10)
+        self.assertEqual(state.visible_live(now=10.5), boxes)
+        self.assertEqual(state.visible(None, now=10.5), ())
+        self.assertEqual(state.visible_live(now=11.26), ())
+        state.update_live((), captured_at=11)
+        self.assertEqual(state.visible_live(now=11.1), ())
+
 
 if __name__ == "__main__":
     unittest.main()

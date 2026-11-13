@@ -4,8 +4,8 @@
 
 The v16 MinMax W8A16 + V-range context is qualified for the verified Ventuno Q
 prototype (`ventuno_q`, Linux aarch64) only. It does not run on Jetson or imply
-IQ9075 compatibility. CSI capture remains outside this validation; use the
-existing demo/video input. Scores are not probabilities and the initial 0.7
+IQ9075 compatibility. CSI capture remains outside this validation. Scores are
+not probabilities and the initial 0.7
 threshold is uncalibrated. Validate a factory threshold before production use.
 
 For a labeled MVTec showcase, `NUVION_ANOMALYVFM_DEMO_THRESHOLD` can set an
@@ -14,6 +14,17 @@ continues to use `NUVION_ZERO_SHOT_THRESHOLD`. A video banner identifies the dem
 and its threshold. A threshold selected from showcase images is not a held-out
 accuracy result or factory calibration. Use square video geometry (768×768) for
 the square MVTec input and retain the unmodified deterministic 24-image playlist.
+
+For fixed-camera inspection outside DEMO mode, set
+`NUVION_ANOMALYVFM_LIVE_ROI=x,y,width,height` in capture pixels. Use a square
+that fits the capture frame; for example, `360,110,560,560` at 1280×720.
+The model receives the crop resized to 768×768 while the stream keeps its
+original size and shows a cyan inspection outline. Set
+`NUVION_ANOMALYVFM_LIVE_BOXES=true` to show localized model regions in red
+when the image-level score reaches the live threshold and the heatmap contains
+a distinct region. Both options default off and have no effect in DEMO mode.
+Live boxes expire 1.25 seconds after the analyzed frame was captured; they
+represent the latest result and do not track a moving part between frames.
 
 ## Package and identity
 

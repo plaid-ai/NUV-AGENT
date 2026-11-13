@@ -24,7 +24,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from nuvion_app.inference.defect_regions import extract_defect_regions
+from nuvion_app.inference.defect_regions import InspectionROI, extract_defect_regions
 from nuvion_app.runtime.settings_overlay import SHA256_PATTERN
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector, _require_qnn_only_profile
 
@@ -247,6 +247,10 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
         demo = str(self.environ.get("NUVION_DEMO_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
         override = self.environ.get("NUVION_ANOMALYVFM_DEMO_THRESHOLD")
         self.demo_mode_enabled = demo
+        self.live_roi = None if demo else InspectionROI.from_setting(self.environ.get("NUVION_ANOMALYVFM_LIVE_ROI"))
+        self.live_boxes_enabled = not demo and str(
+            self.environ.get("NUVION_ANOMALYVFM_LIVE_BOXES", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.demo_threshold_applied = demo and override is not None
         threshold = override if self.demo_threshold_applied else self.environ.get("NUVION_ZERO_SHOT_THRESHOLD", "0.7")
         super().__init__(True, str(self.selection.manifest_path),
@@ -395,7 +399,8 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
                 if (frame_rgb.dtype != np.uint8 or frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3
                         or not 0 < min(frame_rgb.shape[:2]) <= max(frame_rgb.shape[:2]) <= 8192):
                     raise ValueError("Expected HWC RGB uint8 frame up to 8192 pixels")
-                rgb = image.fromarray(frame_rgb).resize((768, 768), image.Resampling.BILINEAR)
+                pixels = self.live_roi.crop(frame_rgb) if self.live_roi else frame_rgb
+                rgb = image.fromarray(pixels).resize((768, 768), image.Resampling.BILINEAR)
                 batch = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32).transpose(2, 0, 1)[None] / np.float32(255))
                 started = time.perf_counter()
                 outputs = self._session.run(["image_logit", "pixel_logits"], {"rgb": batch})
@@ -404,6 +409,11 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
                     _require_qnn_only_profile(self._session.end_profiling())
                     self._profile_verified = True
                 score, self.last_anomaly_map = postprocess(*outputs)
+                regions = ()
+                if self.demo_mode_enabled or self.live_boxes_enabled:
+                    regions = extract_defect_regions(self.last_anomaly_map, is_defect=score >= self.threshold)
+                    if regions and self.live_roi:
+                        regions = self.live_roi.project(regions, frame_rgb.shape[1], frame_rgb.shape[0])
                 self.ready, self.last_error = True, None
                 self.model_sha256 = self.selection.digest.removeprefix("sha256:")
                 self.graph_sha256 = self._verified_graph_sha256
@@ -412,7 +422,7 @@ class AnomalyVFMDetector(VisualADHTPAnomalyDetector):
                 self.inference_count += 1
                 self._result_at = time.monotonic()
                 return {"label": "defect" if score >= self.threshold else "normal", "score": score,
-                        "defect_regions": extract_defect_regions(self.last_anomaly_map, is_defect=score >= self.threshold) if self.demo_mode_enabled else (),
+                        "defect_regions": regions,
                         "raw_score": score, "backend": BACKEND, "labels": ["anomaly_score"], "scores": [score],
                         "model_sha256": self.model_sha256, "graph_sha256": self.graph_sha256,
                         "manifest_sha256": self.loaded_manifest_sha256, "image_size": 768,

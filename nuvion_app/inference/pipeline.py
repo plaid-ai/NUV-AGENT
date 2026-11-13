@@ -174,7 +174,9 @@ GLibUnix = load_glib_unix(gi, GLib)
 from nuvion_app.inference.zero_shot import ZeroShotAnomalyDetector
 from nuvion_app.runtime.visualad import VisualADAnomalyDetector
 from nuvion_app.runtime.visualad_htp import VisualADHTPAnomalyDetector
-from nuvion_app.inference.defect_regions import DefectRegionState, draw_defect_regions, sample_key
+from nuvion_app.inference.defect_regions import (
+    DefectRegionState, draw_defect_regions, draw_inspection_roi, sample_key,
+)
 from nuvion_app.runtime.anomalyvfm import AnomalyVFMDetector, build_anomalyvfm_detector
 from nuvion_app.inference.video_source import build_video_source_pipeline
 from nuvion_app.inference.video_source import DEPTHAI_APPSRC_NAME
@@ -3633,7 +3635,10 @@ class NuvionEventState:
                     try:
                         queued_frame = (
                             TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context)
-                            if getattr(self, "demo_mode", False)
+                            if getattr(self, "demo_mode", False) or (
+                                self.backend == "anomalyvfm_qnn"
+                                and getattr(self.zero_shot, "live_boxes_enabled", False)
+                            )
                             else frame_rgb
                         )
                         self.zero_shot_queue.put_nowait(queued_frame)
@@ -3721,9 +3726,12 @@ class NuvionEventState:
                     self._set_anomaly_overlay(f"{self.backend.upper()} inference unavailable")
                     continue
                 if result:
-                    self.defect_region_state.update(
-                        demo_context, result.get("defect_regions", ()) if is_anomaly else ()
-                    )
+                    regions = result.get("defect_regions", ()) if is_anomaly else ()
+                    if (self.backend == "anomalyvfm_qnn" and not self.demo_mode
+                            and frame_arrived_at is not None):
+                        self.defect_region_state.update_live(regions, captured_at=frame_arrived_at)
+                    else:
+                        self.defect_region_state.update(demo_context, regions)
                     label = result.get("label", "ZSAD")
                     score = float(result.get("score", 0.0))
                     status = "DEFECT" if is_anomaly else "NORMAL"
@@ -3753,7 +3761,7 @@ class NuvionEventState:
                             )
                             if frame_arrived_at is not None:
                                 provenance += (
-                                    "mode=continuous_latest "
+                                    f"mode={'sampled' if not self.demo_mode and ZERO_SHOT_SAMPLE_SEC > 0 else 'continuous_latest'} "
                                     f"queueWaitSeconds={max(0.0, processing_started - frame_arrived_at):.3f} "
                                     f"frameToResultSeconds={max(0.0, self.last_inference_at - frame_arrived_at):.3f} "
                                 )
@@ -3765,6 +3773,8 @@ class NuvionEventState:
                             )
                         if self.backend == "anomalyvfm_qnn":
                             provenance += "experimental=true thresholdStatus=UNCALIBRATED "
+                            if not self.demo_mode and getattr(self.zero_shot, "live_boxes_enabled", False):
+                                provenance += f"liveRegions={len(regions)} "
                         log.info("[MODEL] %s status=%s", provenance, status)
                     overlay = OverlayPayload(
                         status=status,
@@ -4409,10 +4419,22 @@ class GStreamerInferenceApp:
             )
 
         defect_overlay_pipeline = ""
-        if self.demo_mode and self.user_data.backend == "anomalyvfm_qnn":
+        detector = getattr(self.user_data, "zero_shot", None)
+        self.live_inspection_roi = None
+        self.live_inspection_boxes = False
+        self._live_roi_drawn = False
+        self._live_boxes_drawn = False
+        if self.user_data.backend == "anomalyvfm_qnn" and not self.demo_mode:
+            self.live_inspection_roi = detector.live_roi
+            self.live_inspection_boxes = detector.live_boxes_enabled
+            if self.live_inspection_roi:
+                self.live_inspection_roi.validate_frame(self.video_width, self.video_height)
+        if self.user_data.backend == "anomalyvfm_qnn" and (
+            self.demo_mode or self.live_inspection_roi or self.live_inspection_boxes
+        ):
             gi.require_foreign("cairo")
             if Gst.ElementFactory.find("cairooverlay") is None:
-                raise RuntimeError("AnomalyVFM demo localization requires cairooverlay")
+                raise RuntimeError("AnomalyVFM localization requires cairooverlay")
             defect_overlay_pipeline = (
                 "videoconvert ! video/x-raw,format=BGRx ! "
                 "cairooverlay name=defect_overlay ! videoconvert ! "
@@ -4420,7 +4442,6 @@ class GStreamerInferenceApp:
 
         if self.demo_mode:
             demo_banner = ""
-            detector = getattr(self.user_data, "zero_shot", None)
             if isinstance(detector, AnomalyVFMDetector):
                 scope = "DEMO-ONLY" if detector.demo_threshold_applied else "UNCALIBRATED"
                 demo_banner = (
@@ -4830,9 +4851,23 @@ class GStreamerInferenceApp:
         )
 
     def _draw_defect_overlay(self, _overlay, context, timestamp, _duration) -> None:
-        sample = self.user_data.resolve_demo_sample(timestamp)
-        regions = self.user_data.defect_region_state.visible(sample, max_age=0.75 if self.demo_video else 3)
+        if self.demo_mode:
+            sample = self.user_data.resolve_demo_sample(timestamp)
+            regions = self.user_data.defect_region_state.visible(sample, max_age=0.75 if self.demo_video else 3)
+        else:
+            if self.live_inspection_roi:
+                draw_inspection_roi(context, self.live_inspection_roi)
+                if not self._live_roi_drawn:
+                    self._live_roi_drawn = True
+                    log.info("[INSPECTION] live ROI rendered %s stream=%sx%s model=768x768",
+                             self.live_inspection_roi, self.video_width, self.video_height)
+            if not self.live_inspection_boxes or critical_event_safety_gate.is_stopped():
+                return
+            regions = self.user_data.defect_region_state.visible_live()
         draw_defect_regions(context, regions, self.video_width, self.video_height)
+        if regions and not self.demo_mode and not self._live_boxes_drawn:
+            self._live_boxes_drawn = True
+            log.info("[INSPECTION] live defect regions rendered count=%s", len(regions))
 
     def _draw_tracking_overlay(self, _overlay, context, _timestamp, _duration) -> None:
         snapshot = self.user_data.tracking_overlay_state.snapshot()
