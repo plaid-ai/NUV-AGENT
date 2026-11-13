@@ -94,3 +94,24 @@ def clip_event_offset_ms(
         previous_end = end
         contains_event |= start <= event_ns < end
     return (event_ns - first) // 1_000_000 if first is not None and contains_event else None
+
+
+def select_event_fragments(
+    bounds: dict[str, tuple[int, int | None]],
+    event_ns: int,
+    pre_ns: int,
+    post_ns: int,
+) -> list[tuple[str, tuple[int, int]]] | None:
+    """Pick only finished, consecutive fragments around the captured frame."""
+    fragments = sorted(
+        ((path, (start, end)) for path, (start, end) in bounds.items()
+         if end is not None and end > start),
+        key=lambda fragment: fragment[1][0],
+    )
+    selected = [fragment for fragment in fragments
+                if fragment[1][1] > event_ns - pre_ns and fragment[1][0] <= event_ns + post_ns]
+    if not selected or selected[-1][1][1] < event_ns + post_ns:
+        return None
+    if clip_event_offset_ms(tuple(bound for _, bound in selected), event_ns) is None:
+        return None
+    return selected

@@ -38,7 +38,9 @@ import aiohttp
 import websockets
 from nuvion_app.inference.connectivity import ConnectivityReporter
 from nuvion_app.inference.connectivity import ConnectivityThresholds
-from nuvion_app.inference.clip_segments import clip_event_offset_ms, list_stable_segments
+from nuvion_app.inference.clip_segments import (
+    clip_event_offset_ms, list_stable_segments, select_event_fragments,
+)
 from nuvion_app.inference.camera_control import (
     CAMERA_SOURCE_ELEMENT_NAME,
     build_camera_controller,
@@ -3554,18 +3556,33 @@ class NuvionEventState:
             return None, None
 
         pre_count = max(1, int(math.ceil(CLIP_PRE_SEC / CLIP_SEGMENT_SEC)))
-        post_count = max(1, int(math.ceil(CLIP_POST_SEC / CLIP_SEGMENT_SEC)))
-
-        pre_segments = self._collect_segments(before=detected_at, count=pre_count)
-        time.sleep(CLIP_POST_SEC + CLIP_SEGMENT_SEC)
-        post_segments = self._collect_segments(after=detected_at, count=post_count)
-
-        segments = pre_segments + [s for s in post_segments if s not in pre_segments]
         event_offset_ms = None
+        selected = None
         if event_running_time_ns is not None:
-            with self.clip_lock:
-                bounds = tuple(self.clip_fragment_bounds.get(path) for path in segments)
-            event_offset_ms = clip_event_offset_ms(bounds, event_running_time_ns)
+            deadline = time.monotonic() + CLIP_POST_SEC + max(4, 3 * CLIP_SEGMENT_SEC)
+            while time.monotonic() < deadline:
+                with self.clip_lock:
+                    selected = select_event_fragments(
+                        self.clip_fragment_bounds, event_running_time_ns,
+                        round(CLIP_PRE_SEC * 1_000_000_000), round(CLIP_POST_SEC * 1_000_000_000),
+                    )
+                if selected is not None:
+                    break
+                time.sleep(0.1)
+            if selected is None:
+                log.warning("[CLIP] Could not record the inspected frame and post-event window")
+                return None, None
+            segments = [path for path, _ in selected]
+            event_offset_ms = clip_event_offset_ms(
+                tuple(bounds for _, bounds in selected), event_running_time_ns,
+            )
+        else:
+            post_count = max(1, int(math.ceil(CLIP_POST_SEC / CLIP_SEGMENT_SEC)))
+            pre_segments = self._collect_segments(before=detected_at, count=pre_count)
+            time.sleep(CLIP_POST_SEC + CLIP_SEGMENT_SEC)
+            post_segments = self._collect_segments(after=detected_at, count=post_count)
+            segments = pre_segments + [s for s in post_segments if s not in pre_segments]
+
         minimum_segments = max(2, pre_count)
         if len(segments) < minimum_segments:
             log.warning(
@@ -3579,6 +3596,7 @@ class NuvionEventState:
         list_file = os.path.join(CLIP_CLIPS_DIR, f"concat_{ts}.txt")
         output_path = os.path.join(CLIP_CLIPS_DIR, f"clip_{ts}.mp4")
 
+        keep_output = False
         try:
             with open(list_file, "w") as f:
                 for seg in segments:
@@ -3597,15 +3615,26 @@ class NuvionEventState:
                 "copy",
                 output_path,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
                 log.warning("[CLIP] ffmpeg failed: %s", result.stderr.strip())
                 return None, None
+            if selected is not None:
+                with self.clip_lock:
+                    if any(self.clip_fragment_bounds.get(path) != bounds for path, bounds in selected):
+                        log.warning("[CLIP] Segment ring changed while joining event video")
+                        return None, None
+            keep_output = True
         finally:
             try:
                 os.remove(list_file)
             except OSError:
                 pass
+            if not keep_output:
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
 
         return output_path, event_offset_ms
 
@@ -3681,7 +3710,7 @@ class NuvionEventState:
                             TimedInferenceFrame(frame_rgb, time.monotonic(), demo_context, running_time_ns)
                             if getattr(self, "demo_mode", False) or (
                                 self.backend == "anomalyvfm_qnn"
-                                and getattr(self.zero_shot, "live_boxes_enabled", False)
+                                and not getattr(self, "demo_mode", False)
                             )
                             else frame_rgb
                         )

@@ -84,3 +84,16 @@ def test_event_offset_uses_inference_frame_and_actual_fragment_boundaries():
     assert clip_event_offset_ms(fragments, 11_250_000_000) is None
     assert clip_event_offset_ms((fragments[0], (10_200_000_000, 11_000_000_000)), 10_400_000_000) is None
     assert clip_event_offset_ms((None, fragments[1]), 10_400_000_000) is None
+
+
+def test_capture_window_waits_for_closed_post_event_fragments_and_preserves_event():
+    from nuvion_app.inference.clip_segments import select_event_fragments
+
+    ns = 1_000_000_000
+    bounds = {'early': (6*ns, 8*ns), 'before': (8*ns, 10*ns),
+              'event': (10*ns, 12*ns), 'after': (12*ns, None)}
+    assert select_event_fragments(bounds, 11*ns, 2*ns, 2*ns) is None
+    bounds['after'] = (12*ns, 14*ns)
+    assert [name for name, _ in select_event_fragments(bounds, 11*ns, 2*ns, 2*ns)] == ['before', 'event', 'after']
+    del bounds['event']
+    assert select_event_fragments(bounds, 11*ns, 2*ns, 2*ns) is None
