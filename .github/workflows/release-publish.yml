@@ -324,7 +324,7 @@ jobs:
           "$RELEASE_TEST_VENV/bin/python" -m pip install --require-hashes -r packaging/release/requirements-cloud-kms.txt
           "$RELEASE_TEST_VENV/bin/python" -m pip install \
             transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
-            tokenizers==0.23.1 safetensors==0.8.0
+            tokenizers==0.23.1 safetensors==0.8.0 Pillow==12.1.0
           "$RELEASE_TEST_VENV/bin/python" packaging/release/run-isolated-tests.py
 
       - name: Verify tested release tree

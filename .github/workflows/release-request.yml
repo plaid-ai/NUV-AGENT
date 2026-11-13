@@ -54,6 +54,6 @@ jobs:
             -r packaging/release/requirements-cloud-kms.txt
           "${RUNNER_TEMP}/request-venv/bin/python" -m pip install \
             transformers==5.16.1 huggingface-hub==1.29.0 hf-xet==1.6.0 \
-            tokenizers==0.23.1 safetensors==0.8.0
+            tokenizers==0.23.1 safetensors==0.8.0 Pillow==12.1.0
           "${RUNNER_TEMP}/request-venv/bin/python" \
             packaging/release/run-isolated-tests.py
