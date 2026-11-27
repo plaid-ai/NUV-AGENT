@@ -47,3 +47,12 @@ in a separate runtime directory without reinstalling NumPy. Leave the flag
 unset on other devices until qualified. The optional tracker runs after
 recording, independently of live inference. If it cannot match or track the
 inference frame, playback still works and the captured image remains available.
+
+### Native checkout file modes for manual DEB qualification
+
+Build the DEB from native Git checkout modes: directories `0755`, regular tracked
+files `0644`, and tracked executable files `0755`. A `git archive` extraction may
+produce `0775`/`0664` modes; normalize those from the Git index before building.
+The DEB builder preserves source modes under the root updater, while the Agent
+bundle normalizes its modes. Matching bundle hashes alone therefore cannot prove
+that two DEBs match. Reinstall and repeat qualification if the DEB bytes change.

@@ -34,7 +34,8 @@
   "notes": [
     "Qualifies the actual Monza/QCS8300 Pro 2 board under the existing pro-demo hardware profile; no IQ9075 OTA, motor or production accuracy qualification.",
     "H.264 decode uses avdec_h264; QNN/HTP inference remains on NPU.",
-    "The first hardware-decoder trial was rejected because video JPEG diversity was 2; no failed observations were admitted as passing evidence."
+    "The first hardware-decoder trial was rejected because video JPEG diversity was 2; no failed observations were admitted as passing evidence.",
+    "The initial git-archive source inherited 0664/0775 modes and produced a different DEB. This proof was collected after reinstalling and rerunning all profiles with the canonical Git-checkout DEB."
   ],
   "recordedClipReplay": {
     "recordedSourceEventId": 832087,
@@ -48,5 +49,6 @@
     "clipLastFrameMs": 10886,
     "framesAfterTrack": 139,
     "untrackedFramesDoNotRenderBoxes": true
-  }
+  },
+  "debSourceModes": "Native Git checkout: directories 0755, tracked regular files 0644, tracked executable files 0755"
 }
