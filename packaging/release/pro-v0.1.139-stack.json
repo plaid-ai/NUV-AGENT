@@ -1,0 +1,39 @@
+{
+  "physicalDevice": "NUVION Pro 2 (Ventuno Q Monza/QCS8300)",
+  "agentComponentSha": "5701771e38cf9e094670465b5222b606885f8c56",
+  "agentVersion": "0.1.139",
+  "runtimePython": "3.12",
+  "onnxruntime": "1.30.0",
+  "onnxruntimeQnn": "2.6.0",
+  "numpy": "2.5.2",
+  "opencvPythonHeadless": "4.13.0.92",
+  "modelManifestSha256": "31fcfef6afbc0f1f7b6f970e2d3da149cdc11102571e44a043e1bafa10ecb69b",
+  "inputs": [
+    {
+      "profile": "video-1",
+      "source": "boardcamera_iron_ore_things.mp4",
+      "trimStartSeconds": 8,
+      "durationSeconds": 8,
+      "sha256": "6218732c96873f6065abd402d9d9b2bd1a0ab6d55c8714c1dff33aaae6a75e3f"
+    },
+    {
+      "profile": "video-2",
+      "source": "boardcamera_iron_ore_7_wood.mp4",
+      "trimStartSeconds": 8,
+      "durationSeconds": 8,
+      "sha256": "06bf0c2271d7d968f2550d5334cd67bfcdf9f6df23411b31120b500ee53477f6"
+    }
+  ],
+  "uiSourceSha": "af8f34647df77fd167eab192897fae1db5cf12ce",
+  "mvtecSource": "https://apt.plaidai.io/demo/mvtec/v1/metal_nut.tar.xz",
+  "qualificationOnlyEnv": {
+    "GST_PLUGIN_FEATURE_RANK": "v4l2h264dec:0",
+    "NUVION_DEMO_MVTEC_BASE_URL": "https://apt.plaidai.io/demo/mvtec/v1",
+    "NUVION_DEMO_IMAGE_DURATION_SEC": "1.7"
+  },
+  "notes": [
+    "Qualifies the actual Monza/QCS8300 Pro 2 board under the existing pro-demo hardware profile; no IQ9075 OTA, motor or production accuracy qualification.",
+    "H.264 decode uses avdec_h264; QNN/HTP inference remains on NPU.",
+    "The first hardware-decoder trial was rejected because video JPEG diversity was 2; no failed observations were admitted as passing evidence."
+  ]
+}
