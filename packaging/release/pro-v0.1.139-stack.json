@@ -35,5 +35,18 @@
     "Qualifies the actual Monza/QCS8300 Pro 2 board under the existing pro-demo hardware profile; no IQ9075 OTA, motor or production accuracy qualification.",
     "H.264 decode uses avdec_h264; QNN/HTP inference remains on NPU.",
     "The first hardware-decoder trial was rejected because video JPEG diversity was 2; no failed observations were admitted as passing evidence."
-  ]
+  ],
+  "recordedClipReplay": {
+    "recordedSourceEventId": 832087,
+    "test": "replay of existing recorded defect with its recorded seed boxes; no new live event",
+    "runtimeSeconds": 2.053,
+    "eventTimeMs": 5252,
+    "frames": 42,
+    "firstTimeMs": 3959,
+    "lastTimeMs": 5628,
+    "horizontalBoxDisplacementNormalized": 0.088894,
+    "clipLastFrameMs": 10886,
+    "framesAfterTrack": 139,
+    "untrackedFramesDoNotRenderBoxes": true
+  }
 }
